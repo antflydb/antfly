@@ -17926,6 +17926,17 @@ pub const NativeFile = struct {
                     // the uncrashed discovery pass alone could hit it.
                     if (self.redo) |*redo| {
                         try redo.appendRecord(self.allocator, next.commit_sequence, CompactCheckpoint.fromCheckpointSlot(next));
+                        // perf/lwa-reclaim-reconcile: same gap as the durable
+                        // path's own ordinary append (`publishCheckpoint`'s
+                        // own comment on its matching call) -- this
+                        // ride-along append is this commit's own durability
+                        // record for its diverted logical mutations (it
+                        // becomes fully durable for free on a later commit's
+                        // own sync, never retried or unwound on its own), so
+                        // nothing is left to ever undo. Left undropped,
+                        // `overlay_undo` kept accumulating this commit's
+                        // entries right alongside the durable path's own.
+                        redo.dropOverlayUndo(self.allocator);
                     }
                     self.header.checkpoints[self.header.active_checkpoint] = next;
                     recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
@@ -18571,6 +18582,32 @@ pub const NativeFile = struct {
                     state.retired_inline_bytes = 0;
                 }
                 self.publishCommittedSequenceToInode();
+                // perf/lwa-reclaim-reconcile: this is the ordinary (by far
+                // most common) successful redo-log append -- durability
+                // comes from `redo.writer.sync()` a few lines above, so
+                // this commit's own logical mutations are exactly as
+                // published as the fold/page-shaped branches' own calls to
+                // `dropOverlayUndo` already treat theirs. Missing here,
+                // `overlay_undo` kept accumulating every ordinary commit's
+                // undo entries indefinitely (nothing ever drains it short
+                // of a fold), so a *later*, unrelated commit's own
+                // `abortTransaction`/`rollbackTransactionSavepoint` (mark
+                // relative to *its own* starting length, `dropOverlayUndo`'s
+                // own doc comment) walked straight through every earlier
+                // commit's already-published entries too, each
+                // `removeLastVersion` silently unwinding one more
+                // genuinely-committed version. Before Bug 2
+                // (perf/lwa-budget-tail) closed the diverting-commit budget
+                // admission gap, a diverting commit essentially never
+                // failed this way, so the leak never had anything to
+                // wrongly undo; once it can fail, the very next rejected
+                // commit erased every prior commit's own retirement debt,
+                // observed live as `retirementNeedsService()` reporting
+                // `false` after a sequence of successful overwrites that
+                // had genuinely superseded chains to retire ("lite
+                // reclamation capacity reserve sustains bounded
+                // overwrites"/"drains wide value graphs").
+                redo.dropOverlayUndo(self.allocator);
                 return;
             }
             // §9 (redo log full under a reader pin): even the minimal
