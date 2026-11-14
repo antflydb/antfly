@@ -16806,24 +16806,30 @@ pub const NativeFile = struct {
             // across private-flush chunking. `redo_fold_retain_pending`
             // below is sourced entirely from that overlay's own staged
             // pages, so it never sees these pages at all; the
-            // `putCatalogBatchForRoot`/`putDocumentBatch` call just
-            // above only retained each chain's own *root* (`retainRecord`),
-            // never its children, which a normal (non-redo) write
-            // retains through `writeExtentNode`'s/`writeValuePagesAllocated`'s
-            // own `retainValue` calls -- calls this exact head's own
-            // diverting commit already made, but against
-            // `pageAllocatorForDivertingCommit`'s allocator, which never
-            // attaches a ledger, so every one of them was a silent
-            // no-op. Walking each surviving head's chain here and
+            // `putCatalogBatchForRoot` call just above only retained
+            // each chain's own *root* (`retainRecord`), never its
+            // children, which a normal (non-redo) write retains through
+            // `writeExtentNode`'s own `retainValue` calls -- calls this
+            // exact head's own diverting commit already made, but
+            // against `pageAllocatorForDivertingCommit`'s allocator,
+            // which never attaches a ledger, so every one of them was a
+            // silent no-op. Walking each surviving head's chain here and
             // retaining whatever `writes.pages.ledger` has not already
-            // counted covers that gap; a page it already retained
-            // (the root, or an ordinary staged continuation page
-            // `redo_fold_retain_pending` is about to cover) is simply
-            // skipped. Only reachable with a real ledger attached
-            // (`!diverting`, i.e. `checkpointRedoLog`'s own fold); a
-            // diverting commit's own `writes.pages.ledger` is always
-            // null, so this is a no-op there.
-            if (!diverting) {
+            // counted covers that gap; a page it already retained (the
+            // root) is simply skipped.
+            //
+            // Scoped to catalog roots only (`root != .documents`):
+            // `writeDocumentValue` never sets `direct_value_pages` (only
+            // `writeCatalogValue` does), so a document's own chain is
+            // always fully covered already, by `retainRecord` (its root)
+            // and `redo_fold_retain_pending` (its staged continuation
+            // pages) -- walking it here too would be redundant extra
+            // page-read/allocation work on every document fold, observed
+            // live to tip an already-tight storage budget into failing
+            // the triggering commit itself instead of only the
+            // opportunistic checkpoint ("lite reclamation opportunistic
+            // redo checkpoint failure is visible and recovers").
+            if (!diverting and root != @backingInt(TransactionWrites.Root.documents)) {
                 if (writes.pages.ledger) |state| {
                     const checkpoint = self.activeCheckpoint();
                     for (batch.items) |m| {
