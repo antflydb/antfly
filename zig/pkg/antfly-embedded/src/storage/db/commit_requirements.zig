@@ -47,10 +47,26 @@ pub fn catalogSupported(plan: anytype) bool {
     return true;
 }
 
-/// Bound the physical output before it enters a primary transaction. Transport
-/// adapters must separately account for their encoding overhead and source bytes.
+/// Admission budget for the source envelope and the complete atomic effect set.
+/// The final physical check includes metadata amplification and replay bytes.
 pub const max_output_bytes: usize = 8 * 1024 * 1024;
 pub const max_output_rows: usize = 16 * 1024;
+
+/// Bound speculative dispatch without reducing bulk ingestion to one provider
+/// call per document. A large single source remains one bounded work item.
+pub const max_window_documents: usize = 32;
+pub const max_window_source_bytes: usize = 256 * 1024;
+pub fn windowEnd(writes: anytype, start: usize) usize {
+    var end = start;
+    var bytes: usize = 0;
+    while (end < writes.len and end - start < max_window_documents) {
+        const next = writes[end].key.len +| writes[end].value.len;
+        if (end != start and next > max_window_source_bytes -| bytes) break;
+        bytes +|= next;
+        end += 1;
+    }
+    return end;
+}
 
 /// Incremental accounting is monotonic: callers check only newly appended
 /// effects before dispatching the next producer, avoiding quadratic rescans.
@@ -150,4 +166,15 @@ test "commit requirements incremental output budget counts each effect once" {
     try budget.reserve(max_output_bytes - 8, max_output_rows - 3);
     try std.testing.expectError(error.CommitRequirementTooLarge, budget.reserve(1, 0));
     try std.testing.expectError(error.CommitRequirementTooLarge, budget.reserve(0, 1));
+}
+
+test "commit requirements dispatch windows bound documents and source bytes" {
+    const Write = struct { key: []const u8 = "k", value: []const u8 = "v" };
+    const writes: [max_window_documents + 1]Write = @splat(.{});
+    try std.testing.expectEqual(max_window_documents, windowEnd(&writes, 0));
+    try std.testing.expectEqual(writes.len, windowEnd(&writes, max_window_documents));
+    const large = try std.testing.allocator.alloc(u8, max_window_source_bytes);
+    defer std.testing.allocator.free(large);
+    const by_bytes = [_]Write{ .{ .value = large }, .{} };
+    try std.testing.expectEqual(@as(usize, 1), windowEnd(&by_bytes, 0));
 }

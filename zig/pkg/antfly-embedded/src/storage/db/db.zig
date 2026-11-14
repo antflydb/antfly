@@ -85604,7 +85604,7 @@ test "db commit requirements extraction leaves artifact source descendants to re
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("commit-requirements");
     defer directory.cleanup();
-    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "child-replay", .enable_without_producers = true } });
     defer db.close();
     try db.addEnrichment(.{
         .name = "units",
@@ -85621,6 +85621,7 @@ test "db commit requirements extraction leaves artifact source descendants to re
         .chunk_size = 16,
         .chunk_overlap = 0,
     });
+    try db.addIndex(.{ .name = "child_text", .kind = .full_text, .config_json = "{\"chunk_name\":\"chunks\"}" });
     try db.batch(.{
         .writes = &.{.{ .key = "doc", .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}" }},
         .sync_level = .write,
@@ -85636,6 +85637,124 @@ test "db commit requirements extraction leaves artifact source descendants to re
     const chunks = try db.core.store.scanPrefix(a, chunk_prefix);
     defer docstore_mod.DocStore.freeResults(a, chunks);
     try std.testing.expectEqual(@as(usize, 0), chunks.len);
+    const before = try db.stats(a);
+    defer types.freeDBStats(a, before);
+    var saw_pending = false;
+    for (before.indexes) |index| if (std.mem.eql(u8, index.name, "child_text")) {
+        for (index.source_replay) |source| if (std.mem.eql(u8, source.artifact_name, "chunks")) {
+            try std.testing.expect(!source.producer_complete);
+            saw_pending = true;
+        };
+    };
+    try std.testing.expect(saw_pending);
+    // Run the real replay owner after checking the atomic precommit state.
+    try db.enrichment_runtime.?.start();
+    try db.enrichment_runtime.?.waitForApplied(db.core.nextDerivedSequence());
+    const completed = try db.core.store.scanPrefix(a, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(a, completed);
+    try std.testing.expect(completed.len > 0);
+    try db.runUntilIdle();
+    var found = try db.search(a, .{ .index_name = "child_text", .full_text = .{ .match = .{ .field = "text", .text = "alpha" } }, .return_mode = .chunk });
+    defer found.deinit();
+    try std.testing.expect(found.total_hits > 0);
+}
+
+test "db commit requirements child replay survives materialized visibility waits" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .enrichment = .{ .owner_id = "materialized-children", .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "units",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "chunks",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "units",
+        .chunk_size = 16,
+        .chunk_overlap = 0,
+    });
+    try db.addIndex(.{ .name = "child_text", .kind = .full_text, .config_json = "{\"chunk_name\":\"chunks\"}" });
+    for ([_]types.SyncLevel{ .full_text, .enrichments, .full_index }) |level| {
+        try db.batch(.{
+            .writes = &.{.{ .key = @tagName(level), .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}" }},
+            .sync_level = level,
+            .commit_requires = .direct_enrichments,
+        });
+    }
+    try db.runUntilIdle();
+    var found = try db.search(a, .{ .index_name = "child_text", .full_text = .{ .match = .{ .field = "text", .text = "alpha" } }, .return_mode = .chunk });
+    defer found.deinit();
+    try std.testing.expectEqual(@as(u32, 3), found.total_hits);
+}
+
+test "db commit requirements retain native asset batches across documents" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        single_calls: usize = 0,
+        batch_calls: usize = 0,
+        batch_items: usize = 0,
+        fn one(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_calls += 1;
+            return out.dupe(u8, "single");
+        }
+        fn many(ptr: *anyopaque, out: Allocator, requests: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            self.batch_items += requests.len;
+            const results = try out.alloc([]u8, requests.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (results[0..initialized]) |value| out.free(value);
+                out.free(results);
+            }
+            for (requests, 0..) |request, i| {
+                results[i] = try out.dupe(u8, request.source_text);
+                initialized += 1;
+            }
+            return results;
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .owner_id = "batching", .asset_producer = .{ .ptr = &producer, .vtable = &.{
+            .produce = Producer.one,
+            .produce_batch = Producer.many,
+            .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+        } } },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .execution = .{ .batch_items = 8, .batch_bytes = 8192 },
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "one", .value = "{\"body\":\"one\"}" },
+            .{ .key = "two", .value = "{\"body\":\"two\"}" },
+            .{ .key = "three", .value = "{\"body\":\"three\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    });
+    try std.testing.expectEqual(@as(usize, 1), producer.batch_calls);
+    try std.testing.expectEqual(@as(usize, 3), producer.batch_items);
+    try std.testing.expectEqual(@as(usize, 0), producer.single_calls);
 }
 
 test "db commit requirements output budget stops subsequent producer work atomically" {

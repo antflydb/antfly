@@ -1352,6 +1352,7 @@ pub const DocumentExtractionChunkView = struct {
 };
 
 pub const DocumentExtractionCatalogView = struct {
+    children_pending: bool = false,
     chunks: []DocumentExtractionChunkView = &.{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -1949,7 +1950,69 @@ pub const GeneratedPrecomputeMode = enum {
     direct,
 };
 
+/// Owns prepared artifact bytes and reserves durable output before retaining
+/// each row. The budget is shared with deletion accounting and survives flushes.
+pub const PreparedArtifactWrites = struct {
+    list: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    items: []types.BatchWrite = &.{},
+    budget: ?*@import("commit_requirements.zig").OutputBudget = null,
+
+    pub fn append(self: *@This(), alloc: Allocator, write: types.BatchWrite) !void {
+        const before = if (self.budget) |budget| budget.* else null;
+        errdefer if (self.budget) |budget| if (before) |value| {
+            budget.* = value;
+        };
+        if (self.budget) |budget| {
+            try budget.reserve(write.key.len, 1);
+            try budget.reserve(write.value.len, 0);
+        }
+        try self.list.append(alloc, write);
+        self.items = self.list.items;
+        if (self.budget) |budget| budget.writes_seen = self.items.len;
+    }
+
+    pub fn toOwnedSlice(self: *@This(), alloc: Allocator) ![]types.BatchWrite {
+        const result = try self.list.toOwnedSlice(alloc);
+        self.items = self.list.items;
+        return result;
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.list.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedArtifactDeletes = struct {
+    list: std.ArrayListUnmanaged([]const u8) = .empty,
+    items: [][]const u8 = &.{},
+    budget: ?*@import("commit_requirements.zig").OutputBudget = null,
+
+    pub fn append(self: *@This(), alloc: Allocator, key: []const u8) !void {
+        const before = if (self.budget) |budget| budget.* else null;
+        errdefer if (self.budget) |budget| if (before) |value| {
+            budget.* = value;
+        };
+        if (self.budget) |budget| try budget.reserve(key.len, 1);
+        try self.list.append(alloc, key);
+        self.items = self.list.items;
+        if (self.budget) |budget| budget.deletes_seen = self.items.len;
+    }
+
+    pub fn toOwnedSlice(self: *@This(), alloc: Allocator) ![][]const u8 {
+        const result = try self.list.toOwnedSlice(alloc);
+        self.items = self.list.items;
+        return result;
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.list.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const PrecomputedGeneratedBatch = struct {
+    pending_child_work: bool = false,
     artifact_writes: []types.BatchWrite = &.{},
     artifact_delete_keys: []const []const u8 = &.{},
     documents: []const derived_types.DerivedDocument = &.{},

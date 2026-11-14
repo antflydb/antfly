@@ -13283,7 +13283,7 @@ pub const DataServer = struct {
     ) !void {
         // Never let the replicated apply's write-only wait erase an admission
         // prerequisite. Enabling gates requires an immutable prepared command.
-        if (req.commit_requires != null) return error.UnsupportedCommitRequirement;
+        if (req.commit_requires == .direct_enrichments) return error.UnsupportedCommitRequirement;
         try @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, req);
         try @import("antfly_local_sources").storage_db_artifact_publication_transport.validateBatchRequest(req);
         // Do not allow a private/direct batch route to bypass the metadata

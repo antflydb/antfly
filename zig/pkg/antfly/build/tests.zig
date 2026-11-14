@@ -258,6 +258,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const admission_api_tests = b.addTest(.{
         .root_module = admission_api_root,
         .filters = &.{
+            "commit requirements",
+            "http handler honors public serverless sync levels",
             "public table create index preserves permanent inference budget",
             "public artifact enrichment preserves permanent inference budget",
             "PDF embedding input public contract",

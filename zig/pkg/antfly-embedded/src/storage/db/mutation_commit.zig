@@ -2351,10 +2351,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
                 enrichment_fully_precomputed = effective_req.sync_level == .enrichments and
-                    precomputed_generated.generated_enrichment_refs.len == 0;
+                    precomputed_generated.generated_enrichment_refs.len == 0 and !precomputed_generated.pending_child_work;
             }
             const include_generated_enrichment_hint = use_thin_replay_fast_path and
-                (if (prepare_generated) precomputed_generated.generated_enrichment_refs.len != 0 else S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets());
+                (if (prepare_generated) precomputed_generated.generated_enrichment_refs.len != 0 or precomputed_generated.pending_child_work else S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets());
             if (effective_req.merge_artifacts.len > 0 or (if (req.merge_page) |page| page.artifact_effects.len != 0 else false) or write_buffers.explicit_embedding_artifact_writes.items.len > 0 or
                 write_buffers.explicit_graph_artifact_writes.items.len > 0 or
                 precomputed_generated.artifact_writes.len > 0)
@@ -2725,6 +2725,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 materialized_derived_batch.?.sequence = sequence;
                 var record = try prepareDirectChangeRecord(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, S.ownerField(self, "local_execution").*.row_policy_table_name);
                 defer change_journal_mod.deinitRecord(S.ownerField(self, "alloc").*, &record);
+                if (precomputed_generated.pending_child_work and !journalRecordHasHint(record, .enrichment)) {
+                    const hints = try S.ownerField(self, "alloc").*.alloc(change_journal_mod.TargetHint, record.target_hints.len + 1);
+                    @memcpy(hints[0..record.target_hints.len], record.target_hints);
+                    hints[record.target_hints.len] = .enrichment;
+                    if (record.target_hints.len != 0) S.ownerField(self, "alloc").*.free(record.target_hints);
+                    record.target_hints = hints;
+                }
                 const payload = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, record);
                 errdefer S.ownerField(self, "alloc").*.free(payload);
                 if (preparation.write_plan == null or preparation.write_plan.?.plan().has_text_consumers or splitShadowRequiresMaterializedDerivedBatch(self))

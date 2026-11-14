@@ -134,7 +134,7 @@ pub fn ImplementationFor(comptime D: type) type {
                 alloc: Allocator,
                 db: anytype,
                 doc_key: []const u8,
-                artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+                artifact_delete_keys: anytype,
             ) !void {
                 for (self.groups.items) |group| {
                     const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", group.artifact_name);

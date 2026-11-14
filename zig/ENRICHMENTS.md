@@ -142,22 +142,28 @@ SDKs and implements explicit `none` and `direct_enrichments` for unreplicated lo
 embedded batches. It reuses the existing immutable row plans, pre-lock producer
 preparation, provider memo/batching, source and catalog generation fences, and
 atomic artifact/coverage commit. Direct admission bounds the complete atomic
-effect set (source mutations,
-artifacts, coverage, revisions, counters and replay payload) to 8 MiB and
-16,384 physical rows. Preparation accounts for new artifact effects between
-producers and flushes deferred producer batches at document boundaries. A gate
-does not speculatively prewarm the entire request before checking those bounds;
-per-document concurrency, provider invocation budgets and optimistic retry memos
-remain in use. The final commit check includes metadata amplification.
+effect set (source mutations, artifacts, coverage, revisions, counters and replay
+payload) to 8 MiB and 16,384 physical rows. The submitted source envelope must
+also fit before providers run. Preparation dispatches windows of at most 32
+documents and 256 KiB of source bytes (one large document occupies its own
+window), preserving cross-document dense/sparse and asset batching. Provider
+result contracts receive the remaining output allowance. Artifact emission and
+retirement reserve bytes/rows individually, and the final commit check includes
+metadata amplification. Request-scoped retry memos and runtime working-set
+budgets bound speculative work independently of the durable-output limit.
 Extraction failures represented by terminal manifests reject the gate even when
 there are no consuming indexes. Direct extraction materializes its own units and
-navigation only; artifact-source descendants remain replay work. Write/propose
-acknowledgment uses the normal thin replay record after preparation. Native
+navigation only; artifact-source descendants remain replay work. A durable
+`children_pending` state fence prevents fingerprint reuse from skipping unfinished
+children. The replay record retains the enrichment hint independently of ordinary
+generated requests, and parent completion does not discharge child coverage.
+Write/propose acknowledgment uses the normal thin replay record after preparation. Native
 owner ABI 92 prevents older decoders from ignoring these prerequisites.
 
-Server HTTP, Raft and serverless currently reject explicit requirements before
-admission. Local ordered-publication, replication, child-range dispatch and
-transaction-resolution paths reject the gate as well. These rejections are a
+Explicit `none` is accepted across server, native owner, Raft, serverless and
+transaction ingress. Server HTTP, Raft and serverless currently reject the
+`direct_enrichments` gate before admission. Local ordered-publication, replication,
+child-range dispatch and transaction-resolution paths reject the gate as well. These rejections are a
 capability boundary, not completion of the target engine adapters above.
 Outstanding work includes the immutable prepared-output effect language,
 ordered producer receipts, protocol negotiation, transaction intent transport,

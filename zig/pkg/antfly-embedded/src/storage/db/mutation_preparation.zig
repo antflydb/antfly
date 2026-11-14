@@ -597,7 +597,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dense_embedder: embedder_mod.DenseEmbedder,
             embedding_name: []const u8,
             request: enrichment_types.GeneratedEnrichmentRequest,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             dense_embeddings: anytype,
             sources: []const ChunkEmbeddingSource,
             source_indexes: *std.ArrayListUnmanaged(usize),
@@ -650,7 +650,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dense_embedder: embedder_mod.DenseEmbedder,
             embedding_name: []const u8,
             request: enrichment_types.GeneratedEnrichmentRequest,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             dense_embeddings: anytype,
             sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
             consumer_indexes: []const []const u8,
@@ -726,7 +726,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             semantic_producer: []const u8,
             reprocess_generation: u64,
             revision: ?[32]u8,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
             sources: []const ChunkEmbeddingSource,
             source_indexes: *std.ArrayListUnmanaged(usize),
@@ -769,7 +769,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             semantic_producer: []const u8,
             reprocess_generation: u64,
             revision: ?[32]u8,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
             sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
             consumer_indexes: []const []const u8,
@@ -925,32 +925,48 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 null;
             defer if (fallback_write_plan) |*view| view.release();
+            var fallback_generated_plan: ?GeneratedBatchWritePlan = if (precompute_mode == .direct and preplanned == null)
+                try planGeneratedEnrichmentsForRows(alloc, req, extracted, fallback_write_plan.?.plan().*)
+            else
+                null;
+            defer if (fallback_generated_plan) |*plan| plan.deinit();
+            const resolved_plan = preplanned orelse if (fallback_generated_plan) |*plan| plan else null;
             // Bind every prewarmed result to the target resolved before any
             // provider call. The same memo survives optimistic retries, while
             // epochs may advance during the preceding attempt.
-            if (preplanned) |plan| for (plan.rows) |row| {
+            if (resolved_plan) |plan| for (plan.rows) |row| {
                 for (row.requests) |*request| {
                     if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
                     request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
                 }
             };
             if (precompute_mode == .direct) {
-                const supported = if (preplanned) |plan| plan.direct_gate_supported else @import("commit_requirements.zig").catalogSupported(fallback_write_plan.?.plan().*);
+                const supported = if (resolved_plan) |plan| plan.direct_gate_supported else @import("commit_requirements.zig").catalogSupported(fallback_write_plan.?.plan().*);
                 if (!supported) return error.UnsupportedCommitRequirement;
             }
             var fallback_memo = GeneratedEmbeddingMemo.init(alloc);
             defer fallback_memo.deinit();
             const preparation_memo = generated_memo orelse &fallback_memo;
-            // A direct gate checks each document's retained effects before dispatching
-            // another document. Whole-request speculative prewarming would run all
-            // providers before discovering an oversized early result.
-            if (precompute_mode != .direct) if (preplanned) |plan| if (generated_memo) |memo| {
+            // Legacy preparation retains its ordinary batching; direct gates
+            // dispatch bounded windows and account effects between windows.
+            if (precompute_mode != .direct) if (resolved_plan) |plan| if (generated_memo) |memo| {
                 try prewarmGeneratedDenseMemo(self, req, extracted, precompute_mode, plan, memo, force_generated_artifact_names);
                 try prewarmGeneratedSparseMemo(self, req, extracted, precompute_mode, plan, memo, force_generated_artifact_names);
             };
 
+            var pending_child_work = false;
             var output_budget = @import("commit_requirements.zig").OutputBudget{};
-            var artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+            if (precompute_mode == .direct) {
+                // Reject a source envelope that alone exceeds the admission
+                // budget before any provider calls. Final physical accounting
+                // also covers encoded rows and metadata amplification.
+                for (req.writes) |write| {
+                    try output_budget.reserve(write.key.len, 1);
+                    try output_budget.reserve(write.value.len, 0);
+                }
+                for (req.deletes) |key| try output_budget.reserve(key.len, 1);
+            }
+            var artifact_writes = execution_resources.PreparedArtifactWrites{ .budget = if (precompute_mode == .direct) &output_budget else null };
             errdefer {
                 for (artifact_writes.items) |write| {
                     alloc.free(@constCast(write.key));
@@ -958,7 +974,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 artifact_writes.deinit(alloc);
             }
-            var artifact_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
+            var artifact_delete_keys = execution_resources.PreparedArtifactDeletes{ .budget = if (precompute_mode == .direct) &output_budget else null };
             errdefer {
                 for (artifact_delete_keys.items) |key| alloc.free(@constCast(key));
                 artifact_delete_keys.deinit(alloc);
@@ -1008,11 +1024,34 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 deferred_asset_producer_items.deinit(alloc);
             }
 
+            var window_end: usize = 0;
             for (req.writes, 0..) |_, i| {
-                if (!extracted[i].hasDocument()) continue;
+                if (precompute_mode == .direct and i == window_end) {
+                    flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes) catch |err| {
+                        if (err == error.InferenceResultTooLarge) return error.CommitRequirementTooLarge;
+                        return err;
+                    };
+                    try output_budget.checkpoint(artifact_writes.items, artifact_delete_keys.items);
+                    window_end = @import("commit_requirements.zig").windowEnd(req.writes, i);
+                    if (resolved_plan) |plan| {
+                        const window_plan = GeneratedBatchWritePlan{ .alloc = alloc, .rows = plan.rows[i..window_end], .direct_gate_supported = plan.direct_gate_supported };
+                        var window_req = req;
+                        window_req.writes = req.writes[i..window_end];
+                        try prewarmGeneratedDenseMemo(self, window_req, extracted[i..window_end], precompute_mode, &window_plan, preparation_memo, force_generated_artifact_names);
+                        try prewarmGeneratedSparseMemo(self, window_req, extracted[i..window_end], precompute_mode, &window_plan, preparation_memo, force_generated_artifact_names);
+                    }
+                }
+                if (!extracted[i].hasDocument()) {
+                    if (precompute_mode == .direct and i + 1 == window_end)
+                        flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes) catch |err| {
+                            if (precompute_mode == .direct and err == error.InferenceResultTooLarge) return error.CommitRequirementTooLarge;
+                            return err;
+                        };
+                    continue;
+                }
                 var owned_row_plan: ?GeneratedBatchWritePlan = null;
                 defer if (owned_row_plan) |*plan| plan.deinit();
-                const generated_templates = if (preplanned) |plan|
+                const generated_templates = if (resolved_plan) |plan|
                     plan.rows[i].requests
                 else blk: {
                     owned_row_plan = try planGeneratedEnrichmentsForRows(
@@ -1122,9 +1161,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             // produced, its delete alone is intentional no-output,
                             // and a deferred prompt producer touches neither here —
                             // it settles in the batch flush below or through replay.
-                            const writes_before = artifact_writes.items.len;
-                            const deletes_before = artifact_delete_keys.items.len;
-                            try computeAssetRequestDerived(
+                            computeAssetRequestDerived(
                                 alloc,
                                 self,
                                 cleaned,
@@ -1140,14 +1177,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 &coverage_outcomes,
                                 preparation_memo,
                                 precompute_mode,
-                            );
-                            const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
-                            defer alloc.free(asset_key);
-                            if (sliceContainsWriteKey(artifact_writes.items[writes_before..], asset_key)) {
-                                try appendPrecomputedArtifactCoverageOutcomes(self, alloc, &coverage_outcomes, request, .produced);
-                            } else if (sliceContainsKey(artifact_delete_keys.items[deletes_before..], asset_key)) {
-                                try appendPrecomputedArtifactCoverageOutcomes(self, alloc, &coverage_outcomes, request, .skipped);
-                            }
+                                &pending_child_work,
+                            ) catch |err| {
+                                if (precompute_mode == .direct and err == error.InferenceResultTooLarge) return error.CommitRequirementTooLarge;
+                                return err;
+                            };
                         },
                         .chunk_text => {
                             const writes_before = artifact_writes.items.len;
@@ -1223,13 +1257,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         try output_budget.checkpoint(artifact_writes.items, artifact_delete_keys.items);
                 }
                 try inline_embedding_cleanup.flush(alloc, self, req.writes[i].key, &artifact_delete_keys);
-                if (precompute_mode == .direct) {
-                    try flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes);
+                if (precompute_mode == .direct and i + 1 == window_end) {
+                    flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes) catch |err| {
+                        if (precompute_mode == .direct and err == error.InferenceResultTooLarge) return error.CommitRequirementTooLarge;
+                        return err;
+                    };
                     try output_budget.checkpoint(artifact_writes.items, artifact_delete_keys.items);
                 }
             }
 
-            try flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes);
+            flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes) catch |err| {
+                if (precompute_mode == .direct and err == error.InferenceResultTooLarge) return error.CommitRequirementTooLarge;
+                return err;
+            };
 
             // Resolve coverage only after every deferred producer has contributed its
             // manifest. This keeps terminal outcomes in the same primary commit while
@@ -1259,7 +1299,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (S.ownerField(self, "enrichment_runtime").*) |runtime|
                 try preparation_memo.validateRevisions(runtime.config.dense_embedder, runtime.config.sparse_embedder);
 
-            var result = PrecomputedGeneratedBatch{};
+            var result = PrecomputedGeneratedBatch{ .pending_child_work = pending_child_work };
             errdefer result.deinit(alloc);
             result.artifact_writes = try artifact_writes.toOwnedSlice(alloc);
             result.artifact_delete_keys = try artifact_delete_keys.toOwnedSlice(alloc);

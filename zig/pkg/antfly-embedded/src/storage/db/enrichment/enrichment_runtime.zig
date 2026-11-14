@@ -36110,6 +36110,8 @@ fn documentExtractionStateHasChunkUnitFingerprints(alloc: Allocator, state: []co
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, state, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
+    if (parsed.value.object.get("children_pending")) |pending|
+        if (pending != .bool or pending.bool) return false;
     const version = parsed.value.object.get("chunk_unit_fingerprint_version") orelse return false;
     return document_unit_fingerprint.stateVersionIsCurrent(version);
 }

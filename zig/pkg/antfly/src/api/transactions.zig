@@ -4804,7 +4804,9 @@ fn parseCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTrans
         else => return error.InvalidTransactionCommitRequest,
     };
 
-    if (root.get("commit_requires") != null) return error.UnsupportedCommitRequirement;
+    if (root.get("commit_requires")) |requirement_value| {
+        if (try db_mod.types.parseCommitRequires(requirement_value) == .direct_enrichments) return error.UnsupportedCommitRequirement;
+    }
 
     var req: OwnedTransactionCommitRequest = .{};
     errdefer req.deinit(alloc);
@@ -5482,7 +5484,7 @@ pub fn isEmptySessionCommitBody(body: []const u8) bool {
 fn parseTableBatch(alloc: std.mem.Allocator, value: std.json.Value) !batch_api.OwnedBatchRequest {
     var owned = try batch_api.public_codec.parseBatchValue(alloc, value);
     errdefer owned.deinit(alloc);
-    if (owned.req.commit_requires != null) return error.UnsupportedCommitRequirement;
+    if (owned.req.commit_requires == .direct_enrichments) return error.UnsupportedCommitRequirement;
     return batch_api.takePublic(&owned);
 }
 
@@ -6191,7 +6193,8 @@ test "multi batch parser accepts the public batch envelope without a read set" {
 test "multi batch commit requirements reject before transaction planning" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.UnsupportedCommitRequirement, parseMultiBatchRequest(a, "{\"tables\":{\"docs\":{\"inserts\":{\"a\":{}},\"commit_requires\":\"direct_enrichments\"}}}"));
-    try std.testing.expectError(error.UnsupportedCommitRequirement, parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"commit_requires\":\"none\"}}}"));
+    var no_gate = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"commit_requires\":\"none\"}}}");
+    defer no_gate.deinit(a);
 }
 
 test "multi batch parser derives strongest per-table sync level" {

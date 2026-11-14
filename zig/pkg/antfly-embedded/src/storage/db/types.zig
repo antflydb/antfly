@@ -58,6 +58,7 @@ pub const GeoShapeRelation = enum {
 
 pub const SyncLevel = @import("mutation_values.zig").SyncLevel;
 pub const CommitRequires = @import("mutation_values.zig").CommitRequires;
+pub const parseCommitRequires = @import("mutation_values.zig").parseCommitRequires;
 pub const parsePublicSyncLevelText = @import("mutation_values.zig").parsePublicSyncLevelText;
 pub const parsePublicSyncLevelJson = @import("mutation_values.zig").parsePublicSyncLevelJson;
 pub const publicSyncLevelText = @import("mutation_values.zig").publicSyncLevelText;

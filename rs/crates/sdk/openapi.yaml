@@ -29168,13 +29168,21 @@ components:
 
         Configured producers with no eligible request reject the requirement.
 
-        Prepared outputs are bounded to 8 MiB and 16384 physical rows per batch.
+        Direct admission has an 8 MiB and 16384-row budget for the complete mutation,
 
-        Currently supported by local embedded batches. Server HTTP, Raft, serverless
+        including source keys/values, artifact effects, deletions, coverage, revisions,
 
-        and transaction-resolution surfaces reject explicit requirements before
+        counters and replay payload. Both the submitted source envelope and final
 
-        admission until their prepared-output protocols are available.
+        physical effect set must fit; this is not an artifact-only allowance.
+
+        Explicit none is supported across mutation engines. direct_enrichments is
+
+        currently supported by local embedded batches; server HTTP, Raft, serverless
+
+        and transaction-resolution surfaces reject that gate before admission until
+
+        their prepared-output protocols are available.
 
         Omission retains legacy embedded precomputation for enrichments/full_index
 

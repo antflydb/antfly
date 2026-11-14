@@ -96,10 +96,14 @@ class BatchRequest:
                 Artifact-source stages, committed graph/neighbor context, grouped producers,
                 protected producers and PDF page-image embeddings remain asynchronous.
                 Configured producers with no eligible request reject the requirement.
-                Prepared outputs are bounded to 8 MiB and 16384 physical rows per batch.
-                Currently supported by local embedded batches. Server HTTP, Raft, serverless
-                and transaction-resolution surfaces reject explicit requirements before
-                admission until their prepared-output protocols are available.
+                Direct admission has an 8 MiB and 16384-row budget for the complete mutation,
+                including source keys/values, artifact effects, deletions, coverage, revisions,
+                counters and replay payload. Both the submitted source envelope and final
+                physical effect set must fit; this is not an artifact-only allowance.
+                Explicit none is supported across mutation engines. direct_enrichments is
+                currently supported by local embedded batches; server HTTP, Raft, serverless
+                and transaction-resolution surfaces reject that gate before admission until
+                their prepared-output protocols are available.
                 Omission retains legacy embedded precomputation for enrichments/full_index
                 during the compatibility window; other surfaces retain their existing waits.
             sync_level (SyncLevel | Unset): Response acknowledgment/publication barrier, independent of commit_requires:
