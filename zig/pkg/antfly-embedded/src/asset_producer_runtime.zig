@@ -3634,7 +3634,8 @@ pub const Runtime = struct {
             // The framed owner rejects non-protocol replies at response start.
             // Its observed HTTP status still identifies a terminal provider
             // rejection independently of the missing framed final.
-            if (transport.status != 0 and (transport.status < 200 or transport.status >= 300)) return documentRemoteStatus(transport.status);
+            if ((err == error.DocumentStorageNotConfigured or err == error.InferenceTransportUnavailable) and
+                transport.status != 0 and (transport.status < 200 or transport.status >= 300)) return documentRemoteStatus(transport.status);
             return err;
         };
         defer response.deinit();
@@ -9460,6 +9461,7 @@ fn documentRemoteStatus(status: i32) anyerror {
     return switch (status) {
         401, 403 => error.InferenceEndpointAccessDenied,
         404 => error.ModelNotFound,
+        405, 501 => error.DocumentStorageNotConfigured,
         400, 415, 422 => error.InvalidDocumentSource,
         413 => error.ResourceLimitExceeded,
         408, 504 => error.Timeout,
@@ -9639,6 +9641,8 @@ test "index document checkpoint producer uses duplex remote execution with table
     try std.testing.expectError(error.InferenceEndpointAccessDenied, producer.produce(a, request));
     peer.reject_status.store(404, .release);
     try std.testing.expectError(error.ModelNotFound, producer.produce(a, request));
+    peer.reject_status.store(405, .release);
+    try std.testing.expectError(error.DocumentStorageNotConfigured, producer.produce(a, request));
     peer.reject_status.store(0, .release);
     const output = try producer.produce(a, request);
     defer a.free(output);
@@ -9646,7 +9650,7 @@ test "index document checkpoint producer uses duplex remote execution with table
     const replay = try producer.produce(a, request);
     defer a.free(replay);
     try std.testing.expectEqualStrings("remote page", replay);
-    try std.testing.expectEqual(@as(usize, 3), peer.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 4), peer.calls.load(.acquire));
 }
 
 test "index document checkpoint producer preserves source part prompt and locator precedence" {
