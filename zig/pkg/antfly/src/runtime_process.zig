@@ -57,7 +57,7 @@ pub fn runtimeEntry(
         const message = switch (err) {
             error.FileNotFound => "required file was not found; check the configured path",
             error.AddressInUse => "listen address is already in use",
-            error.VectorMigrationCatalogInUse => "catalog is in use; stop the owning standalone server before running an offline migration",
+            error.VectorMigrationCatalogInUse => "catalog is in use; stop the other server or storage operator before opening it exclusively",
             error.InvalidCharacter, error.InvalidArguments => "invalid command-line value; run with --help",
             else => "startup failed; see the preceding diagnostic for details",
         };

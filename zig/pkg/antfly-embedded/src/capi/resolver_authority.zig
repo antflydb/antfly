@@ -1427,12 +1427,15 @@ fn exerciseIndexedStaticProfiles(profile_count: usize, aliases_per_profile: usiz
         try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/new"), .fromSlice("{\"into\":\"concept/new-target\"}"), &out));
         api.antfly_buffer_free(&out);
     }
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    // Warm enrollment already commits the alias projection transactionally.
+    // The large case isolates its lookup/reopen bounds; drain unrelated empty
+    // producer retirement only in the separate legacy lifecycle fixture.
+    if (legacy_adoption) try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
     native.static_profiles.test_edge_visits.store(0, .monotonic);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"into\":\"concept/final\",\"replace\":true}"), &out));
     api.antfly_buffer_free(&out);
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    if (legacy_adoption) try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
     api.antfly_db_close(handle);
     root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true, .no_sync = true }, false, null, null);
     handle = try api.publishHandle(root);

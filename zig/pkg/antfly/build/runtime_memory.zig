@@ -276,14 +276,14 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
 /// Linked test consumers can omit DWARF without changing Debug safety or test
 /// selection. Symbol mode is part of this measured profile, never inferred from
 /// the optimization level. Unmeasured hosts retain the authored fallback.
-pub fn linkedTestCompileMaxRss(name: []const u8, host: std.Target, target: std.Target, optimize: ?std.lang.Optimize, strip: bool, authored: usize) usize {
+pub fn linkedTestCompileMaxRss(name: []const u8, host: std.Target, target: std.Target, optimize: ?std.lang.Optimize, stripped_default_selection: bool, authored: usize) usize {
     const public_contract = std.mem.eql(u8, name, "public-api-parity");
     const public_integration = std.mem.eql(u8, name, "public-api-integration");
     if (!public_contract and !public_integration)
         return testCompileMaxRss(name, host, target, optimize, authored);
     const gib = 1024 * 1024 * 1024;
     const baseline = std.Target.Cpu.baseline(target.cpu.arch, target.os);
-    if (strip and optimize == .debug and
+    if (stripped_default_selection and optimize == .debug and
         std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
         host.os.tag == .linux and host.cpu.arch == .x86_64 and host.abi == .gnu and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
@@ -340,6 +340,8 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
             .{ .name = "metadata-unit-lane-a-tests", .gib = 22 },
             .{ .name = "metadata-unit-lane-b-tests", .gib = 22 },
             .{ .name = "public-api-parity", .gib = 22 },
+            // This subset retains its parent's floor until measured natively.
+            .{ .name = "public-api-integration", .gib = 22 },
             .{ .name = "api-auth-tests", .gib = 17 },
             .{ .name = "api-derived-coverage-tests", .gib = 17 },
             .{ .name = "raft-unit-tests", .gib = 17 },
@@ -924,6 +926,8 @@ test "public API test claims distinguish measured symbol profiles and retain sma
         try std.testing.expect(stripped >= required and stripped < required + gib);
         try std.testing.expect(unstripped >= unstripped_peak + (unstripped_peak + 9) / 10);
         try std.testing.expect(stripped + 7 * gib <= 20 * gib);
+        try std.testing.expect(linkedTestCompileMaxRss(name, macos, macos, .debug, false, 0) >=
+            testCompileMaxRss("public-api-parity", macos, macos, .debug, 15 * gib));
         try std.testing.expectEqual(24 * gib, linkedTestCompileMaxRss(name, linux, linux, .debug, true, 24 * gib));
         try std.testing.expectEqual(15 * gib, linkedTestCompileMaxRss(name, macos, linux, .debug, true, 0));
         try std.testing.expectEqual(15 * gib, linkedTestCompileMaxRss(name, linux, linux, .safe, true, 0));
