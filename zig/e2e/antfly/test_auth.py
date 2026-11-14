@@ -802,7 +802,11 @@ def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name
         api.post(
             path + "/batch",
             {
-                "inserts": {"gold": {"tier": "gold"}, "silver": {"tier": "silver"}},
+                "inserts": {
+                    "gold": {"tier": "gold", "tenant_id": "a"},
+                    "silver": {"tier": "silver", "tenant_id": "a"},
+                    "other": {"tier": "gold", "tenant_id": "b"},
+                },
                 "sync_level": "full_index",
             },
         )
@@ -824,12 +828,16 @@ def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name
         },
     )
     api.put(
+        "/auth/v1/users/reader/row-filters/*?database=tenant&namespace=allowed",
+        {"term": {"tenant_id": "a"}},
+    )
+    api.put(
         "/auth/v1/users/reader/row-filters/events?database=tenant&namespace=allowed",
         {"term": {"tier": "gold"}},
     )
     api.s.headers["Authorization"] = _basic_auth("reader", "reader")
     for path in ("/databases/tenant/namespaces/allowed/tables/events",):
-        assert api.get(path + "/documents/gold") == {"tier": "gold"}
+        assert api.get(path + "/documents/gold") == {"tier": "gold", "tenant_id": "a"}
         hidden = api.s.get(api.url + path + "/documents/silver", timeout=30)
         assert hidden.status_code == 404, hidden.text
         result = api.post(
