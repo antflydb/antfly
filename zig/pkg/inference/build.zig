@@ -1555,6 +1555,68 @@ pub fn build(b: *std.Build) void {
     const qwen3_embedding_e2e_bench_step = b.step("bench-qwen3-embedding-e2e", "Run pretokenized Qwen3-Embedding encoder E2E benchmarks");
     qwen3_embedding_e2e_bench_step.dependOn(&run_qwen3_embedding_e2e_bench.step);
 
+    const glide_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-glide-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/glide_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    glide_bench_exe.root_module.addImport("build_options", build_options_mod);
+    glide_bench_exe.root_module.addImport("ml", ml_mod);
+    if (pjrt_mod) |pjrt| glide_bench_exe.root_module.addImport("pjrt", pjrt);
+    glide_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    glide_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    glide_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    glide_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    glide_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    glide_bench_exe.root_module.addImport("onnx_graph", onnx.graph);
+    glide_bench_exe.root_module.addImport("onnx_data", onnx.data);
+    glide_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(glide_bench_exe.root_module);
+    configureNativeTool(b, glide_bench_exe, target, enable_system_blas, blas_root, false);
+    const install_glide_bench = b.addInstallArtifact(glide_bench_exe, .{});
+    glide_bench_exe.root_module.strip = strip;
+    const glide_bench_install_step = b.step("glide-bench", "Build the GLiDE parity/throughput benchmark");
+    glide_bench_install_step.dependOn(&install_glide_bench.step);
+    const run_glide_bench = b.addRunArtifact(glide_bench_exe);
+    run_glide_bench.addPassthruArgs();
+    const glide_bench_step = b.step("bench-glide", "Run GLiDE decision backbone parity/throughput benchmark over a reference fixture");
+    glide_bench_step.dependOn(&run_glide_bench.step);
+    const glide_cuda_tests = b.addTest(.{
+        .name = "glide-cuda-tests",
+        .max_rss = 6 * 1024 * 1024 * 1024,
+        .filters = &.{"GLiDE CUDA"},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_glide_cuda.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    var glide_test_imports = inference_internal_mod.import_table.iterator();
+    glide_cuda_tests.root_module.strip = strip;
+    while (glide_test_imports.next()) |entry|
+        glide_cuda_tests.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    configureNativeTool(b, glide_cuda_tests, target, enable_system_blas, blas_root, false);
+    b.step("test-glide-cuda", "Run focused GLiDE CUDA qualification and operator regressions").dependOn(&b.addRunArtifact(glide_cuda_tests).step);
+    // GLiDE config, prompt, token-wrap and public-contract tests without the
+    // model runtime. ANTFLY_GLIDE_REFERENCE enables reference prompt/id parity.
+    const glide_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_glide.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    glide_tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
+    glide_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    glide_tests.root_module.addImport("antfly_platform", configured_platform_mod);
+    glide_tests.root_module.addImport("antfly_decisions", b.modules.get("antfly_decisions").?);
+    b.step("test-glide", "Run GLiDE prompt/token parity and decision contract tests").dependOn(&b.addRunArtifact(glide_tests).step);
+
     const nomic_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-nomic-e2e-bench",
         .root_module = b.createModule(.{

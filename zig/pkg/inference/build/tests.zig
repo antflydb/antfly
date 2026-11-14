@@ -55,7 +55,9 @@ pub fn create(ctx: Context) Suite {
         // 20,025,544,704 bytes with cold caches; reserve 24 GiB in that mode.
         // The focused native CPU ReleaseFast suite peaked at 10,032,644,096
         // bytes. Its old 9 GiB declaration rejected a successful compilation.
-        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) @as(usize, if (ctx.optimize == .safe) 24 else 16) * 1024 * 1024 * 1024 else if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        // Native macOS Metal GLiNER Decide serving (Zig 0.17, ReleaseFast)
+        // peaked at 15,153,954,816 bytes; 16 GiB keeps measured headroom.
+        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) @as(usize, if (ctx.optimize == .safe) 24 else 16) * 1024 * 1024 * 1024 else if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 16 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -418,6 +420,24 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
         "GLiNER production CUDA extraction through concurrent HTTP",
         "pinned CUDA extraction direct and HTTP",
     };
+    // Keep the original Decide batch/cancellation gate runnable on smaller
+    // hosts without admitting the complete 24 GiB family compiler closure.
+    const decide_serving_tests = b.addTest(.{
+        .name = "gliner25-decide-cuda-serving-tests",
+        .max_rss = 11 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &.{ "Decide CUDA serving required artifact", "GLiNER production CUDA distinct input batches Decide", "qualified FP32 attention policy", "Decide Q8 CUDA qualification binds", "Decide CUDA legacy geometry", "Decide Q8 projection mirrors", "Decide Q8 mirror admission", "GLiNER Decide CUDA Q8 half staging", "GLiNER Decide CUDA Q8 execution mirror" },
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    ctx.step("gliner25-decide-cuda-serving-test-build", "Build focused original Decide CUDA batch and cancellation tests").dependOn(&b.addInstallArtifact(decide_serving_tests, .{}).step);
+    const run_decide_serving_tests = ctx.addRunArtifact(decide_serving_tests);
+    run_decide_serving_tests.setEnvironmentVariable("ANTFLY_GLINER_DECIDE_REQUIRE_SERVING_TESTS", "1");
+    const decide_serving_step = ctx.step("test-gliner25-decide-cuda-serving", "Require original Decide CUDA batch-32 ordering, admission and queued cancellation");
+    if (ctx.backend.enable_cuda) {
+        decide_serving_step.dependOn(&run_decide_serving_tests.step);
+    } else {
+        decide_serving_step.dependOn(&b.addFail("Decide CUDA serving tests require -Dcuda=true").step);
+    }
     const gliner25_production_cuda_tests = b.addTest(.{
         .name = "gliner25-production-cuda-tests",
         .max_rss = 24 * 1024 * 1024 * 1024,

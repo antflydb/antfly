@@ -18215,7 +18215,10 @@ fn flushAssetProducerBatchItems(
     defer runtime.alloc.free(requests);
     for (items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
-    if (try indexDocumentProducerRequired(runtime.alloc, items[0]))
+    // One producer configuration can mix literal text and document locators.
+    // A later document must retain its checkpoint owner even when the first
+    // item is text; each invocation still selects its own transport.
+    for (items) |item| if (try indexDocumentProducerRequired(runtime.alloc, item))
         return flushIndexDocumentBatch(runtime, producer, items, window, scope);
 
     const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
@@ -18283,6 +18286,14 @@ fn indexDocumentProducerRequired(a: Allocator, item: AssetProducerBatchItem) !bo
     var parsed = try std.json.parseFromSlice(std.json.Value, a, item.config_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return false;
+    // Privacy inspects literal field text, never a document locator embedded
+    // in the primary JSON. Keep those roots in the bounded detector cohort.
+    if (parsed.value.object.contains(@import("../../../privacy/document.zig").config_key)) return false;
+    if (item.producer_type == .extractor) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        if (try asset_producer_mod.extractionDocumentInput(arena.allocator(), item.asRequest()) == null) return false;
+    }
     const provider = parsed.value.object.get("provider") orelse return item.producer_type == .extractor;
     return provider == .string and std.mem.eql(u8, provider.string, "antfly");
 }

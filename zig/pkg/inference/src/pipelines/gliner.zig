@@ -53,6 +53,8 @@ pub const GlinerConfig = struct {
     /// Physical decision batches are bounded before allocating padded inputs.
     decision_batch_size: usize = 64,
     decision_batch_tokens: usize = 16384,
+    /// Reuse one sequence shape for nearby rows when full groups fit the budget.
+    decision_reuse_batch_padding: bool = false,
     // Special token IDs parsed from added_tokens.json
     token_p: i32 = 0, // [P]
     token_c: i32 = 0, // [C]
@@ -974,15 +976,27 @@ pub const GlinerPipeline = struct {
             }
         }.less);
         if (self.config.decision_batch_size == 0 or self.config.decision_batch_tokens == 0) return error.InvalidDecisionBatchLimits;
+        var padding_floor: usize = 0;
+        if (self.config.decision_reuse_batch_padding and order.len > 0) {
+            const shortest = prepared.rows[order[0]].input_ids.len;
+            const longest = prepared.rows[order[order.len - 1]].input_ids.len;
+            const physical_items = @min(order.len, self.config.decision_batch_size);
+            // Nearby lengths otherwise alternate relative-projection and MPS
+            // plans on every physical forward. Bound extra padding to 25% and
+            // retain the same admitted padded-token ceiling for every group.
+            if (longest - shortest <= shortest / 4 and
+                longest <= self.config.decision_batch_tokens / physical_items)
+                padding_floor = longest;
+        }
         var first: usize = 0;
         while (first < order.len) {
             var end = first + 1;
             while (end < order.len and end - first < self.config.decision_batch_size) : (end += 1) {
-                const tokens = try std.math.mul(usize, end - first + 1, prepared.rows[order[end]].input_ids.len);
+                const tokens = try std.math.mul(usize, end - first + 1, @max(padding_floor, prepared.rows[order[end]].input_ids.len));
                 if (tokens > self.config.decision_batch_tokens) break;
             }
             const indexes = order[first..end];
-            const outputs = try self.runDecisionRows(prepared.rows, indexes);
+            const outputs = try self.runDecisionRows(prepared.rows, indexes, padding_floor);
             defer {
                 for (outputs) |*output| output.deinit();
                 a.free(outputs);
@@ -1018,9 +1032,9 @@ pub const GlinerPipeline = struct {
         return results;
     }
 
-    fn runDecisionRows(self: *GlinerPipeline, rows: []const PreparedDecisionRow, indexes: []const usize) ![]Tensor {
+    fn runDecisionRows(self: *GlinerPipeline, rows: []const PreparedDecisionRow, indexes: []const usize, padding_floor: usize) ![]Tensor {
         const a = self.allocator;
-        var seq: usize = 0;
+        var seq: usize = padding_floor;
         var labels: usize = 0;
         for (indexes) |index| {
             seq = @max(seq, rows[index].input_ids.len);

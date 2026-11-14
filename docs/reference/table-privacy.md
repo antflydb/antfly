@@ -72,6 +72,46 @@ Start a bounded retry or rescan with `POST /tables/customers/privacy/scans`,
 optionally supplying `from_key`, `to_key`, and a page `limit` from 1 to 1000.
 Source updates also schedule inspection through the ordinary producer pipeline.
 
+## Repairing an activation parked before an upgrade
+
+Upgrading the server or correcting a provider does not erase terminal producer
+failures. This includes activations affected by the v0.3.0 text/document
+transport mismatch: their repair ledger can contain `InferenceTransportUnavailable`
+and dependent `ArtifactDependencyFailed` entries even though the provider is
+now healthy. Protected reads continue to fail closed until current receipts and
+consumer publication are complete.
+
+After upgrading and verifying the configured extractor endpoint, inspect the
+policy and its bounded artifact repair ledger:
+
+```http
+GET /tables/customers/privacy
+
+POST /tables/customers/repair/issues
+Content-Type: application/json
+
+{"target":"artifact","limit":50}
+```
+
+Create a fresh privacy scan to explicitly retry inspection and its dependent
+consumers under the **same installed policy**:
+
+```http
+POST /tables/customers/privacy/scans
+Content-Type: application/json
+
+{"limit":100}
+```
+
+The coordinator advances bounded pages; `limit` is a per-page bound, not a cap
+on the total repaired documents. Supply `from_key` and `to_key` when only a
+particular key range needs repair. Poll the returned new `scan_id` until
+`succeeded`; an older failed scan remains historical failure evidence. Verify
+that coverage reports no pending or protected-blocked documents and that
+retrieval returns the redacted projection. If the new scan fails, inspect its
+error codes and repair ledger before retrying again. Do not disable privacy,
+replace the policy, or delete its artifacts to bypass the serving barrier.
+
 ## Producers and execution
 
 The default is the pinned

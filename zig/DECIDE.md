@@ -24,6 +24,22 @@ representation. Laya/OpenDecider and the declared GLiNER decision head retain
 complete distributions, confidence diagnostics and optional action-head
 probabilities. This internal reuse does not publish a second standalone API.
 
+GLiDE checkpoints (`pkg/inference/src/models/glide.zig`) skip the extraction
+lowering. `decideJsonWithAdmission` routes them directly, as it routes
+EmbeddingGemma, but through the extraction admission unit, host lease and bounded
+request heap (`ExtractionV2Input.decide_glide`). `pipelines/glide_prompt.zig`
+ports the reference `prompt.py`: one prompt per input and question, with predicates
+as `true`-first noul options and score levels rendered as `label: description`.
+`pipelines/glide.zig` tokenizes every prompt before admission. It packs
+length-sorted, right-padded micro-batches under the reference 16,384
+padded-token budget and halves a micro-batch that admission rejects. Each readout
+forward returns `[B, 255]` logits; a temperature-scaled softmax over the question's
+options produces the distribution. Presentation reuses the complete-distribution
+`decisions` rows and `trainedResponse`. Warm requests clone the loaded model's
+manifest instead of re-reading its sidecars. `ANTFLY_GLIDE_TRACE=1` prints a
+per-phase wall-clock trace on stderr, a single-request diagnostic.
+See the [GLiDE guide](../docs/guides/models/glide.mdx).
+
 `lib/decisions/trained.zig` owns the private trained adapter. Its historical map,
 `state` and `noul` vocabulary is confined to implementation details and Jev's
 upstream provider format. HTTP requests, SDK results and SQL `ai_decide` use the
@@ -124,7 +140,13 @@ Provider HTTP mocks cover Antfly, Jev and OpenAI serialization, authentication,
 budgets and normalization. Managed real-model tests exercise the checkpoint,
 prototype reuse, identity pins, HTTP presentation and cancellation on Metal
 and CPU. A small Laya fixture checks transport and batch conformance; it is not
-an accuracy evaluation.
+an accuracy evaluation. GLiDE prompt text and token ids are compared
+byte for byte with reference captures (`zig build test-glide` with
+`ANTFLY_GLIDE_REFERENCE` naming the capture directory), and its contract
+mapping and presentation have unit tests.
+`pkg/inference/scripts/glide/capture_reference.py` writes those captures from
+the checkpoints' own Python reference, and `zig build bench-glide` replays them
+to compare readout logits and measure throughput.
 
 These checks qualify the API revision. Production quality and throughput claims
 need current workload evidence; earlier performance artifacts retain their
