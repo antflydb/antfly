@@ -9014,11 +9014,39 @@ pub const NativeFile = struct {
         // sync there (every commit alternates and rewrites them), so the
         // strict full-header comparison was never spuriously tripped and
         // must stay exactly as strict.
-        const headers_equivalent = if (self.redo != null)
-            self.header.active_checkpoint == reader.header.active_checkpoint and
-                std.meta.eql(self.header.checkpoints[self.header.active_checkpoint], reader.header.checkpoints[reader.header.active_checkpoint])
-        else
-            std.meta.eql(self.header, reader.header);
+        // perf/lwa-read-audit: `redo_folded_through` is a derived
+        // bookkeeping hint -- how far back a *fresh, independent* replay
+        // from the log can safely trust the overlay (`recoverRedoLog`'s
+        // own doc comment) -- not a reflection of physical tree content,
+        // and it can legitimately differ here even when nothing on disk
+        // changed at all. A real-publish bookkeeping-only commit (e.g.
+        // `maintainOnce`'s startup pass through `reclaimPagesImpl`'s
+        // ledger consolidation; see that call site's own "bookkeeping-
+        // only commit advances commit_sequence past the true fold
+        // boundary" comment and the matching redo differential oracle
+        // regression it is already safe against on reopen) advances this
+        // process's own in-memory `redo_folded_through` without a
+        // corresponding slot-page rewrite reaching disk for that field,
+        // so `reader` (freshly opened by path, recovered via the exact
+        // same conservative, log-replay-derived computation a real
+        // reopen would use) can come back with a strictly smaller value
+        // for the *same* `commit_sequence` and the *same* roots --
+        // confirmed live: every other field byte-identical, only this
+        // one differing. Comparing it here is also pointless, not just
+        // wrong: `reader.header` is unconditionally replaced by
+        // `self.header` a few lines below regardless of what this
+        // comparison decides, so `reader`'s own `redo_folded_through` is
+        // never actually used. Exclude it; everything else (roots,
+        // page_count, commit_sequence, logical generations) still
+        // compares exactly, so a real concurrent change is still caught.
+        const headers_equivalent = if (self.redo != null) blk: {
+            if (self.header.active_checkpoint != reader.header.active_checkpoint) break :blk false;
+            var self_slot = self.header.checkpoints[self.header.active_checkpoint];
+            var reader_slot = reader.header.checkpoints[reader.header.active_checkpoint];
+            self_slot.redo_folded_through = 0;
+            reader_slot.redo_folded_through = 0;
+            break :blk std.meta.eql(self_slot, reader_slot);
+        } else std.meta.eql(self.header, reader.header);
         if ((self.durable_header == null and !headers_equivalent) or inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentWaitCanceled;
         reader.header = self.header;
         if (coordinated) {
