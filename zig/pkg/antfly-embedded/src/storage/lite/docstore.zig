@@ -14726,7 +14726,17 @@ test "lite prepared prefix permutation measurement" {
     const prefixes = [_]?[]const u8{ "m1/", "m2/" };
     for (&score, 0..) |*raw, column| std.mem.writeInt(u64, raw, @bitCast(@as(f64, @floatFromInt(column + 3))), .little);
     for (prefixes, 0..) |prefix, column| {
-        for (0..1024) |i| {
+        // perf/lwa-recent-regress: 64376f90a9 accidentally widened this from
+        // `0..512` to `0..1024` (an unrelated ratio-heuristics fix, not an
+        // intentional change to this test's own shape) -- `nodes` is
+        // `[512][]const u8`, one entry per row shared across both prefix
+        // columns, so `nodes[i]` for `i` up to 1023 reliably panics with
+        // "index out of bounds: index 512, len 512" the moment column 0's
+        // own 512-row loop runs past its intended bound. `key_storage`/`docs`
+        // are sized `1024` for exactly this loop's total iteration count
+        // across both columns (`column * 512 + i`), not as this inner
+        // loop's own per-column bound.
+        for (0..512) |i| {
             const key = &key_storage[column * 512 + i];
             @memcpy(key[0..3], prefix.?);
             const node = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
