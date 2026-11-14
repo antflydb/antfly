@@ -63,11 +63,13 @@ phase with no fully contained requests is reported as `null`, including valid
 single-batch runs with no ingestion-query observations. `phase_measurements`
 retains the full `initial` and `recovery` process lifetimes, from launch before
 readiness through shutdown, with FD/RSS and mapping-RSS samples and per-lifetime
-peaks. Top-level peaks cover both lifetimes. Sampling failures while a process is
-alive fail qualification; process disappearance after exit ends sampling normally.
+peaks. Top-level peaks cover both lifetimes. Sampling failures stop qualification before further batches and wake the steady
+wait. Only process-lookup failures after exit end sampling normally; permission
+and I/O errors remain failures even when they race with exit.
 Logs and partial reports survive failures. Diagnostic-copy and cleanup errors
 cannot skip server termination or other cleanup, and the primary failure is
-preserved. The low-FD CI lane
+preserved. Failed thread startup never joins an unstarted worker; on an operation
+failure, cleanup stops the server before its bounded query-worker join. The low-FD CI lane
 runs a smaller 1,024-document correctness qualification and retains its reports.
 
 The runner also accepts `--data PATH` for the paper runner's prepared
@@ -104,20 +106,24 @@ ANTFLY_NATIVE_CHUNK_EXECUTION_MODEL=/absolute/path/to/embeddinggemma2-bundle \
 
 ### Recorded synthetic qualification
 
-The [recorded 100,000-document run](../../zig/bench/vectors/descriptor_pressure_100k.json)
+The [schema-2 100,000-document run](../../zig/bench/vectors/descriptor_pressure_100k.json)
 passed at all three limits with identical corpus digests, concurrent self-queries,
-full recovered visibility, and successful graceful exits before and after reopen:
+full recovered visibility, and successful graceful exits before and after reopen.
+It supersedes the earlier summary whose phase attribution and recovery sampling
+were incomplete. Resource peaks below include both complete process lifetimes;
+query percentiles exclude intervals crossing either phase boundary.
 
-| Soft limit | Ingestion seconds | Sampled peak FDs | Sampled peak RSS (MiB) | Query p99 during ingestion (ms) | Steady query p99 (ms) |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 | 514.9 | 232 | 989.4 | 360.2 | 54.1 |
-| 1,024 | 550.9 | 542 | 938.3 | 390.8 | 59.2 |
-| 65,536 | 558.0 | 720 | 810.4 | 393.5 | 55.1 |
+| Soft limit | Ingestion seconds | Overall peak FDs | Recovery peak FDs | Overall peak RSS (MiB) | Ingestion query p99 (ms) | Steady query p99 (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 674.3 | 205 | 186 | 822.3 | 480.7 | 101.4 |
+| 1,024 | 687.0 | 544 | 332 | 739.9 | 474.1 | 103.2 |
+| 65,536 | 658.5 | 711 | 331 | 759.8 | 445.1 | 64.9 |
 
 These are single ordered observations on a shared macOS ARM64 host with warm OS
-caches and a fixed self-query, not evidence of a speed advantage for lower limits.
-The first profile overlapped worktree cleanup. Process RSS includes the growing
-index, mappings and other server allocations; it does not isolate vector mapping
-residency on macOS. The JSON records the binary hash, exact timing distributions,
-workload, sampling scope and limitations. The Linux CI report supplies the
-additional per-mapping residency observations for its smaller corpus.
+caches and a fixed self-query, not evidence of a speed advantage for any limit.
+Process RSS includes the index, mappings and other server allocations; it does
+not isolate vector mapping residency on macOS. The JSON pins the measured engine
+and qualifier commits/hashes and retains transition-query distributions and
+per-lifetime sample counts and peaks. Later changes strengthen error handling and
+fail-fast behavior without changing the successful-run measurement semantics.
+The Linux CI runner additionally records per-mapping RSS for its smaller corpus.

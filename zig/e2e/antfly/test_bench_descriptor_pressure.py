@@ -472,3 +472,166 @@ def test_permission_failure_is_not_treated_as_an_exec_lookup_race(monkeypatch):
     monitor = bench.Monitor(SimpleNamespace(pid=123, poll=lambda: None))
     monitor.run()
     assert isinstance(monitor.failure, PermissionError)
+
+
+@pytest.mark.parametrize("error_type", [PermissionError, OSError])
+def test_nonlookup_sampling_errors_remain_fatal_when_process_exits(
+    monkeypatch, error_type
+):
+    import bench_descriptor_pressure as bench
+    import threading
+
+    process = SimpleNamespace(pid=123, returncode=None)
+    process.poll = lambda: process.returncode
+
+    def denied():
+        process.returncode = 0
+        raise error_type("genuine sampler failure during shutdown")
+
+    monkeypatch.setattr(bench, "descriptor_reader", lambda _pid: denied)
+    monkeypatch.setattr(bench, "logical_process_reader", lambda _pid: lambda: {})
+    monitor = bench.Monitor(process)
+    monitor.samples.append({"fds": 3, "rss_bytes": 100})
+    monitor.failure_event = threading.Event()
+    monitor.run()
+    assert isinstance(monitor.failure, error_type)
+    assert monitor.failure_event.is_set()
+    with pytest.raises(error_type, match="genuine sampler failure"):
+        monitor.close()
+
+
+def test_query_thread_start_failure_is_not_replaced_by_join_error(
+    tmp_path, monkeypatch, qualification_fakes
+):
+    from pathlib import Path
+    import bench_descriptor_pressure as bench
+
+    joined = []
+
+    def fail_start(_thread):
+        raise RuntimeError("query thread creation failed")
+
+    def unexpected_join(_thread, **_kwargs):
+        joined.append(True)
+        raise RuntimeError("cannot join an unstarted thread")
+
+    monkeypatch.setattr(bench.threading.Thread, "start", fail_start)
+    monkeypatch.setattr(bench.threading.Thread, "join", unexpected_join)
+    monkeypatch.setattr(
+        bench, "call", lambda *_args, **_kwargs: {"status": "committed"}
+    )
+    with pytest.raises(RuntimeError, match="query thread creation failed"):
+        bench.qualify(Path("/unused"), 256, 256, None, tmp_path, 0.01)
+    assert not joined
+    assert qualification_fakes.servers[0].stopped
+    assert all(m.closed for m in qualification_fakes.monitors)
+
+
+@pytest.mark.parametrize("join_failure", [False, True])
+def test_primary_write_failure_stops_server_before_query_join(
+    tmp_path, monkeypatch, qualification_fakes, join_failure
+):
+    from pathlib import Path
+    import bench_descriptor_pressure as bench
+
+    state = qualification_fakes
+    joins, batches = [], []
+
+    class Worker:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def join(self, *, timeout):
+            assert state.servers[0].stopped, (
+                "failure cleanup must unblock the reader first"
+            )
+            joins.append(timeout)
+            if join_failure:
+                raise RuntimeError("secondary query join failure")
+
+        def is_alive(self):
+            return False
+
+    def call(_session, _url, _method, path, *_args):
+        if path.endswith("/batch"):
+            batches.append(True)
+            if len(batches) == 2:
+                raise RuntimeError("primary write failure")
+        return {"status": "committed"}
+
+    monkeypatch.setattr(bench.threading, "Thread", Worker)
+    monkeypatch.setattr(bench, "call", call)
+    with pytest.raises(RuntimeError, match="primary write failure") as caught:
+        bench.qualify(Path("/unused"), 256, 512, None, tmp_path, 0.01)
+    assert joins == [10]
+    if join_failure:
+        assert "close_query_worker" in " ".join(caught.value.__notes__)
+    assert all(m.closed for m in state.monitors)
+    assert all(s.closed for s in state.sessions)
+
+
+@pytest.mark.parametrize("fail_at", ["startup", "first_batch"])
+def test_sampler_failure_prevents_admitting_another_batch(
+    tmp_path, monkeypatch, qualification_fakes, fail_at
+):
+    from pathlib import Path
+    import bench_descriptor_pressure as bench
+
+    state = qualification_fakes
+    original_start = bench.Monitor.start
+    batches, calls = [], []
+
+    def fail(monitor):
+        monitor.failure = PermissionError("sampling permission revoked")
+        monitor.failure_event.set()
+
+    def start(monitor):
+        original_start(monitor)
+        if fail_at == "startup":
+            fail(monitor)
+
+    def call(_session, _url, _method, path, *_args):
+        calls.append(path)
+        if path.endswith("/batch"):
+            batches.append(True)
+            if len(batches) > 1:
+                pytest.fail("a batch was admitted after sampling failed")
+            fail(state.monitors[0])
+        return {"status": "committed"}
+
+    monkeypatch.setattr(bench.Monitor, "start", start)
+    monkeypatch.setattr(bench, "call", call)
+    with pytest.raises(BaseExceptionGroup, match="process monitoring failed"):
+        bench.qualify(Path("/unused"), 256, 512, None, tmp_path, 3600)
+    assert len(batches) == (0 if fail_at == "startup" else 1)
+    if fail_at == "startup":
+        assert not calls
+    assert state.servers[0].stopped
+    assert all(m.closed for m in state.monitors)
+
+
+def test_steady_wait_observes_sampler_failure_without_waiting_for_deadline(
+    monkeypatch, qualification_fakes
+):
+    import bench_descriptor_pressure as bench
+
+    measurements = bench.ProcessMeasurements()
+    measurements.start(SimpleNamespace(pid=1, ready=False))
+    monitor = qualification_fakes.monitors[0]
+    monitor.failure = PermissionError("sampling lost during steady phase")
+    monitor.failure_event.set()
+    waits = []
+
+    def wait(seconds):
+        waits.append(seconds)
+        assert measurements.failed.is_set()
+        return True
+
+    monkeypatch.setattr(measurements.failed, "wait", wait)
+    with pytest.raises(BaseExceptionGroup, match="process monitoring failed"):
+        measurements.wait(3600)
+    assert waits == [3600]
+    measurements.close()

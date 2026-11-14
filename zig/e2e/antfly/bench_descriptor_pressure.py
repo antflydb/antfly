@@ -111,6 +111,7 @@ class Monitor:
         self.fds = descriptor_reader(pid)
         self.samples = []
         self.failure = None
+        self.failure_event = None
         self.vector_rss_samples = []
         self.done = threading.Event()
         self.thread = threading.Thread(target=self.run)
@@ -139,12 +140,12 @@ class Monitor:
                         )
                     missing_since = None
                 except OSError as exc:
-                    if self.process.poll() is not None:
-                        return
                     # proc_pidinfo and /proc can briefly lose the image during
                     # exec/exit before waitpid observes termination. Retry only
                     # lookup races, never permission or actual sampling errors.
                     if isinstance(exc, (ProcessLookupError, FileNotFoundError)):
+                        if self.process.poll() is not None:
+                            return
                         missing_since = (
                             time.monotonic() if missing_since is None else missing_since
                         )
@@ -155,6 +156,8 @@ class Monitor:
                 self.done.wait(0.05)
         except BaseException as exc:
             self.failure = exc
+            if self.failure_event is not None:
+                self.failure_event.set()
 
     def start(self):
         self.thread.start()
@@ -218,13 +221,33 @@ class ProcessMeasurements:
     def __init__(self):
         self.phase = "initial"
         self.monitors = {}
+        self.failed = threading.Event()
 
     def start(self, process):
         if self.phase in self.monitors:
             raise RuntimeError(f"duplicate process phase {self.phase}")
         monitor = Monitor(process)
+        monitor.failure_event = self.failed
         self.monitors[self.phase] = monitor
         monitor.start()
+
+    def check(self):
+        # Constant-time healthy path; callbacks publish the exception before
+        # signalling. Query failures also wake this event and are checked by
+        # the qualification's shared health check.
+        if not self.failed.is_set():
+            return
+        errors = [
+            monitor.failure
+            for monitor in self.monitors.values()
+            if monitor.failure is not None
+        ]
+        if errors:
+            raise BaseExceptionGroup("process monitoring failed", errors)
+
+    def wait(self, seconds):
+        self.failed.wait(seconds)
+        self.check()
 
     def finish_phase(self):
         self.monitors[self.phase].close()
@@ -283,8 +306,23 @@ class ProcessMeasurements:
         }
 
 
+def join_query_worker(worker, timeout):
+    worker.join(timeout=timeout)
+    if worker.is_alive():
+        raise RuntimeError("query worker failed to stop")
+
+
 def finish_qualification(
-    report, output, limit, *, server, session, wrapper, measurements, primary_error
+    report,
+    output,
+    limit,
+    *,
+    server,
+    session,
+    wrapper,
+    measurements,
+    primary_error,
+    query_worker=None,
 ):
     """Attempt every cleanup even when diagnostics or earlier cleanup fail."""
     errors = []
@@ -305,6 +343,11 @@ def finish_qualification(
             lambda: shutil.copyfile(server.log_path, output / f"server-{limit}.log"),
         )
         attempt("stop_server", lambda: server.stop(test_failed=not report["completed"]))
+    # On a primary failure, terminate the server before waiting for an
+    # outstanding query: closing its connection unblocks the reader. Every
+    # teardown failure remains secondary to the operation that failed.
+    if query_worker is not None:
+        attempt("close_query_worker", lambda: join_query_worker(query_worker, 10))
     attempt("close_monitors", measurements.close)
     attempt("close_session", session.close)
     attempt("unlink_wrapper", lambda: wrapper.unlink(missing_ok=True))
@@ -436,6 +479,8 @@ def qualify(binary, limit, count, data, output, steady_seconds):
     server = None
     measurements = ProcessMeasurements()
     session = requests.Session()
+    worker = None
+    worker_started = False
     try:
         write_server_wrapper(wrapper, binary, limit)
         server = StandaloneAntflyServer(
@@ -446,6 +491,7 @@ def qualify(binary, limit, count, data, output, steady_seconds):
             on_process_started=measurements.start,
         )
         report["server_root"] = str(server.root)
+        measurements.check()
         url = server.api_url
         call(session, url, "POST", "/tables/documents", {"num_shards": 1})
         call(
@@ -466,23 +512,28 @@ def qualify(binary, limit, count, data, output, steady_seconds):
         query_times = QueryMeasurements()
         digest = hashlib.sha256()
 
+        def check_health():
+            measurements.check()
+            if query_errors:
+                raise RuntimeError(query_errors[0])
+
         def queries():
             with requests.Session() as reader:
                 try:
                     while not query_done.is_set():
+                        check_health()
                         started_query = query_times.begin()
                         query(reader, url, first_vector)
                         query_times.finish(started_query)
                         query_done.wait(0.02)
                 except BaseException as exc:
                     query_errors.append(str(exc))
+                    measurements.failed.set()
 
-        worker = None
         started = time.perf_counter()
         try:
             for offset in range(0, count, 256):
-                if query_errors:
-                    raise RuntimeError(query_errors[0])
+                check_health()
                 documents = {}
                 for index in range(offset, min(offset + 256, count)):
                     vector, mask = row(index)
@@ -512,6 +563,7 @@ def qualify(binary, limit, count, data, output, steady_seconds):
                 if worker is None:
                     worker = threading.Thread(target=queries)
                     worker.start()
+                    worker_started = True
                 report["committed"] = min(offset + 256, count)
                 if (
                     offset == 0
@@ -528,20 +580,21 @@ def qualify(binary, limit, count, data, output, steady_seconds):
                         ),
                         flush=True,
                     )
+            check_health()
             report["visibility"] = wait_visible(session, url, count)
             report["ingestion_seconds"] = time.perf_counter() - started
             query_times.switch("steady")
-            if query_done.wait(steady_seconds):
-                raise RuntimeError("unexpected early query completion")
+            measurements.wait(steady_seconds)
+            check_health()
         finally:
             query_times.switch("finished")
             query_done.set()
-            if worker:
-                worker.join(timeout=310)
-                if worker.is_alive():
-                    raise RuntimeError("query worker failed to stop")
-        if query_errors:
-            raise RuntimeError(query_errors[0])
+            # Never join a thread whose start failed, nor replace a primary
+            # operation failure with a join error. Failure cleanup stops the
+            # server first and then performs the bounded join.
+            if worker_started and sys.exception() is None:
+                join_query_worker(worker, 310)
+        check_health()
         report.update(
             {
                 "corpus_sha256": digest.hexdigest(),
@@ -559,8 +612,10 @@ def qualify(binary, limit, count, data, output, steady_seconds):
         measurements.finish_phase()
         measurements.phase = "recovery"
         server.resume()
+        measurements.check()
         report["recovered_visibility"] = wait_visible(session, url, count)
         for _ in range(20):
+            measurements.check()
             query(session, url, first_vector)
         process = server.proc
         server.pause()
@@ -587,6 +642,7 @@ def qualify(binary, limit, count, data, output, steady_seconds):
             wrapper=wrapper,
             measurements=measurements,
             primary_error=sys.exception(),
+            query_worker=worker if worker_started else None,
         )
     return report
 

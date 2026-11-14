@@ -1,8 +1,12 @@
 {
-  "schema_version": 1,
-  "captured_utc": "2026-11-14T04:34:53.969360+00:00",
-  "engine_source_commit": "6d453bbbf83ae2bf2b374fdd806bf1adfe1c94e1",
-  "engine_binary_sha256": "3d1dfd09c0574f66d419c62435d095d9c3aea74cef167cf0e688a3f6f2c57ba6",
+  "schema_version": 2,
+  "report_type": "aggregate_summary",
+  "captured_utc": "2026-11-14T05:52:13.491755+00:00",
+  "engine_source_commit": "f4fd4d1e0a9876e34fd1121b7e808021cb534350",
+  "engine_binary_sha256": "7dff0a99c41a605ee716d4c8bac4b29cd8726ef9fc60df83e376ebc9f28b48c0",
+  "qualifier_source_commit": "cfd081a15478fff01868f19e856b1c649d8db4c4",
+  "qualifier_sha256": "3f8c47c4806f913be54e93f31651052f4e772d03dfb1d5fa9437db5bce92fd02",
+  "python_version": "3.12.11 (main, Sep  2 2025, 14:12:30) [Clang 20.1.4 ]",
   "host": {
     "platform": "macOS-27.0.1-arm64-arm-64bit",
     "client_nofile": [
@@ -38,122 +42,196 @@
       "soft_limit": 256,
       "completed": true,
       "committed": 100000,
-      "ingestion_seconds": 514.8772881659679,
-      "documents_per_second": 194.22103537758989,
-      "peak_fds": 232,
-      "peak_rss_bytes": 1037484032,
+      "ingestion_seconds": 674.2772915419773,
+      "documents_per_second": 148.30693730069726,
+      "peak_fds": 205,
+      "peak_rss_bytes": 862240768,
+      "peak_vector_mapping_rss_bytes": null,
       "batch_latency": {
         "count": 391,
-        "p50_ms": 1221.3614579522982,
-        "p95_ms": 1606.4613750204444,
-        "p99_ms": 1866.9446670101024,
-        "max_ms": 2124.0523330052383
+        "p50_ms": 1521.680333011318,
+        "p95_ms": 2300.1811249996535,
+        "p99_ms": 6743.957000027876,
+        "max_ms": 8512.392374977935
       },
       "query_latency": {
         "ingestion": {
-          "count": 6206,
-          "p50_ms": 35.94381202128716,
-          "p95_ms": 249.8604590073228,
-          "p99_ms": 360.24183401605114,
-          "max_ms": 768.1802499573678
+          "count": 6400,
+          "p50_ms": 47.194666491122916,
+          "p95_ms": 312.0022499933839,
+          "p99_ms": 480.70158303016797,
+          "max_ms": 2754.1322500328533
         },
         "steady": {
-          "count": 155,
-          "p50_ms": 43.54908398818225,
-          "p95_ms": 45.7822079770267,
-          "p99_ms": 54.12699998123571,
-          "max_ms": 54.92520902771503
+          "count": 120,
+          "p50_ms": 56.997333507752046,
+          "p95_ms": 81.75549999577925,
+          "p99_ms": 101.36420896742493,
+          "max_ms": 101.94933303864673
+        },
+        "transition": {
+          "count": 1,
+          "p50_ms": 69.00758401025087,
+          "p95_ms": 69.00758401025087,
+          "p99_ms": 69.00758401025087,
+          "max_ms": 69.00758401025087
         }
       },
       "graceful_exit_code": 0,
       "recovered_exit_code": 0,
-      "recovered_visible_documents": 100000,
-      "samples": 9682,
-      "peak_vector_mapping_rss_bytes": null
+      "phase_measurements": {
+        "initial": {
+          "peak_fds": 205,
+          "peak_rss_bytes": 862240768,
+          "peak_vector_mapping_rss_bytes": null,
+          "sampling_error": null,
+          "sample_count": 12564,
+          "vector_mapping_sample_count": 672
+        },
+        "recovery": {
+          "peak_fds": 186,
+          "peak_rss_bytes": 395067392,
+          "peak_vector_mapping_rss_bytes": null,
+          "sampling_error": null,
+          "sample_count": 330,
+          "vector_mapping_sample_count": 18
+        }
+      },
+      "recovered_visible_documents": 100000
     },
     {
       "soft_limit": 1024,
       "completed": true,
       "committed": 100000,
-      "ingestion_seconds": 550.9254579999833,
-      "documents_per_second": 181.51275920889287,
-      "peak_fds": 542,
-      "peak_rss_bytes": 983826432,
+      "ingestion_seconds": 687.0281549579813,
+      "documents_per_second": 145.55444238834144,
+      "peak_fds": 544,
+      "peak_rss_bytes": 775831552,
+      "peak_vector_mapping_rss_bytes": null,
       "batch_latency": {
         "count": 391,
-        "p50_ms": 1275.4009580239654,
-        "p95_ms": 1679.3853339622729,
-        "p99_ms": 3908.736667013727,
-        "max_ms": 8291.75870801555
+        "p50_ms": 1556.1634170007892,
+        "p95_ms": 2454.8443750245497,
+        "p99_ms": 3530.8684580377303,
+        "max_ms": 4804.960292007308
       },
       "query_latency": {
         "ingestion": {
-          "count": 6204,
-          "p50_ms": 36.79824998835102,
-          "p95_ms": 269.8057500529103,
-          "p99_ms": 390.79637499526143,
-          "max_ms": 3325.314665969927
+          "count": 6851,
+          "p50_ms": 45.705791970249265,
+          "p95_ms": 310.49337500007823,
+          "p99_ms": 474.10354198655114,
+          "max_ms": 2467.9558749776334
         },
         "steady": {
-          "count": 156,
-          "p50_ms": 38.28060449450277,
-          "p95_ms": 44.10470899892971,
-          "p99_ms": 59.174333000555634,
-          "max_ms": 159.50462501496077
+          "count": 132,
+          "p50_ms": 49.38212499837391,
+          "p95_ms": 69.36933397082612,
+          "p99_ms": 103.20220800349489,
+          "max_ms": 143.83091701893136
+        },
+        "transition": {
+          "count": 2,
+          "p50_ms": 54.62772952159867,
+          "p95_ms": 59.65487501816824,
+          "p99_ms": 59.65487501816824,
+          "max_ms": 59.65487501816824
         }
       },
       "graceful_exit_code": 0,
       "recovered_exit_code": 0,
-      "recovered_visible_documents": 100000,
-      "samples": 10264,
-      "peak_vector_mapping_rss_bytes": null
+      "phase_measurements": {
+        "initial": {
+          "peak_fds": 544,
+          "peak_rss_bytes": 775831552,
+          "peak_vector_mapping_rss_bytes": null,
+          "sampling_error": null,
+          "sample_count": 12995,
+          "vector_mapping_sample_count": 690
+        },
+        "recovery": {
+          "peak_fds": 332,
+          "peak_rss_bytes": 651788288,
+          "peak_vector_mapping_rss_bytes": null,
+          "sampling_error": null,
+          "sample_count": 136,
+          "vector_mapping_sample_count": 8
+        }
+      },
+      "recovered_visible_documents": 100000
     },
     {
       "soft_limit": 65536,
       "completed": true,
       "committed": 100000,
-      "ingestion_seconds": 558.0474352919846,
-      "documents_per_second": 179.19623615450803,
-      "peak_fds": 720,
-      "peak_rss_bytes": 849772544,
+      "ingestion_seconds": 658.5469139170018,
+      "documents_per_second": 151.84947023015468,
+      "peak_fds": 711,
+      "peak_rss_bytes": 796753920,
+      "peak_vector_mapping_rss_bytes": null,
       "batch_latency": {
         "count": 391,
-        "p50_ms": 1310.6711250147782,
-        "p95_ms": 1916.3044589804485,
-        "p99_ms": 2430.035667028278,
-        "max_ms": 2977.018582983874
+        "p50_ms": 1423.8915829919279,
+        "p95_ms": 2599.758209020365,
+        "p99_ms": 3210.012791038025,
+        "max_ms": 5237.886999966577
       },
       "query_latency": {
         "ingestion": {
-          "count": 6127,
-          "p50_ms": 40.792583022266626,
-          "p95_ms": 268.0486250319518,
-          "p99_ms": 393.4504170319997,
-          "max_ms": 1026.009207998868
+          "count": 6736,
+          "p50_ms": 44.0441244863905,
+          "p95_ms": 294.73637498449534,
+          "p99_ms": 445.0819590128958,
+          "max_ms": 2221.3757500285283
         },
         "steady": {
-          "count": 159,
-          "p50_ms": 38.4605840081349,
-          "p95_ms": 44.36766600701958,
-          "p99_ms": 55.1434580120258,
-          "max_ms": 267.96600001398474
+          "count": 143,
+          "p50_ms": 43.652833031956106,
+          "p95_ms": 53.0332499765791,
+          "p99_ms": 64.87491697771475,
+          "max_ms": 71.57258299412206
+        },
+        "transition": {
+          "count": 2,
+          "p50_ms": 47.197562467772514,
+          "p95_ms": 56.57704098848626,
+          "p99_ms": 56.57704098848626,
+          "max_ms": 56.57704098848626
         }
       },
       "graceful_exit_code": 0,
       "recovered_exit_code": 0,
-      "recovered_visible_documents": 100000,
-      "samples": 10363,
-      "peak_vector_mapping_rss_bytes": null
+      "phase_measurements": {
+        "initial": {
+          "peak_fds": 711,
+          "peak_rss_bytes": 796753920,
+          "peak_vector_mapping_rss_bytes": null,
+          "sampling_error": null,
+          "sample_count": 12418,
+          "vector_mapping_sample_count": 660
+        },
+        "recovery": {
+          "peak_fds": 331,
+          "peak_rss_bytes": 555515904,
+          "peak_vector_mapping_rss_bytes": null,
+          "sampling_error": null,
+          "sample_count": 199,
+          "vector_mapping_sample_count": 11
+        }
+      },
+      "recovered_visible_documents": 100000
     }
   ],
   "scope": [
     "One ordered trial per limit on a shared macOS ARM64 host; observations, not a statistical speed comparison or production sizing guarantee.",
-    "End-to-end ingestion includes client synthetic vector generation, JSON serialization, index acknowledgement and final visibility checks.",
-    "Queries run concurrently with ingestion and in a separate steady phase. No write or query failure is retried.",
-    "All profiles use fresh server data and the same corpus digest. OS caches are warm; no cache purge or CPU/container resource isolation.",
-    "First profile overlapped worktree cleanup. Other host work is not controlled.",
-    "RSS is whole-server resident memory. Sampled FD/RSS peaks are lower bounds, not hard quotas.",
-    "macOS per-vector-mapping RSS is unavailable. The Linux runner samples .afvb mapping RSS separately, including deleted generations.",
+    "End-to-end ingestion includes client generation, JSON serialization, index acknowledgement and final visibility checks.",
+    "Query intervals crossing phase boundaries are retained only in the transition bucket; empty phases are null. No failed write or query is retried.",
+    "Initial and recovery resource windows include launch before readiness, workload activity, and shutdown. Overall peaks include both process lifetimes.",
+    "All profiles use fresh server data and the same corpus digest. The runner does not purge OS caches or isolate CPUs; other host activity is uncontrolled.",
+    "RSS is whole-server resident memory. Sampled resource peaks are lower bounds, not hard quotas.",
+    "macOS per-vector-mapping RSS is unavailable. The Linux runner separately samples .afvb mapping RSS, including deleted generations.",
+    "The completed run is pinned to the engine and qualifier hashes above. Subsequent error-path changes strengthen failure reporting and fail-fast checks without changing successful-run phase attribution or resource sample accounting.",
+    "Raw CLI reports contain sample series; this committed summary retains per-lifetime peaks, sample counts and latency distributions.",
     "This synthetic workload is not Cohere recall/distribution qualification or a mixed-query performance benchmark."
   ]
 }
