@@ -91,6 +91,20 @@ preparation scope, retaining only live pixels when execution starts. Each phase
 returns unused capacity before acquiring model execution resources. Admission
 failure precedes the backing allocation and retains its policy/pressure identity.
 
+Prepared model inputs borrow the allocation owner's proven payload range and
+stack-owned shape for the synchronous invocation. They do not clone pixels,
+patches, masks or stage inputs onto an unadmitted execution heap. Storage-domain
+provenance supplies the existing session input-residency credit; execution owns
+only the remaining model workspace and output lease. Output admission retires
+execution peaks after a forward, independently of the preparation lifetime.
+
+Synchronous child preparation scopes include live ancestors in feasibility
+without charging their leases again. Source decoding, regional crops, resized
+pixels and codec slab growth therefore cannot hide an intrinsically oversized
+request behind several individually valid leases. Slab growth includes both
+prior slab capacity and prepared pixels. A stable aggregate policy failure stays
+permanent; reservations held by an unrelated request remain retryable contention.
+
 Boolean broker cancellation callbacks retain their first typed checkpoint
 failure atomically until the synchronous caller joins. The retained checkpoint
 control propagates through nested LightOn vision, prefill and page brokers as

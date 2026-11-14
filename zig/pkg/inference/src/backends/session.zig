@@ -946,6 +946,17 @@ pub const Session = struct {
         };
     }
 
+    /// Prepared inputs already have a live allocation owner. Include all of
+    /// that request's retained preparation in feasibility, charging execution
+    /// only for amounts not credited by planRun's storage provenance.
+    pub fn admitPrepared(self: Session, request: RunRequest, owned_host_bytes: usize) !RunPermit {
+        var pressure: ?memory.AdmissionPressure = null;
+        return .{ .session = self, .request = request, .lease = if (self.run_admission) |admission|
+            try admission.acquireAmountsWithOwned(try admission.estimateRequest(request, self.outputInfo()), .{ .host_scratch_bytes = owned_host_bytes }, &pressure)
+        else
+            null };
+    }
+
     /// Acquire only a later phase's additional peak while the original lease
     /// remains live. Counters, live-memory checks and external ownership all
     /// use ordinary admission; a rejected supplement leaves the base untouched.
@@ -1359,6 +1370,16 @@ pub const RunPermit = struct {
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return outputs;
+    }
+
+    /// Transfer only surviving output admission after a synchronous forward;
+    /// prepared inputs keep their independent owner and execution peaks retire.
+    pub fn runTransferringOutputs(self: *RunPermit, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) ![]Tensor {
+        if (self.execution_yielded) return self.runWithControl(inputs, allocator, control);
+        const outputs = try self.runWithControl(inputs, allocator, control);
+        if (self.execution_yielded) return outputs;
+        errdefer deinitTensorSlice(outputs, allocator);
+        return Session.attachOutputAdmission(outputs, allocator, &self.lease);
     }
 
     /// Use the chunk's existing admission for resident typed decisions.

@@ -86,6 +86,18 @@ pub const AdmittedAllocator = struct {
         return (try admission.estimateRequest(request, session.outputInfo())).host_kv_bytes == 0;
     }
 
+    /// A live payload range owned by this allocator, excluding bookkeeping.
+    pub fn ownsRange(self: *const @This(), bytes: []const u8) bool {
+        if (bytes.len == 0) return true;
+        const address = @intFromPtr(bytes.ptr);
+        var block = self.blocks;
+        while (block) |entry| : (block = entry.next) {
+            const base = @intFromPtr(entry);
+            if (address >= base + @sizeOf(Header) and address - base <= entry.bytes and bytes.len <= entry.bytes - (address - base)) return true;
+        }
+        return false;
+    }
+
     pub fn allocationOverhead(alignment: std.mem.Alignment) usize {
         return std.mem.alignForward(usize, @sizeOf(Header), alignment.toByteUnits());
     }

@@ -292,7 +292,11 @@ pub const CTCRecognizer = struct {
     }
 
     pub fn recognize(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
-        var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, self.session.withAdmissionControl(control), .{}, null);
+        return self.recognizePrepared(img, control, null);
+    }
+
+    pub fn recognizePrepared(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope) !RecognitionResult {
+        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.session.withAdmissionControl(control), parent);
         defer preparation.deinit();
         const work = try preparation.allocator();
         var input_width = self.preprocess.width;
@@ -332,10 +336,10 @@ pub const CTCRecognizer = struct {
             @intCast(self.preprocess.height),
             @intCast(input_width),
         };
-        var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
+        var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
 
-        var permit = try self.session.admit(try self.session.planRun(&.{input_tensor}, null));
+        var permit = try preparation.admitRun(self.session.withAdmissionControl(control), try self.session.planRun(&.{input_tensor}, null));
         defer permit.deinit();
         if (try permit.runResidentWithControl(&.{input_tensor}, self.allocator, control)) |resident_outputs| {
             var resident = resident_outputs;
@@ -437,7 +441,13 @@ pub const Vision2SeqRecognizer = struct {
     }
 
     pub fn recognize(self: *Vision2SeqRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
-        var result = try self.reader.readDecodedRaw(img, .{ .execution_control = control });
+        return self.recognizePrepared(img, control, null);
+    }
+
+    pub fn recognizePrepared(self: *Vision2SeqRecognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope) !RecognitionResult {
+        var reader = self.reader;
+        reader.preparation_parent = parent;
+        var result = try reader.readDecodedRaw(img, .{ .execution_control = control });
         defer result.deinit();
 
         const trimmed = std.mem.trim(u8, result.text, " \t\r\n");
@@ -460,14 +470,19 @@ pub const Recognizer = union(enum) {
     }
 
     pub fn recognize(self: *Recognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
+        return self.recognizePrepared(img, control, null);
+    }
+
+    pub fn recognizePrepared(self: *Recognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope) !RecognitionResult {
         return switch (self.*) {
-            .ctc => |*recognizer| recognizer.recognize(img, control),
-            .vision2seq => |*recognizer| recognizer.recognize(img, control),
+            .ctc => |*recognizer| recognizer.recognizePrepared(img, control, parent),
+            .vision2seq => |*recognizer| recognizer.recognizePrepared(img, control, parent),
         };
     }
 };
 
 pub const MultiStageOCRPipeline = struct {
+    preparation_parent: ?*const @import("preprocessing_memory.zig").Scope = null,
     allocator: std.mem.Allocator,
     detector: backends.Session,
     detection_preprocess: PreprocessConfig,
@@ -514,13 +529,15 @@ pub const MultiStageOCRPipeline = struct {
 
     pub fn runWithControl(self: *MultiStageOCRPipeline, image_bytes: []const u8, control: ?InferenceExecutionControl) !MultiStageOCRResult {
         if (control) |active| try active.update(.tokenizing, 0, 1);
-        var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, self.detector.withAdmissionControl(control), .{}, null);
+        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent);
         defer preparation.deinit();
         const work = try preparation.allocator();
         const img = image.decode(work, image_bytes) catch |err| return preparation.failure(err);
         defer img.deinit(work);
         try preparation.trim();
-        return self.runDecodedWithControl(img, control);
+        var execution = self.*;
+        execution.preparation_parent = &preparation;
+        return execution.runDecodedWithControl(img, control);
     }
 
     pub fn runDecoded(self: *MultiStageOCRPipeline, img: image.Image) !MultiStageOCRResult {
@@ -557,14 +574,14 @@ pub const MultiStageOCRPipeline = struct {
             for (regions, 0..) |region, index| {
                 if (control) |active|
                     try active.update(.executing, @intCast(index), @intCast(regions.len));
-                var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, self.detector.withAdmissionControl(control), .{}, null);
+                var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent);
                 defer preparation.deinit();
                 const work = try preparation.allocator();
                 const cropped = crop.cropBBox(work, img, region.bbox, self.recognition_crop_orientation) catch |err| return preparation.failure(err);
                 defer cropped.deinit(work);
                 try preparation.trim();
 
-                const rec = try recognizer.recognize(cropped, control);
+                const rec = try recognizer.recognizePrepared(cropped, control, &preparation);
                 if (rec.text.len == 0) {
                     self.allocator.free(rec.text);
                     continue;
@@ -612,7 +629,7 @@ pub const MultiStageOCRPipeline = struct {
 
     fn detect(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]TextRegion {
         const input_size = try detectionInputSize(self.detection_preprocess, img.width, img.height);
-        var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, self.detector.withAdmissionControl(control), .{}, null);
+        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent);
         defer preparation.deinit();
         const work = try preparation.allocator();
         const pixel_values = image.preprocessDecodedRectScaledWithResample(
@@ -635,10 +652,10 @@ pub const MultiStageOCRPipeline = struct {
             @intCast(input_size.height),
             @intCast(input_size.width),
         };
-        var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
+        var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
 
-        const outputs = try self.detector.runWithControl(&.{input_tensor}, self.allocator, control);
+        const outputs = try preparation.run(self.detector, &.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) return self.allocator.dupe(TextRegion, &.{});
 
@@ -651,7 +668,7 @@ pub const MultiStageOCRPipeline = struct {
     fn analyzeLayout(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]LayoutRegion {
         const layout = self.layout orelse return self.allocator.dupe(LayoutRegion, &.{});
 
-        var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, layout.withAdmissionControl(control), .{}, null);
+        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, layout.withAdmissionControl(control), self.preparation_parent);
         defer preparation.deinit();
         const work = try preparation.allocator();
         const pixel_values = image.preprocessDecodedRectScaledWithResample(
@@ -674,10 +691,10 @@ pub const MultiStageOCRPipeline = struct {
             @intCast(self.detection_preprocess.height),
             @intCast(self.detection_preprocess.width),
         };
-        var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
+        var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
 
-        const outputs = try layout.runWithControl(&.{input_tensor}, self.allocator, control);
+        const outputs = try preparation.run(layout, &.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) return self.allocator.dupe(LayoutRegion, &.{});
 
@@ -691,8 +708,11 @@ pub const MultiStageOCRPipeline = struct {
             return;
         };
 
-        const bbox_data = try self.allocator.alloc(f32, regions.len * 4);
-        defer self.allocator.free(bbox_data);
+        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, order.withAdmissionControl(control), self.preparation_parent);
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const bbox_data = work.alloc(f32, regions.len * 4) catch |err| return preparation.failure(err);
+        defer work.free(bbox_data);
         for (regions, 0..) |region, idx| {
             bbox_data[idx * 4 + 0] = @floatCast(region.bbox[0]);
             bbox_data[idx * 4 + 1] = @floatCast(region.bbox[1]);
@@ -702,10 +722,10 @@ pub const MultiStageOCRPipeline = struct {
 
         const input_name = if (order.inputInfo().len > 0) order.inputInfo()[0].name else "boxes";
         const shape = [_]i64{ 1, @intCast(regions.len), 4 };
-        var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, bbox_data);
+        var input_tensor = try preparation.tensor(f32, input_name, &shape, bbox_data);
         defer input_tensor.deinit();
 
-        const outputs = order.runWithControl(&.{input_tensor}, self.allocator, control) catch |err| switch (err) {
+        const outputs = preparation.run(order, &.{input_tensor}, self.allocator, control) catch |err| switch (err) {
             error.Cancelled, error.Timeout => return err,
             else => {
                 sortRegionsByReadingOrder(TextRegion, regions);

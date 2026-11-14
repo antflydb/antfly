@@ -58,9 +58,58 @@ pub const Scope = struct {
     budget_bytes: usize = 0,
     local_controller: memory.AdmissionController = .{},
     started: bool = false,
+    /// Synchronous ancestor preparation remains live while a child executes.
+    parent: ?*const Scope = null,
 
     pub fn init(backing: std.mem.Allocator, session: ?sessions.Session, credit: Credit, budget: ?*memory.RunBudget) @This() {
         return .{ .owner = .{ .backing = backing, .session = session, .prepaid_host_bytes = credit.process_bytes }, .budget = budget, .borrowed_budget_bytes = credit.budget_bytes };
+    }
+
+    pub fn child(backing: std.mem.Allocator, session: sessions.Session, parent: ?*const Scope) @This() {
+        var result = init(backing, session, .{}, null);
+        result.parent = parent;
+        return result;
+    }
+
+    pub fn ownedHostBytesFor(self: *const @This(), session: sessions.Session) !usize {
+        const admission = session.run_admission orelse return 0;
+        var owned: usize = if (self.owner.session) |source| if (source.run_admission) |source_admission|
+            if (source_admission.controller == admission.controller) try std.math.add(usize, self.owner.prepaid_host_bytes, self.owner.reserved_bytes) else 0
+        else
+            0 else 0;
+        if (self.parent) |parent| owned = try std.math.add(usize, owned, try parent.ownedHostBytesFor(session));
+        return owned;
+    }
+
+    /// Borrow proven, admitted storage for one synchronous model invocation.
+    /// Shape and payload remain owned by the caller; no tensor copy is made.
+    pub fn tensor(self: *const @This(), comptime T: type, name: []const u8, shape: []const i64, values: []const T) !@import("../backends/tensor.zig").Tensor {
+        const bytes = std.mem.sliceAsBytes(values);
+        if (!self.owner.ownsRange(bytes)) return error.InvalidAdmissionLeaseReduction;
+        const Tensor = @import("../backends/tensor.zig").Tensor;
+        const result = Tensor{ .data = @constCast(bytes), .dtype = if (T == f32) .f32 else if (T == i64) .i64 else @compileError("unsupported prepared input dtype"), .shape = shape, .name = name, .allocator = self.owner.backing, .owns_data = false, .owns_shape = false, .shared_storage = @constCast(bytes), .admitted_storage_domain = if (self.owner.session) |session| if (session.run_admission) |admission| admission.controller else null else null };
+        _ = try result.denseElementCount();
+        return result;
+    }
+
+    pub fn admitRun(self: *@This(), session: sessions.Session, request: sessions.RunRequest) !sessions.RunPermit {
+        try self.trim();
+        return session.admitPrepared(request, try self.ownedHostBytesFor(session));
+    }
+
+    /// Direct native executors consume the prepared host arrays themselves.
+    pub fn admitInputRun(self: *@This(), session: sessions.Session, request: sessions.RunRequest) !sessions.RunPermit {
+        if (request.input_bytes > self.owner.live_bytes) return error.InvalidAdmissionLeaseReduction;
+        var credited = request;
+        credited.pre_admitted_host_bytes = request.input_bytes;
+        return self.admitRun(session, credited);
+    }
+
+    pub fn run(self: *@This(), session: sessions.Session, inputs: []const @import("../backends/tensor.zig").Tensor, allocator_: std.mem.Allocator, control: ?@import("../execution_control.zig").InferenceExecutionControl) ![]@import("../backends/tensor.zig").Tensor {
+        const active = session.withAdmissionControl(control);
+        var permit = try self.admitRun(active, try active.planRun(inputs, null));
+        defer permit.deinit();
+        return permit.runTransferringOutputs(inputs, allocator_, control);
     }
 
     pub fn allocator(self: *@This()) !std.mem.Allocator {
@@ -83,7 +132,7 @@ pub const Scope = struct {
         const budget_growth = required_budget -| self.budget_bytes;
         if (self.budget) |budget| try reserveBudget(budget, budget_growth);
         errdefer if (self.budget) |budget| budget.release(.{ .kind = .scratch, .tier = .host, .bytes = budget_growth });
-        const lease = if (self.owner.session) |session| (try session.admitHostPreprocessOwned(amount, owned)).lease else null;
+        const lease = if (self.owner.session) |session| (try session.admitHostPreprocessOwned(amount, try std.math.add(usize, owned, if (self.parent) |parent| try parent.ownedHostBytesFor(session) else 0))).lease else null;
         // Offline callers may have only a local run budget and no session.
         // A local lease gives those reservations the same owned cleanup path.
         const result = lease orelse try self.local_controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = amount }, false);
@@ -474,4 +523,74 @@ test "preprocessing admission discards recovered proposals without losing termin
     a.free(first);
     try scope.trim();
     try std.testing.expectEqualDeep(weights.amounts, controller.snapshot());
+}
+
+test "prepared tensor borrowing preserves pointer admission and independent output lifetime" {
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const Fake = struct {
+        expected: [*]const f32,
+        calls: usize = 0,
+        fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{.{ .name = "out", .dtype = .f32, .shape = &.{ 1, 2 } }};
+        }
+        fn run(raw: *anyopaque, inputs: []const Tensor, a: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(inputs[0].asFloat32().ptr == self.expected);
+            self.calls += 1;
+            const outputs = try a.alloc(Tensor, 1);
+            errdefer a.free(outputs);
+            outputs[0] = try Tensor.initFloat32(a, "out", &.{ 1, 2 }, &.{ 7, 9 });
+            return outputs;
+        }
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var controller = memory.AdmissionController{};
+    var fake = Fake{ .expected = undefined };
+    const session = sessions.Session{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .inputInfo = Fake.info, .outputInfo = Fake.info, .backend = Fake.backend, .close = Fake.close }, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 }, .static_workspace_bytes = 1024, .check_live_memory = false } };
+    var parent = Scope.child(std.testing.allocator, session, null);
+    defer parent.deinit();
+    const parent_a = try parent.allocator();
+    _ = try parent_a.alloc(u8, 128);
+    try parent.trim();
+    var child_scope = Scope.child(std.testing.allocator, session, &parent);
+    defer child_scope.deinit();
+    const a = try child_scope.allocator();
+    const values = try a.alloc(f32, 16);
+    @memset(values, 3);
+    fake.expected = values.ptr;
+    try child_scope.trim();
+    var input = try child_scope.tensor(f32, "in", &.{ 1, 16 }, values);
+    defer input.deinit();
+    try std.testing.expectEqual(@as(usize, 64), try session.inputResidencyCredit(&.{input}));
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, child_scope.tensor(f32, "foreign", &.{1}, &.{1}));
+    const outputs = try child_scope.run(session, &.{input}, std.testing.allocator, null);
+    defer std.testing.allocator.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    child_scope.deinit();
+    parent.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 7, 9 }, outputs[0].asFloat32());
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(controller.snapshot().host_scratch_bytes < 512);
+}
+
+test "prepared child scopes distinguish aggregate policy failure from peer contention" {
+    for ([_]bool{ false, true }) |contended| {
+        var controller = memory.AdmissionController{};
+        const session = Test.session(&controller, if (contended) 80 * 1024 else 40 * 1024);
+        var parent = Scope.child(std.testing.allocator, session, null);
+        defer parent.deinit();
+        const a = try parent.allocator();
+        _ = try a.alloc(u8, 20 * 1024);
+        try parent.trim();
+        var peer = try session.admitHostPreprocess(if (contended) 40 * 1024 else 0);
+        defer peer.deinit();
+        var child_scope = Scope.child(std.testing.allocator, session, &parent);
+        defer child_scope.deinit();
+        const child_a = try child_scope.allocator();
+        try std.testing.expectError(error.OutOfMemory, child_a.alloc(u8, 24 * 1024));
+        try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, child_scope.failure(error.OutOfMemory));
+    }
 }
