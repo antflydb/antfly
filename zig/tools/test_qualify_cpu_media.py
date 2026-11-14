@@ -19,11 +19,104 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
-from qualify_cpu_media import validate_read, validate_timeout, main, request
+from qualify_cpu_media import (
+    validate_read,
+    validate_timeout,
+    main,
+    request,
+    MemoryGuard,
+    pinned_installation,
+    installation_manifest,
+    run_case,
+)
+
+
+class InstallationAssertions(unittest.TestCase):
+    def test_execution_inventory_contains_exact_weights_and_supporting_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            for name in ("model.safetensors", "tokenizer.json", "config.json"):
+                (source / name).write_text(name)
+            args = SimpleNamespace(models_dir=root, report=root / "report.json")
+            case = dict(
+                model="owner/model", checkpoint_dir=source, revision="unverified-label"
+            )
+            with pinned_installation(args, case) as (inventory, identity):
+                self.assertEqual(3, len(identity["assets"]))
+                self.assertEqual("unverified-label", identity["declared_revision"])
+                self.assertNotIn("checkpoint_revision", identity)
+                self.assertEqual(
+                    (source / "model.safetensors").stat().st_ino,
+                    (inventory / "owner/model/model.safetensors").stat().st_ino,
+                )
+                self.assertEqual(identity["assets"], installation_manifest(inventory))
+            self.assertFalse(inventory.exists())
+
+    def test_asset_mutation_invalidates_an_otherwise_successful_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "model.safetensors").write_text("weights")
+            metadata = source / "tokenizer.json"
+            metadata.write_text("original")
+            args = SimpleNamespace(models_dir=root, report=root / "report.json")
+            case = dict(model="owner/model", checkpoint_dir=source)
+
+            def execute(*unused):
+                metadata.write_text("changed")
+                return dict(success=True)
+
+            with patch("qualify_cpu_media.run_pinned_case", side_effect=execute):
+                result = run_case(args, case, 0)
+            self.assertFalse(result["success"])
+            self.assertFalse(result["installation_verified_after_execution"])
+
+    def test_composition_cannot_resolve_a_different_unhashed_leaf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model.safetensors").write_text("weights")
+            definition = root / "document.json"
+            definition.write_text(json.dumps({"models": [{"model": "other/model"}]}))
+            args = SimpleNamespace(models_dir=root, report=root / "report.json")
+            case = dict(
+                model="reader/composite",
+                preload_model="owner/model",
+                checkpoint_dir=root,
+                model_definition=definition,
+            )
+            with self.assertRaisesRegex(ValueError, "pinned leaf"):
+                with pinned_installation(args, case):
+                    self.fail("unhashed model accepted")
+
+
+class MemoryAssertions(unittest.TestCase):
+    def test_abort_is_terminal_even_after_the_last_successful_response(self):
+        guard = MemoryGuard(1)
+        self.assertTrue(guard.observe({"pss_bytes": 2 * 1024**2}))
+        result = dict(success=True)
+        guard.finish(result)
+        self.assertFalse(result["success"])
+        self.assertIn("PSS", result["error"])
+        guard.finish(result)
+        self.assertFalse(result["success"])
 
 
 class CompletionAssertions(unittest.TestCase):
+    def test_pdf_text_layer_does_not_qualify_native_ocr_execution(self):
+        response = {
+            "data": [{"status": "complete", "text": "header footer"}],
+            "usage": {"model_calls": 0},
+        }
+        with self.assertRaisesRegex(ValueError, "did not execute"):
+            validate_read(response, ["header", "footer"], require_model_execution=True)
+        response["usage"]["model_calls"] = 1
+        validate_read(response, ["header", "footer"], require_model_execution=True)
+
     def test_success_requires_complete_output_and_known_answer(self):
         for response in (
             {},

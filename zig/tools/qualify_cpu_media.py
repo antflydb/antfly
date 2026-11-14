@@ -17,7 +17,7 @@
 """Run bounded native CPU /read checks against a fresh, owned local worker.
 
 Cases are JSON objects with model, kind (image/audio/document), fixture, and
-expected (nonempty text fragments). Optional checkpoint_dir hashes local weights;
+expected (nonempty text fragments). checkpoint_dir pins the complete local installation;
 options supplies /read options, such as max_tokens or selected document pages.
 No models are downloaded and no shared service is mutated. First-request timings
 include lazy preparation but are not a claim of a cold OS page cache.
@@ -25,6 +25,7 @@ include lazy preparation but are not a claim of a cold OS page cache.
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import http.client
 import json
@@ -34,6 +35,7 @@ import signal
 import socket
 import subprocess
 import threading
+import tempfile
 import time
 
 
@@ -49,7 +51,9 @@ def normalize(value):
     return " ".join(value.casefold().split())
 
 
-def validate_read(response, expected):
+def validate_read(response, expected, *, require_model_execution=False):
+    if require_model_execution and response.get("usage", {}).get("model_calls", 0) < 1:
+        raise ValueError("document qualification did not execute the pinned reader")
     document = response.get("document")
     if document is not None and document.get("status") != "complete":
         raise ValueError("document orchestration was incomplete")
@@ -133,7 +137,138 @@ def process_sample(pid):
     return totals
 
 
+def installation_manifest(root):
+    return [
+        {
+            "name": str(path.relative_to(root)),
+            "bytes": path.stat().st_size,
+            "sha256": sha256(path),
+        }
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    ]
+
+
+def model_path(name):
+    path = Path(name)
+    if (
+        path.is_absolute()
+        or len(path.parts) != 2
+        or any(part in (".", "..") or ":" in part or "@" in part for part in path.parts)
+    ):
+        raise ValueError(
+            "qualification requires an unqualified owner/name model identity"
+        )
+    return path
+
+
+@contextlib.contextmanager
+def pinned_installation(args, case):
+    """An isolated resolver inventory containing exactly the hashed installation.
+
+    Hard links avoid copying model bytes. Hash verification after execution
+    detects mutations of linked source files. No cache or shared service changes.
+    """
+    source = Path(case["checkpoint_dir"]).resolve()
+    if not source.is_relative_to(args.models_dir.resolve()):
+        raise ValueError("checkpoint_dir must be inside the supplied models-dir")
+    if not source.is_dir():
+        raise ValueError("checkpoint_dir is not an installed model directory")
+    leaf = case.get("preload_model", case["model"])
+    relative = model_path(leaf)
+    with tempfile.TemporaryDirectory(
+        prefix="cpu-media-models-", dir=args.report.parent
+    ) as directory:
+        root = Path(directory)
+        target = root / relative
+        target.mkdir(parents=True)
+        for path in sorted(source.rglob("*")):
+            if (
+                path.is_relative_to(root)
+                or not path.is_file()
+                or any(part.startswith(".") for part in path.relative_to(source).parts)
+            ):
+                continue
+            output = target / path.relative_to(source)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(path.resolve(), output)
+            except OSError as error:
+                raise ValueError(
+                    "place the report on the checkpoint filesystem for zero-copy qualification"
+                ) from error
+        definition = case.get("model_definition")
+        if case["model"] != leaf:
+            if not definition:
+                raise ValueError("composed readers require model_definition")
+            destination = (
+                root / "readers" / model_path(case["model"]) / "document_agent.json"
+            )
+            destination.parent.mkdir(parents=True)
+            raw = Path(definition).read_bytes()
+            parsed = json.loads(raw)
+            bindings = parsed.get("models", [])
+            if not bindings or any(
+                binding.get("model") != leaf
+                or binding.get("provider", "antfly") != "antfly"
+                for binding in bindings
+            ):
+                raise ValueError(
+                    "qualification definition must use only the pinned leaf"
+                )
+            destination.write_bytes(raw)
+        elif definition:
+            raise ValueError(
+                "model_definition requires a distinct composed reader identity"
+            )
+        assets = installation_manifest(root)
+        if not any(asset["name"].endswith(".safetensors") for asset in assets):
+            raise ValueError("checkpoint_dir contains no safetensors weights")
+        identity = hashlib.sha256(
+            json.dumps(assets, sort_keys=True).encode()
+        ).hexdigest()
+        yield (
+            root,
+            dict(
+                installation_sha256=identity,
+                assets=assets,
+                declared_revision=case.get("revision"),
+            ),
+        )
+
+
+class MemoryGuard:
+    def __init__(self, limit_mib):
+        self.limit_bytes = limit_mib * 1024**2
+        self.exceeded = threading.Event()
+
+    def observe(self, sample):
+        if self.limit_bytes and sample["pss_bytes"] > self.limit_bytes:
+            self.exceeded.set()
+            return True
+        return False
+
+    def finish(self, result):
+        if self.exceeded.is_set():
+            result.update(
+                success=False,
+                error="sampled process PSS exceeded the qualification abort limit",
+            )
+
+
 def run_case(args, case, index):
+    with pinned_installation(args, case) as (models_root, identity):
+        result = run_pinned_case(args, case, index, models_root, identity)
+        unchanged = installation_manifest(models_root) == identity["assets"]
+        result["installation_verified_after_execution"] = unchanged
+        if not unchanged:
+            result.update(
+                success=False, error="pinned model assets changed during execution"
+            )
+        return result
+
+
+def run_pinned_case(args, case, index, models_root, identity):
     kind = case["kind"]
     if kind not in ("image", "audio", "document") or not case.get("expected"):
         raise ValueError("each case needs a kind and nonempty expected fragments")
@@ -156,25 +291,16 @@ def run_case(args, case, index):
         else {"documents": [source]}
     )
     result = dict(
-        checkpoint_revision=case.get("revision"),
         model=case["model"],
         kind=kind,
         fixture_sha256=sha256(fixture),
         trials=[],
     )
+    result.update(identity)
     result["preload_model"] = case.get("preload_model", case["model"])
-    if case.get("model_definition"):
-        result["model_definition_sha256"] = sha256(case["model_definition"])
-    result["weights"] = (
-        [
-            {"name": path.name, "bytes": path.stat().st_size, "sha256": sha256(path)}
-            for path in sorted(Path(case["checkpoint_dir"]).glob("*.safetensors"))
-        ]
-        if case.get("checkpoint_dir")
-        else []
-    )
-    if case.get("checkpoint_dir") and not result["weights"]:
-        raise ValueError("checkpoint_dir contains no safetensors weights")
+    result["weights"] = [
+        asset for asset in identity["assets"] if asset["name"].endswith(".safetensors")
+    ]
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -204,6 +330,7 @@ def run_case(args, case, index):
         result["openblas_sha256"] = sha256(library)
     stopped = threading.Event()
     samples = []
+    memory_guard = MemoryGuard(args.abort_pss_mib)
     process = None
     thread = None
     started = time.monotonic()
@@ -216,7 +343,7 @@ def run_case(args, case, index):
                     "--config",
                     str(args.config),
                     "--models-dir",
-                    str(args.models_dir),
+                    str(models_root),
                     "--host",
                     "127.0.0.1",
                     "--port",
@@ -239,11 +366,11 @@ def run_case(args, case, index):
                         **process_sample(process.pid),
                     )
                     samples.append(sample)
-                    if (
-                        args.abort_pss_mib
-                        and sample["pss_bytes"] > args.abort_pss_mib * 1024**2
-                    ):
-                        os.killpg(process.pid, signal.SIGTERM)
+                    if memory_guard.observe(sample):
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
                         return
 
             thread = threading.Thread(target=monitor, daemon=True)
@@ -286,7 +413,11 @@ def run_case(args, case, index):
                 result["trials"].append(row)
                 if status != 200:
                     raise ValueError(f"read failed: {status} {response}")
-                validate_read(response, case["expected"])
+                validate_read(
+                    response,
+                    case["expected"],
+                    require_model_execution=kind == "document",
+                )
                 if trial == 0:
                     result["startup_to_first_complete_seconds"] = (
                         time.monotonic() - started
@@ -314,7 +445,11 @@ def run_case(args, case, index):
                 )
                 if status != 200:
                     raise ValueError("worker did not recover after cancellation")
-                validate_read(recovered, case["expected"])
+                validate_read(
+                    recovered,
+                    case["expected"],
+                    require_model_execution=kind == "document",
+                )
                 result["cancellation"]["recovery_complete"] = True
             result["success"] = True
         except Exception as error:
@@ -339,9 +474,16 @@ def run_case(args, case, index):
                     pass
                 if thread is not None:
                     thread.join(timeout=2)
+                    if thread.is_alive():
+                        result.update(
+                            success=False,
+                            error="qualification memory monitor did not settle",
+                        )
+    memory_guard.finish(result)
     result["samples"] = samples
     result["peak_pss_bytes"] = max(
-        (sample["pss_bytes"] for sample in samples), default=0
+        (sample["pss_bytes"] for sample in samples if sample["pss_bytes"] > 0),
+        default=None,
     )
     return result
 

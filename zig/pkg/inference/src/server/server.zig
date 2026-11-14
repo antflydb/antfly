@@ -6285,6 +6285,21 @@ pub const Node = struct {
         return output.text;
     }
 
+    fn generationPreparation(self: *Node) @import("../backends/admitted_allocator.zig").AdmittedAllocator {
+        const Preparation = struct {
+            fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
+                const node: *Node = @ptrCast(@alignCast(raw));
+                return node.model_manager.admitHostPreflight(bytes);
+            }
+        };
+        return @import("../backends/admitted_allocator.zig").AdmittedAllocator{
+            .backing = std.heap.smp_allocator,
+            .admission_context = self,
+            .admit = Preparation.acquire,
+            .trim_on_free = true,
+        };
+    }
+
     fn generateMessagesDirectPrepared(
         self: *Node,
         caller_allocator: std.mem.Allocator,
@@ -6305,6 +6320,9 @@ pub const Node = struct {
         prompt_cache_key: ?[]const u8,
         supplied_control: InferenceExecutionControl,
     ) !DirectGenerateOutput {
+        var preparation = self.generationPreparation();
+        defer preparation.deinit();
+        const preparation_allocator = preparation.allocator();
         // Model execution is owned by the generation resource lease below.
         // A caller's document/source/output quota must not become a second
         // tensor-workspace limit or retain logically freed intermediates.
@@ -6328,7 +6346,8 @@ pub const Node = struct {
         execution_control = model_path_selection.bind(execution_control);
         defer self.allocator.free(model_path);
         const resolved_at_ns = embedTimingNowNs();
-        var admission_manifest = try self.loadBoundManifest(allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control));
+        var admission_manifest = self.loadBoundManifest(preparation_allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
+            return if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
         defer admission_manifest.deinit();
         const executor_contract = try resolvedGenerateExecutorContract(self, &admission_manifest);
         const decoded_pixels = try measureDirectGenerateDecodedPixels(&admission_manifest, messages);
@@ -6371,7 +6390,9 @@ pub const Node = struct {
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         // Preserve model resolution, capability checks, admission and cancellation
         // for silence, but do not ask a generative model to invent a transcript.
-        if (preflight.audio_transcription and try audioReadIsDigitalSilence(allocator, messages, execution_control)) {
+        if (preflight.audio_transcription and (audioReadIsDigitalSilence(preparation_allocator, messages, execution_control) catch |err|
+            return if (err == error.OutOfMemory) preparation.admission_error orelse err else err))
+        {
             return .{ .text = try allocator.dupe(u8, ""), .prompt_tokens = 0, .completion_tokens = 0, .truncated = false, .silent_audio = true };
         }
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
@@ -6420,7 +6441,8 @@ pub const Node = struct {
             self.defaultGenerationLimits(budget_backend_class),
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        const prompt_estimate = try countPromptTokens(allocator, model_path, model, gpt_config, messages, max_tokens, preflight.enable_thinking, preflight.grammar != null);
+        const prompt_estimate = countPromptTokens(preparation_allocator, model_path, model, gpt_config, messages, max_tokens, preflight.enable_thinking, preflight.grammar != null) catch |err|
+            return if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
         const prompt_tokens = prompt_estimate.token_count;
         try validateGenerateExecutorInvocation(executor_contract, .{
             .item_count = 1,
@@ -10327,8 +10349,12 @@ pub const Node = struct {
     ) !readers_api.BatchResult {
         // Reader/generator execution owns process admission. Keep its tensors
         // off document source/output quotas and copy only bounded results back.
+        var control = self.bindExecutionControl(null, supplied_control);
+        try control.check();
+        var request_slot = try ReadRequestSlot.acquire(self, &control);
+        defer request_slot.deinit();
         const work = std.heap.smp_allocator;
-        var result = try self.readEncodedImagesReportedInWorkspace(work, model_name, request, supplied_control);
+        var result = try self.readEncodedImagesReportedInWorkspace(work, model_name, request, control);
         defer result.deinit(work);
         return cloneReaderBatchResult(allocator, result);
     }
@@ -10342,8 +10368,6 @@ pub const Node = struct {
     ) !readers_api.BatchResult {
         var execution_control = self.bindExecutionControl(null, supplied_control);
         try execution_control.check();
-        var request_slot = try ReadRequestSlot.acquire(self, &execution_control);
-        defer request_slot.deinit();
         const deadline_ns = execution_control.deadline_ns;
         const Cancel = struct {
             fn cancelled(raw: *const anyopaque) bool {
@@ -11647,7 +11671,7 @@ pub const Node = struct {
         if (whisper.encoder.backend() == .native) if (admitted_workspace) |workspace|
             try workspace.bindSession(whisper.encoder.withAdmissionControl(control));
         var pipeline = try whisper.pipeline(request.language, max_working_bytes, control, timestamps, .full);
-        if (whisper.encoder.backend() == .native and pipeline.batch_dispatch == null)
+        if (whisper.encoder.backend() == .native)
             pipeline.native_workspace = admitted_workspace;
 
         // The same windowed path the HTTP handler takes: clips longer than
@@ -21914,7 +21938,9 @@ pub const Node = struct {
         defer admitted.deinit();
         var bounded = BoundedRequestAllocator{ .backing = admitted.allocator(), .limit = 512 * 1024 * 1024 };
         const a = bounded.allocator();
-        const control = self.bindExecutionControl(null, supplied);
+        var control = self.bindExecutionControl(null, supplied);
+        var request_slot = try ReadRequestSlot.acquire(self, &control);
+        defer request_slot.deinit();
         const result = (switch (operation) {
             .read => if (encoded) |request| switch (request) {
                 .images => |images| document_service.Service(Node).readEncodedJson(self, a, json, images, control),
@@ -52559,4 +52585,111 @@ fn checkReaderWorkspaceOutputClone(a: std.mem.Allocator) !void {
 
 test "reader workspace output transfer preserves ownership and every OOM cleanup" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReaderWorkspaceOutputClone, .{});
+}
+
+test "native media Node dispatcher transfers serial credit and releases physical encoder peaks" {
+    const a = std.testing.allocator;
+    const Tensor = backends_mod.Tensor;
+    const Info = backends_mod.TensorInfo;
+    const Session = backends_mod.Session;
+    const Fake = struct {
+        batched: bool,
+        fn info(_: *anyopaque) []const Info {
+            return &.{.{ .name = "values", .dtype = .f32, .shape = &.{ -1, 1 } }};
+        }
+        fn independent(raw: *anyopaque, _: []const Tensor) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.batched;
+        }
+        fn backend(_: *anyopaque) backends_mod.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(_: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator) ![]Tensor {
+            const scratch = try alloc.alloc(u8, 128 * 1024);
+            defer alloc.free(scratch);
+            @memset(scratch, 42);
+            const out = try alloc.alloc(Tensor, 1);
+            errdefer alloc.free(out);
+            out[0] = try Tensor.initFloat32(alloc, "values", &.{ 1, 1 }, inputs[0].asFloat32());
+            return out;
+        }
+        fn controlled(raw: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]Tensor {
+            try control.check();
+            return run(raw, inputs, alloc);
+        }
+    };
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    for ([_]bool{ false, true }) |batched| {
+        var fake = Fake{ .batched = batched };
+        var controller = runtime.tier.memory.AdmissionController{};
+        var gate: std.atomic.Mutex = .unlocked;
+        const session = Session{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .runWithControl = Fake.controlled, .inputInfo = Fake.info, .outputInfo = Fake.info, .backend = Fake.backend, .close = Fake.close, .independentBatchRows = Fake.independent }, .execution_gate = &gate, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 192 * 1024 }, .static_workspace_bytes = 128 * 1024, .check_live_memory = false } };
+        var workspace = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = a, .session = session, .trim_on_free = true };
+        defer workspace.deinit();
+        var input = try Tensor.initFloat32(a, "values", &.{ 1, 1 }, &.{7});
+        defer input.deinit();
+        const dispatch = node.tensorBatchDispatch(.transcribe);
+        const outputs = try dispatch.run(workspace.allocator(), session, null, &gate, &.{input}, .{ .io = std.testing.io });
+        try std.testing.expectEqualSlices(f32, &.{7}, outputs[0].asFloat32());
+        // The output remains alive, but not the encoder's 128 KiB peak.
+        try std.testing.expect(controller.snapshot().host_scratch_bytes < 4096);
+        for (outputs) |*tensor| tensor.deinit();
+        workspace.allocator().free(outputs);
+        try workspace.trim();
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    }
+}
+
+test "document direct entry owns one request through native text and releases failures" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .max_concurrent_requests = 1, .max_work_units = 64 });
+    defer node.deinit();
+    const Probe = struct {
+        node: *Node,
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(usize, 1), self.node.inference_admission.inFlightRequests());
+            self.calls += 1;
+        }
+    };
+    var probe = Probe{ .node = &node };
+    const fixture = @import("antfly_documents").fixtures.get("two-pages.pdf");
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
+    defer a.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, fixture);
+    const json = try std.fmt.allocPrint(a, "{{\"model\":\"antfly/native-document\",\"documents\":[{{\"id\":\"pdf\",\"url\":\"data:application/pdf;base64,{s}\",\"media_type\":\"application/pdf\"}}]}}", .{encoded});
+    defer a.free(json);
+    const result = try node.readDocumentsJsonWithControl(a, json, .{ .ptr = &probe, .check_fn = Probe.check });
+    defer a.free(result);
+    try std.testing.expect(probe.calls > 0);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+    try std.testing.expect(node.tryAcquireRequestSlot());
+    defer node.releaseRequestSlot();
+    try std.testing.expectError(error.QueueFull, node.readDocumentsJsonWithControl(a, json, .{}));
+    try std.testing.expectError(error.QueueFull, node.extractDocumentsJsonWithControl(a, "{}", .{}));
+    const borrowed = try node.readDocumentsJsonWithControl(a, json, .{ .request_slot_admitted = true, .ptr = &probe, .check_fn = Probe.check });
+    a.free(borrowed);
+    try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+}
+
+test "generation preparation admits prompt formatting before execution and refunds on denial" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    var initial = try node.model_manager.admitHostPreflight(1);
+    initial.release();
+    node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 };
+    var preparation = node.generationPreparation();
+    defer preparation.deinit();
+    const content = try a.alloc(u8, 8192);
+    defer a.free(content);
+    @memset(content, 'x');
+    const formatted = generation.formatMessages(preparation.allocator(), &.{.{ .role = "user", .content = content }});
+    try std.testing.expectError(error.OutOfMemory, formatted);
+    try std.testing.expectEqual(error.ResourceLimitExceeded, preparation.admission_error.?);
+    try preparation.trim();
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().hostTotalBytes());
 }

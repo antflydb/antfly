@@ -282,12 +282,11 @@ pub const TranscriptionPipeline = struct {
         var planned = try self.encoder.planShapes(&.{.{ .name = "input_features", .shape = &mel_shape, .dtype = .f32 }}, 1);
         planned.sequence = @max(planned.sequence, n_frames);
         planned.host_preprocess_bytes = std.math.add(usize, pcm_bytes, mel_bytes) catch return error.ResourceLimitExceeded;
-        var encoder_scope = if (self.native_workspace) |workspace|
-            try workspace.admitRun(planned)
-        else
-            @import("../backends/admitted_allocator.zig").AdmittedAllocator.RunScope{ .permit = try self.encoder.admit(planned) };
-        defer encoder_scope.deinit();
-        const encoder_permit = &encoder_scope.permit;
+        // Request-owned CPU preprocessing is admitted as it allocates. The
+        // physical dispatcher decides whether execution borrows that owner or
+        // belongs to a fused batch; queued requests must not prepay idle peaks.
+        var encoder_permit: ?@import("../backends/session.zig").RunPermit = if (self.native_workspace != null) null else try self.encoder.admit(planned);
+        defer if (encoder_permit) |*permit| permit.deinit();
 
         const mel_started = platform.time.monotonicNs();
         const mel = try audio.whisperMelFromPcmSecondsMels(allocator, samples, sample_rate, context_seconds, @intCast(n_mels));
@@ -299,9 +298,9 @@ pub const TranscriptionPipeline = struct {
         var mel_tensor = try backends.Tensor.initFloat32(allocator, "input_features", &mel_shape, mel);
         defer mel_tensor.deinit();
         const encoder_outputs = if (self.batch_dispatch) |dispatch|
-            try dispatch.run(allocator, self.encoder, encoder_permit, null, &.{mel_tensor}, self.execution_control)
+            try dispatch.run(allocator, self.encoder, if (encoder_permit) |*permit| permit else null, null, &.{mel_tensor}, self.execution_control)
         else
-            try encoder_permit.runWithControl(&.{mel_tensor}, allocator, self.execution_control);
+            try @import("../server/tensor_microbatch.zig").runSerial(allocator, self.encoder, if (encoder_permit) |*permit| permit else null, &.{mel_tensor}, self.execution_control);
         defer {
             for (encoder_outputs) |*t| {
                 var mt = t.*;
@@ -310,10 +309,8 @@ pub const TranscriptionPipeline = struct {
             allocator.free(encoder_outputs);
         }
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
-        // CPU outputs remain charged to the allocation owner. Return the
-        // encoder's unused estimate before allocating decoder state; retaining
-        // the full encoder peak through decoding double-counts disjoint phases.
-        if (encoder_scope.owner != null) encoder_scope.deinit();
+        // Serial CPU outputs retain allocation credit; batched outputs retain
+        // the physical batch's output lease. Neither retains the encoder peak.
         timing.encoder_ns = platform.time.monotonicNs() -| encoder_started;
         const enc_seq_len: usize = if (encoder_outputs[0].shape.len >= 2) @intCast(encoder_outputs[0].shape[1]) else 1;
         const enc_mask = try allocator.alloc(i64, enc_seq_len);

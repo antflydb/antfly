@@ -363,6 +363,17 @@ pub const RunBudget = struct {
         return .{ .limits = limits };
     }
 
+    pub fn currentAmounts(self: *const RunBudget) AdmissionAmounts {
+        return .{
+            .host_weight_bytes = self.host_weight_bytes,
+            .backend_weight_bytes = self.backend_weight_bytes,
+            .host_kv_bytes = self.host_kv_bytes,
+            .backend_kv_bytes = self.backend_kv_bytes,
+            .host_scratch_bytes = self.host_scratch_bytes,
+            .backend_scratch_bytes = self.backend_scratch_bytes,
+        };
+    }
+
     pub fn reserveEstimate(self: *RunBudget, estimate: Estimate) !void {
         try self.tryReserve(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });
         errdefer self.release(.{ .kind = .kv, .tier = estimate.kv_tier, .bytes = estimate.kv_bytes });

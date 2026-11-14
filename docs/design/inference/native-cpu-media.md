@@ -6,7 +6,9 @@ Tracks [#1668](https://github.com/antflydb/antfly/issues/1668), after #1659 and 
 
 Checkpoint maps remain random-access by default. A consumer that scans a full
 selected tensor temporarily gives that mapped span sequential advice, then
-restores random advice on all exits. The kernel may round to page boundaries;
+restores random advice on all exits. A compute invocation advises a borrowed
+range only on its first matrix traversal, avoiding per-token advice syscalls.
+The kernel may round to page boundaries;
 this does not prefetch or allocate a full checkpoint. Metadata discovery and
 embedding-row lookup do not warm all weights. CPU matrix consumers recognize
 borrowed F32 operands by both their model owner and actual mapped address;
@@ -17,19 +19,26 @@ allocation. Allocation failures release both data and shape with their original
 alignment. Recurrent decoder projection matrices share the existing bounded BF16
 linear kernel with attention decoders; convolution, norms and recurrent state
 retain their normal representation. The kernel widens at most an 8 MiB matrix
-block (or one full row) at a time, checks cancellation between blocks and returns
-its scratch reservation on errors. It never makes a full F32 vocabulary mirror
+block (or one full row) at a time and checks cancellation between blocks. It
+reuses at most 8 MiB of conversion storage per compute invocation, keeping the
+retained capacity charged until teardown. Oversized rows use temporary storage
+after releasing idle cached capacity; failed growth refunds its reservation.
+It never makes a full F32 vocabulary mirror
 just to apply the output projection. Sparse expert and quantized paths retain
 their own storage and execution policy.
 
-Native serial Whisper execution binds the request-local workspace to the loaded
+Native Whisper preprocessing binds its request-local workspace to the loaded
 encoder's process ledger. Binding rejects a different ledger or an active borrowed
-permit. The execution estimate becomes credit for actual allocations; allocations
-grow only the deficit. After encoding, surviving tensors retain credit through
-their allocator while unused encoder workspace is released before decoding.
-Queued/batched and accelerator executors keep their separate memory ownership.
+permit. The physical dispatcher chooses ownership: a serial fallback lends its
+execution estimate to actual allocations, while queued/fused work uses the
+batch's allocator and lease. Merely installing a dispatcher does not imply a
+batch was executed. Queue metadata trims unused growth capacity before admission
+of the physical batch. After encoding, surviving outputs retain their respective
+allocation/batch credits while unused encoder workspace is released before decoding.
 Document leaves preserve the complete execution control, including the logical
-request permit. Direct reader callers acquire that permit before queueing;
+request permit. Top-level direct document read/extract operations acquire that
+permit before source processing, including operations satisfied by native text.
+Direct reader callers acquire it before queueing;
 physical encoded/raster batches reserve weighted work without acquiring another
 logical request. A one-request worker can therefore process a document without
 rejecting its own nested OCR call. Expanded work saturation remains a retryable
@@ -40,8 +49,11 @@ profile uses one logical request, 64 work units and a 4-million-pixel request
 ceiling. Omitting work capacity makes it follow concurrency and can reject a
 normal full-page raster before model execution.
 
-Generative execution uses a reclaiming, thread-safe heap under its existing
-model generation resource lease. The caller allocator owns returned text, not
+Generative preparation admits manifest reading, prompt rendering/tokenization
+and silence detection before their allocations, independently of the caller's
+document quota. Failed preparation preserves the admission error identity and
+refunds allocations. Generative execution then uses a reclaiming, thread-safe
+heap under its model generation resource lease. The caller allocator owns returned text, not
 model tensors. Encoded document readers follow the same boundary: execution
 retains its own owned buffers, then copies only the compact result into the
 caller's bounded output allocator. This prevents a document's 512 MiB
@@ -73,7 +85,15 @@ ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global" zig build \
 The verification tool never downloads models, changes shared services or
 provisions infrastructure. It starts a fresh local server for each case and
 terminates its entire owned process group on success, timeout or failure.
-Provide an already installed model root and a JSON list of cases:
+Provide an already installed model root and a JSON list of cases. Each case must
+name its exact `checkpoint_dir` inside that root. The tool builds a private resolver
+inventory from hard links to its visible model files, including weights, tokenizer,
+configuration and preprocessing assets. It runs only that inventory and verifies
+all hashes again after execution. Put the report on the same filesystem as the
+checkpoint so no model-byte copy is needed. Private inventory links are removed
+after worker teardown; original files are never modified. `revision` is a declared
+origin label, not a verified Hub revision: `installation_sha256` and the complete
+asset manifest identify the bytes actually supplied to execution.
 
 ```json
 [
@@ -97,7 +117,9 @@ Provide an already installed model root and a JSON list of cases:
 ```
 
 Use `kind: "document"` and a PDF fixture to exercise native document orchestration
-and page rendering with the selected reader. For selected pages set `"pages": [2]` in the case; the tool places that
+and page rendering with the selected reader. Document qualification requires a
+nonzero measured model-call count; native PDF text alone does not qualify OCR.
+For selected pages set `"pages": [2]` in the case; the tool places that
 selection in the document source. Keep the
 whole-document fixture small or provide a prepared one-page PDF; a token-limited
 prefix does not count as a complete read. Use a separately rendered page to
@@ -107,8 +129,9 @@ The HTTP timeout header narrows the document model's declared deadline; it does
 not increase it. For a slow CPU PDF check, use an existing named document model
 with an explicit bounded `budget.deadline_ms` and `read.native_text: "always_ocr"`.
 Set the case's `model` to that name, `preload_model` to its underlying OCR model,
-and `model_definition` to the local definition JSON. The report hashes that
-definition independently of the checkpoint. This exercises forced OCR rather
+and `model_definition` to the local definition JSON. The isolated inventory and
+asset identity include that definition; its bindings must use only the pinned
+local leaf. This exercises forced OCR rather
 than accidentally passing on a PDF's existing text layer. Require both header
 and footer text, complete document/item status and untruncated output.
 
@@ -123,11 +146,16 @@ taskset -c 5-8 python3 zig/tools/qualify_cpu_media.py \
 ```
 
 On Linux, the report samples PSS, CPU ticks and major/minor faults for the owned
-supervisor and workers. It records runtime/config/fixture/checkpoint/OpenBLAS
+supervisor and workers. A sampled abort-limit breach is terminal even if it
+races the final successful response. Missing PSS measurements are reported as
+unknown rather than zero. It records runtime/config/fixture/installation/OpenBLAS
 hashes, affinity and host load. Preserve server logs for backend selection,
 resolved memory policy and admission diagnostics. Set
 `TERMITE_SERVER_GENERATE_TIMING=1` for serial reader resolution, loading,
-setup and generation timings (including vision, prefill and decode). For a
+setup and generation timings (including vision, prefill and decode). Failed
+generations emit `generate_failure` with the error identity, active phase,
+elapsed phase timings and last observed decoded-token count. Formatting uses
+bounded storage and excludes prompt/output contents. For a
 separate Whisper phase diagnostic, `antfly-inference-dev transcribe MODEL_DIR
 speech.wav --backend native --language en` emits `timing_ms` with mel, encoder,
 prefill and decode times. That direct CLI diagnostic does not replace the
