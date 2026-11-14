@@ -93,6 +93,14 @@ pub const SegmentAttention = struct {
     keys: usize,
     num_heads: usize,
     head_dim: usize,
+    /// Optional row-segment hint: `[start, len]` pairs that tile the
+    /// queries (== keys) in order, each query attending within its own row
+    /// at row-local positions. `ranges`/positions must describe the same
+    /// visibility; backends without a row path ignore it.
+    row_spans: ?[]const u32 = null,
+    /// Opt in to the F16-staged row flash kernel for `row_spans` (F32
+    /// accumulation). Off by default: only GLiDE requests it.
+    f16_row_flash: bool = false,
 };
 /// Grouped K/V rows retain their original head count. Optional compact-head
 /// contract: a declined request uses the caller's existing expanded-head path.
