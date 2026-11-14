@@ -84,7 +84,7 @@ func microphoneConversionPreservesOneSecondOfStereoSpeech(rate: Double) throws {
   #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
 }
 
-@Test func previewBackpressureDoesNotDestroyTheCompleteRecording() throws {
+@Test func previewBackpressureDoesNotDestroyTheCompleteRecording() async throws {
   let sink = SpeechAudioBuffer()
   let format = AVAudioFormat(
     commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
@@ -93,7 +93,21 @@ func microphoneConversionPreservesOneSecondOfStereoSpeech(rate: Double) throws {
   block.frameLength = frames
   block.floatChannelData![0].initialize(repeating: 0, count: Int(frames))
   sink.append(block)
-  #expect(throws: DictationError.self) { try sink.drain() }
+  let pipeline = LiveDictation(
+    incremental: false, needsCleanup: false,
+    recognize: { _, _ in
+      Issue.record("An overflowed live tail must not be committed")
+      return []
+    },
+    clean: { DictationResult(raw: $0, text: $0) })
+  let recovered = try await pipeline.finishWithRecognitionFallback(
+    tail: { try sink.drain() }, allowFallback: true
+  ) {
+    let complete = try sink.all()
+    #expect(complete.count == Int(frames) * 4)
+    return DictationResult(raw: "preserved clip", text: "preserved clip")
+  }
+  #expect(recovered.text == "preserved clip")
   #expect(try sink.all().count == Int(frames) * 4)
   block.frameLength = 1
   sink.append(block)

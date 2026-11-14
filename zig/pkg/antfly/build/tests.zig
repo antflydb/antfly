@@ -5638,6 +5638,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone continuous HA mutation guard follows role lifecycle",
             "antfly config uses cli override before common config",
             "standalone memory budget conversion rejects overflow",
+            "standalone open file preflight supports constrained deployments",
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
             "standalone public ready endpoint fails closed before API initialization",
@@ -5818,6 +5819,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "inference worker",
             "standalone inference host placement",
             "standalone chunk minimum content",
+            "native model chunk requests inherit configured ceilings",
+            "native model chunk configured ceilings survive the real provider ABI",
             "native call policy is scoped",
             "memory admission diagnostics retain",
             "session manager load clones preserve",
@@ -6159,6 +6162,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_native_vector_store_tests = b.addRunArtifact(native_vector_store_tests);
     const native_vector_store_test_step = b.step("vector-block-store-test", "Run native vector segment publication and recovery tests");
     native_vector_store_test_step.dependOn(&run_native_vector_store_tests.step);
+    const vector_fd_tests = b.addTest(.{
+        .root_module = native_vector_store_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .filters = &.{"vector block mapped descriptors"},
+    });
+    b.step("vector-block-fd-test", "Qualify mapped vector descriptor admission and generation leases").dependOn(&b.addRunArtifact(vector_fd_tests).step);
+    @import("../../../build_support/antfly/test_partitions.zig").installLocalArtifact(b, vector_fd_tests, "install-vector-block-fd-tests", "Install descriptor qualification for isolated low-RLIMIT children", "vector-block-fd-tests");
     const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     antfly_imports.configureRuntimeContracts(shard_test_mod);
     shard_test_mod.addImport("bloom", bloom_mod);
@@ -6273,6 +6283,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = persistent_test_mod,
         .filters = &.{
             "lite persistent mapped",
+            "native segment publication admits writer and mmap before creating output",
+            "native sink publication admits writer and mmap before invoking builder",
             "persistent index snapshots use mapped segment files",
             "persistent index sink builder",
         },

@@ -317,7 +317,7 @@ archive paths and links, and verifies the staged payload, including licenses.
 Cached downloads are verified before reuse. It never follows a mutable latest URL
 at app startup and never invokes Zig or builds Antfly from source.
 
-The current pin is **v0.3.0-rc.13**, the published next-channel release used for
+The current pin is **v0.3.0**, the published stable release used for
 this app's compatibility qualification. The app and runtime require macOS 15 and
 Apple Silicon. Intel app builds and runtime fallbacks are not supported.
 The signed app contains the released CLI and its notices, not a separately built

@@ -2575,6 +2575,11 @@ jobs:
           ulimit -n 256
           taskset -c ${{ steps.e2e_cpus.outputs.list }} zig build http-low-fd-ratchet-test
 
+      - name: Qualify mapped vector descriptors at supported open-file limits
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }}
+          scripts/ci/zig-vector-block-fd-test.sh
+
       - name: Run low-FD Autograph regression
         env:
           SKIP_BUILD: "1"

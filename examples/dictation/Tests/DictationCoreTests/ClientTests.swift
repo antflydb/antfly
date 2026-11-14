@@ -805,8 +805,14 @@ private final class PendingAssetProtocol: URLProtocol, @unchecked Sendable {
   static let stopped = AssetRequestSignal()
   override class func canInit(with request: URLRequest) -> Bool { true }
   override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-  override func startLoading() { Task { await Self.started.send() } }
-  override func stopLoading() { Task { await Self.stopped.send() } }
+  override func startLoading() {
+    let signal = PendingAssetProtocol.started
+    Task { await signal.send() }
+  }
+  override func stopLoading() {
+    let signal = PendingAssetProtocol.stopped
+    Task { await signal.send() }
+  }
 }
 extension ClientTests {
   @Test(.timeLimit(.minutes(1))) func assetInstallationCancellationCancelsTheUnderlyingRequest()
@@ -821,5 +827,51 @@ extension ClientTests {
     pending.cancel()
     await #expect(throws: CancellationError.self) { try await pending.value }
     await PendingAssetProtocol.stopped.wait()
+  }
+}
+
+extension ClientTests {
+  @Test func cleanupWarmupContainsNoAudioOrUserTranscriptAndUsesSmallBudget() async throws {
+    FixtureProtocol.reply = { request in
+      #expect(request.url?.path == "/ai/v1/generate")
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      #expect(body["model"] as? String == "generators/cleanup")
+      #expect(body["max_tokens"] as? Int == 8)
+      #expect(body["audio"] == nil && body["transcript_text"] == nil && body["dictionary"] == nil)
+      return (
+        200, "application/json",
+        #"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"Ready."}}]}"#
+      )
+    }
+    try await client().prewarmCleanup(model: "generators/cleanup")
+  }
+  @Test func formattedCleanupKeepsFirstEventAndFirstDraftTiming() async throws {
+    FixtureProtocol.reply = { request in
+      let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
+      #expect(
+        body["dictionary"] as? [String] == (0..<64).map { "UnrelatedEntry" + String($0) } + [
+          "Antfly"
+        ])
+      let raw = body["transcript_text"] as! String
+      let event = try JSONSerialization.data(withJSONObject: [
+        "type": "dictation.delta", "delta": raw,
+      ])
+      let base = try formattingEvents(raw: raw, text: raw)
+      // SSE lifecycle must keep transcript, delta, and completion in order.
+      let pieces = base.components(separatedBy: "\n\n")
+      let response =
+        pieces[0] + "\n\ndata: " + String(decoding: event, as: UTF8.self) + "\n\n"
+        + pieces.dropFirst().joined(separator: "\n\n")
+      return (200, "text/event-stream", response)
+    }
+    var preset = Configuration().presets[0]
+    preset.outputMode = .clean
+    preset.cleanupModel = "generators/cleanup"
+    let result = try await client().cleanupText(
+      "What about Antfly now?", preset: preset,
+      dictionary: (0..<64).map { "UnrelatedEntry" + String($0) } + ["Antfly"],
+      formatting: .init(commands: true, pressEnter: false))
+    #expect(result.text == "What about Antfly now?")
+    #expect(result.timing?.firstEvent != nil && result.timing?.firstDraft != nil)
   }
 }

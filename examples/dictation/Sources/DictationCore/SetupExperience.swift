@@ -180,8 +180,11 @@ public enum ModelSetupState: Equatable, Sendable {
 }
 
 extension Preset {
-  public func supportsProcessing(with model: DiscoveredModel?) -> Bool {
-    (try? ProcessingPlan(preset: self, model: model)) != nil
+  public func supportsProcessing(with model: DiscoveredModel?, nativeAppleStreaming: Bool = false)
+    -> Bool
+  {
+    (try? ProcessingPlan(preset: self, model: model, nativeAppleStreaming: nativeAppleStreaming))
+      != nil
   }
   public func hasCompatibleSharedProcessor(in catalog: ModelCatalog) -> Bool {
     let name = cleanupModel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -196,7 +199,7 @@ extension Configuration {
   public func selectingManagedTranscriber(
     _ operation: ModelSetupOperation, catalog: ModelCatalog,
     resolution: CleanupResolution = .requireCompatible,
-    processing: ProcessingResolution = .requireCompatible
+    processing: ProcessingResolution = .requireCompatible, nativeAppleStreaming: Bool = false
   ) throws -> Configuration {
     let generators = Set(
       catalog.data.filter { $0.task == "generate" && $0.id.hasPrefix("generators/") }.map(\.id))
@@ -229,7 +232,9 @@ extension Configuration {
     }
     let model = catalog.transcriber(operation.transcriber)
     let unsupported = candidate.presets.indices.filter {
-      !candidate.presets[$0].supportsProcessing(with: model)
+      !candidate.presets[$0].supportsProcessing(
+        with: model,
+        nativeAppleStreaming: operation == .appleSpeech && nativeAppleStreaming)
     }
     if !unsupported.isEmpty && processing == .requireCompatible {
       throw ManagedProcessingConflict(presets: unsupported.map { candidate.presets[$0].name })
