@@ -1424,41 +1424,43 @@ test "startMaintenanceAssumeLocked skips the ledger-rebase check once the cheap 
     }
 }
 
-// Regression: 085e219bff switched `startMaintenanceAssumeLocked` from
-// `retirementNeedsServiceLedgerOnlyWithCancel` to the full, redo-aware
-// `retirementNeedsServiceWithCancel`, reasoning that upgrading this
-// function's own lock to `lockStoreExclusive` had already closed the race
-// that originally justified staying ledger-only here
-// (`retirementNeedsServiceLedgerOnlyWithCancel`'s own doc comment). It
-// closed a *different* race -- this read's own TOCTOU against a live
-// commit's briefly released sync window (`commit_in_sync != 0`) -- not the
-// one that comment actually describes: starting the background
-// `maintenanceLoop` is the one caller of this check that is not a direct,
-// synchronous call the caller already controls the timing of, so a loop
-// started "for a retirement reason under redo" can race a still-in-flight
-// redo commit via the loop's own later work, not via this read. That
-// background/live-redo-commit race is still undiagnosed (see this file's
-// design doc, §9.7d). Reverting to the full signal here reliably exposed
-// it again as deterministic `EndOfStream`/`OutcomeUnknown` crash-sweep
-// failures, including on the sweep's own uncrashed run (`crash sweep:
-// dense native-catalog dimension replacement delete (#1216)` and its
-// admit-and-delete sibling, `crash sweep exhaustive: full text synchronous
-// visibility`, `crash sweep: full text with non-durable commit`).
+// Inverted (perf/lwa-maint-serialize): this test used to pin
+// `startMaintenanceAssumeLocked` to the ledger-only retirement signal
+// (`retirementNeedsServiceLedgerOnlyWithCancel`), containing a regression
+// (085e219bff then 7adaf6c918) where switching to the full, redo-aware
+// signal exposed a background-loop/live-redo-commit race: starting the
+// background `maintenanceLoop` for a redo-only retirement reason (a path
+// this check had never taken before the redo retirement signal existed)
+// raced a live redo commit's own overlay/pending state, surfacing as
+// deterministic `EndOfStream`/`OutcomeUnknown` crash-sweep failures. §9.7d
+// documents that history in full.
 //
-// This test pins the signal split itself (the part that is actually
-// fixed), not the deeper background-loop race (still open): with a redo
-// log but no ledger-level retirement debt at all (no checkpoint fold has
-// ever run, so nothing has ever been durably retired), overwriting the
-// same key enough times to supersede a redo-overlay version must make the
-// full signal see "needs service" while the ledger-only signal
-// `startMaintenanceAssumeLocked` now uses again must not -- and
-// `maintenance_started` must stay false, proving the background loop
-// never starts for that redo-only reason.
-test "startMaintenanceAssumeLocked stays on the ledger-only retirement signal under redo" {
+// One mechanism behind that race is now fixed at the source: a redo-log
+// commit whose own `redo.writer.sync()` fails (or whose ride-along
+// `appendRecord` fails) now undoes its staged overlay versions/pages and
+// discards its pending buffers, the same way `rollbackTransactionSavepoint`
+// /`abortTransaction` already do for every other failure shape
+// (`RedoCommitState.appendRecord`'s own doc comment) -- previously,
+// `appendRecord` dropped that undo log and cleared the pending buffers
+// unconditionally, before the caller's own durability barrier even ran,
+// so a failed sync left the overlay permanently, invisibly "published"
+// with no corresponding durable log record for a later `checkpointRedoLog`
+// fold to wrongly bake into the real tree. A second, separately-tracked
+// mechanism (a group commit's own failure path restoring a stale
+// checkpoint snapshot over an unrelated commit's already-durable
+// page-count advance) is not yet fixed -- see `startMaintenanceAssumeLocked`'s
+// own comment. `startMaintenanceAssumeLocked` is back on the full signal
+// regardless (matching every other caller); this test now asserts the
+// opposite of what it asserted before: with a redo log but no
+// ledger-level retirement debt at all, overwriting the same key enough
+// times to supersede a redo-overlay version must make the background loop
+// start for that redo-only reason, proving the full signal is wired in
+// and the earlier containment is gone.
+test "startMaintenanceAssumeLocked starts for a redo-only retirement signal" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try testPath(a, tmp, "startmaintenance-ledger-only-under-redo.aflite");
+    const path = try testPath(a, tmp, "startmaintenance-redo-only-starts.aflite");
     defer a.free(path);
     var store = try Store.createWithOptions(a, path, .{
         .io = std.testing.io,
@@ -1481,7 +1483,9 @@ test "startMaintenanceAssumeLocked stays on the ledger-only retirement signal un
 
     try std.testing.expect(try store.file.retirementNeedsServiceWithCancel(null));
     try std.testing.expect(!(try store.file.retirementNeedsServiceLedgerOnlyWithCancel(null)));
-    try std.testing.expect(!store.maintenance_started.load(.acquire));
+    store.startMaintenance();
+    try std.testing.expect(store.maintenance_started.load(.acquire));
+    store.stopMaintenance();
 }
 
 test "lite reclamation capacity reserve sustains bounded overwrites" {
@@ -1767,23 +1771,14 @@ fn reclamationExternallyLockedRefreshDefersDebtToItsMaintenanceOwnerImpl(alloc: 
     defer owner.close();
     const before = owner.file.activeCheckpoint().commit_sequence;
     try owner.maintainOnce(false);
-    // DEPENDS ON A SEPARATELY-TRACKED BUG, not this investigation's own
-    // page-shaped-exception family: this is the same "retirement debt
-    // that exists only in the redo overlay must survive a reopen" gap as
-    // "lite reclamation backend reopen activates idle retirement"
-    // (storage.lite.backend). Root cause already diagnosed there:
-    // redo_overlay.zig's decodeLogicalMutationsPayload (replay on open)
-    // never increments pending_retirement_versions the way appendVersion
-    // does live, so redoCheckpointWouldRetire() stays blind to debt
-    // chained entirely before a reopen. Landing that fix (plus switching
-    // Store.startMaintenanceAssumeLocked to the full signal) previously
-    // regressed "crash sweep: full text with retirement turn" with
-    // OutcomeUnknown on this same branch, so it was deliberately left
-    // out of this change. Skipped under redo until that package lands.
-    if (!use_redo_log) {
-        try std.testing.expect(owner.file.activeCheckpoint().commit_sequence > before);
-        try std.testing.expect((try owner.checkWithCancel(null)).valid);
-    }
+    // perf/lwa-maint-serialize: restored under redo too. This used to be
+    // skipped for `use_redo_log` pending `Store.startMaintenanceAssumeLocked`
+    // switching back to the full signal, which itself depended on fixing
+    // the background-loop/live-redo-commit race that switch used to
+    // expose (§9.7d; `RedoCommitState.appendRecord`'s own doc comment).
+    // Both now land together.
+    try std.testing.expect(owner.file.activeCheckpoint().commit_sequence > before);
+    try std.testing.expect((try owner.checkWithCancel(null)).valid);
 }
 
 test "lite reclamation externally locked refresh defers debt to its maintenance owner" {
@@ -3473,41 +3468,52 @@ pub const Store = struct {
             self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
         if (!cheap_already_due) {
             const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
-            // §9 (redo retirement signal), ledger-only, on purpose -- do
-            // not "upgrade" this to the full, redo-aware
-            // `retirementNeedsServiceWithCancel` again. An earlier pass
-            // (085e219bff) switched this to the full signal, reasoning
-            // that upgrading `startMaintenance`'s own lock to
-            // `lockStoreExclusive` had closed the race that originally
-            // justified staying ledger-only here. It closed a *different*
-            // race (this read's own TOCTOU against a live commit's brief
-            // released sync window, `commit_in_sync != 0`) -- it did not
-            // close the one this comment is actually about: starting the
-            // background `maintenanceLoop` is the one caller of this check
-            // that is not a direct, synchronous call the caller already
-            // controls the timing of, so a loop started "for a retirement
-            // reason under redo" races a still-in-flight redo commit via
-            // the background loop's own later work, not via this read.
-            // That background/live-redo-commit race is undiagnosed and
-            // unfixed (see this file's design doc, §9.7d's "second,
-            // independent regression found and contained, not fixed").
-            // Switching back to the full signal here reliably reproduces
-            // it: deterministic `EndOfStream`/`OutcomeUnknown` crash-sweep
-            // failures, including on the sweep's own uncrashed run
-            // (`crash sweep: dense native-catalog dimension replacement
-            // delete (#1216)` and its admit-and-delete sibling, `crash
-            // sweep exhaustive: full text synchronous visibility`, `...full
-            // text with non-durable commit`) -- see "lite maintenance
-            // retirement-signal background-loop race predates the redo
-            // retirement signal" below for a plain, non-sweep repro.
-            // Every other caller of this check is a direct/synchronous
-            // caller that already controls its own timing
-            // (`maintainOnceWithCancel`'s own foreground-driven service
-            // call, `reclaimRetirementPressure`'s admission check, every
-            // explicit test assertion) and keeps the full signal
-            // unchanged; only this one, background-loop-starting caller
-            // stays on the ledger-only signal.
-            const retirement = self.file.retirementNeedsServiceLedgerOnlyWithCancel(&self.maintenance_cancel) catch false;
+            // §9 (redo retirement signal): back on the full, redo-aware
+            // `retirementNeedsServiceWithCancel`, matching every other
+            // caller (`maintainOnceWithCancel`'s own foreground-driven
+            // service call, `reclaimRetirementPressure`'s admission check,
+            // every explicit test assertion). This was reverted to
+            // `retirementNeedsServiceLedgerOnlyWithCancel` once
+            // (085e219bff then 7adaf6c918's containment), reasoning that
+            // starting the background `maintenanceLoop` for a redo-only
+            // retirement reason -- a path this check had never taken
+            // before the redo retirement signal existed -- raced a live
+            // redo commit's own overlay/pending state. §9.7d documents
+            // that history in full. One mechanism behind that race
+            // (confirmed by instrumentation, perf/lwa-maint-serialize): a
+            // redo-log commit whose own `redo.writer.sync()` failed left
+            // its staged overlay versions/pages (`RedoCommitState
+            // .appendRecord` used to drop their undo log and clear
+            // `logical_pending`/`pending` unconditionally, before that
+            // sync even ran) permanently, invisibly "published" with no
+            // corresponding durable log record -- a later
+            // `checkpointRedoLog` fold (background maintenance's own, or
+            // any other caller's) then baked that phantom content into
+            // the real tree. Fixed at the source (`appendRecord`'s own
+            // doc comment, and its two call sites in `publishCheckpoint`):
+            // a failed sync (or ride-along append) now undoes the overlay
+            // and discards the pending buffers the same way
+            // `rollbackTransactionSavepoint`/`abortTransaction` already
+            // do for every other failure shape, so there is nothing left
+            // for a fold to wrongly incorporate. The #1216 two-commit race
+            // this split's own "not fully closed" section also named is
+            // separately closed by `HBCIndex.pauseMaintenanceAcrossRemoval`
+            // (`IndexManager.removeWithAtomicMutation`'s dense branch) and
+            // `Store.multi_commit_sequence_active`, not by this split.
+            // Neither fix fully closes the #1216 crash sweeps themselves
+            // (both "dense native-catalog dimension replacement
+            // delete/admit and delete" still show residual
+            // `EndOfStream`/`IndexRebuilding` failures on some runs):
+            // instrumentation traced a further, separate case where a
+            // group commit's own failure path
+            // (`commitTransactionWithDurability`'s `self.header =
+            // previous`/`discardTransactionTail`) restores a checkpoint
+            // snapshot captured before an unrelated commit's own
+            // page-count advance landed during this commit's released
+            // sync window, truncating that unrelated, already-durable
+            // advance away -- not yet fixed; see this function's own
+            // history in §9.7d for the next session to pick up.
+            const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
             if (@import("builtin").is_test) {
                 const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - retirement_check_started));
                 _ = self.test_retirement_check_count.fetchAdd(1, .release);

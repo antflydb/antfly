@@ -10044,24 +10044,20 @@ pub const NativeFile = struct {
     }
 
     /// §9 (redo retirement signal): the same check, but never considering
-    /// redo-overlay debt -- used only by `Store.startMaintenanceAssumeLocked`
-    /// (docstore.zig). That caller's job is deciding whether to spin up a
-    /// *background* maintenance thread, a code path that, under redo, has
-    /// never run for a retirement reason before now (redo debt alone used
-    /// to make this whole function always return false): doing so for the
-    /// first time surfaced a pre-existing concurrency bug in the
-    /// background maintenance loop's interaction with a live redo commit
-    /// (reproduced independently of every other change in this patch --
-    /// see the crash-sweep/close+reopen regressions this gated on), which
-    /// overlaps the write-serialization race already being fixed on
-    /// `perf/lwa-writer-race`. Every other caller of
-    /// `retirementNeedsServiceWithCancel` -- explicit test assertions,
-    /// `Store.maintainOnceWithCancel`'s own foreground-driven service
-    /// call, `reclaimRetirementPressure`'s admission check -- is a
-    /// direct, synchronous call the caller already controls the timing
-    /// of, not a decision to launch a new concurrent task, so none of
-    /// them need this exclusion. Revisit once the writer-race fix lands:
-    /// this split can likely be removed then.
+    /// redo-overlay debt. Formerly used by `Store.startMaintenanceAssumeLocked`
+    /// (docstore.zig) to avoid starting the background maintenance loop
+    /// for a redo-only retirement reason, which used to race a live redo
+    /// commit's own overlay/pending state (§9.7d). One mechanism behind
+    /// that race is fixed at the source now (`RedoCommitState
+    /// .appendRecord`'s own doc comment: a failed sync/append undoes its
+    /// staged overlay content instead of leaving it permanently published
+    /// with no durable record), so `startMaintenanceAssumeLocked` is back
+    /// on the full, `retirementNeedsServiceWithCancel` signal like every
+    /// other caller -- a second, separately-tracked mechanism is not yet
+    /// fixed (see that function's own comment). Kept only for the
+    /// regression test that pins the full signal is wired in
+    /// ("startMaintenanceAssumeLocked starts for a redo-only retirement
+    /// signal", docstore.zig) by contrasting against this one.
     pub fn retirementNeedsServiceLedgerOnlyWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !bool {
         return self.retirementNeedsServiceCoreWithCancel(cancel, false);
     }
