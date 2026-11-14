@@ -1639,7 +1639,13 @@ def test_ordered_native_delivery_spans_packs_without_parquet_payloads(
                             hydration = {
                                 k: after[k] - before[k]
                                 for k in after
-                                if "hydration" in k
+                                # Slow-profile gauges can first appear during
+                                # this request and describe a different request.
+                                # Only cumulative hydration counters admit a
+                                # before/after delta; the assertions below still
+                                # require native delivery without source reads.
+                                if k.startswith("antfly_lake_query_hydration_")
+                                and k.endswith("_total")
                             }
                             hits = result["hits"]["hits"]
                             assert [hit["_source"]["id"] for hit in hits] == list(

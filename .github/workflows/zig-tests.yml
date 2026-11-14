@@ -2882,7 +2882,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Install build tools
-        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb libopenblas0-pthread
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb libopenblas0-pthread postgresql-client
 
       - name: Prepare ARC test cache dirs
         run: |
@@ -2993,6 +2993,16 @@ jobs:
           echo "ANTFLY_WASMTIME_LIB=$lib" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
+      - name: Restore verified inference model bundles
+        if: startsWith(matrix.suite, 'inference-')
+        id: inference_models_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.ANTFLY_INFERENCE_MODELS_DIR }}
+          # ARC scratch PVCs are ephemeral: a stable path alone does not retain
+          # weights across jobs. Restore bundles, never loaded model state.
+          key: inference-model-bundles-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.suite }}-${{ hashFiles('zig/e2e/inference/models.py', 'scripts/ci/inference_e2e_shards.py', '.github/workflows/zig-tests.yml') }}
+
       - name: Run Antfly inference full E2E
         if: startsWith(matrix.suite, 'inference-')
         working-directory: zig
@@ -3040,6 +3050,11 @@ jobs:
         if: matrix.suite == 'inference-generation'
         working-directory: zig
         env:
+          # Exercise the same shipped CPU backend as the inference shard.
+          ANTFLY_INFERENCE_BLAS: openblas
+          OPENBLAS_NUM_THREADS: "2"
+          ANTFLY_E2E_PHASE_TIMINGS: "1"
+          ANTFLY_INFERENCE_SERVER_LOG_DIR: ${{ runner.temp }}/inference-server-logs
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_STANDALONE_TESTS: "1"
           ANTFLY_INFERENCE_STANDALONE_MODEL_NAME: ggml-org/gemma-4-e2b-it-gguf
@@ -3052,7 +3067,7 @@ jobs:
         run: |
           # Reuse the immutable models downloaded by the generation shard.
           export ANTFLY_INFERENCE_STANDALONE_MODELS_DIR="$ANTFLY_INFERENCE_MODELS_DIR"
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q \
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q -s --durations=10 \
             e2e/antfly/test_standalone.py::test_standalone_inference_process_envelope_composition
 
       - name: Download shared full E2E plan
@@ -3084,6 +3099,19 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh \
             -p zig_e2e_shard --antfly-ci-shard "${suite#antfly-}" \
             --antfly-ci-plan "${RUNNER_TEMP}/e2e-plan/plan.json" e2e/antfly
+
+      - name: Save verified inference model bundles
+        # Approved PR code runs in a dispatched main workflow. It may consume
+        # trusted cache entries, but must never publish into main's cache scope.
+        if: >-
+          success() && startsWith(matrix.suite, 'inference-') &&
+          inputs.pr_number == '' && github.ref == 'refs/heads/main' &&
+          (inputs.head_sha == '' || inputs.head_sha == github.sha) &&
+          steps.inference_models_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.ANTFLY_INFERENCE_MODELS_DIR }}
+          key: ${{ steps.inference_models_cache.outputs.cache-primary-key }}
 
       - name: Retain full API timings and per-test results
         if: always() && startsWith(matrix.suite, 'antfly-')

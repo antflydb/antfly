@@ -27,6 +27,25 @@ from inference_e2e_shards import (
 
 
 class ShardTests(unittest.TestCase):
+    def test_model_bundle_cache_is_reusable_but_pr_jobs_cannot_publish_it(self):
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/zig-tests.yml"
+        ).read_text()
+        restore = workflow.split("- name: Restore verified inference model bundles", 1)[
+            1
+        ].split("- name:", 1)[0]
+        save = workflow.split("- name: Save verified inference model bundles", 1)[
+            1
+        ].split("- name:", 1)[0]
+        self.assertIn("${{ env.ANTFLY_INFERENCE_MODELS_DIR }}", restore)
+        self.assertIn("hashFiles('zig/e2e/inference/models.py'", restore)
+        self.assertIn("${{ matrix.suite }}", restore)
+        self.assertIn("inputs.pr_number == ''", save)
+        self.assertIn("github.ref == 'refs/heads/main'", save)
+        self.assertIn("inputs.head_sha == '' || inputs.head_sha == github.sha", save)
+        self.assertIn("success()", save)
+        self.assertIn("steps.inference_models_cache.outputs.cache-primary-key", save)
+
     def test_each_file_runs_exactly_once_and_new_files_are_admitted(self):
         files = discover_tests(
             Path(__file__).resolve().parents[2] / "zig/e2e/inference"

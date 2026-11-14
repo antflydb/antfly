@@ -963,7 +963,12 @@ test "lite native index reads remain pinned while newer checkpoints publish" {
     defer docs.close();
     var indexes = Store.init(allocator, &docs);
     try writeFileAbsolute(&indexes, "segments/current", "generation-one");
-    const pinned = docs.file.activeCheckpoint();
+    // A checkpoint value identifies a generation; a live read owns its page
+    // retention. Exercise the real reader lease while the allocator reuses
+    // pages for the next publication.
+    var snapshot = try docs.beginRead();
+    defer snapshot.abort();
+    const pinned = snapshot.checkpoint;
     try writeFileAbsolute(&indexes, "segments/current", "generation-two");
 
     const old = (try docs.file.getIndexCatalogRecordAtCheckpointAlloc(allocator, "segments/current", pinned)) orelse return error.TestUnexpectedResult;

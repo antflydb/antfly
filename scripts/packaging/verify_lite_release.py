@@ -73,11 +73,22 @@ def verify(
 
             lib_name = lite_library_name(platform)
             library = source_bytes(f"./lib/{lib_name}")
-            apple_bridge = (
-                source_bytes("./lib/libantfly-apple.dylib")
-                if build_contract_schema >= 7 and platform.release_os == "Darwin"
-                else None
+            # Contract 7 adds the Apple provider bridge beside libantfly. A
+            # matching main library alone cannot certify its packaged runtime.
+            libraries = (
+                {
+                    name.removeprefix("lib/"): source_bytes(name)
+                    for name, actual in names.items()
+                    if name.startswith("lib/") and source.getmember(actual).isfile()
+                }
+                if build_contract_schema >= 7
+                else {}
             )
+            if build_contract_schema >= 7 and platform.release_os == "Darwin":
+                require(
+                    "libantfly-apple.dylib" in libraries,
+                    f"missing Apple provider bridge: {archive_path}",
+                )
             worker = None
             if build_contract_schema < 6:
                 source_bytes("./antfly-lite")
@@ -120,12 +131,13 @@ def verify(
             / f"antfly_embedded-{python_version}-py3-none-{platform.wheel_platform}.whl"
         )
         with zipfile.ZipFile(wheel_path) as wheel:
-            if apple_bridge is not None:
+            for name, content in libraries.items():
+                if Path(name).suffix == ".pc":
+                    continue  # pkg-config is shipped in the native npm package.
                 require(
-                    "antfly_embedded/_lib/libantfly-apple.dylib" in wheel.namelist()
-                    and wheel.read("antfly_embedded/_lib/libantfly-apple.dylib")
-                    == apple_bridge,
-                    f"Apple bridge mismatch: {wheel_path}",
+                    f"antfly_embedded/_lib/{name}" in wheel.namelist()
+                    and wheel.read(f"antfly_embedded/_lib/{name}") == content,
+                    f"{'Apple bridge mismatch' if name == 'libantfly-apple.dylib' else 'library mismatch'}: {wheel_path}: {name}",
                 )
             require(
                 wheel.read(f"antfly_embedded/_lib/{lib_name}") == library,
@@ -196,13 +208,14 @@ def verify(
                 require(member is not None, f"missing {name} in {npm_path}")
                 return member.read()
 
-            manifest = json.loads(npm_bytes("package.json"))
-            if apple_bridge is not None:
+            for name, content in libraries.items():
                 require(
-                    "package/lib/libantfly-apple.dylib" in npm.getnames()
-                    and npm_bytes("lib/libantfly-apple.dylib") == apple_bridge,
-                    f"Apple bridge mismatch: {npm_path}",
+                    f"package/lib/{name}" in npm.getnames()
+                    and npm_bytes(f"lib/{name}") == content,
+                    f"{'Apple bridge mismatch' if name == 'libantfly-apple.dylib' else 'library mismatch'}: {npm_path}: {name}",
                 )
+
+            manifest = json.loads(npm_bytes("package.json"))
             require(
                 manifest["name"] == f"@antfly/{package_name}",
                 f"wrong npm package: {npm_path}",

@@ -6584,10 +6584,27 @@ test "enrichment worker chunk cache keys preserve embedded separators" {
     try std.testing.expect(!std.mem.eql(u8, left, right));
 }
 
+test "leann recovery charges elapsed provider work before admitting another dispatch" {
+    const Session = @import("../../leann_recovery.zig").Session;
+    var session = Session{ .budget_ns = std.time.ns_per_ms, .elapsed_ns = 7 };
+    const started = platform_time.monotonicNs();
+    // Supply a known past start; no sleep or sub-clock-resolution assumption.
+    try std.testing.expect(started >= 2 * std.time.ns_per_ms);
+    session.finishDispatch(started - 2 * std.time.ns_per_ms);
+    try std.testing.expect(session.elapsed_ns >= 2 * std.time.ns_per_ms + 7);
+    try std.testing.expectError(error.ReembedBudgetExceeded, session.beginDispatch());
+    session.elapsed_ns = std.math.maxInt(u64) - 1;
+    session.finishDispatch(started - 2 * std.time.ns_per_ms);
+    try std.testing.expectEqual(std.math.maxInt(u64), session.elapsed_ns);
+}
+
 test "transient leann re-embeds one chunk from its re-chunked parent like the producer" {
     const alloc = std.testing.allocator;
     const Probe = struct {
         revision: u8 = 1,
+        // Simulate charged provider work without depending on a one-nanosecond
+        // wall-clock tick. The real elapsed-time accounting is covered below.
+        charge_session: ?*@import("../../leann_recovery.zig").Session = null,
         bad_value: ?f32 = null,
         chunk_calls: usize = 0,
         cancel_on_chunk: ?*std.atomic.Value(bool) = null,
@@ -6598,6 +6615,10 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         parts_calls: usize = 0,
         texts: std.ArrayListUnmanaged([]u8) = .empty,
 
+        fn charge(self: *@This()) void {
+            if (self.charge_session) |session| session.elapsed_ns = @max(session.elapsed_ns, session.budget_ns);
+        }
+
         fn embedDense(_: *anyopaque, a: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
             const v = try a.alloc(f32, dims);
             @memset(v, 1);
@@ -6607,6 +6628,7 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         fn embedDenseBatch(raw: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.batch_calls += 1;
+            self.charge();
             const out = try a.alloc([]const f32, texts.len);
             for (out, texts) |*v, text| {
                 try self.texts.append(std.testing.allocator, try std.testing.allocator.dupe(u8, text));
@@ -6620,6 +6642,7 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         fn parts(raw: *anyopaque, a: Allocator, _: []const u8, _: []const template.ContentPart, dims: u32) ![]f32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.parts_calls += 1;
+            self.charge();
             const out = try a.alloc(f32, dims);
             @memset(out, self.bad_value orelse 1);
             return out;
@@ -6639,6 +6662,7 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         fn chunk(raw: *anyopaque, a: Allocator, _: []const u8, input: @import("inference_chunker").Input, _: @import("../../../chunking/types.zig").Config, context: inference_request_context.RequestContext) ![]@import("inference_chunker").Chunk {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.chunk_calls += 1;
+            self.charge();
             try context.check();
             if (self.cancel_on_chunk) |signal| signal.store(true, .release);
             try context.check();
@@ -6880,6 +6904,8 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         document.expected_source_hash = try densePartsSourceHash(alloc, document, &.{.{ .text = "literal" }}, @splat(probe.revision));
         var session = @import("../../leann_recovery.zig").Session{ .budget_ns = 1 };
         defer session.deinit();
+        probe.charge_session = &session;
+        defer probe.charge_session = null;
         const calls = probe.parts_calls;
         try std.testing.expectError(error.ReembedBudgetExceeded, reembedDenseDocumentsSession(&runtime, alloc, &.{ document, document }, 2, &out, &found, &session));
         try std.testing.expectEqual(calls + 1, probe.parts_calls);
@@ -6896,6 +6922,8 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         chunk.expected_vector_digest = null;
         var session = @import("../../leann_recovery.zig").Session{ .budget_ns = 1 };
         defer session.deinit();
+        probe.charge_session = &session;
+        defer probe.charge_session = null;
         const calls = probe.batch_calls;
         try std.testing.expectError(error.ReembedBudgetExceeded, reembedDenseDocumentsSession(&runtime, alloc, &.{ chunk, chunk }, 2, &out, &found, &session));
         try std.testing.expectEqual(calls + 1, probe.batch_calls);
@@ -6944,6 +6972,8 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         {
             var budgeted = @import("../../leann_recovery.zig").Session{ .budget_ns = 1, .elapsed_ns = 1 };
             defer budgeted.deinit();
+            probe.charge_session = &budgeted;
+            defer probe.charge_session = null;
             const first_chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "leann_idx_chunks", 0);
             defer alloc.free(first_chunk);
             request.doc_key = first_chunk;
