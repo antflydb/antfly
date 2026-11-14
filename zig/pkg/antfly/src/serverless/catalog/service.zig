@@ -5943,12 +5943,22 @@ fn findNamedArtifactAction(
 }
 
 test "commit requirements catalog intent recovers and old recoverers cannot undo newer definitions" {
+    try testDirectCatalogRecovery(false);
+    try testDirectCatalogRecovery(true);
+}
+
+fn testDirectCatalogRecovery(comptime object_backed: bool) !void {
     const a = std.testing.allocator;
     var root_buf: [256]u8 = undefined;
     const root = tmpPath(&root_buf, "direct-catalog-recovery");
     defer cleanupTmp(root);
-    var fs = try @import("fs_store.zig").FsStore.init(a, std.mem.span(root));
-    var metadata = fs.catalogStore();
+    const uri = try std.fmt.allocPrint(a, "file://{s}/objects", .{std.mem.span(root)});
+    defer a.free(uri);
+    var backend = if (object_backed)
+        try @import("object_store.zig").ObjectStore.initFileUri(a, uri)
+    else
+        try @import("fs_store.zig").FsStore.init(a, std.mem.span(root));
+    var metadata = backend.catalogStore();
     defer metadata.deinit();
     try std.testing.expect(try metadata.ensureTable("docs", "docs", 1, .{}, "", "", "{}"));
     var memory = @import("objectstore").MemoryClient.init(a);
