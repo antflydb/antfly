@@ -4253,6 +4253,21 @@ pub const TransactionSavepoint = struct {
     checkpoint: CheckpointSlot,
     writes_generation: u64,
     undo_mark: usize,
+    /// perf/lwa-txn-overlay: `RedoCommitState.overlay_undo.items.len` at
+    /// savepoint time (0 for a non-redo file) -- unlike `undo_mark`
+    /// above, this one is *not* gated on `writes_generation`: a private
+    /// flush (which replaces `TransactionWrites`, invalidating `undo_mark`'s
+    /// own replay) moves staged mutations out of `writes.maps` and into
+    /// `shared`/`logical_pending` instead, which this field's own replay
+    /// must still be able to undo after a flush, not just before one.
+    overlay_undo_mark: usize,
+    /// perf/lwa-txn-overlay (unbounded buffering): `RedoCommitState
+    /// .logical_pending`/`.pending`'s own lengths at savepoint time (0
+    /// for a non-redo file) -- truncated back to on rollback so the
+    /// eventual commit's own log record never encodes a mutation this
+    /// savepoint discarded.
+    logical_pending_mark: usize,
+    pending_mark: usize,
 };
 
 pub const OwnedDocument = struct {
@@ -4427,6 +4442,16 @@ const CompactCheckpoint = struct {
 /// instead: true only for the span of `checkpointRedoLog`'s own
 /// transaction, whose whole job is to perform the deferred copy-on-write
 /// work and publish a real checkpoint.
+///
+/// One entry in `RedoCommitState.overlay_undo` -- either a logical
+/// mutation's `(root, key)` (the value/version itself lives in `shared`'s
+/// own chain; only enough is kept here to find and remove it again) or a
+/// page-shaped write's `page_id`.
+const OverlayUndoEntry = union(enum) {
+    logical: struct { root: u8, key: []u8 },
+    page: u64,
+};
+
 const RedoCommitState = struct {
     writer: redo_log.Writer,
     /// This transaction's accumulated logical mutations, encoded via
@@ -4474,10 +4499,69 @@ const RedoCommitState = struct {
     /// 25%-remaining bound before trying again, which could otherwise
     /// let it grow uncheckpointed all the way to `error.LogFull`.
     checkpoint_pending_error: bool = false,
+    /// perf/lwa-txn-overlay (transaction isolation): every `appendVersion`/
+    /// `appendPage` call this in-flight transaction has itself made onto
+    /// `shared`, in staging order -- the redo-overlay analogue of
+    /// `TransactionWrites.undo`. Previously, `appendLogicalMutation`
+    /// pushed a mutation's new version onto `shared` the moment a private
+    /// batch flushed, with nothing to undo it: an aborted transaction's
+    /// writes stayed visible in the shared overlay forever (both to other
+    /// readers immediately, and to this same file later, once some
+    /// unrelated later commit's sequence number caught up to the one the
+    /// abandoned version was tagged with). `abortTransaction` now pops
+    /// every entry (removing each from `shared`, restoring its chain to
+    /// whatever was current before this transaction touched it);
+    /// `rollbackTransactionSavepoint` pops back to a savepoint mark only.
+    /// A successful commit simply drops this list without touching
+    /// `shared` again -- every version it names is already exactly the
+    /// state the transaction means to publish.
+    overlay_undo: std.ArrayListUnmanaged(OverlayUndoEntry) = .empty,
 
     fn deinit(self: *RedoCommitState, allocator: Allocator) void {
         self.logical_pending.deinit(allocator);
         self.pending.deinit(allocator);
+        for (self.overlay_undo.items) |entry| switch (entry) {
+            .logical => |e| allocator.free(e.key),
+            .page => {},
+        };
+        self.overlay_undo.deinit(allocator);
+    }
+
+    /// Undoes every `overlay_undo` entry back to `mark` (an earlier
+    /// `overlay_undo.items.len`), in reverse (LIFO) order -- see that
+    /// field's own doc comment. Used by both `abortTransaction` (`mark =
+    /// 0`) and `rollbackTransactionSavepoint` (`mark = ` the savepoint's
+    /// own recorded length).
+    fn undoOverlaySince(self: *RedoCommitState, allocator: Allocator, io: std.Io, mark: usize) void {
+        while (self.overlay_undo.items.len > mark) {
+            const entry = self.overlay_undo.pop().?;
+            switch (entry) {
+                .logical => |e| {
+                    self.shared.removeLastVersion(std.heap.page_allocator, io, e.root, e.key);
+                    allocator.free(e.key);
+                },
+                .page => |page_id| self.shared.discardPage(std.heap.page_allocator, io, page_id),
+            }
+        }
+    }
+
+    /// Drops every `overlay_undo` entry *without* touching `shared` --
+    /// called once this transaction's own staged versions/pages have
+    /// actually published (durably or as a ride-along), so there is
+    /// nothing left to ever undo. Frees each entry's own tracking key;
+    /// the version/page itself stays in `shared`, exactly as published.
+    /// Must run on every path that successfully publishes this
+    /// transaction's content, or a later, unrelated transaction's own
+    /// `abortTransaction`/`rollbackTransactionSavepoint` (which replay
+    /// `overlay_undo` back to a mark relative to *their own* starting
+    /// length) would walk past these already-published entries and
+    /// wrongly undo them too.
+    fn dropOverlayUndo(self: *RedoCommitState, allocator: Allocator) void {
+        for (self.overlay_undo.items) |entry| switch (entry) {
+            .logical => |e| allocator.free(e.key),
+            .page => {},
+        };
+        self.overlay_undo.clearRetainingCapacity();
     }
 
     /// Records one logical mutation for the in-flight transaction.
@@ -4512,7 +4596,18 @@ const RedoCommitState = struct {
             value = try std.heap.page_allocator.dupe(u8, m.value);
         }
         errdefer std.heap.page_allocator.free(value);
+        // perf/lwa-txn-overlay (transaction isolation): reserve everything
+        // fallible for undo-tracking *before* pushing the version into
+        // `shared` below. Once that call succeeds, this function must not
+        // fail without recording how to undo it -- an untracked version
+        // would survive an abort/rollback and leak into view the moment
+        // some later, unrelated commit's sequence number catches up to
+        // the one it was tagged with (this bug's own original shape).
+        const owned_key = try allocator.dupe(u8, m.key);
+        errdefer allocator.free(owned_key);
+        try self.overlay_undo.ensureUnusedCapacity(allocator, 1);
         try self.shared.appendVersion(std.heap.page_allocator, io, root, m.key, sequence, value, m.is_delete, m.external_value_root_page, m.external_value_len);
+        self.overlay_undo.appendAssumeCapacity(.{ .logical = .{ .root = root, .key = owned_key } });
     }
 
     /// Records one page-shaped write for the in-flight transaction (see
@@ -4527,7 +4622,11 @@ const RedoCommitState = struct {
         // Also `std.heap.page_allocator`-owned -- see `appendLogicalMutation`.
         const owned = try std.heap.page_allocator.dupe(u8, bytes);
         errdefer std.heap.page_allocator.free(owned);
+        // perf/lwa-txn-overlay: same undo-tracking discipline as
+        // `appendLogicalMutation` above, reserved before the push.
+        try self.overlay_undo.ensureUnusedCapacity(allocator, 1);
         try self.shared.appendPage(std.heap.page_allocator, io, page_id, owned);
+        self.overlay_undo.appendAssumeCapacity(.{ .page = page_id });
     }
 
     /// Appends `logical_pending`/`pending` (prefixed with `compact` and a
@@ -4551,6 +4650,9 @@ const RedoCommitState = struct {
         try self.writer.append(commit_sequence, record.items);
         self.logical_pending.clearRetainingCapacity();
         self.pending.clearRetainingCapacity();
+        // perf/lwa-txn-overlay: this transaction's content just published
+        // (durably or as a ride-along) -- nothing left to undo.
+        self.dropOverlayUndo(allocator);
     }
 
     /// The exact byte length `appendRecord` would write right now for the
@@ -16813,6 +16915,9 @@ pub const NativeFile = struct {
             .checkpoint = self.activeCheckpoint(),
             .writes_generation = self.transaction_writes_generation,
             .undo_mark = writes.undo.items.len,
+            .overlay_undo_mark = if (self.redo) |*redo| redo.overlay_undo.items.len else 0,
+            .logical_pending_mark = if (self.redo) |*redo| redo.logical_pending.items.len else 0,
+            .pending_mark = if (self.redo) |*redo| redo.pending.items.len else 0,
         };
     }
 
@@ -16884,6 +16989,22 @@ pub const NativeFile = struct {
     pub fn rollbackTransactionSavepoint(self: *NativeFile, sp: TransactionSavepoint) void {
         self.evictCacheForPagesReusedSince(sp.checkpoint.page_count);
         defer self.header.checkpoints[self.header.active_checkpoint] = sp.checkpoint;
+        // perf/lwa-txn-overlay (transaction isolation): undo exactly the
+        // shared-overlay versions/pages this transaction pushed since
+        // `sp`, and drop the matching bytes from this transaction's own
+        // not-yet-logged record -- independent of `writes`'s own
+        // generation below. A private flush, which doesn't touch
+        // `self.header`'s root pointers under redo-log mode (no real tree
+        // write happens for a diverted mutation), already moved anything
+        // staged before the flush out of `writes.maps` and into `shared`/
+        // `logical_pending`, so the checkpoint restore above cannot
+        // discard it the way it discards a legacy, page-shaped flush's
+        // build.
+        if (self.redo) |*redo| {
+            redo.undoOverlaySince(self.allocator, self.runtimeIo(), sp.overlay_undo_mark);
+            redo.logical_pending.shrinkRetainingCapacity(sp.logical_pending_mark);
+            redo.pending.shrinkRetainingCapacity(sp.pending_mark);
+        }
         const writes = self.transaction_writes orelse return;
         if (self.transaction_writes_generation != sp.writes_generation) return; // already superseded by the checkpoint restore above.
         std.debug.assert(writes.undo_depth > 0);
@@ -16922,6 +17043,21 @@ pub const NativeFile = struct {
         self.invalidateLedger();
         const previous = self.transaction_header orelse return;
         defer self.debugExitCommitSpan();
+        // perf/lwa-txn-overlay (transaction isolation): discard every
+        // shared-overlay version/page this transaction itself staged
+        // (never a version some other, already-published commit owns --
+        // safe under the single-writer model), and the not-yet-logged
+        // record bytes that would otherwise bleed into whatever
+        // transaction stages next on this same instance. See
+        // `RedoCommitState.overlay_undo`'s own doc comment for the bug
+        // this closes: previously, nothing here ever touched `shared` at
+        // all, so an aborted transaction's writes stayed visible in the
+        // overlay forever.
+        if (self.redo) |*redo| {
+            redo.undoOverlaySince(self.allocator, self.runtimeIo(), 0);
+            redo.logical_pending.clearRetainingCapacity();
+            redo.pending.clearRetainingCapacity();
+        }
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
         self.transaction_writes = null;
         self.header = previous;
@@ -17191,6 +17327,12 @@ pub const NativeFile = struct {
                             try self.checkpointRedoLogNested();
                             redo.logical_pending.clearRetainingCapacity();
                             redo.pending.clearRetainingCapacity();
+                            // perf/lwa-txn-overlay: this commit's content
+                            // just published via the fold above -- see
+                            // `dropOverlayUndo`'s own doc comment for why
+                            // this must run on every path that publishes,
+                            // not just the ordinary `appendRecord` one.
+                            redo.dropOverlayUndo(self.allocator);
                             return;
                         }
                         // Page-shaped only (or nothing of this commit's
@@ -17717,6 +17859,10 @@ pub const NativeFile = struct {
                     try self.checkpointRedoLogNested();
                     redo.logical_pending.clearRetainingCapacity();
                     redo.pending.clearRetainingCapacity();
+                    // perf/lwa-txn-overlay: see the matching comment in
+                    // `commitTransactionWithDurability`'s own ride-along
+                    // branch above.
+                    redo.dropOverlayUndo(self.allocator);
                     return;
                 }
                 // Page-shaped only (or nothing of this commit's own --
@@ -31915,6 +32061,99 @@ test "lite redo log versioned overlay lets a pinned older checkpoint see its own
     const v2_after_checkpoint = (try file.getDocumentAlloc(a, "k")).?;
     defer a.free(v2_after_checkpoint);
     try std.testing.expectEqualStrings("v2", v2_after_checkpoint);
+}
+
+// perf/lwa-txn-overlay (transaction isolation): `appendLogicalMutation`
+// used to push a mutation's new version onto `SharedRedoOverlay` the
+// moment a private batch flushed, with nothing to undo it on
+// `abortTransaction`/`rollbackTransactionSavepoint`. An aborted or
+// rolled-back write stayed visible in the shared overlay forever: to a
+// concurrent reader immediately (its own mark, derived from
+// `committedSequence()`, never actually advanced past the write, but
+// nothing had tagged the write for removal either), and to this same
+// file afterward, once some later, unrelated commit's own sequence
+// number caught up to the one the abandoned version was tagged with
+// (the aborted/rolled-back transaction's own intended final sequence,
+// reused verbatim by whatever commits next since nothing advanced
+// `self.header`'s counter for a discarded attempt).
+test "lite redo log abort and savepoint rollback discard overlay versions a private flush already pushed into the shared overlay" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-abort-overlay-isolation.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+
+    try file.beginTransaction();
+    try file.putDocument("baseline", "kept");
+    try file.commitTransaction();
+
+    // --- Abort: stage, force a private flush (so the mutation already
+    // reached the shared overlay under the old design), then abort the
+    // whole transaction. ---
+    try file.beginTransaction();
+    try file.putDocument("aborted", "should-not-be-visible");
+    // Forces `flushTransactionWrites` -> `appendLogicalMutation`, exactly
+    // like a private batch flush inside a longer transaction (`deleteTree`'s
+    // own `CatalogDeleteBatch.flush`).
+    _ = try file.materializeTransactionCheckpoint();
+    file.abortTransaction();
+
+    // A concurrent ReadView (opened right now, same process, pinned to
+    // whatever is currently committed) must not see the aborted write.
+    {
+        var view = try ReadView.open(&file, std.testing.io);
+        defer view.release(std.testing.io);
+        try std.testing.expectEqual(@as(?[]u8, null), try view.getDocumentAlloc(a, "aborted"));
+    }
+
+    // A later transaction on the same file must not see it either, even
+    // after its own commit advances the logical sequence past whatever
+    // the aborted transaction would have published as.
+    try file.beginTransaction();
+    try file.putDocument("later", "value");
+    try file.commitTransaction();
+    try std.testing.expectEqual(@as(?[]u8, null), try file.getDocumentAlloc(a, "aborted"));
+
+    // --- Savepoint rollback: stage, force a flush, open a savepoint,
+    // stage+flush more, then roll back to the savepoint -- only the
+    // post-savepoint entry must disappear, even though both entries went
+    // through their own private flush. ---
+    try file.beginTransaction();
+    try file.putDocument("kept-before-savepoint", "a");
+    _ = try file.materializeTransactionCheckpoint();
+    const sp = try file.beginTransactionSavepoint();
+    try file.putDocument("rolled-back", "b");
+    _ = try file.materializeTransactionCheckpoint();
+    file.rollbackTransactionSavepoint(sp);
+    try file.commitTransaction();
+
+    {
+        const kept = (try file.getDocumentAlloc(a, "kept-before-savepoint")).?;
+        defer a.free(kept);
+        try std.testing.expectEqualStrings("a", kept);
+    }
+    try std.testing.expectEqual(@as(?[]u8, null), try file.getDocumentAlloc(a, "rolled-back"));
+
+    file.close();
+
+    // Reopen: recovery replays only the committed log. None of the
+    // aborted/rolled-back entries were ever durably logged, so there is
+    // nothing for replay to resurrect.
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(a, "aborted"));
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(a, "rolled-back"));
+    const kept2 = (try reopened.getDocumentAlloc(a, "kept-before-savepoint")).?;
+    defer a.free(kept2);
+    try std.testing.expectEqualStrings("a", kept2);
+    const baseline2 = (try reopened.getDocumentAlloc(a, "baseline")).?;
+    defer a.free(baseline2);
+    try std.testing.expectEqualStrings("kept", baseline2);
+    const later2 = (try reopened.getDocumentAlloc(a, "later")).?;
+    defer a.free(later2);
+    try std.testing.expectEqualStrings("value", later2);
 }
 
 // The retention half of the ReadView model this design is working
