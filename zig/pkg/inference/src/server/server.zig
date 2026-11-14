@@ -3325,6 +3325,12 @@ fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
 }
 
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (@import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(err)) |message| return ctx.status(400).json(.{
+        .@"error" = "INVALID_MODEL",
+        .reason = @errorName(err),
+        .message = message,
+        .retryable = false,
+    });
     if (err == error.ResourceLimitExceeded) return modelResourceLimitResponse(ctx);
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
@@ -12920,7 +12926,9 @@ pub const Node = struct {
         // identity supplies its own measured ceiling. FP32 and Q8 evidence
         // independently cover the 1B's 1024-token budget.
         if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
-            options.classification_batch_items = gliner_decide_qualification.cuda_batch_items;
+            const policy = gliner_decide_qualification.executionBatchPolicy(qualified_identity.?, .cuda) orelse return error.UnsupportedGlinerDecisionArtifact;
+            options.classification_batch_items = policy.batch_items;
+            options.classification_batch_tokens = policy.padded_batch_tokens;
             options.max_sequences_per_item = 1;
         } else if (backend == .metal and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
             const policy = gliner_decide_qualification.metalExecutionPolicy(qualified_identity.?) orelse return error.UnsupportedGlinerDecisionArtifact;
@@ -26726,7 +26734,9 @@ pub const Node = struct {
                 try jsonEncodeString(&body, a, entry.path);
                 try body.appendSlice(a, ":{\"compatibility\":\"incompatible\",\"error\":{\"code\":");
                 try jsonEncodeString(&body, a, @errorName(rejected.err));
-                try body.appendSlice(a, ",\"message\":\"the model directory could not be read; repair or re-pull it\"}}");
+                try body.appendSlice(a, ",\"message\":");
+                try jsonEncodeString(&body, a, @import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(rejected.err) orelse "the model directory could not be read; repair or re-pull it");
+                try body.appendSlice(a, "}}");
                 model_count += 1;
             }
 
@@ -28150,6 +28160,8 @@ fn extractionV2FailureResponse(ctx: *httpx.Context, err: anyerror, failure: extr
 }
 
 fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (@import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(err) != null)
+        return modelLoadFailureResponse(ctx, err);
     if (err == error.UnsupportedConstrainedProbabilities) return generationErrorResponse(ctx, err);
     if (isInferenceExecutorContractError(err))
         return inferenceExecutorContractFailureResponse(ctx, err);
@@ -31479,12 +31491,43 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
 }
 
 fn inferenceExecutorContractFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    // Resolving capabilities first reads the manifest. Preserve load/config
+    // failures instead of treating every failure as a request size violation.
+    if (!isInferenceExecutorContractError(err) and err != error.UnsupportedGlinerBoundaryRuntime)
+        return modelLoadFailureResponse(ctx, err);
     const failure = generateExecutorContractError(err);
     return ctx.status(failure.status).json(.{
         .@"error" = failure.batch.code,
         .message = failure.batch.message,
         .retryable = failure.batch.retryable,
     });
+}
+
+test "executor contract failures preserve configuration load and resource identities" {
+    const a = std.testing.allocator;
+    const Case = struct { err: anyerror, status: u16, code: []const u8 };
+    for ([_]Case{
+        .{ .err = error.MissingGlinerSpanEncoderConfig, .status = 400, .code = "INVALID_MODEL" },
+        .{ .err = error.InvalidGlinerSpanEncoderConfig, .status = 400, .code = "INVALID_MODEL" },
+        .{ .err = error.InferenceBatchTooLarge, .status = 413, .code = "BATCH_TOO_LARGE" },
+        .{ .err = error.InferenceInputTokensExceeded, .status = 413, .code = "INPUT_TOKEN_LIMIT_EXCEEDED" },
+        .{ .err = error.InvalidInferenceCapabilities, .status = 500, .code = "INVALID_MODEL_CAPABILITIES" },
+        .{ .err = error.UnsupportedGlinerBoundaryRuntime, .status = 400, .code = "MODEL_NOT_QUALIFIED" },
+        .{ .err = error.ResourceLimitExceeded, .status = 400, .code = "MODEL_RESOURCE_LIMIT" },
+        .{ .err = error.ResourceTemporarilyUnavailable, .status = 503, .code = "MODEL_RESOURCE_BUSY" },
+        .{ .err = error.Timeout, .status = 504, .code = "INFERENCE_TIMEOUT" },
+    }) |case| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try inferenceExecutorContractFailureResponse(&ctx, case.err);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.code, parsed.value.object.get("error").?.string);
+    }
 }
 
 fn isInferenceExecutorContractError(err: anyerror) bool {
@@ -37146,6 +37189,31 @@ test "model listing reports an unreadable model per entry and keeps the others" 
     const broken = root.get("extractors").?.object.get("acme/broken-gliner").?.object;
     try std.testing.expectEqualStrings("incompatible", broken.get("compatibility").?.string);
     try std.testing.expectEqualStrings("MissingGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
+
+    // Both the legacy request from #1678 and explicit v2 must preserve the
+    // discovery diagnosis rather than inventing a request resource limit.
+    const diagnostic = broken.get("error").?.object;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.get("message").?.string, "encoder_config/config.json") != null);
+    for ([_][]const u8{
+        "{\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
+        "{\"schema_version\":2,\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
+    }) |json| {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        request.body = json;
+        var ctx = httpx.Context.init(allocator, io, &request);
+        defer ctx.deinit();
+        var response = try node.extractJSON(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        var payload = try std.json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+        defer payload.deinit();
+        const failure = payload.value.object;
+        try std.testing.expectEqualStrings("INVALID_MODEL", failure.get("error").?.string);
+        try std.testing.expectEqualStrings(diagnostic.get("code").?.string, failure.get("reason").?.string);
+        try std.testing.expectEqualStrings(diagnostic.get("message").?.string, failure.get("message").?.string);
+        try std.testing.expect(!failure.get("retryable").?.bool);
+    }
 
     // Readiness counts the usable model instead of collapsing to zero.
     try node.refreshReadinessInventory(io);

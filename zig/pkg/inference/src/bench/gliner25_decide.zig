@@ -72,9 +72,8 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidBackend;
     defer session.close();
     if (std.mem.eql(u8, selected, "metal") and session.backend() != .metal) return error.InvalidBackend;
-    if (std.mem.eql(u8, selected, "metal"))
-        try factory.sealGlinerDecisionTokenizerDigest(session, inference.models.gliner_decide_qualification.Digest.of(tokenizer_bytes));
-    if (factory.getGlinerDecideMetalExecutionPolicy(session)) |policy| {
+    try factory.sealGlinerDecisionTokenizerDigest(session, inference.models.gliner_decide_qualification.Digest.of(tokenizer_bytes));
+    if (factory.getGlinerDecideExecutionBatchPolicy(session)) |policy| {
         microbatch = @min(microbatch, policy.batch_items);
         batch_tokens = @min(batch_tokens, policy.padded_batch_tokens);
     }
@@ -89,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
         .config = .{
             .decision_batch_size = microbatch,
             .decision_batch_tokens = batch_tokens,
-            .decision_reuse_batch_padding = if (factory.getGlinerDecideMetalExecutionPolicy(session)) |policy| policy.reuse_batch_padding else false,
+            .decision_reuse_batch_padding = if (factory.getGlinerDecideExecutionBatchPolicy(session)) |policy| policy.reuse_batch_padding else false,
             .model_type = manifest.gliner_model_type,
             .classification_head = .label_marker_mlp,
             .max_length = manifest.max_position_embeddings,
@@ -210,6 +209,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
         .physical_batch_token_limit = pipeline.config.decision_batch_tokens,
         .physical_reuse_batch_padding = pipeline.config.decision_reuse_batch_padding,
         .controlled = pipeline.execution_control != null,
+        .execution_batch_policy = factory.getGlinerDecideExecutionBatchPolicy(pipeline.session),
         .metal_model_policy = factory.getGlinerDecideMetalExecutionPolicy(pipeline.session),
         .metal_runtime_stats = factory.getGlinerMetalRuntimeStats(pipeline.session),
         .prepared_input_ids = token_rows,
