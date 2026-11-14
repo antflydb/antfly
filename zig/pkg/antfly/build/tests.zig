@@ -3320,7 +3320,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // for native lake API codegen rather than failing scheduler admission.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 10) * 1024 * 1024 * 1024,
         .root_module = lake_scaffold_test_mod,
-        .filters = &.{ "lake", "parquet", "iceberg", "external source", "row fragment", "sidecar" },
+        .filters = &.{ "lake", "parquet", "iceberg", "external source", "row fragment", "sidecar", "serverless.segment.sidecar_manifest.test." },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
@@ -5583,7 +5583,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // composition links it below rather than every standalone runtime
     // consumer (standalone_restore_tests and the separately linked catalog root).
     const lib_standalone_runtime_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_owner_test_root.zig"),
+        .root_source_file = b.path(@import("test_owner_names.zig").standalone_runtime_source),
         .target = target,
         .optimize = optimize,
     });

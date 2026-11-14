@@ -656,12 +656,11 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         },
     },
     .{
-        .source = "pkg/antfly/src/standalone_runtime_test_root.zig",
+        .source = names.standalone_runtime_source,
         .artifact = names.standalone_runtime,
         .selection = "standalone runtime module compiles",
         .skip = &.{
             "common.config.test.",
-            "system_catalog.domain.test.external lake",
             "system_catalog.domain.test.graph catalog",
         },
     },
