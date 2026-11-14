@@ -399,7 +399,7 @@ test "lite reclamation writer busy retries gate image copies until publication i
     for (0..4) |_| {
         const before = Hook.writes;
         const retry = store.maintenance_policy.status.state == .deferred;
-        store.maintainOnceWithCancel(retry, &store.maintenance_cancel) catch |err| {
+        store.maintainOnceWithCancel(retry, &store.maintenance_cancel, false) catch |err| {
             try std.testing.expectEqual(error.FileBusy, err);
             store.recordMaintenanceError(err);
         };
@@ -493,7 +493,7 @@ test "lite reclamation retries reuse estimates and reassess changed roots when a
     for (0..5) |_| {
         try std.testing.expectEqual(reclamation.State.deferred, store.maintenance_policy.status.state);
         const retry = store.maintenance_policy.status.state == .deferred or store.maintenance_policy.status.state == .failed;
-        try store.maintainOnceWithCancel(retry, &store.maintenance_cancel);
+        try store.maintainOnceWithCancel(retry, &store.maintenance_cancel, false);
         try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
     }
     try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
@@ -593,7 +593,7 @@ test "lite reclamation worker cancels post assessment status replay after foregr
     Hook.owner = &store;
     defer Hook.owner = null;
     defer store.file.test_cancel_on_read = null;
-    try std.testing.expectError(error.MaintenanceCanceled, store.maintainOnceWithCancel(false, &store.maintenance_cancel));
+    try std.testing.expectError(error.MaintenanceCanceled, store.maintainOnceWithCancel(false, &store.maintenance_cancel, false));
     try std.testing.expect(store.maintenance_cancel.requested.load(.acquire));
     try std.testing.expect(Hook.owner_reads <= 2);
     try std.testing.expectEqualDeep(Hook.checkpoint, store.file.activeCheckpoint());
@@ -2143,12 +2143,17 @@ test "lite reclamation automatic worker bounds sustained overwrite history (redo
 // re-queuing for the whole call, which -- before the fix -- reliably lost
 // every bare attempt across all `max_rounds` and gave up.
 //
-// `automatic: true`: the one caller this fix actually changes (the
-// maintenance worker's own dedicated background task, which can never be
-// the same thread that already holds this store's writer slot). A manual
-// `vacuum()` call deliberately keeps the old give-up behavior instead --
-// see "lite native docstore reserves one writer until abort or commit",
-// which blocking here would deadlock.
+// `performVacuum(null, true, true)`: the last argument,
+// `from_background_worker`, is the one this fix actually keys off (not
+// `automatic`, which answers a different, policy question -- see
+// `maintainOnceWithCancel`'s own doc comment for why conflating the two
+// deadlocked a direct, synchronous caller that already held the writer
+// slot). `true` here because this test's own call is from the main test
+// thread, never the thread holding the writer slot (a separate
+// `io.concurrent` task, below). A manual `vacuum()` call deliberately
+// keeps the old give-up behavior instead -- see "lite native docstore
+// reserves one writer until abort or commit", which blocking here would
+// deadlock.
 test "lite vacuum completes under a sustained competing writer via a fair final round" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const Writer = struct {
@@ -2218,7 +2223,7 @@ test "lite vacuum completes under a sustained competing writer via a fair final 
 
     const writes_before = writer.writes.load(.monotonic);
     const vacuum_started_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
-    _ = try store.performVacuum(null, true);
+    _ = try store.performVacuum(null, true, true);
     const vacuum_ns: u64 = @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds - vacuum_started_ns);
 
     writer.stop.store(true, .release);
@@ -3528,7 +3533,7 @@ pub const Store = struct {
             self.mutex.unlock();
             if (@import("builtin").is_test) _ = self.test_maintenance_cycles.fetchAdd(1, .release);
             var failed = false;
-            self.maintainOnceWithCancel(retry, &self.maintenance_cancel) catch |err| {
+            self.maintainOnceWithCancel(retry, &self.maintenance_cancel, true) catch |err| {
                 failed = true;
                 self.recordMaintenanceError(err);
             };
@@ -3576,7 +3581,10 @@ pub const Store = struct {
     /// without a concurrency lane and deterministic qualification. Ordinary
     /// clients need no maintenance loop. `force` retries existing debt.
     pub fn maintainOnce(self: *Store, force: bool) !void {
-        return self.maintainOnceWithCancel(force, null);
+        // `false`: a direct, synchronous caller can never be assumed off
+        // this store's own writer thread -- see `maintainOnceWithCancel`'s
+        // own doc comment.
+        return self.maintainOnceWithCancel(force, null, false);
     }
 
     /// The detached connection owner calls this before provider/index work,
@@ -3598,7 +3606,23 @@ pub const Store = struct {
         if (!self.file.free_pages_verified) return error.EnrichmentWaitCanceled;
     }
 
-    fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
+    /// `from_background_worker`: `true` only from `maintenanceLoop`'s own
+    /// call, on its dedicated background task -- by construction never a
+    /// thread that could already hold this store's writer slot, since that
+    /// task never itself opens a write transaction. Every other caller
+    /// (`maintainOnce`'s public callers, and every test here that drives
+    /// this function directly and synchronously) must pass `false`:
+    /// "automatic" (`performVacuum`'s own `automatic: bool`, still set from
+    /// `force or retry`-independent call-site intent) answers "is this the
+    /// maintenance subsystem's own vacuum, not a user's `vacuum()` call" --
+    /// a *policy* question -- not "is the calling thread safe to block for
+    /// a writer ticket", a *concurrency* question these used to be wrongly
+    /// conflated under one `automatic` flag (regression: "lite reclamation
+    /// writer busy retries gate image copies until publication is
+    /// available" calls this synchronously while its own thread holds an
+    /// open `Txn`/the writer slot -- blocking that same thread on its own,
+    /// never-to-be-released hold deadlocked it).
+    fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken, from_background_worker: bool) !void {
         if (self.read_only) return;
         // External owners also defer requested allocator-format conversion to
         // this detached maintenance turn. Vacuum uses the same short capture
@@ -3757,7 +3781,7 @@ pub const Store = struct {
         // whatever debt accrued or `requestReassessment` call arrived while
         // this exact run was in flight.
         const vacuum_started = self.maintenance_policy.snapshot();
-        const report = self.performVacuum(cancel, true) catch |err| {
+        const report = self.performVacuum(cancel, true, from_background_worker) catch |err| {
             if (err == error.FileBusy or err == error.WouldBlock) {
                 lockStore(self);
                 self.shrink_waiting_for_writer = true;
@@ -4047,7 +4071,7 @@ pub const Store = struct {
         // See the matching comment in `maintainOnceWithCancel`: captured
         // before the run, not re-derived from "now" once it returns.
         const vacuum_started = self.maintenance_policy.snapshot();
-        const report = try self.performVacuum(cancel, false);
+        const report = try self.performVacuum(cancel, false, false);
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
@@ -4061,7 +4085,11 @@ pub const Store = struct {
         return report;
     }
 
-    fn performVacuum(self: *Store, cancel: ?*const maintenance.CancelToken, automatic: bool) !native.VacuumReport {
+    /// `from_background_worker`: see `maintainOnceWithCancel`'s own doc
+    /// comment -- a strictly narrower, concurrency-only question than
+    /// `automatic`'s policy one. Only `true` when the caller is provably
+    /// not the thread that could be holding this store's writer slot.
+    fn performVacuum(self: *Store, cancel: ?*const maintenance.CancelToken, automatic: bool, from_background_worker: bool) !native.VacuumReport {
         if (self.read_only) return error.ReadOnly;
         const io = self.file.runtime();
         var capture = native.ChangeCapture{};
@@ -4184,17 +4212,21 @@ pub const Store = struct {
         // the bare, nonblocking `reserveWriterSlot` -- but it is also why
         // giving up after the *final* round's own bare attempt failed was
         // wrong for the one caller that can never be the reentrant one:
-        // `automatic` (the maintenance worker's own dedicated background
-        // task, never a thread that could already hold this store's writer
-        // slot itself). A sustained foreground writer that keeps re-queuing
-        // through the fair, ticketed `reserveWriterSlotYielding` every
-        // ordinary commit already uses can win every one of this loop's
-        // bare nonblocking attempts indefinitely -- `writer_active`/
-        // `next_writer_ticket` just never line up for a probe that never
-        // takes a ticket of its own -- so online vacuum could lose forever
-        // under sustained write load (observed live: "lite reclamation
-        // automatic worker bounds sustained overwrite history", 1-in-5ish).
-        // For `automatic` only, the last round escalates to that same fair
+        // `from_background_worker` (`maintenanceLoop`'s own dedicated
+        // background task, never a thread that could already hold this
+        // store's writer slot itself -- *not* the same thing as
+        // `automatic`; see `maintainOnceWithCancel`'s own doc comment for
+        // why conflating the two deadlocked a direct, synchronous caller
+        // that already held the slot). A sustained foreground writer that
+        // keeps re-queuing through the fair, ticketed
+        // `reserveWriterSlotYielding` every ordinary commit already uses
+        // can win every one of this loop's bare nonblocking attempts
+        // indefinitely -- `writer_active`/`next_writer_ticket` just never
+        // line up for a probe that never takes a ticket of its own -- so
+        // online vacuum could lose forever under sustained write load
+        // (observed live: "lite reclamation automatic worker bounds
+        // sustained overwrite history", 1-in-5ish). Only from the
+        // background worker, the last round escalates to that same fair
         // queue instead of probing: it takes a real ticket, so it is
         // guaranteed to be served once every writer *already* queued ahead
         // of it (never an unbounded or growing set -- new writers queue
@@ -4208,7 +4240,7 @@ pub const Store = struct {
             const final_round = round + 1 == max_rounds;
             if (!self.file.no_sync) try image.prepared.file.sync(io);
             const reserved = blk: {
-                if (final_round and automatic) {
+                if (final_round and from_background_worker) {
                     try self.reserveWriterSlotYielding();
                     break :blk true;
                 }
