@@ -27375,6 +27375,27 @@ pub const IndexManager = struct {
         return try text_index_maintenance.needsMerge(self.alloc, index, policy);
     }
 
+    /// WS4 phase 2's inline fast path (`mutation_materialization.
+    /// InlineTextPublication.install`) adds its one-document segment (and
+    /// any delete-tracking bitmap) directly, bypassing
+    /// `finalizeTextBatchMutations`'s own post-write bookkeeping entirely.
+    /// Call this once per inline publication that actually touched the
+    /// index (a new segment, a delete, or both) so `compaction_pending`
+    /// still gets set when the policy says so -- otherwise
+    /// `TextMergeScheduler.select` never considers this index and segments
+    /// (and the per-write cost of scanning them for deletes) accumulate
+    /// without bound. Mirrors `finalizeTextBatchMutations`/
+    /// `beginTextMergeTask`'s own needsMerge/schedule/noteComplete
+    /// sequence; never compacts synchronously here, since that would
+    /// defeat the inline path's whole point.
+    pub fn noteInlineTextPublicationSegments(self: *IndexManager, entry: *TextIndex) !void {
+        if (try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
+            TextMergeScheduler.schedule(entry);
+        } else {
+            TextMergeScheduler.noteComplete(entry);
+        }
+    }
+
     fn forceCompactTextIndexWithOptions(
         self: *IndexManager,
         entry: *TextIndex,
