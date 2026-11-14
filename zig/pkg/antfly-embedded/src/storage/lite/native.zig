@@ -7248,10 +7248,39 @@ pub const NativeFile = struct {
             }
         }.populate);
 
+        // `checkpointRedoLog`'s own fold consumes a fresh `commit_sequence`
+        // for its checkpoint publish without ever appending a matching log
+        // record (its `checkpointing = true` span disables every diversion
+        // point, so that sequence is never logged) -- by design, since the
+        // checkpoint slot is already a complete, self-sufficient durability
+        // record for it. `redo_log.replay`'s own scan of the physical log
+        // therefore legitimately stops one behind the checkpoint whenever
+        // the most recent event before a crash was such a fold: `outcome
+        // .last_sequence` reports the last record it actually found on
+        // disk (superseded or not), which is correct for *that* question,
+        // but is not on its own a safe cursor to resume the writer from.
+        // Recovery's restored checkpoint (`recovered_checkpoint_sequence`,
+        // taken after the `compact.toCheckpointSlot()` update above) is
+        // never behind what the log physically holds, but a fold can leave
+        // it strictly *ahead* -- resuming the writer at the log's own
+        // last-seen sequence in that case lets the very next commit
+        // recompute `checkpoint.commit_sequence + 1` as its own next
+        // sequence while the writer's continuity check still expects
+        // `outcome.last_sequence + 1`, one behind -- a guaranteed
+        // `error.SequenceOutOfOrder` (surfacing as `error.OutcomeUnknown`)
+        // on the very first write after reopen. Clamping the writer's
+        // resumed sequence to at least the recovered checkpoint's own
+        // keeps the two in the same continuity domain they share on every
+        // live commit (ride-along and durable alike both advance
+        // `self.header`'s checkpoint and the log's `last_sequence`
+        // together; only a fold's own checkpoint-only publish ever splits
+        // them).
+        const recovered_checkpoint_sequence = self.header.checkpoints[self.header.active_checkpoint].commit_sequence;
+        const resumed_sequence = @max(outcome.last_sequence orelse recovered_checkpoint_sequence, recovered_checkpoint_sequence);
         self.redo = RedoCommitState{
-            .writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, outcome.last_sequence),
+            .writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, resumed_sequence),
             .shared = shared,
-            .durable_sequence = outcome.last_sequence orelse checkpoint.commit_sequence,
+            .durable_sequence = resumed_sequence,
             .checkpoint_sequence = checkpoint.commit_sequence,
         };
         self.publishRedoLogState();
