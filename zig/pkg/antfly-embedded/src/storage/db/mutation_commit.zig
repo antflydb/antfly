@@ -4322,6 +4322,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                 }
             }
+            // `install()` above may have just flipped `compaction_pending`
+            // on (see `IndexManager.noteInlineTextPublicationSegments`).
+            // Wake the merge worker the same way
+            // `applyDerivedBatchTargetsProfiled` already does for the
+            // non-inline path, instead of leaving it to find the work on
+            // its own next idle poll.
+            if (inline_text_publication_count != 0) {
+                if (S.ownerField(self, "text_merge_runtime").*) |runtime| runtime.notify();
+            }
             if (inline_graph_publication) |prepared| {
                 prepared.install();
                 inline_graph_publication = null;

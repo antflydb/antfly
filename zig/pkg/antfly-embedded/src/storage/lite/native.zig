@@ -8069,6 +8069,33 @@ pub const NativeFile = struct {
         // landed.
         const old_tail = redo.writer.tail;
         const new_checkpoint_sequence = self.activeCheckpoint().commit_sequence;
+        // The commit just above already consumed `new_checkpoint_sequence`
+        // without ever appending a matching log record for it
+        // (`checkpointing = true` disabled the whole redo-append branch for
+        // that one commit, same as the `redo_fell_back_to_slot` case this
+        // mirrors) -- `self.header`'s checkpoint is durably ahead of
+        // `redo.writer.last_sequence` from this point on, committed or not.
+        // Advance the writer's own sequence counter (never `tail`, which
+        // the reclaim/zero/shrink steps below still own) right here, before
+        // any of them, rather than only as a side effect of the `Writer
+        // .init`/`initAt` calls those steps reach on success: every step
+        // from here through the end of this function is itself a durability
+        // barrier the crash sweep injects faults into (the log-zeroing
+        // write+sync, `maybeShrinkRedoLogCapacity`'s own commit), and a
+        // `try` failing partway through used to return with the writer
+        // never fixed up -- `self.header` already durably one ahead,
+        // `redo.writer.last_sequence` still naming the pre-fold value.
+        // Every later commit then recomputed the same doomed
+        // `header.commit_sequence + 1` from the unmoved header and
+        // collided with the writer's own stale continuity check forever
+        // (`error.SequenceOutOfOrder`, surfacing as the equally far less
+        // specific `error.OutcomeUnknown`) -- a derived worker retrying
+        // that error treats it as transient and backs off, but nothing
+        // about this file ever changes on its own, so it never recovers.
+        // Reproduced via "crash sweep: graph metric build and compaction
+        // mid-scenario": a fault landing on this function's own log-zero
+        // sync, right after its internal fold commit had already landed.
+        redo.writer.last_sequence = new_checkpoint_sequence;
         // §9.6a: unlike the pre-sharing design, this is not an
         // unconditional clear -- a reader pinned to an older checkpoint
         // than the one that just landed may still need an overlay version
