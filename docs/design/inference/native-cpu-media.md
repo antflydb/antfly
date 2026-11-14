@@ -374,8 +374,13 @@ the admitted caller allocator before starting host worker threads. Worker
 execution allocates nothing through that allocator, preserving head parallelism
 without sharing a non-thread-safe request ledger. The caller's borrowed I/O
 executor serves both the vision blocks and decoder prefill. Worker width respects
-the effective CPU quota; callers without an executor use the shared bounded
-synchronous pool. No layer creates a fresh set of operating-system threads.
+the effective CPU quota. Default/offline loading owns one bounded executor for
+both GEMM and attention, including on macOS. The executor has a stable heap
+address across pipeline moves and is released on load failure or pipeline
+teardown; supplied executors remain borrowed. Its internal thread/task storage
+uses a thread-safe heap rather than a request's admitted allocator. Low-level
+attention calls without an executor use the shared synchronous fallback. No
+layer creates a fresh set of operating-system threads.
 Allocation failure before launch releases all prepared worker storage.
 
 Encoder/decoder recognizers move their owned text allocations and leases into

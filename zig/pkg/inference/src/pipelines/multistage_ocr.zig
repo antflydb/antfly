@@ -1702,18 +1702,34 @@ fn checkVisionRecognizerCallerOwnership(a: std.mem.Allocator) !void {
     defer target.deinit();
     const out_allocator = try target.allocator();
     const earlier = try out_allocator.dupe(u8, "earlier");
+    try target.trim();
+    const GrowthGate = struct {
+        attempts: usize = 0,
+        fn deny(raw: *anyopaque, _: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            return error.ResourceLimitExceeded;
+        }
+    };
+    var gate = GrowthGate{};
+    target.owner.admit = GrowthGate.deny;
+    target.owner.admission_context = &gate;
+    target.owner.rollback_admission = null;
+    // Decoder allocations remain allowed through their own preparation owner.
+    // A destination copy would require growth and fail before returning text.
     var pixels: [12]u8 = @splat(128);
     const result = try recognizer.recognizePrepared(.{ .data = &pixels, .width = 2, .height = 2, .channels = 3 }, null, null, &target);
     try std.testing.expectEqual(@as(usize, 1), encoder.calls);
     try std.testing.expectEqual(@as(usize, 2), decoder.calls);
     try std.testing.expectEqualStrings("hello", result.text);
     try std.testing.expect(target.owner.ownsRange(result.text));
+    try std.testing.expectEqual(@as(usize, 0), gate.attempts);
     // A subsequent destination failure must leave transferred text usable and
     // cleanup independent of the decoder's already-destroyed result frame.
-    target.owner.session.?.run_admission.?.limits = .{ .host_limit_bytes = 1, .scratch_limit_bytes = 1 };
     try target.trim();
-    try std.testing.expectError(error.OutOfMemory, out_allocator.alloc(u8, 1024));
+    try std.testing.expectError(error.OutOfMemory, out_allocator.dupe(u8, result.text));
     try std.testing.expectEqual(error.ResourceLimitExceeded, target.failure(error.OutOfMemory));
+    try std.testing.expect(gate.attempts > 0);
     try std.testing.expectEqualStrings("hello", result.text);
     try std.testing.expectEqualStrings("earlier", earlier);
 }

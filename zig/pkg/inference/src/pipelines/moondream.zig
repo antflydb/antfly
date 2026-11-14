@@ -103,9 +103,45 @@ pub const PromptTokens = struct {
     }
 };
 
+/// Borrow a caller's executor, or keep one bounded owner for the complete
+/// offline pipeline lifetime. Its address must stay stable across Pipeline moves.
+const Executor = union(enum) {
+    borrowed: std.Io,
+    owned: *std.Io.Threaded,
+
+    fn init(allocator: std.mem.Allocator, supplied: ?std.Io) !Executor {
+        if (supplied) |provided| return .{ .borrowed = provided };
+        const owner = try allocator.create(std.Io.Threaded);
+        const background = if (@import("builtin").single_threaded) 0 else @min(@import("inference_linalg").pool.cachedCpuCount(), @import("inference_linalg").pool.max_workers) -| 1;
+        const limit: std.Io.Limit = if (background == 0) .nothing else .limited(background);
+        // Executor internals are accessed by multiple threads. A request's
+        // admitted allocator may own the header, but cannot be its work heap.
+        owner.* = std.Io.Threaded.init(std.heap.smp_allocator, .{ .async_limit = limit, .concurrent_limit = limit });
+        return .{ .owned = owner };
+    }
+
+    fn io(self: Executor) std.Io {
+        return switch (self) {
+            .borrowed => |borrowed| borrowed,
+            .owned => |owner| owner.io(),
+        };
+    }
+
+    fn deinit(self: *Executor, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .borrowed => {},
+            .owned => |owner| {
+                owner.deinit();
+                allocator.destroy(owner);
+            },
+        }
+        self.* = undefined;
+    }
+};
+
 pub const Pipeline = struct {
     allocator: std.mem.Allocator,
-    io: ?std.Io = null,
+    executor: Executor,
     config: Config,
     tokenizer: *hf_tokenizer.HfTokenizer,
     compute: if (build_options.enable_native) *native_mod.NativeCompute else void,
@@ -127,7 +163,8 @@ pub const Pipeline = struct {
         return loadWithControl(allocator, model_dir, null, null);
     }
 
-    /// `io` schedules the GEMM worker pool; without it macOS runs serially.
+    /// Reuse a supplied executor for GEMM and attention. Offline callers get
+    /// one bounded executor, released with the pipeline on every platform.
     pub fn loadWithControl(
         allocator: std.mem.Allocator,
         model_dir: []const u8,
@@ -137,7 +174,9 @@ pub const Pipeline = struct {
         if (!build_options.enable_native) return error.NativeNotEnabled;
         if (control) |active| try active.check();
 
-        const runtime_io = io orelse std.Options.debug_io;
+        var executor = try Executor.init(allocator, if (control) |active| active.io orelse io else io);
+        errdefer executor.deinit(allocator);
+        const runtime_io = executor.io();
         var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, runtime_io, model_dir);
         defer publication_lease.deinit(runtime_io);
         if (control) |active| try active.verifyModelSelection(allocator, runtime_io, model_dir);
@@ -218,17 +257,14 @@ pub const Pipeline = struct {
 
         const compute = try allocator.create(native_mod.NativeCompute);
         errdefer allocator.destroy(compute);
-        compute.* = if (io) |runtime|
-            native_mod.NativeCompute.initWithIo(allocator, weights, null, runtime)
-        else
-            native_mod.NativeCompute.init(allocator, weights, null);
+        compute.* = native_mod.NativeCompute.initWithIo(allocator, weights, null, runtime_io);
         // Consume the f16 checkpoint matrices directly instead of widening
         // every projection to f32 on each use.
         compute.borrow_typed_matrix_weights = true;
 
         return .{
             .allocator = allocator,
-            .io = io,
+            .executor = executor,
             .config = config,
             .tokenizer = tok,
             .compute = compute,
@@ -247,6 +283,7 @@ pub const Pipeline = struct {
         }
         self.allocator.free(self.stop_token_ids);
         self.tokenizer.deinitSelf();
+        self.executor.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -279,7 +316,7 @@ pub const Pipeline = struct {
         const pixels = try preprocessImage(self.allocator, self.config, image_bytes);
         defer self.allocator.free(pixels);
         var cb = self.backend(control);
-        return arch.encodeImageWithIo(&cb, self.allocator, self.config, pixels, true, if (control) |active| active.io orelse self.io else self.io);
+        return arch.encodeImageWithIo(&cb, self.allocator, self.config, pixels, true, if (control) |active| active.io orelse self.executor.io() else self.executor.io());
     }
 
     pub fn embedTokens(self: *Pipeline, ids: []const i32, out: []f32) !void {
@@ -384,7 +421,7 @@ pub const Pipeline = struct {
         var kv = try arch.KvState.init(self.allocator, self.config);
         defer kv.deinit();
         kv.host_prefill_attention = true;
-        kv.host_attention_io = if (control) |active| active.io orelse self.io else self.io;
+        kv.host_attention_io = if (control) |active| active.io orelse self.executor.io() else self.executor.io();
 
         var history = std.ArrayListUnmanaged(i64).empty;
         defer history.deinit(self.allocator);
@@ -586,4 +623,72 @@ test "cleanAnswer strips partial stop markers and whitespace" {
         defer std.testing.allocator.free(out);
         try std.testing.expectEqualStrings(case[1], out);
     }
+}
+
+fn checkDefaultExecutorAllocation(a: std.mem.Allocator) !void {
+    var executor = try Executor.init(a, null);
+    defer executor.deinit(a);
+}
+
+test "moondream default executor owns bounded parallel dispatch on the current platform" {
+    var executor = try Executor.init(std.testing.allocator, null);
+    defer executor.deinit(std.testing.allocator);
+    const owner = switch (executor) {
+        .owned => |owned| owned,
+        .borrowed => return error.TestUnexpectedResult,
+    };
+    const cpus = @min(@import("inference_linalg").pool.cachedCpuCount(), @import("inference_linalg").pool.max_workers);
+    const background = if (@import("builtin").single_threaded) 0 else cpus -| 1;
+    const limit: std.Io.Limit = if (background == 0) .nothing else .limited(background);
+    try std.testing.expectEqualDeep(limit, owner.async_limit);
+    try std.testing.expectEqualDeep(limit, owner.concurrent_limit);
+    const Probe = struct {
+        caller: std.Thread.Id,
+        calls: std.atomic.Value(usize) = .init(0),
+        background: std.atomic.Value(bool) = .init(false),
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.Thread.getCurrentId() != self.caller) self.background.store(true, .release);
+            _ = self.calls.fetchAdd(1, .acq_rel);
+        }
+    };
+    var probe = Probe{ .caller = std.Thread.getCurrentId() };
+    const jobs = [_]@import("inference_linalg").pool.Job{
+        .{ .fn_ptr = Probe.run, .ctx = &probe },
+        .{ .fn_ptr = Probe.run, .ctx = &probe },
+    };
+    try @import("inference_linalg").pool.dispatchJobsIo(executor.io(), &jobs);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls.load(.acquire));
+    if (background > 0) try std.testing.expect(probe.background.load(.acquire));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkDefaultExecutorAllocation, .{});
+}
+
+test "moondream borrowed executor requires no allocation and remains usable after release" {
+    const supplied = std.testing.io;
+    var executor = try Executor.init(std.testing.failing_allocator, supplied);
+    try std.testing.expect(executor == .borrowed);
+    try std.testing.expect(executor.io().vtable == supplied.vtable);
+    try std.testing.expect(executor.io().userdata == supplied.userdata);
+    executor.deinit(std.testing.failing_allocator);
+    try supplied.checkCancel();
+}
+
+fn checkDefaultLoadFailure(a: std.mem.Allocator, path: []const u8) !void {
+    if (Pipeline.load(a, path)) |value| {
+        var pipeline = value;
+        pipeline.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.FileNotFound, err);
+    }
+}
+
+test "moondream default loader releases its executor on load and allocation failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    try checkDefaultLoadFailure(std.testing.allocator, path);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkDefaultLoadFailure, .{path});
 }

@@ -805,7 +805,8 @@ pub fn attentionHostParallelWithIo(allocator: std.mem.Allocator, q: []const f32,
     errdefer allocator.free(output);
     if (rows == 0) return output;
     const cpus = linalg.pool.cachedCpuCount();
-    const workers = @max(@as(usize, 1), @min(@min(cpus, 8), num_heads));
+    const worker_cap = linalg.pool.max_workers;
+    const workers = @max(@as(usize, 1), @min(@min(cpus, worker_cap), num_heads));
 
     const Worker = struct {
         q: []const f32,
@@ -847,8 +848,8 @@ pub fn attentionHostParallelWithIo(allocator: std.mem.Allocator, q: []const f32,
         }
     };
 
-    var states: [8]Worker = undefined;
-    var jobs: [8]linalg.pool.Job = undefined;
+    var states: [linalg.pool.max_workers]Worker = undefined;
+    var jobs: [linalg.pool.max_workers]linalg.pool.Job = undefined;
     var prepared: usize = 0;
     defer for (states[0..prepared]) |*state| {
         state.workspace.deinit(allocator);
