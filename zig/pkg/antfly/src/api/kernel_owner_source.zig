@@ -293,6 +293,10 @@ pub const ProvisionedKernelOwnerSource = struct {
     mutex: std.atomic.Mutex = .unlocked,
     quiescing: bool = false,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    // Retain per-group admission watermarks across owner close/reopen gaps. Otherwise
+    // a delayed pre-DDL descriptor can remove a newer index and its artifacts
+    // without changing the schema version or physical root generation.
+    catalog_observations: std.AutoHashMapUnmanaged(u64, metadata_api.CatalogRoutingChangeToken) = .empty,
     publications: std.ArrayListUnmanaged(*PendingPublication) = .empty,
     owner_cache_hits: std.atomic.Value(u64) = .init(0),
     owner_cache_misses: std.atomic.Value(u64) = .init(0),
@@ -400,6 +404,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     };
 
     pub const LoadedDescriptor = struct {
+        catalog_observation: ?metadata_api.CatalogRoutingChangeToken = null,
         path: []u8,
         schema_json: []u8,
         indexes_json: []u8,
@@ -421,6 +426,12 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .restore = self.restore,
                 .initial_child_bootstrap_json = self.initial_child_bootstrap_json orelse "",
             };
+        }
+
+        fn readControls(self: *const LoadedDescriptor, base: ReadControls) ReadControls {
+            var controls = base;
+            controls.catalog_observation = self.catalog_observation;
+            return controls;
         }
 
         pub fn deinit(self: *LoadedDescriptor, alloc: std.mem.Allocator) void {
@@ -814,6 +825,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.publications.deinit(self.alloc);
         self.entries.deinit(self.alloc);
         self.entries = .empty;
+        self.catalog_observations.deinit(self.alloc);
+        self.catalog_observations = .empty;
         self.mutex.unlock();
         if (self.owns_context) self.context.deinit();
     }
@@ -1023,7 +1036,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !?restore_state_contract.State {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .transient, .{});
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .transient, descriptor.readControls(.{}));
         defer lease.deinit();
         defer lease.requestTransientRetirement();
         var response = (try lease.owner().restoreStateJson(table_name)) orelse return null;
@@ -2192,7 +2205,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !void {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .transient, .{});
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .transient, descriptor.readControls(.{}));
         defer lease.deinit();
         // Warmup can overlap startup catch-up or foreground admission. Retire
         // only a transient owner, while the lease still pins it. Borrowing
@@ -2210,7 +2223,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn prepareOnlineMergeOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !void {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, .{});
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, descriptor.readControls(.{}));
         defer lease.deinit();
     }
 
@@ -2260,6 +2273,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             descriptor.view(),
             retain_cold_owner or advance_index_repair,
             if (retain_cold_owner) .resident else .transient,
+            descriptor.readControls(.{}),
         )) orelse return .{ .state = .busy };
         defer lease.deinit();
         errdefer lease.requestTransientRetirement();
@@ -2416,6 +2430,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             // A scheduled repair returns busy immediately behind live leases.
             retain_cold_owner,
             if (retain_cold_owner) .resident else .transient,
+            descriptor.readControls(.{}),
         )) orelse return .{ .result = .{ .state = .busy } };
         defer lease.deinit();
         errdefer lease.requestTransientRetirement();
@@ -3065,6 +3080,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer projection.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         return .{
+            .catalog_observation = projection.catalog_observation,
             .path = path,
             .schema_json = projection.schema_json,
             .indexes_json = projection.indexes_json,
@@ -3081,6 +3097,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const ReadControls = struct {
+        catalog_observation: ?metadata_api.CatalogRoutingChangeToken = null,
         execution_deadline_ns: ?u64 = null,
         execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
@@ -3130,7 +3147,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var descriptor = try self.loadDescriptorWithBudget(self.alloc, group_id, table_name, controls.catalogBudget(self.catalog));
         defer descriptor.deinit(self.alloc);
         try controls.check();
-        return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, controls);
+        return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, descriptor.readControls(controls));
     }
 
     fn transactionRecoveryStatus(err: anyerror) abi.Status {
@@ -3903,15 +3920,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
         wait_for_readers: bool,
         residency: Residency,
+        controls: ReadControls,
     ) !?Lease {
-        if (wait_for_readers) return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, true, residency, .{ .allow_deferred_catalog = true });
+        var reconcile_controls = controls;
+        reconcile_controls.allow_deferred_catalog = true;
+        if (wait_for_readers) return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, true, residency, reconcile_controls);
         // Periodic inspection must yield to admitted foreground/maintenance
         // leases. Queueing a writer here closes foreground admission while an
         // existing lease may itself be waiting for a long derived-index apply.
         // Return busy without installing that gate; the startup scheduler
         // retains the inspection debt and retries. Explicit structural changes
         // and admitted repair work keep their writer-preference contract.
-        return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .exclusive_if_idle, residency, .{ .allow_deferred_catalog = true }) catch |err| switch (err) {
+        return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .exclusive_if_idle, residency, reconcile_controls) catch |err| switch (err) {
             error.StorageKernelOwnerTransitionRequired, error.StorageKernelOwnerStaleDescriptor => null,
             else => return err,
         };
@@ -4134,6 +4154,29 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
         if (self.quiescing) return error.Canceled;
+        if (!controls.historical_raft_apply) if (controls.catalog_observation) |incoming| {
+            const observation = try self.catalog_observations.getOrPut(self.alloc, group_id);
+            var stale = false;
+            if (observation.found_existing) {
+                const current = observation.value_ptr.*;
+                if (incoming.authorityEql(current) and incoming.revision < current.revision)
+                    stale = true;
+            }
+            if (stale) {
+                // Unrelated catalog changes need not invalidate a warm read.
+                // Only reuse an exact live contract; a missing/changed owner
+                // would let the delayed capture mutate durable definitions.
+                const unchanged = for (self.entries.items) |entry| {
+                    if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name) and
+                        !entry.retired and !entry.closing and !entry.opened_for_historical_apply and
+                        (!controls.prepare_graph_indexes or entry.graph_replay_indexes_prepared) and
+                        exactApplyDescriptor(entry, descriptor)) break true;
+                } else false;
+                if (!unchanged) return error.StorageKernelOwnerStaleDescriptor;
+            } else {
+                observation.value_ptr.* = incoming;
+            }
+        };
         // Return to the caller rather than waiting with a descriptor captured
         // before publication; a retry must acquire the new catalog descriptor.
         if (self.publicationPendingLocked(group_id, table_name)) return error.StorageReadTemporarilyUnavailable;
@@ -7723,6 +7766,68 @@ test "storage owner rejects prior ABI before reading deferred-output field" {
     try std.testing.expect(owner == null);
 }
 
+test "owner descriptor catalog watermark fences index-only regressions across owner close" {
+    const Source = ProvisionedKernelOwnerSource;
+    var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    defer source.catalog_observations.deinit(std.testing.allocator);
+    var entry: Source.Entry = .{
+        .group_id = 1,
+        .table_name = @constCast("docs"),
+        .generation = 7,
+        .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .schema_json = @constCast("{}"),
+        .indexes_json = @constCast("{\"model_a\":{},\"model_b\":{}}"),
+        .restore_bootstrap_json = @constCast(""),
+        .initial_child_bootstrap_json = @constCast(""),
+        .owner = undefined,
+        .resident = true,
+    };
+    try source.entries.append(std.testing.allocator, &entry);
+    var descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = entry.generation,
+        .identity = entry.identity,
+        .schema_json = entry.schema_json,
+        .indexes_json = entry.indexes_json,
+    };
+    var controls: Source.ReadControls = .{ .catalog_observation = .{ .metadata_group_id = 11, .revision = 42 } };
+    {
+        var lease = try source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .shared, .resident, controls);
+        defer lease.deinit();
+        try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
+    }
+    // Only the index catalog changed. Both schema and physical root remain
+    // equal, so the schema-version safeguard cannot detect this delayed DDL.
+    controls.catalog_observation.?.revision = 41;
+    {
+        var lease = try source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .shared, .resident, controls);
+        defer lease.deinit();
+        try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
+    }
+    descriptor.indexes_json = "{\"model_a\":{}}";
+    for ([_]Source.LeaseAdmission{ .shared, .exclusive, .exclusive_if_idle }) |admission| {
+        try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, controls));
+        try std.testing.expect(!entry.retired);
+    }
+    // Committed Raft entries still use their exact historical descriptor;
+    // they must not acquire current-catalog authority or lower this watermark.
+    controls.historical_raft_apply = true;
+    entry.active_users = 1;
+    try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .exclusive, .resident, controls));
+    try std.testing.expect(entry.retired);
+    try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
+    controls.historical_raft_apply = false;
+    // Owner retirement releases the registry mutex while draining the runtime.
+    // The observation must survive that gap rather than live on the entry.
+    source.entries.clearRetainingCapacity();
+    try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .shared, .resident, controls));
+    try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
+    // Catalog observations must never alter the existing replicated wire.
+    const wire = try std.json.Stringify.valueAlloc(std.testing.allocator, descriptor, .{});
+    defer std.testing.allocator.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "catalog_observation") == null);
+}
+
 test "owner descriptor changes do not retire a live owner for an older schema version" {
     const Source = ProvisionedKernelOwnerSource;
     try std.testing.expectEqual(@as(?u32, 7), Source.schemaVersionFromJson("{\"default_type\":\"_default\",\"types\":{\"a\":{\"version\":1}},\"version\":7}"));
@@ -7820,7 +7925,7 @@ test "scheduled repair admission yields to readers and reuses exact configured g
         .schema_json = entry.schema_json,
         .indexes_json = entry.indexes_json,
     };
-    try std.testing.expect((try source.acquireDescriptorForReconcile(1, "docs", "/unused", descriptor, false, .transient)) == null);
+    try std.testing.expect((try source.acquireDescriptorForReconcile(1, "docs", "/unused", descriptor, false, .transient, .{})) == null);
     try std.testing.expect(!entry.exclusive_pending);
     try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, .shared));
     entry.active_users -= 1;

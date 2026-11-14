@@ -2016,6 +2016,7 @@ fn listTableRangesWithBudget(
 }
 
 pub const TableGroupDescriptorProjection = struct {
+    catalog_observation: ?metadata_api.CatalogRoutingChangeToken = null,
     table_id: u64,
     doc_identity_shard_id: u64,
     doc_identity_range_id: u64,
@@ -2175,7 +2176,7 @@ fn descriptorProjectionFromRoutingSnapshot(
     const table = findTableByName(snapshot.tables, table_name) orelse return null;
     for (snapshot.ranges) |range| {
         if (range.table_id != table.table_id or range.group_id != group_id) continue;
-        return try descriptorProjectionFromValues(
+        var projection = try descriptorProjectionFromValues(
             alloc,
             table.table_id,
             metadata_table_manager.rangeDocIdentityShardId(range),
@@ -2186,8 +2187,33 @@ fn descriptorProjectionFromRoutingSnapshot(
             .{ .start = range.start_key, .end = range.end_key orelse "" },
             restoreIdentityFromRange(range),
         );
+        projection.catalog_observation = .{
+            .metadata_group_id = snapshot.metadata_group_id,
+            .metadata_incarnation = snapshot.metadata_incarnation,
+            .revision = snapshot.catalog_revision,
+        };
+        return projection;
     }
     return null;
+}
+
+test "descriptor projection retains the catalog observation with the physical definition" {
+    const tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = "{\"model_b\":{}}" }};
+    const ranges = [_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .range_id = 71, .start_key = "", .end_key = null }};
+    const incarnation: metadata_api.MetadataClusterIncarnation = @splat(3);
+    var projection = (try descriptorProjectionFromRoutingSnapshot(std.testing.allocator, .{
+        .metadata_group_id = 11,
+        .metadata_incarnation = incarnation,
+        .catalog_revision = 42,
+        .tables = @constCast(&tables),
+        .ranges = @constCast(&ranges),
+    }, "docs", 7001)).?;
+    defer projection.deinit(std.testing.allocator);
+    const observation = projection.catalog_observation.?;
+    try std.testing.expectEqual(@as(u64, 11), observation.metadata_group_id);
+    try std.testing.expectEqual(incarnation, observation.metadata_incarnation.?);
+    try std.testing.expectEqual(@as(u64, 42), observation.revision);
+    try std.testing.expectEqualStrings(tables[0].indexes_json, projection.indexes_json);
 }
 
 fn descriptorProjectionFromValues(
