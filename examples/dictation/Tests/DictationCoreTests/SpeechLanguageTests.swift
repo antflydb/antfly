@@ -108,3 +108,16 @@ import Testing
   #expect(config.preset(for: "test.editor").canUseCleanupPreparation(for: "generators/editor"))
   #expect(!specific.canUseCleanupPreparation(for: nil))
 }
+
+@Test func systemSpeechLanguageNeverSwitchesWritingSystems() throws {
+  #expect(
+    try SpeechLanguages.system(preferred: ["zh-Hant-TW"], supported: ["zh_CN", "zh_TW"]) == "zh-TW")
+  #expect(
+    try SpeechLanguages.system(preferred: ["zh-Hans-SG"], supported: ["zh_TW", "zh_CN"]) == "zh-CN")
+  #expect(
+    try SpeechLanguages.system(
+      preferred: ["sr-Latn-RS", "en-US"], supported: ["sr_Cyrl_RS", "en_US"]) == "en-US")
+  #expect(throws: (any Error).self) {
+    try SpeechLanguages.system(preferred: ["zh-Hant-TW"], supported: ["zh_CN"])
+  }
+}

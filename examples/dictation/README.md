@@ -307,10 +307,13 @@ and cleanup in Connection settings to run those requests concurrently.
 Whole utterance can recognize during recording but cleans once on release.
 Incremental explicitly requires stable sessions and disallows Rewrite. Automatic
 and Whole utterance can fall back to the recorded clip using the same provider if
-session recognition fails; the UI explains this. Explicit Incremental fails instead.
+session recognition fails, including finalization after release; the UI explains
+this. Cleanup failures and cancellation never re-run recognition. Explicit
+Incremental fails instead.
 
-Apple currently recognizes recorded files, so Automatic explains that transcription
-and cleanup run after release. Unknown capability metadata also uses recorded clips.
+External Apple transcribers without stable-segment metadata recognize recorded
+files after release. The bundled Apple engine uses native streaming on supported
+Macs. Unknown server capability metadata uses recorded clips.
 Legacy live preview on older Whisper servers remains provisional and requires the
 final full clip pass. Sessions are deleted on completion/failure/cancel; idle expiry
 bounds sessions whose creation response was interrupted. Session disposal runs separately
@@ -697,7 +700,9 @@ completion checks, and output limits are preserved. Cleanup never requests trans
 
 Raw text appears before cleanup finishes. **Use original now** cancels remaining
 processing and selects the raw transcript; automatic paste still targets only the
-original captured text field, without executing a spoken Enter command. Cleanup
+original captured text field, without executing a spoken Enter command.
+Copy-only retries remain copy-only when selecting the original; recovery uses
+the active submission’s settings and destination. Cleanup
 previews remain non-insertable until complete and protected formatting markers are
 never shown as draft prose.
 
@@ -726,3 +731,10 @@ change, opt-in because short local samples showed no consistent gain. Its bounde
 expiring, instruction-only session cache never reuses a session
 containing a previous dictation. The app continues to bundle the pinned released
 runtime; bridge improvements take effect after an Antfly release and pin update.
+
+Native Apple system-language selection uses Apple’s supported-locale equivalence.
+Other locale matching preserves writing systems (for example Traditional versus
+Simplified Chinese), then tries the next preferred language rather than silently
+switching scripts. Transcript assembly preserves explicit whitespace and uses
+boundary scripts rather than the preset language when inferring spaces, so Latin
+words stay separated in mixed-language dictation.

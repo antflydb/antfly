@@ -55,6 +55,7 @@ struct PreparedModelSetup: Sendable {
   @Published var discovery = ""
   @Published var models: [DiscoveredModel] = []
   @Published private(set) var nativeSpeechLanguages: [String]?
+  private var nativePreferredSpeechLanguages: [String]?
   @Published private(set) var discoveryState = ModelDiscoveryState.unchecked
   private struct SpeechSelection: Equatable {
     let server: String
@@ -225,6 +226,13 @@ struct PreparedModelSetup: Sendable {
   private var cadenceTask: Task<Void, Never>?
   private var timeoutTask: Task<Void, Never>?
   private(set) var generation = UUID()
+  struct SubmissionContext {
+    let preset: Preset
+    let configuration: Configuration
+    let destination: InsertionTarget?
+  }
+  private(set) var activeSubmission: SubmissionContext?
+
   private var cleanupWarmupTask: Task<Void, Never>?
   private var warmedCleanupModel: String?
   private var warmedCleanupAt: ContinuousClock.Instant?
@@ -996,28 +1004,38 @@ struct PreparedModelSetup: Sendable {
       if let retainedEncoding { archiveAudio(retainedEncoding, run: run) }
       runSubmission(preset: preset, snapshot: snapshot, destination: target, releasedAt: releasedAt)
       { [self] in
-        // Successful sessions need only the final PCM tail, never a full WAV copy.
-        var audio: Data?
         await pump?.value
         try Task.checkCancellation()
         guard generation == run else { throw CancellationError() }
-        if usesSession, let pipeline = live { return try await pipeline.finish(mic.buffer.drain()) }
+        let fallback: @MainActor @Sendable () async throws -> DictationResult = { [self] in
+          let audio: Data
+          if let retainedEncoding {
+            audio = try await retainedEncoding.value
+          } else {
+            audio = try await recording.encoded()
+          }
+          try Task.checkCancellation()
+          guard generation == run else { throw CancellationError() }
+          await cleanupPreparation(for: preset)?.value
+          try Task.checkCancellation()
+          return try await client(snapshot).dictate(
+            audio: audio, preset: preset, dictionary: snapshot.dictionary,
+            formatting: VoiceFormatting.Options(snapshot),
+            events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
+        }
+        if usesSession, let pipeline = live {
+          return try await pipeline.finishWithRecognitionFallback(
+            mic.buffer.drain(), allowFallback: preset.processingStrategy != .incremental
+          ) { @MainActor [self] in
+            processingWarning =
+              "Live recognition failed on release. Processing the recorded clip with the same speech engine."
+            return try await fallback()
+          }
+        }
         if usesSession && preset.processingStrategy == .incremental {
           throw DictationError.invalid(liveFailure ?? "Incremental processing failed.")
         }
-        if let retainedEncoding {
-          audio = try await retainedEncoding.value
-        } else {
-          audio = try await recording.encoded()
-        }
-        try Task.checkCancellation()
-        guard generation == run else { throw CancellationError() }
-        await cleanupPreparation(for: preset)?.value
-        try Task.checkCancellation()
-        return try await client(snapshot).dictate(
-          audio: audio!, preset: preset, dictionary: snapshot.dictionary,
-          formatting: VoiceFormatting.Options(snapshot),
-          events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
+        return try await fallback()
       }
     } catch {
       previewTask?.cancel()
@@ -1039,7 +1057,7 @@ struct PreparedModelSetup: Sendable {
         events: { [weak self] in await self?.receive($0, run: run) }, progress: { _ in })
     }
   }
-  private func runSubmission(
+  func runSubmission(
     preset: Preset, snapshot: Configuration, destination: InsertionTarget?,
     releasedAt: TimeInterval? = nil, verifiesRecognition: Bool = true,
     operation: @escaping @MainActor () async throws -> DictationResult
@@ -1049,6 +1067,8 @@ struct PreparedModelSetup: Sendable {
       phase = .failed
       return
     }
+    activeSubmission = SubmissionContext(
+      preset: preset, configuration: snapshot, destination: destination)
     state = .processing
     result = ""
     canRecoverRaw = false
@@ -1175,15 +1195,18 @@ struct PreparedModelSetup: Sendable {
     }
   }
   var canUseOriginalWhileCleaning: Bool {
-    state == .processing && phase == .cleaning
+    activeSubmission != nil && state == .processing && phase == .cleaning
       && !preview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
   func useOriginalWhileCleaning() {
     guard canUseOriginalWhileCleaning else { return }
     let original = preview
-    let snapshot = recordingConfig ?? config
-    let preset = selected ?? snapshot.preset(for: nil)
+    guard let submission = activeSubmission else { return }
+    let snapshot = submission.configuration
+    let preset = submission.preset
+    let destination = submission.destination
     cancel()
+    target = destination
     preview = original
     result = original
     canRecoverRaw = true
@@ -1191,10 +1214,10 @@ struct PreparedModelSetup: Sendable {
       scheduleHistory(
         HistoryEntry(
           preset: preset.name, model: preset.model,
-          application: target?.bundleID ?? "", raw: original, text: original,
+          application: destination?.bundleID ?? "", raw: original, text: original,
           status: "original_selected"), snapshot: snapshot)
     }
-    if snapshot.autoPaste, target != nil {
+    if snapshot.autoPaste, destination != nil {
       insertOriginal()
     } else {
       canRecoverRaw = false
@@ -1346,6 +1369,7 @@ struct PreparedModelSetup: Sendable {
         }
         if snapshot.usesManagedRuntime, canUseManagedAppleSpeech, #available(macOS 26, *) {
           nativeSpeechLanguages = await NativeAppleSpeech.supportedLanguages()
+          nativePreferredSpeechLanguages = await NativeAppleSpeech.preferredLanguages()
         }
         let data = try await client(snapshot, token: token).models()
         try Task.checkCancellation()
@@ -1532,6 +1556,8 @@ struct PreparedModelSetup: Sendable {
     let model = ModelCatalog(data: models).transcriber(preset.model)
     let apple = model?.isAppleSpeech == true || preset.model == "transcribers/apple-speech"
     return try preset.resolvingLanguage(
+      preferred: config.usesManagedRuntime && apple
+        ? nativePreferredSpeechLanguages ?? Locale.preferredLanguages : Locale.preferredLanguages,
       supported: config.usesManagedRuntime && apple ? nativeSpeechLanguages : nil,
       detectsLanguage: supportsLanguageDetection(preset),
       whisper: preset.model == "transcribers/whisper" || preset.model.hasPrefix("openai/whisper-"))
@@ -1664,6 +1690,7 @@ struct PreparedModelSetup: Sendable {
       }
     }
     generation = UUID()
+    activeSubmission = nil
     requestTask?.cancel()
     previewTask?.cancel()
     cadenceTask?.cancel()

@@ -166,15 +166,57 @@ private final class PreferenceWriteCount: @unchecked Sendable {
     let root = try directory()
     defer { try? FileManager.default.removeItem(at: root) }
     let store = Store(directory: root, registerHotkey: false)
-    store.config.autoPaste = false
+    store.config.autoPaste = true
+    var snapshot = store.config
+    snapshot.autoPaste = false
+    snapshot.presets[0].outputMode = .verbatim
+    store.runSubmission(preset: snapshot.preset(for: nil), snapshot: snapshot, destination: nil) {
+      try await Task.sleep(for: .seconds(60))
+      throw CancellationError()
+    }
     store.preview = "What about Antfly now?"
     store.phase = .cleaning
-    store.state = .processing
     #expect(store.canUseOriginalWhileCleaning)
     store.useOriginalWhileCleaning()
     #expect(store.result == "What about Antfly now?")
     #expect(store.state == .idle && store.phase == .ready)
     #expect(!store.canUseOriginalWhileCleaning)
+    #expect(store.activeSubmission == nil)
+    await store.prepareToQuit()
+  }
+
+  @Test @MainActor func copyOnlySubmissionReplacesEarlierRecoveryDestination() async throws {
+    let root = try directory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = Store(
+      directory: root, registerHotkey: false,
+      originalPaster: { _, _ in
+        Issue.record("A copy-only retry must never paste the original")
+      })
+    var snapshot = store.config
+    snapshot.autoPaste = true
+    let preset = snapshot.preset(for: nil)
+    store.runSubmission(
+      preset: preset, snapshot: snapshot,
+      destination: InsertionTarget(pid: 0, bundleID: "previous.editor", element: nil)
+    ) {
+      try await Task.sleep(for: .seconds(60))
+      throw CancellationError()
+    }
+    #expect(store.activeSubmission?.destination?.bundleID == "previous.editor")
+    store.cancel()
+    snapshot.autoPaste = false
+    store.runSubmission(preset: preset, snapshot: snapshot, destination: nil) {
+      try await Task.sleep(for: .seconds(60))
+      throw CancellationError()
+    }
+    #expect(store.activeSubmission?.destination == nil)
+    store.preview = "Original from retry"
+    store.phase = .cleaning
+    store.useOriginalWhileCleaning()
+    #expect(store.result == "Original from retry")
+    #expect(store.state == .idle && store.phase == .ready)
+    #expect(store.message == "Original transcript ready to copy. Cleanup canceled.")
     await store.prepareToQuit()
   }
 

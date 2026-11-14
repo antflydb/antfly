@@ -203,9 +203,35 @@ public actor LiveDictation {
       }
     }
   }
+  public struct RecognitionFailure: Error, LocalizedError, Sendable {
+    public let detail: String
+    public var errorDescription: String? { detail }
+  }
+  public func finishWithRecognitionFallback(
+    _ tail: Data, allowFallback: Bool,
+    fallback: @Sendable () async throws -> DictationResult
+  ) async throws -> DictationResult {
+    do { return try await finish(tail) } catch let failure as RecognitionFailure {
+      try Task.checkCancellation()
+      guard allowFallback else { throw failure }
+      await cancel()
+      try Task.checkCancellation()
+      return try await fallback()
+    }
+  }
   public func finish(_ tail: Data) async throws -> DictationResult {
+    try Task.checkCancellation()
+    guard !stopped else { throw CancellationError() }
     do {
-      try await append(tail, commit: true)
+      do { try await append(tail, commit: true) } catch is CancellationError {
+        throw CancellationError()
+      } catch {
+        try Task.checkCancellation()
+        throw RecognitionFailure(detail: error.localizedDescription)
+      }
+      if needsCleanup && !raw.isEmpty {
+        await observe(DictationProgress(phase: .cleaning, raw: raw, draft: draft))
+      }
       if let worker { await worker.value }
       try Task.checkCancellation()
       guard !stopped else { throw CancellationError() }

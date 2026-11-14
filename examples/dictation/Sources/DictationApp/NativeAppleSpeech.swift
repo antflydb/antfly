@@ -14,6 +14,17 @@ actor NativeAppleSpeech {
   static func supportedLanguages() async -> [String] {
     await SpeechTranscriber.supportedLocales.map(\.identifier).sorted()
   }
+  static func preferredLanguages() async -> [String] {
+    var resolved: [String] = []
+    for language in Locale.preferredLanguages {
+      if let locale = await SpeechTranscriber.supportedLocale(
+        equivalentTo: Locale(identifier: language))
+      {
+        resolved.append(locale.identifier)
+      }
+    }
+    return resolved
+  }
   private let analyzer: SpeechAnalyzer
   private let transcriber: SpeechTranscriber
   private let format: AVAudioFormat

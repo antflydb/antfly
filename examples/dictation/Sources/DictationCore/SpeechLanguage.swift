@@ -41,7 +41,13 @@ public enum SpeechLanguages {
       }) {
         return normalized(exact)
       }
-      if let equivalent = supported.first(where: { primary($0) == primary(candidate) }) {
+      let script = Locale.Language(identifier: normalized(candidate)).maximalIdentifier
+      let candidateScript = Locale.Language(identifier: script).script?.identifier
+      if let equivalent = supported.first(where: {
+        guard primary($0) == primary(candidate) else { return false }
+        let maximal = Locale.Language(identifier: normalized($0)).maximalIdentifier
+        return Locale.Language(identifier: maximal).script?.identifier == candidateScript
+      }) {
         return normalized(equivalent)
       }
     }
