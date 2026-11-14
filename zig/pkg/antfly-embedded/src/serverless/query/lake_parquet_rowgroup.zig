@@ -755,7 +755,7 @@ const PersistentObjectRangeCacheState = struct {
         protected: bool,
     };
     const inventory_checkpoint_name = "INVENTORY.clean";
-    const inventory_checkpoint_magic = "AFIC1";
+    const inventory_checkpoint_magic = "AFIC2";
     const inventory_checkpoint_header = 5 + 8 + 16 + 16 + 32;
     const inventory_checkpoint_limit = 8 * 1024 * 1024;
 
@@ -841,6 +841,11 @@ const PersistentObjectRangeCacheState = struct {
         const file = try dir.createFile(io, inventory_checkpoint_name, .{ .truncate = true, .permissions = @fromBackingInt(@intCast(0o600)) });
         defer file.close(io);
         errdefer dir.deleteFile(io, inventory_checkpoint_name) catch {};
+        // Directory timestamps can have a coarse clock resolution. Give the
+        // sealed directory a deliberately historical mtime so a subsequent
+        // entry mutation cannot share this clock tick and validate a stale
+        // inventory. Unsupported metadata updates disable only this shortcut.
+        try dir.setTimestamps(io, ".", .{ .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(1) } });
         const stamp = try dir.statFile(io, ".", .{});
         var header: [inventory_checkpoint_header]u8 = undefined;
         header[0..5].* = inventory_checkpoint_magic.*;
@@ -11520,6 +11525,22 @@ test "external lake opening disk inventory checkpoints accelerate clean restart 
     }
     // New directory entries invalidate the clean image (including interrupted
     // writes); a corrupt or absent checkpoint never disables demand recovery.
+    {
+        // Older timestamp-only witnesses are not sufficient even when their
+        // payload and directory stamp are otherwise valid.
+        var dir = try std.Io.Dir.cwd().openDir(io, root, .{});
+        defer dir.close(io);
+        const previous = try dir.readFileAlloc(io, "INVENTORY.clean", a, .limited(8192));
+        defer a.free(previous);
+        previous[0..5].* = "AFIC1".*;
+        try dir.writeFile(io, .{ .sub_path = "INVENTORY.clean", .data = previous });
+    }
+    {
+        var cache = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+        defer cache.deinit();
+        try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().inventory_checkpoint_hits);
+        try std.testing.expectEqual(@as(usize, 1), cache.statsSnapshot().inventory_scan_entries);
+    }
     {
         var dir = try std.Io.Dir.cwd().openDir(io, root, .{});
         defer dir.close(io);

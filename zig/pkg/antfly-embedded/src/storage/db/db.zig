@@ -38558,14 +38558,17 @@ pub const DB = struct {
         if (!installed or admission != .admitted) return false;
         if (item.kind == .dense_vector) {
             const entry = self.core.denseIndex(item.name) orelse return false;
-            if (entry.index.leann) |store| {
+            if (entry.index.leann != null) {
                 // LEANN has no HBC posting/capture certificate. Its own
                 // committed graph (plus exact pending buffer) is the serving
                 // authority, including for replicated graph publication.
                 if (item.projection_checkpoint_published_count) |certified| {
                     if (certified != item.doc_count) return false;
                 }
-                return if (store.coverageTarget()) |target| store.graphCovers(target) else true;
+                // Source replay can queue newer replicated records while the
+                // committed generation remains admitted and searchable. That
+                // debt gates completion/full_index, not serving admission.
+                return true;
             }
             if (item.projection_checkpoint_published_count) |certified| {
                 const checkpoint: apply_state.ProjectionCheckpoint = .{
@@ -150420,6 +150423,21 @@ test "db applies leader-planned leann records through ordered apply" {
     var results = try entry.index.searchWithRequest(.{ .query = &[_]f32{ 2, 2.5, 1, 6 }, .k = 1 });
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 1), results.items.items.len);
+
+    // Pause the planner and enqueue another source image. The old committed
+    // graph remains searchable even while full_index coverage is outstanding.
+    const Pending = struct { vector_id: u64, vector: []const f32, metadata: []const u8 };
+    try leann_store.apply(&[_]Pending{.{ .vector_id = n + 1, .vector = &.{ 0, 0, 0, 1 }, .metadata = "doc:pending" }}, &.{});
+    try std.testing.expect(!leann_store.graphCovers(leann_store.coverageTarget().?));
+    const pending_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, pending_stats);
+    for (pending_stats.indexes) |item| if (std.mem.eql(u8, item.name, "leann_idx")) {
+        try std.testing.expectEqual(@as(u64, n), item.doc_count);
+        try std.testing.expect(item.serving_snapshot_ready);
+    };
+    var still_searchable = try entry.index.searchWithRequest(.{ .query = &[_]f32{ 2, 2.5, 1, 6 }, .k = 1 });
+    defer still_searchable.deinit();
+    try std.testing.expectEqual(@as(usize, 1), still_searchable.items.items.len);
 }
 
 test "db rejects leann records when leann replication is off" {

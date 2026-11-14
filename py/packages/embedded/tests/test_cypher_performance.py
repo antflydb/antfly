@@ -108,12 +108,13 @@ def _ranked_graph_fixture(tmp_path_factory, storage, *, index_id=False):
         # Keep the population above the unordered-source limit, including
         # native paging and large-offset coverage. Mutation cases build their
         # own writable databases; query limits and state remain per request.
-        populate(db, 13000)
+        # Admit empty indexes before the single corpus load. These tests
+        # qualify query plans; rebuilding historical source windows is covered
+        # by the private mutation/rebuild fixtures below.
         db.sql("CREATE INDEX ranked ON docs(score DESC)")
-        db.run_until_idle()
         if index_id:
             db.sql("CREATE INDEX by_id ON docs(id)")
-            db.run_until_idle()
+        populate(db, 13000)
         # Retain the owner: indexed Lite reads currently need the serving
         # owner's statement leases. These consumers issue queries only; every
         # mutation/rebuild regression continues using the private graph_db.
@@ -8582,9 +8583,8 @@ def test_unbounded_key_domains_and_cardinality_skip_duplicate_runs(graph_db):
 
 @pytest.mark.parametrize("count", [8000, 50000])
 def test_ordered_group_offset_does_not_retain_discarded_output(graph_db, count):
-    populate(graph_db, count)
     graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
-    graph_db.run_until_idle()
+    populate(graph_db, count)
     ordered = sorted((f"n{i}", str(i)) for i in range(count))
     observers = "count(*),min(n.score),max(n.score)" if count == 8000 else "count(*)"
     for skip, limit in ((count - 100, 5), (count - 1, None), (count + 1000, 5)):
@@ -8746,6 +8746,10 @@ OBSERVER_DOMAIN_ROWS = 16384
 
 
 def scope_domains(db, count):
+    # Build the same complete indexed corpus through one batch, avoiding two
+    # historical backfills in fixtures whose assertions concern query work.
+    db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    db.sql("CREATE INDEX ranked ON docs(score DESC)")
     with db.open_table("docs") as table:
         table.batch(
             [
@@ -8754,8 +8758,6 @@ def scope_domains(db, count):
             ],
             timestamp=1,
         )
-    db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
-    db.sql("CREATE INDEX ranked ON docs(score DESC)")
     db.run_until_idle()
 
 
@@ -9031,12 +9033,12 @@ def test_sql_filtered_observers_and_constant_admission_have_bounded_work(observe
 
 def test_sql_observer_windows_bound_high_cardinality_groups(graph_db):
     count = 64000
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
     with graph_db.open_table("docs") as table:
         table.batch(
             [af.WriteIntent(key=f"k{i:06}", value={"id": f"k{i:06}", "score": i % 3}) for i in range(count)],
             timestamp=1,
         )
-    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
     graph_db.run_until_idle()
     empty_null_partition = graph_db.cypher_json(
         "g",
