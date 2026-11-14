@@ -296,9 +296,23 @@ test "lite secrets admission failure rolls back without fencing readers" {
     defer tmp.cleanup();
     const path = try testPath(a, tmp);
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = native.NativeFile.minimumOwnerStorageBytes(true) } });
+    // §9.7a: redo-log is on by default now, and `createWithOptions`
+    // reserves its log capacity (floored at 64 KiB for a budget this
+    // tight) out of the same `max_storage_bytes` admission check that
+    // guards store creation itself -- the bare `minimumOwnerStorageBytes`
+    // this test wants for its *write* budget leaves no room for that
+    // reservation and makes creation itself fail with
+    // `LiteStorageBudgetExceeded`, before ever reaching the admission
+    // failure this test exists to exercise. Create unbounded (so the
+    // default-sized log reserves freely) and apply the tight budget
+    // afterward, exactly like this test already does at the end to lift
+    // it again -- `refreshAdmissionAssumeLocked` reads
+    // `maintenance_policy.options.max_storage_bytes` on every commit, not
+    // just at creation.
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .reclamation = .{ .enabled = false } });
     defer docs.close();
     docs.maintenance_start_suppressed = true;
+    docs.maintenance_policy.options.max_storage_bytes = native.NativeFile.minimumOwnerStorageBytes(true);
     var provider = TestProvider{};
     var secrets = try Store.init(a, &docs, "scope", provider.provider());
     defer secrets.deinit();
@@ -563,6 +577,19 @@ test "lite secrets reject tampering mismatched indexes and revision exhaustion" 
     var store = try Store.init(alloc, &docs, "scope", provider.provider());
     defer store.deinit();
     _ = try store.nativeStore().?.writer.put("scope", "key", "value", .absent);
+    // §9.3a: the put above lands only in the redo-log overlay (committed,
+    // not yet checkpointed); every read already prefers the overlay over
+    // the physical tree. The tampering below goes in through
+    // `putCatalogRecord`'s bare-commit path, which writes the real tree
+    // directly and never diverts (`publishBareCommit`'s own doc comment:
+    // "a bare commit never diverts... so it always logs its own
+    // ride-along record... regardless"), so without folding first the
+    // tamper lands somewhere no read path this test exercises would ever
+    // see -- the clean overlay entry keeps winning and the corruption is
+    // silently invisible. Fold once so the key's only copy is the
+    // physical tree record the bare-commit tampering below actually
+    // reaches, matching what on-disk tampering means for a real file.
+    try docs.file.checkpointRedoLog();
     const key = store.entryKey("key");
     const bytes = (try docs.file.getCatalogRecordAlloc(alloc, &key)).?;
     defer alloc.free(bytes);
