@@ -15,11 +15,11 @@ The shared direction is:
 - serverless enrichment is asynchronous publication work, not a query-time
   dependency
 
-## Commit Requirements And Visibility Waits (proposed)
+## Commit Requirements And Visibility Waits
 
 Tracking: [#1681](https://github.com/antflydb/antfly/issues/1681).
-This section specifies the target contract; it does not claim that every engine
-already implements precommit enrichment admission.
+This section specifies the admission contract. The engine protocols below record
+how each adapter enforces it and which backend capabilities are required.
 
 Write admission and visibility are independent axes:
 
