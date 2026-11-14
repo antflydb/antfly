@@ -15251,9 +15251,23 @@ pub const IndexManager = struct {
                 // the two can never leave the catalog saying "img" is gone
                 // while its stale dims survive underneath a later
                 // re-admission -- see `HBCIndex.deleteNativeCatalogScopeForRemoval`.
+                // perf/lwa-maint-serialize: these two commits must never let
+                // background maintenance reclaim against the first one's
+                // own retirement debt before the second lands -- see
+                // `HBCIndex.pauseMaintenanceAcrossRemoval`'s own doc
+                // comment (#1216's own two-commit race).
+                entry.index.pauseMaintenanceAcrossRemoval();
+                // Only valid while `entry.index` itself still is --
+                // `retireDenseIndexEntry` below destroys it, so the
+                // success path below resumes explicitly, *before* that
+                // call, instead of via `defer`; this `errdefer` covers
+                // every early-return failure path above that point, where
+                // `entry.index` is still live.
+                errdefer entry.index.resumeMaintenanceAcrossRemoval();
                 try entry.index.deleteNativeCatalogScopeForRemoval();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
                 try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
+                entry.index.resumeMaintenanceAcrossRemoval();
                 const replicated_leann = if (entry.index.leann) |leann_store| leann_store.isReplicated() else false;
                 self.retireDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);

@@ -200,7 +200,26 @@ pub const Sink = struct {
     allocator: Allocator,
 
     pub fn sink(self: *Sink) native_catalog_backend.Sink {
-        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc, .submitDeferred = submitDeferred };
+        return .{
+            .ptr = self,
+            .submit = submit,
+            .loadAllAlloc = loadAllAlloc,
+            .submitDeferred = submitDeferred,
+            .pauseMaintenance = pauseMaintenance,
+            .resumeMaintenance = resumeMaintenance,
+        };
+    }
+
+    /// perf/lwa-maint-serialize: see `native_catalog_backend.Sink
+    /// .pauseMaintenance`'s own doc comment.
+    fn pauseMaintenance(ptr: *anyopaque) void {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        self.store.beginMultiCommitSequence();
+    }
+
+    fn resumeMaintenance(ptr: *anyopaque) void {
+        const self: *Sink = @ptrCast(@alignCast(ptr));
+        self.store.endMultiCommitSequence();
     }
 
     fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {

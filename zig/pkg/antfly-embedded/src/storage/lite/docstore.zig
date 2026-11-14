@@ -2678,6 +2678,17 @@ pub const Store = struct {
     maintenance_cancel: maintenance.CancelToken = .{},
     maintenance_running: bool = false,
     generation_workspace_active: bool = false,
+    /// perf/lwa-maint-serialize: set for the span of a caller-driven,
+    /// multi-step logical operation that commits more than once on
+    /// `self.file` and depends on nothing else mutating/reclaiming pages
+    /// in between -- today, the native-catalog HBC index delete sequence
+    /// (`HBCIndex.deleteNativeCatalogScopeForRemoval`'s own durable
+    /// scope-clear commit, then the separate catalog-removal commit;
+    /// see `beginMultiCommitSequence`'s own doc comment). Checked
+    /// alongside `generation_workspace_active` by every maintenance gate
+    /// below: unlike that flag, this one carries no vacuum-workspace
+    /// budget semantics, it is purely an exclusion.
+    multi_commit_sequence_active: bool = false,
     maintenance_start_suppressed: bool = false,
     test_maintenance_hook: if (@import("builtin").is_test) ?MaintenanceTestHook else void = if (@import("builtin").is_test) null else {},
     test_maintenance_cycles: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
@@ -3573,7 +3584,7 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         try self.maintenance_cancel.check();
-        if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return false;
+        if (self.maintenance_running or self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null) return false;
         return self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel);
     }
 
@@ -3640,7 +3651,7 @@ pub const Store = struct {
             // window -- see `lockStoreExclusive`.
             lockStoreExclusive(self);
             defer self.mutex.unlock();
-            if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
+            if (self.maintenance_running or self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null) return;
             if (cancel) |token| try token.check();
             const previous_cancel = self.file.allocator_cancel_token;
             self.file.allocator_cancel_token = cancel;
@@ -3677,7 +3688,7 @@ pub const Store = struct {
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
             lockStore(self);
             defer self.mutex.unlock();
-            if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
+            if (self.maintenance_running or self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null) return;
             if (cancel) |token| try token.check();
             if (self.shrink_waiting_for_writer) {
                 if (!self.writerSlotAvailable()) {
@@ -4112,7 +4123,7 @@ pub const Store = struct {
             lockStoreExclusive(self);
             defer self.mutex.unlock();
             if (cancel) |token| try token.check();
-            if (self.generation_workspace_active or self.file.change_capture != null or (self.maintenance_running and !automatic)) {
+            if (self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null or (self.maintenance_running and !automatic)) {
                 std.log.warn("lite vacuum refused: another maintenance cycle owns the workspace", .{});
                 return error.FileBusy;
             }
@@ -4392,7 +4403,7 @@ pub const Store = struct {
         if (self.read_only) return error.ReadOnly;
         lockStore(self);
         defer self.mutex.unlock();
-        if (self.generation_workspace_active or self.maintenance_running or self.file.change_capture != null) return error.FileBusy;
+        if (self.generation_workspace_active or self.multi_commit_sequence_active or self.maintenance_running or self.file.change_capture != null) return error.FileBusy;
         if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
         if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
         const status = try self.reclamationStatusAssumeLocked();
@@ -4414,6 +4425,52 @@ pub const Store = struct {
         self.maintenance_policy.status.temporary_bytes = limit orelse 0;
         self.admission_refresh_size = 0;
         return .{ .owner = self, .options = options };
+    }
+
+    /// perf/lwa-maint-serialize: marks the start of a caller-driven,
+    /// multi-step logical operation that commits more than once on
+    /// `self.file` and must never let background maintenance (or any
+    /// other reclaim/checkpoint pass gated the same way) run between
+    /// those commits. `self.multi_commit_sequence_active` is checked by
+    /// every maintenance gate `generation_workspace_active` already is
+    /// (`maintenanceNeedsService`, `maintainOnceWithCancel`,
+    /// `performVacuum`, `reserveGenerationWorkspace`, `checkpointRedoLog`,
+    /// `maybeCheckpointRedoLogOnIdleTurn`) -- a maintenance pass that is
+    /// already mid-cycle when this is called finishes that cycle (it does
+    /// not get interrupted), but every gate it re-checks on its next
+    /// iteration sees the flag and backs off until `endMultiCommitSequence`
+    /// clears it.
+    ///
+    /// Concretely: `IndexManager.removeWithAtomicMutation`'s dense/HBC
+    /// branch (#1216) calls this before `HBCIndex
+    /// .deleteNativeCatalogScopeForRemoval`'s own durable scope-clear
+    /// commit and only calls `endMultiCommitSequence` after the separate
+    /// catalog-removal commit that makes the delete visible -- see
+    /// `HBCIndex.pauseMaintenanceAcrossRemoval`'s own doc comment for why
+    /// those two commits, and nothing else, need this. A crash between
+    /// the two is unaffected (this is in-memory, per-handle state, not
+    /// itself a durability concern); what this closes is a live handle's
+    /// own background maintenance observing and acting on the first
+    /// commit's retirement debt before the second one lands.
+    pub fn beginMultiCommitSequence(self: *Store) void {
+        lockStore(self);
+        self.multi_commit_sequence_active = true;
+        self.mutex.unlock();
+    }
+
+    /// Ends the span `beginMultiCommitSequence` opened. Idempotent-safe to
+    /// call even if maintenance never actually had anything to do in the
+    /// meantime; always wakes and re-evaluates the maintenance loop
+    /// afterward, same as `GenerationWorkspace.deinit`, so debt that
+    /// accrued during the sequence (the scope-clear commit's own
+    /// retirement debt, in particular) is serviced promptly rather than
+    /// waiting for the next unrelated wake.
+    pub fn endMultiCommitSequence(self: *Store) void {
+        lockStore(self);
+        self.multi_commit_sequence_active = false;
+        self.maintenance_wake.set(self.file.runtime());
+        self.mutex.unlock();
+        self.startMaintenance();
     }
 
     /// Publishes an offline, fully finalized store generation while fencing
@@ -4927,7 +4984,7 @@ pub const Store = struct {
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStoreExclusive(self);
         defer self.mutex.unlock();
-        if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return error.FileBusy;
+        if (self.maintenance_running or self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null) return error.FileBusy;
         try self.file.checkpointRedoLog();
     }
 
@@ -4944,7 +5001,7 @@ pub const Store = struct {
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStoreExclusive(self);
         defer self.mutex.unlock();
-        if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
+        if (self.maintenance_running or self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null) return;
         const redo = self.file.redo orelse return;
         if (redo.checkpointing) return;
         const io = self.file.runtime();
