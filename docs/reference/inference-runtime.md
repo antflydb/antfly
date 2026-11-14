@@ -340,3 +340,38 @@ Relation models may advertise `untyped_entities` in their model capabilities.
 These models emit generic `ENTITY` nodes and accept relation names without typed
 endpoints. Antfarm uses this capability for REBEL artifacts, including renamed
 installations, while preserving typed schemas for other relation models.
+
+The CUDA BF16 source-audio route uses NVIDIA cuDNN 9 alongside cuBLAS and
+cuBLASLt. Automatic library selection keeps the owned full-F32 audio route when
+this vendor stack is unavailable; required-library mode reports the missing
+dependency during preparation. The choice is recorded before source cache keys,
+rounding or numerical work. Convolution and attention use the normal system loader lookup
+for `libcudnn.so.9`. `ANTFLY_INFERENCE_CUDA_CUDNN_LIBRARY` selects an explicit
+cuDNN library path; its dependencies must also be resolvable by the process
+loader. An explicit path is authoritative and failure does not fall back to a
+different installation. Antfly does not search another model runtime's Python
+packages. An active source-precision operation does not initialize an SDK or
+replay different arithmetic after work has started.
+
+Making cuDNN available can also enable an existing optional attention route.
+When validating convolution alone against a previously unavailable cuDNN
+attention runtime, pin the existing
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_CUDNN=0` attention policy explicitly and
+record the actual dispatch witnesses. SDK availability alone does not establish
+attention numerical equivalence.
+
+`ANTFLY_INFERENCE_CUDA_BF16_PREFIX_ATTENTION=1` is an experimental opt-in for
+source vision's generic BF16 BSHD prefix-key attention program (HD64,
+16-query/128-key tiles, K8 accumulation). It retains all physical query rows,
+uses an explicit post-dot F32 scale, and keeps unnormalized BF16 probabilities
+with an F32 denominator. The default attention schedule is unchanged. This
+candidate needs the regenerated CUDA bundle and independent full-model quality
+and hardware performance qualification before deployment; selecting it with a
+missing kernel or unsupported device fails instead of changing schedules.
+
+`ANTFLY_INFERENCE_CUDA_SOURCE_BIAS_WORKSPACE_1MIB=1` is an experimental
+source BF16 biased-projection policy. It limits the cuBLASLt preference to at
+most 1 MiB of the existing funded workspace, preserving its allocation and
+lifetime. Vendor plans and audio capture identities distinguish this policy
+from the default full funded capacity. Numerical and performance qualification
+is required before deployment; no particular vendor algorithm is forced.

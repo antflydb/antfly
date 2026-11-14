@@ -179,6 +179,39 @@ fn expectJsonApprox(expected: std.json.Value, actual: std.json.Value, tolerance:
     }
 }
 
+/// The immutable capture predates the public presenter's confidence fields.
+/// Keep every original field and derive only the two current API fields from
+/// frozen probabilities, using an independent base-2 entropy reference.
+fn expectedCurrentDecideAnswers(a: std.mem.Allocator, frozen_answers: std.json.Value, frozen_probabilities: std.json.Value) !std.json.Value {
+    if (frozen_answers != .object or frozen_probabilities != .object or frozen_answers.object.count() != frozen_probabilities.object.count()) return error.InvalidFamilyReference;
+    var answers: std.json.ObjectMap = .empty;
+    var tasks = frozen_answers.object.iterator();
+    while (tasks.next()) |task| {
+        const frozen = task.value_ptr.*;
+        if (frozen != .object or frozen.object.contains("confidence") or frozen.object.contains("confidence_method")) return error.InvalidFamilyReference;
+        const distribution = frozen_probabilities.object.get(task.key_ptr.*) orelse return error.InvalidFamilyReference;
+        if (distribution != .object or distribution.object.count() < 2) return error.InvalidFamilyReference;
+        var information: f64 = 0;
+        var total: f64 = 0;
+        for (distribution.object.values()) |value| {
+            if (value != .float or !std.math.isFinite(value.float) or value.float < 0 or value.float > 1) return error.InvalidFamilyReference;
+            const probability = value.float;
+            total += probability;
+            if (probability > 0) information += probability * std.math.log2(probability);
+        }
+        if (@abs(total - 1) > 1e-12) return error.InvalidFamilyReference;
+        const confidence = std.math.clamp(1 + information / std.math.log2(@as(f64, @floatFromInt(distribution.object.count()))), 0, 1);
+        // Copy the object map so no parsed oracle field is mutated.
+        var answer: std.json.ObjectMap = .empty;
+        var fields = frozen.object.iterator();
+        while (fields.next()) |field| try answer.put(a, field.key_ptr.*, field.value_ptr.*);
+        try answer.put(a, "confidence", .{ .float = confidence });
+        try answer.put(a, "confidence_method", .{ .string = "normalized_inverse_entropy" });
+        try answers.put(a, task.key_ptr.*, .{ .object = answer });
+    }
+    return .{ .object = answers };
+}
+
 fn extractionResponseJson(a: std.mem.Allocator, classifications: []const pipeline.Classification, prompt_tokens: usize) ![]u8 {
     var rows = std.array_list.Managed(std.json.Value).init(a);
     for (classifications) |classification| for (classification.labels) |label| {
@@ -201,8 +234,67 @@ fn extractionResponseJson(a: std.mem.Allocator, classifications: []const pipelin
     return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = root }, .{});
 }
 
-fn parity(metal: bool) !void {
-    const directory = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse return error.SkipZigTest;
+test "Decide frozen public probabilities require the complete current presenter contract" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try referenceBytes(a);
+    const capture = try std.json.parseFromSlice(Reference, a, bytes, .{ .ignore_unknown_fields = true });
+    for (capture.value.public_decide_requests) |reference| {
+        const request = try decide.parse(a, reference.decide_request_json);
+        var rows = std.array_list.Managed(std.json.Value).init(a);
+        var tasks = reference.probabilities.object.iterator();
+        while (tasks.next()) |task| {
+            var probabilities = task.value_ptr.object.iterator();
+            while (probabilities.next()) |probability| {
+                var row: std.json.ObjectMap = .empty;
+                try row.put(a, "name", .{ .string = task.key_ptr.* });
+                try row.put(a, "label", .{ .string = probability.key_ptr.* });
+                try row.put(a, "score", probability.value_ptr.*);
+                try rows.append(.{ .object = row });
+            }
+        }
+        var item: std.json.ObjectMap = .empty;
+        try item.put(a, "classifications", .{ .array = rows });
+        var data = std.array_list.Managed(std.json.Value).init(a);
+        try data.append(.{ .object = item });
+        var usage: std.json.ObjectMap = .empty;
+        try usage.put(a, "prompt_tokens", .{ .integer = @intCast(reference.encoded.input_ids.len) });
+        try usage.put(a, "completion_tokens", .{ .integer = 0 });
+        var extraction: std.json.ObjectMap = .empty;
+        try extraction.put(a, "data", .{ .array = data });
+        try extraction.put(a, "usage", .{ .object = usage });
+        const extraction_json = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = extraction }, .{});
+        const response_json = try decide.responseJson(a, request, extraction_json, .span_marker);
+        const response = try std.json.parseFromSlice(std.json.Value, a, response_json, .{});
+        const expected = try expectedCurrentDecideAnswers(a, reference.decide_expected.object.get("answers").?, reference.probabilities);
+        const actual = response.value.object.get("answers").?;
+        try expectJsonApprox(reference.decide_expected.object.get("model").?, response.value.object.get("model").?, 5e-4);
+        try expectJsonApprox(expected, actual, 5e-4);
+        var answers = actual.object.iterator();
+        while (answers.next()) |answer| {
+            const fields = &answer.value_ptr.object;
+            const confidence = fields.get("confidence").?;
+            try fields.put(a, "unexpected", .null);
+            try std.testing.expectError(error.TestExpectedEqual, expectJsonApprox(expected, actual, 5e-4));
+            _ = fields.swapRemove("unexpected");
+            try fields.put(a, "confidence_method", .{ .string = "max_probability" });
+            try std.testing.expectError(error.TestExpectedEqual, expectJsonApprox(expected, actual, 5e-4));
+            try fields.put(a, "confidence_method", .{ .string = "normalized_inverse_entropy" });
+            try fields.put(a, "confidence", .{ .float = -1 });
+            try std.testing.expectError(error.TestExpectedApproxEqAbs, expectJsonApprox(expected, actual, 5e-4));
+            try fields.put(a, "confidence", confidence);
+        }
+        try expectJsonApprox(expected, actual, 5e-4);
+    }
+    try verifyCaptureBytes(bytes);
+}
+
+const ParityBackend = enum { native, metal, cuda };
+
+fn parity(comptime backend: ParityBackend) !void {
+    const metal = backend == .metal;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse return if (backend == .cuda) error.MissingRequiredGlinerArtifact else error.SkipZigTest;
     if (metal and !@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const capture_bytes = try referenceBytes(a);
@@ -273,8 +365,20 @@ fn parity(metal: bool) !void {
     try std.testing.expect(crossed_local_window);
     try service.verifyFiles(a, directory, files);
 
-    const session = if (metal) try factory.createMetalSession(a, directory) else try factory.createNativeSession(a, directory);
+    const session = switch (backend) {
+        .native => try factory.createNativeSession(a, directory),
+        .metal => try factory.createMetalSession(a, directory),
+        // This diagnostic owner executes the real managed encoder/head without
+        // authorizing registry publication or the CUDA HTTP request gate.
+        .cuda => try factory.createGlinerCudaSessionWithPrecision(a, directory, .fp32),
+    };
     defer session.close();
+    const expected_backend: @TypeOf(session.backend()) = switch (backend) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+    };
+    try std.testing.expectEqual(expected_backend, session.backend());
     const config = try factory.getGlinerSpanConfig(session);
     try std.testing.expect(config == .modern_bert);
     try std.testing.expectEqual(@as(u32, 1792), config.modern_bert.hidden_size);
@@ -291,13 +395,17 @@ fn parity(metal: bool) !void {
     const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     defer tok.tokenizer().deinitTokenizer();
 
-    const watchdog = if (metal) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
+    const watchdog: ?*@import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog = if (backend != .native) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(std.testing.io);
     const tolerance: f64 = if (metal) 5e-3 else 2e-3;
     var max_error: f64 = 0;
     for (ref.requests, 0..) |request, request_index| {
-        errdefer std.debug.print("Decide-1B {s}/{s}\n", .{ if (metal) "metal" else "native", request.id });
+        const cuda_launches_before = if (comptime backend == .cuda and @import("build_options").enable_cuda)
+            (factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats).kernel_launches
+        else
+            0;
+        errdefer std.debug.print("Decide-1B {s}/{s}\n", .{ @tagName(backend), request.id });
         const control = @import("../execution_control.zig").InferenceExecutionControl{
             .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,
             .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s,
@@ -364,10 +472,16 @@ fn parity(metal: bool) !void {
             };
             try std.testing.expectEqual(offset, outputs[0].asFloat32().len);
         }
+        if (comptime backend == .cuda and @import("build_options").enable_cuda)
+            try std.testing.expect((factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats).kernel_launches > cuda_launches_before);
     }
     try std.testing.expectEqual(@as(usize, 2), ref.public_decide_requests.len);
     for (ref.public_decide_requests) |reference| {
-        errdefer std.debug.print("Decide-1B {s}/public/{s}\n", .{ if (metal) "metal" else "native", reference.id });
+        const cuda_launches_before = if (comptime backend == .cuda and @import("build_options").enable_cuda)
+            (factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats).kernel_launches
+        else
+            0;
+        errdefer std.debug.print("Decide-1B {s}/public/{s}\n", .{ @tagName(backend), reference.id });
         const control = @import("../execution_control.zig").InferenceExecutionControl{
             .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,
             .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s,
@@ -432,17 +546,186 @@ fn parity(metal: bool) !void {
         const expected_model = reference.decide_expected.object.get("model") orelse return error.InvalidFamilyReference;
         const expected_answers = reference.decide_expected.object.get("answers") orelse return error.InvalidFamilyReference;
         try expectJsonApprox(expected_model, response.value.object.get("model") orelse return error.InvalidFamilyReference, 5e-4);
-        try expectJsonApprox(expected_answers, response.value.object.get("answers") orelse return error.InvalidFamilyReference, 5e-4);
+        const expected_current_answers = try expectedCurrentDecideAnswers(request_allocator, expected_answers, reference.probabilities);
+        try expectJsonApprox(expected_current_answers, response.value.object.get("answers") orelse return error.InvalidFamilyReference, 5e-4);
+        if (comptime backend == .cuda and @import("build_options").enable_cuda)
+            try std.testing.expect((factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats).kernel_launches > cuda_launches_before);
     }
-    std.debug.print("GLiNER2.5-Decide-1B {s}: {d} regular + {d} public cases, max raw-logit error {e}\n", .{ if (metal) "metal" else "native", ref.requests.len, ref.public_decide_requests.len, max_error });
+    if (comptime backend == .cuda and @import("build_options").enable_cuda) {
+        const control = @import("../execution_control.zig").InferenceExecutionControl{
+            .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,
+            .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s,
+        };
+        try cudaWindowParity(a, session, tok.tokenizer(), .{ .modern_bert = config.modern_bert }, control);
+    }
+    std.debug.print("GLiNER2.5-Decide-1B {s}: {d} regular + {d} public cases, max raw-logit error {e}\n", .{ @tagName(backend), ref.requests.len, ref.public_decide_requests.len, max_error });
 }
 
 test "GLiNER2.5 Decide 1B pinned full session native classifier parity" {
-    try parity(false);
+    try parity(.native);
 }
 test "GLiNER2.5 Decide 1B pinned full session Metal classifier parity" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
-    try parity(true);
+    try parity(.metal);
+}
+
+// Explicit opt-in turns an absent model/backend into a failure rather than a
+// successful soft skip. Exact weight/capture bytes are checked by parity().
+test "GLiNER2.5 Decide 1B pinned full session CUDA F32 classifier qualification" {
+    if (!platform.env.getenvBool("ANTFLY_GLINER25_DECIDE_1B_CUDA_PARITY")) return error.SkipZigTest;
+    if (comptime !@import("build_options").enable_cuda) return error.CudaNotEnabled;
+    try parity(.cuda);
+}
+
+/// The independently captured singleton logits remain the oracle when rows
+/// are composed into a padded physical batch. This does not authorize public
+/// multi-item requests or change the serving/Q8 qualification envelope.
+fn cudaWindowParity(a: std.mem.Allocator, session: @import("../backends/session.zig").Session, tokenizer: anytype, config: executor.EncoderConfig, base_control: @import("../execution_control.zig").InferenceExecutionControl) !void {
+    const memory = @import("../runtime/tier/memory.zig");
+    const wire = @import("extraction_v2.zig");
+    const frozen = @import("gliner_graph_qualification_fixtures.zig").decide_1b_windows;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(frozen, &digest, .{});
+    const hexadecimal = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings("a5cff9fd74c25a93c8367490218170c94c3c47f6edcc035a2db356202f8dad81", &hexadecimal);
+    const Capture = struct { variant: []const u8, cases: []const struct {
+        id: []const u8,
+        text: []const u8,
+        native_schema_json: []const u8,
+        window_words: usize,
+        classification_logits: []const f64,
+        windows: []const struct { input_ids: []const i64 },
+        expected: pipeline.ExpectedSample,
+    } };
+    const parsed = try std.json.parseFromSlice(Capture, a, frozen, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const ref = parsed.value;
+    try std.testing.expectEqualStrings("decide_1b", ref.variant);
+    try std.testing.expectEqual(@as(usize, 4), ref.cases.len);
+    const limits = try factory.resolveBudgetLimitsForSessions(&.{session}, memory.defaultLimitsForBackend(.gpu), .{});
+    // No operator override, workload scratch widening or failed-admission skip.
+    // The existing managed backend and driver retain their live-memory checks.
+    for (ref.cases) |case| {
+        var control = base_control;
+        control.deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s;
+        errdefer std.debug.print("Decide-1B CUDA frozen window {s}\n", .{case.id});
+        const schema = try std.json.parseFromSlice(std.json.Value, a, case.native_schema_json, .{});
+        defer schema.deinit();
+        const body = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "window", .schema = schema.value, .options = .{ .offset_unit = "unicode_codepoints", .long_document = .{ .mode = "window", .window_words = case.window_words, .overlap_words = @as(usize, 16) } }, .inputs = .{.{ .content = case.text }} }, .{});
+        defer a.free(body);
+        var request = try wire.parseJson(a, body, .{});
+        defer request.deinit();
+        const item = &request.items[0];
+        var prepared = try executor.prepareItem(a, tokenizer, item, .{ .max_sequence_tokens = 1024, .max_batch_tokens = 1024 }, .{ .modern_span_extraction = true, .control = control });
+        defer prepared.deinit(a);
+        try std.testing.expectEqual(case.windows.len, prepared.batches.len);
+        for (case.windows, prepared.batches) |window, batch| try std.testing.expectEqualSlices(i64, window.input_ids, batch.input_ids);
+        if (std.mem.eql(u8, case.id, "token_boundary")) {
+            try std.testing.expectEqual(@as(usize, 1), prepared.batches.len);
+            try std.testing.expectEqual(@as(usize, 1024), prepared.batches[0].input_ids.len);
+        }
+        var prepared_items = [_]executor.PreparedItem{prepared};
+        const plan = executor.Plan{ .items = &prepared_items, .prompt_tokens = prepared.prompt_tokens };
+        const scratch = try executor.plannedDeviceScratchUpperBound(config, &request, &plan, .{});
+        var budget = memory.RunBudget.init(limits);
+        const estimate = memory.Estimate{ .prompt_tokens = prepared.prompt_tokens, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = scratch, .scratch_tier = .backend };
+        try budget.reserveEstimate(estimate);
+        defer budget.releaseEstimate(estimate);
+        const before = (factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats).kernel_launches;
+        var managed = try factory.getManagedComputeBackend(session, a, &budget, control);
+        defer managed.deinit();
+        var logits = try executor.preparedItemLogits(&managed.backend, a, config, item, &prepared, null);
+        defer logits.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), logits.rows.len);
+        try std.testing.expectEqual(case.classification_logits.len, logits.rows[0].len);
+        for (case.classification_logits, logits.rows[0]) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-3);
+        var result = try @import("gliner_span_long_executor.zig").extract(&managed.backend, a, config.modern_bert, item, &prepared, item.options.native(.{ .control = control }));
+        defer result.deinit();
+        try pipeline.expectSample(case.expected, result.samples[0], pipeline.fp32_confidence_tolerance);
+        try std.testing.expect((factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats).kernel_launches > before);
+    }
+    // All three singleton targets have the same captured schema. Include the
+    // 1024-token row in every width, alongside short rows with real padding.
+    const indices = [_]usize{ 3, 0, 1 };
+    var compiled = try schema_mod.compile(a, ref.cases[0].native_schema_json, .{});
+    defer compiled.deinit();
+    var singletons: [3]processor.PreparedBatch = undefined;
+    var built: usize = 0;
+    defer for (singletons[0..built]) |*prepared| prepared.deinit();
+    for (indices, &singletons) |index, *prepared| {
+        const case = ref.cases[index];
+        try std.testing.expectEqualStrings(ref.cases[0].native_schema_json, case.native_schema_json);
+        try std.testing.expectEqual(@as(usize, 1), case.windows.len);
+        prepared.* = try processor.prepare(a, tokenizer, &.{.{ .text = case.text, .schema = &compiled }}, .{ .max_sequence_tokens = 1024, .max_batch_tokens = 1024 });
+        built += 1;
+        try std.testing.expectEqualSlices(i64, case.windows[0].input_ids, prepared.input_ids);
+    }
+    const counts = try a.alloc(usize, compiled.schema.classifications.len);
+    defer a.free(counts);
+    for (compiled.schema.classifications, counts) |classification, *count| count.* = classification.task.labels.len;
+    for ([_]usize{ 2, 4, 8 }) |width| {
+        var control = base_control;
+        control.deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s;
+        errdefer std.debug.print("Decide-1B CUDA composed frozen batch={d}\n", .{width});
+        var samples: [8]processor.Sample = undefined;
+        var task_counts: [8][]const usize = undefined;
+        var sequence: usize = 0;
+        var markers: usize = 0;
+        for (0..width) |row| {
+            samples[row] = singletons[row % singletons.len].samples[0];
+            task_counts[row] = counts;
+            sequence = @max(sequence, samples[row].input_ids.len);
+            markers = @max(markers, samples[row].classification_labels.len);
+        }
+        // SAME classifier-only physical-shape planner used by the production
+        // ModernBERT session. These calls do not execute the entity/span heads
+        // whose full peak remains reserved in the window cases above.
+        const scratch = try @import("../models/cuda_weights.zig").layaCudaWorkspace(width, sequence, markers, config.hiddenSize(), config.intermediateSize());
+        var budget = memory.RunBudget.init(limits);
+        const estimate = memory.Estimate{ .prompt_tokens = try std.math.mul(usize, sequence, width), .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = scratch, .scratch_tier = .backend };
+        std.debug.print("Decide-1B CUDA composed admission width={d} sequence={d} markers={d} scratch_bytes={d} scratch_limit_bytes={d}\n", .{ width, sequence, markers, scratch, limits.scratch_limit_bytes });
+        try budget.reserveEstimate(estimate);
+        defer budget.releaseEstimate(estimate);
+        const before = (factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats).kernel_launches;
+        var managed = try factory.getManagedComputeBackend(session, a, &budget, control);
+        defer managed.deinit();
+        const batches = try executor.classificationBatchLogits(&managed.backend, a, config, samples[0..width], task_counts[0..width], null);
+        defer {
+            for (batches) |rows| {
+                for (rows) |row| a.free(row);
+                a.free(rows);
+            }
+            a.free(batches);
+        }
+        try std.testing.expectEqual(width, batches.len);
+        for (batches, 0..) |rows, index| {
+            try std.testing.expectEqual(@as(usize, 1), rows.len);
+            const want = ref.cases[indices[index % indices.len]].classification_logits;
+            try std.testing.expectEqual(want.len, rows[0].len);
+            for (want, rows[0]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 2e-3);
+        }
+        try std.testing.expect((factory.getCudaRuntimeStats(session) orelse return error.MissingCudaRuntimeStats).kernel_launches > before);
+        std.debug.print("Decide-1B CUDA composed numerical PASS width={d} rows={d} original_raw_logit_tolerance=2e-3\n", .{ width, batches.len });
+    }
+}
+
+test "Decide CUDA composed classifier shapes fit unchanged floor and reject insufficient scratch" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const planner = @import("../models/cuda_weights.zig").layaCudaWorkspace;
+    const floor = try planner(1, 16384, 16384, 1792, 3840);
+    for ([_]usize{ 2, 4, 8 }) |width| {
+        const scratch = try planner(width, 1024, 2, 1792, 3840);
+        try std.testing.expect(scratch <= floor);
+        const estimate = memory.Estimate{ .prompt_tokens = 1024 * width, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = scratch, .scratch_tier = .backend };
+        var admitted = memory.RunBudget.init(.{ .scratch_limit_bytes = floor });
+        try admitted.reserveEstimate(estimate);
+        try std.testing.expectEqual(scratch, admitted.scratchTotalBytes());
+        admitted.releaseEstimate(estimate);
+        try std.testing.expectEqual(@as(usize, 0), admitted.scratchTotalBytes());
+        var refused = memory.RunBudget.init(.{ .scratch_limit_bytes = scratch - 1 });
+        try std.testing.expectError(error.MemoryBudgetExceeded, refused.reserveEstimate(estimate));
+        try std.testing.expectEqual(@as(usize, 0), refused.scratchTotalBytes());
+    }
 }
 
 const LongContextReference = struct {

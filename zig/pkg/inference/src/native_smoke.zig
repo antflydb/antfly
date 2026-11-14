@@ -190,9 +190,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .native => .cpu,
         else => .gpu,
     };
-    var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
-    budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
-    budget_limits = try applyBudgetOverrides(budget_limits, opts);
+    const budget_limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, runtime.tier.memory.defaultLimitsForBackend(budget_backend_class), try budgetOverrideLimits(opts));
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
         .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config, .workspace_capacity = model.session.generationWorkspaceCapacity() },
@@ -839,14 +837,18 @@ fn printUsage() void {
     , .{});
 }
 
-fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
+fn budgetOverrideLimits(opts: Options) !runtime.tier.memory.Limits {
     return (runtime.tier.memory.BudgetOverridesMib{
         .host = opts.host_budget_mb,
         .backend = opts.backend_budget_mb,
         .combined = opts.combined_budget_mb,
         .kv = opts.kv_budget_mb,
         .scratch = opts.scratch_budget_mb,
-    }).apply(defaults);
+    }).toByteLimits();
+}
+
+fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
+    return runtime.tier.memory.applyLimitOverrides(defaults, try budgetOverrideLimits(opts));
 }
 
 fn countPromptTokens(attention_mask: anytype) usize {

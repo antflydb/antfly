@@ -21,6 +21,8 @@ const Interruption = @import("../execution_control.zig").Interruption;
 const UninterruptibleGuard = @import("../execution_control.zig").UninterruptibleGuard;
 const ops = @import("../ops/ops.zig");
 const contracts = @import("backend_contracts.zig");
+const CloseScope = @import("../backends/session.zig").Session.CloseScope;
+const CleanupContext = @import("../execution/cleanup_context.zig").Context;
 
 /// Backend-owned model runtime state.
 ///
@@ -30,11 +32,28 @@ const contracts = @import("backend_contracts.zig");
 /// model execution path, including backend-side cache/KV state as backends grow
 /// that capability.
 pub const ModelRuntime = struct {
+    /// A copied table changing ordinary destruction must explicitly opt in.
+    /// Acceptance precedes every provider/context cast; fallback preserves it.
+    pub const ColdCleanupServices = struct {
+        accepts: *const fn (*const VTable) bool,
+        deinit: *const fn (*anyopaque, CleanupContext) void,
+        reset: ?*const fn (*anyopaque, CleanupContext) anyerror!void = null,
+        /// Settle speculative request work before its current provider/B retires.
+        /// This does not reset KV or destroy the cached runtime.
+        finish_request: ?*const fn (*anyopaque, CleanupContext) anyerror!void = null,
+    };
+
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         capabilities: ?*const fn (ctx: *anyopaque) RuntimeCapabilities = null,
+        /// Borrow actual numerical owner for provider operation exclusion.
+        /// Target-specific schedules/weights/caches retain their original ABI.
+        operation_backend: ?*const fn (ctx: *anyopaque) *const ops.ComputeBackend = null,
+        accepts_operation_backend: ?*const fn (*const VTable) bool = null,
+        /// Side-effect-free decline before any state reset or submission.
+        supports_forward_request: ?*const fn (ctx: *anyopaque, request: ForwardRequest, operation: ForwardOperation) bool = null,
         prepare: ?*const fn (
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
@@ -67,7 +86,11 @@ pub const ModelRuntime = struct {
             allocator: std.mem.Allocator,
             request: DecodeRequest,
         ) anyerror!GreedyDecodeOutput = null,
+        /// Retain resources needed by resident outputs independently of cache
+        /// ownership. Host-only outputs do not pin the runtime.
+        retain_output_owner: ?*const fn (ctx: *anyopaque) OutputOwner = null,
         deinit: *const fn (ctx: *anyopaque) void,
+        cold_cleanup_services: ?*const ColdCleanupServices = null,
         reset: ?*const fn (ctx: *anyopaque) anyerror!void = null,
         debug_timing_stats: ?*const fn (ctx: *anyopaque) RuntimeDebugTimingStats = null,
         reset_debug_timing_stats: ?*const fn (ctx: *anyopaque) void = null,
@@ -87,8 +110,64 @@ pub const ModelRuntime = struct {
         return caps;
     }
 
+    pub fn supportsForwardRequest(self: *const ModelRuntime, request: ForwardRequest, operation: ForwardOperation) bool {
+        switch (request) {
+            .prefill => |prefill_request| {
+                if (prefill_request.query_seq_len == 0 or prefill_request.input_ids.len != prefill_request.query_seq_len or prefill_request.query_seq_len > prefill_request.seq_len) return false;
+            },
+            .decode => {
+                const caps = self.capabilities();
+                if (operation == .greedy and !caps.supports_greedy_decode) return false;
+                if (operation == .logits and !caps.supports_decode) return false;
+            },
+        }
+        if (self.vtable.supports_forward_request) |supports| return supports(self.ptr, request, operation);
+        return true;
+    }
+
+    fn retainOutputOwner(self: *const ModelRuntime, output: *ModelOutput) void {
+        // Both prefill and decode export owned value headers. Their runtime
+        // owner/affinity remains unchanged; synchronous request borrows do not.
+        if (output.device_logits_backend) |backend| output.device_logits_backend = backend.withoutSynchronousBorrows();
+        if (output.prepared_tail) |*tail| tail.backend = tail.backend.withoutSynchronousBorrows();
+        if (output.owner == null and (output.device_logits != null or output.prepared_tail != null)) {
+            if (self.vtable.retain_output_owner) |retain| output.owner = retain(self.ptr);
+        }
+    }
+
+    fn operationBackend(self: *const ModelRuntime) ?ops.ComputeBackend {
+        const accepts = self.vtable.accepts_operation_backend orelse return null;
+        if (!accepts(self.vtable)) return null;
+        const getter = self.vtable.operation_backend orelse return null;
+        return getter(self.ptr).*;
+    }
+    /// The owning invocation calls this on every exit while its actual backend
+    /// operation and cleanup epoch are still held. Unsupported runtimes have no
+    /// asynchronous request work and return without acquiring an operation.
+    pub fn finishRequestWithCleanup(self: *ModelRuntime, current: CleanupContext) !void {
+        const services = self.vtable.cold_cleanup_services orelse return;
+        const finish = services.finish_request orelse return;
+        if (!services.accepts(self.vtable)) return error.RuntimeRequestCleanupChanged;
+        const backend = self.operationBackend();
+        if (backend) |target| if (current.operation != null) {
+            _ = try current.operationFor(&target);
+        };
+        try @import("../execution/backend_operation.zig").callOpaque(backend, current.operation, finish, .{ self.ptr, current });
+    }
+
+    pub fn resetWithCleanup(self: *ModelRuntime, current: CleanupContext) !void {
+        if (self.vtable.cold_cleanup_services) |services| {
+            if (services.accepts(self.vtable)) if (services.reset) |reset_fn| {
+                return @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), current.operation, reset_fn, .{ self.ptr, current });
+            };
+        }
+        return self.resetWithOperation(current.operation);
+    }
     pub fn reset(self: *ModelRuntime) !void {
-        if (self.vtable.reset) |reset_fn| return reset_fn(self.ptr);
+        return self.resetWithOperation(null);
+    }
+    pub fn resetWithOperation(self: *ModelRuntime, borrowed: ?@import("../execution/backend_operation.zig").Borrowed) !void {
+        if (self.vtable.reset) |reset_fn| try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), borrowed, reset_fn, .{self.ptr});
     }
 
     pub fn prepare(
@@ -103,7 +182,7 @@ pub const ModelRuntime = struct {
         else
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
-        const prepared = try prepare_fn(self.ptr, allocator, request);
+        const prepared = try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, prepare_fn, .{ self.ptr, allocator, request });
         try request.check();
         return prepared;
     }
@@ -138,8 +217,9 @@ pub const ModelRuntime = struct {
         else
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
-        var output = try self.vtable.prefill(self.ptr, allocator, request);
-        errdefer output.deinit(allocator);
+        var output = try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, self.vtable.prefill, .{ self.ptr, allocator, request });
+        self.retainOutputOwner(&output);
+        errdefer output.deinitWithCleanup(allocator, .{ .boundary = request.cleanup_epoch, .operation = request.backend_operation });
         try request.check();
         return output;
     }
@@ -156,8 +236,9 @@ pub const ModelRuntime = struct {
         else
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
-        var output = try decode_fn(self.ptr, allocator, request);
-        errdefer output.deinit(allocator);
+        var output = try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, decode_fn, .{ self.ptr, allocator, request });
+        self.retainOutputOwner(&output);
+        errdefer output.deinitWithCleanup(allocator, .{ .boundary = request.cleanup_epoch, .operation = request.backend_operation });
         try request.check();
         return output;
     }
@@ -174,8 +255,11 @@ pub const ModelRuntime = struct {
         else
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
-        var output = try decode_greedy_fn(self.ptr, allocator, request);
-        errdefer output.deinit();
+        var output = try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), request.backend_operation, decode_greedy_fn, .{ self.ptr, allocator, request });
+        if (output.token_tensor != null and output.owner == null) {
+            if (self.vtable.retain_output_owner) |retain| output.owner = retain(self.ptr);
+        }
+        errdefer output.deinitWithCleanup(.{ .boundary = request.cleanup_epoch, .operation = request.backend_operation });
         try request.check();
         return output;
     }
@@ -192,7 +276,7 @@ pub const ModelRuntime = struct {
         else
             UninterruptibleGuard{};
         defer hard_cancellation.deinit();
-        const output = try decode_sample_fn(self.ptr, allocator, request);
+        const output = try @import("../execution/backend_operation.zig").callOpaque(self.operationBackend(), request.decode.backend_operation, decode_sample_fn, .{ self.ptr, allocator, request });
         try request.decode.check();
         return output;
     }
@@ -207,8 +291,56 @@ pub const ModelRuntime = struct {
     }
 
     pub fn deinit(self: *ModelRuntime) void {
+        self.deinitWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn deinitWithBoundary(self: *ModelRuntime, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        self.deinitWithCleanup(.{ .boundary = boundary });
+    }
+    pub fn deinitWithCleanup(self: *ModelRuntime, cleanup_context: CleanupContext) void {
+        if (self.vtable.cold_cleanup_services) |services| {
+            if (services.accepts(self.vtable)) {
+                services.deinit(self.ptr, cleanup_context);
+                self.* = undefined;
+                return;
+            }
+        }
         self.vtable.deinit(self.ptr);
         self.* = undefined;
+    }
+};
+
+/// One backend-owned session-runtime role per generation invocation. The
+/// retaining Model and its execution scope keep this selected runtime alive;
+/// no participant or request pointer is published into the shared cache.
+pub const RequestFinish = struct {
+    runtime: ?*ModelRuntime = null,
+    context: ?*anyopaque = null,
+    table: ?*const ModelRuntime.VTable = null,
+
+    pub fn receive(self: *RequestFinish, selected: *ModelRuntime) !void {
+        const services = selected.vtable.cold_cleanup_services orelse return;
+        if (services.finish_request == null) return;
+        if (!services.accepts(selected.vtable)) return error.RuntimeRequestCleanupChanged;
+        if (self.runtime) |held| {
+            if (held != selected or self.context != selected.ptr or self.table != selected.vtable)
+                return error.RuntimeRequestParticipantChanged;
+            return;
+        }
+        // Entry-specific host-assisted runtimes cannot claim this one session
+        // role. A new role must be planned before it can submit asynchronous work.
+        if (selected.capabilities().state_ownership == .host_assisted_inputs)
+            return error.UnsupportedRuntimeRequestParticipant;
+        self.runtime = selected;
+        self.context = selected.ptr;
+        self.table = selected.vtable;
+    }
+
+    pub fn finish(self: *RequestFinish, current: CleanupContext) !void {
+        const selected = self.runtime orelse return;
+        if (selected.ptr != self.context or selected.vtable != self.table)
+            return error.RuntimeRequestParticipantChanged;
+        try selected.finishRequestWithCleanup(current);
+        self.* = .{};
     }
 };
 
@@ -223,6 +355,8 @@ pub const RuntimeStateOwnership = enum {
     /// Runtime execution owns persistent backend-side model/KV/cache state.
     backend_owned,
 };
+
+pub const ForwardOperation = enum { logits, greedy };
 
 pub const RuntimeCapabilities = struct {
     supports_decode: bool = false,
@@ -285,6 +419,38 @@ pub const SamplingConfig = struct {
             self.repetition_penalty == 1.0 and
             self.frequency_penalty == 0 and
             self.presence_penalty == 0;
+    }
+};
+
+/// One retained dependency of a resident result. The result releases it after
+/// its tensors, or as soon as explicit materialization leaves only host values.
+/// The provider supplies the reference; retaining requires no wrapper allocation.
+pub const OutputOwner = struct {
+    ptr: *anyopaque,
+    release: *const fn (*anyopaque) void,
+    begin_cleanup: ?*const fn (*anyopaque) CloseScope = null,
+    cleanup_services: ?*const CleanupServices = null,
+    pub const CleanupServices = struct {
+        accepts: *const fn (*const OutputOwner) bool,
+        release: *const fn (*anyopaque, CleanupContext) void,
+    };
+
+    /// Explicit owned capability; no epoch is retained for a later release.
+    pub fn releaseWithBoundary(self: OutputOwner, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        self.releaseWithCleanup(.{ .boundary = boundary });
+    }
+    pub fn releaseWithCleanup(self: OutputOwner, cleanup_context: CleanupContext) void {
+        if (self.cleanup_services) |services| {
+            if (services.accepts(&self)) {
+                services.release(self.ptr, cleanup_context);
+                return;
+            }
+        }
+        self.release(self.ptr);
+    }
+
+    pub fn beginCleanup(self: OutputOwner) CloseScope {
+        return if (self.begin_cleanup) |begin| begin(self.ptr) else .{};
     }
 };
 
@@ -358,7 +524,13 @@ pub const ModelOutput = struct {
         }
 
         pub fn deinit(self: *PreparedTail) void {
-            self.backend.free(self.final_hidden);
+            self.deinitWithCleanup(.{ .outside_execution = true });
+        }
+        pub fn deinitWithBoundary(self: *PreparedTail, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+            self.deinitWithCleanup(.{ .boundary = boundary });
+        }
+        pub fn deinitWithCleanup(self: *PreparedTail, cleanup_context: CleanupContext) void {
+            self.backend.freeWithCleanup(self.final_hidden, cleanup_context);
             self.* = undefined;
         }
     };
@@ -369,41 +541,81 @@ pub const ModelOutput = struct {
     device_logits_backend: ?ops.ComputeBackend = null,
     prepared_tail: ?PreparedTail = null,
     final_logit_softcap: f32 = 0.0,
+    owner: ?OutputOwner = null,
+
+    fn releaseOwnerWithCleanup(self: *ModelOutput, cleanup_context: CleanupContext) void {
+        if (self.owner) |owner| {
+            self.owner = null;
+            owner.releaseWithCleanup(cleanup_context);
+        }
+    }
 
     pub fn hostLogits(self: *ModelOutput, allocator: std.mem.Allocator) ![]const f32 {
+        return self.hostLogitsWithCleanup(allocator, .{ .outside_execution = true });
+    }
+    pub fn hostLogitsWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) ![]const f32 {
+        return self.hostLogitsWithCleanup(allocator, .{ .boundary = boundary });
+    }
+    pub fn hostLogitsWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, cleanup_context: CleanupContext) ![]const f32 {
         if (self.logits) |logits| return logits;
         if (self.prepared_tail) |*tail| {
             const device_logits = (try tail.logits()) orelse return error.InvalidModelOutput;
             const backend = tail.backend;
-            const logits = try backend.toFloat32(device_logits, allocator);
-            backend.free(device_logits);
+            const logits = materialized: {
+                defer {
+                    var cleanup = if (self.owner) |owner| owner.beginCleanup() else CloseScope{};
+                    defer cleanup.deinit();
+                    backend.freeWithCleanup(device_logits, cleanup_context);
+                }
+                break :materialized try backend.toFloat32(device_logits, allocator);
+            };
             applyFinalLogitSoftcapInPlace(logits, tail.final_logit_softcap);
-            tail.deinit();
+            var cleanup = if (self.owner) |owner| owner.beginCleanup() else CloseScope{};
+            defer cleanup.deinit();
+            tail.deinitWithCleanup(cleanup_context);
             self.prepared_tail = null;
             self.logits = logits;
+            cleanup.deinit();
+            self.releaseOwnerWithCleanup(cleanup_context);
             return logits;
         }
         if (self.device_logits) |device_logits| {
             const backend = self.device_logits_backend orelse return error.InvalidModelOutput;
             const logits = try backend.toFloat32(device_logits, allocator);
-            backend.free(device_logits);
+            var cleanup = if (self.owner) |owner| owner.beginCleanup() else CloseScope{};
+            defer cleanup.deinit();
+            backend.freeWithCleanup(device_logits, cleanup_context);
             self.device_logits = null;
             self.device_logits_backend = null;
             applyFinalLogitSoftcapInPlace(logits, self.final_logit_softcap);
             self.logits = logits;
+            cleanup.deinit();
+            self.releaseOwnerWithCleanup(cleanup_context);
             return logits;
         }
         return error.InvalidModelOutput;
     }
 
     pub fn takeHostLogits(self: *ModelOutput, allocator: std.mem.Allocator) ![]f32 {
-        _ = try self.hostLogits(allocator);
+        return self.takeHostLogitsWithCleanup(allocator, .{ .outside_execution = true });
+    }
+    pub fn takeHostLogitsWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) ![]f32 {
+        return self.takeHostLogitsWithCleanup(allocator, .{ .boundary = boundary });
+    }
+    pub fn takeHostLogitsWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, cleanup_context: CleanupContext) ![]f32 {
+        _ = try self.hostLogitsWithCleanup(allocator, cleanup_context);
         const logits = self.logits orelse return error.InvalidModelOutput;
         self.logits = null;
         return logits;
     }
 
     pub fn greedyToken(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize) !i64 {
+        return self.greedyTokenWithCleanup(allocator, vocab_size, .{ .outside_execution = true });
+    }
+    pub fn greedyTokenWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) !i64 {
+        return self.greedyTokenWithCleanup(allocator, vocab_size, .{ .boundary = boundary });
+    }
+    pub fn greedyTokenWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, vocab_size: usize, cleanup_context: CleanupContext) !i64 {
         if (vocab_size == 0) return error.InvalidModelOutput;
         if (self.prepared_tail) |*tail| {
             if (tail.vocab_size == vocab_size) {
@@ -417,7 +629,7 @@ pub const ModelOutput = struct {
             }
         }
 
-        const logits = try self.hostLogits(allocator);
+        const logits = try self.hostLogitsWithCleanup(allocator, cleanup_context);
         if (logits.len < vocab_size) return error.InvalidModelOutput;
         var best_idx: usize = 0;
         for (logits[1..vocab_size], 1..) |value, idx| {
@@ -427,11 +639,21 @@ pub const ModelOutput = struct {
     }
 
     pub fn deinit(self: *ModelOutput, allocator: std.mem.Allocator) void {
+        self.deinitWithCleanup(allocator, .{ .outside_execution = true });
+    }
+    pub fn deinitWithBoundary(self: *ModelOutput, allocator: std.mem.Allocator, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        self.deinitWithCleanup(allocator, .{ .boundary = boundary });
+    }
+    pub fn deinitWithCleanup(self: *ModelOutput, allocator: std.mem.Allocator, cleanup_context: CleanupContext) void {
+        var cleanup = if (self.owner) |owner| owner.beginCleanup() else CloseScope{};
+        defer cleanup.deinit();
         if (self.logits) |logits| allocator.free(logits);
         if (self.device_logits) |device_logits| {
-            if (self.device_logits_backend) |backend| backend.free(device_logits);
+            if (self.device_logits_backend) |backend| backend.freeWithCleanup(device_logits, cleanup_context);
         }
-        if (self.prepared_tail) |*tail| tail.deinit();
+        if (self.prepared_tail) |*tail| tail.deinitWithCleanup(cleanup_context);
+        cleanup.deinit();
+        self.releaseOwnerWithCleanup(cleanup_context);
         self.* = undefined;
     }
 };
@@ -444,6 +666,8 @@ fn applyFinalLogitSoftcapInPlace(logits: []f32, softcap: f32) void {
 }
 
 pub const PrepareRequest = struct {
+    cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
+    backend_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
     execution_control: ?InferenceExecutionControl = null,
     /// Best-effort prompt/KV length hint. Backends may use this to prebuild
     /// shape-specific resources without mutating logical generation state.
@@ -455,6 +679,8 @@ pub const PrepareRequest = struct {
 };
 
 pub const PrefillRequest = struct {
+    cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
+    backend_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
     execution_control: ?InferenceExecutionControl = null,
     input_ids: []const i64,
     seq_len: usize,
@@ -473,15 +699,47 @@ pub const PrefillRequest = struct {
     }
 };
 
+/// Borrowed task decision for this synchronous decode call only. Backends may
+/// omit an unneeded successor, but never retain this view or infer completion
+/// of numerical work from it. Null on DecodeRequest preserves lookahead.
+pub const DecodeContinuation = struct {
+    remaining_tokens: usize,
+    primary_stop_token: i32 = -1,
+    extra_stop_tokens: []const i32 = &.{},
+
+    pub fn check(self: DecodeContinuation) !void {
+        if (self.remaining_tokens == 0) return error.InvalidDecodeContinuation;
+    }
+
+    pub fn isLast(self: DecodeContinuation) bool {
+        return self.remaining_tokens == 1;
+    }
+
+    pub fn stops(self: DecodeContinuation, token: i64) bool {
+        if (token < 0) return false;
+        if (self.primary_stop_token >= 0 and token == self.primary_stop_token) return true;
+        for (self.extra_stop_tokens) |stop| {
+            if (stop >= 0 and token == stop) return true;
+        }
+        return false;
+    }
+};
+
 pub const DecodeRequest = struct {
+    cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
+    backend_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
     execution_control: ?InferenceExecutionControl = null,
     token_id: i64,
     input_token_tensor: ?ops.CT = null,
     position: usize,
     attention_mode: cache_mod.AttentionMode = .paged_decode,
 
+    /// Valid only during the current numerical call; never cached by a runtime.
+    continuation: ?DecodeContinuation = null,
+
     pub fn check(self: DecodeRequest) !void {
         if (self.execution_control) |control| try control.check();
+        if (self.continuation) |policy| try policy.check();
     }
 };
 
@@ -498,11 +756,22 @@ pub const GreedyDecodeOutput = struct {
     /// transfer it again or call deinit.
     token_tensor: ?ops.CT = null,
     token_tensor_backend: ?*const ops.ComputeBackend = null,
+    owner: ?OutputOwner = null,
 
     pub fn deinit(self: *GreedyDecodeOutput) void {
+        self.deinitWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn deinitWithBoundary(self: *GreedyDecodeOutput, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        self.deinitWithCleanup(.{ .boundary = boundary });
+    }
+    pub fn deinitWithCleanup(self: *GreedyDecodeOutput, cleanup_context: CleanupContext) void {
+        var cleanup = if (self.owner) |owner| owner.beginCleanup() else CloseScope{};
+        defer cleanup.deinit();
         if (self.token_tensor) |tensor| {
-            if (self.token_tensor_backend) |backend| backend.free(tensor);
+            if (self.token_tensor_backend) |backend| backend.freeWithCleanup(tensor, cleanup_context);
         }
+        cleanup.deinit();
+        if (self.owner) |owner| owner.releaseWithCleanup(cleanup_context);
         self.* = undefined;
     }
 };
@@ -626,12 +895,20 @@ fn applyMinP(probs: []f32, min_p: f32) void {
 /// ModelRuntime values for per-request mutable state. Runtime values then
 /// execute prefill/decode so cache/KV ownership has one place to live.
 pub const ModelExecutor = struct {
+    /// A copied table changing ordinary destruction must explicitly opt in.
+    /// Acceptance precedes every provider/context cast; fallback preserves it.
+    pub const ColdCleanupServices = struct {
+        accepts: *const fn (*const VTable) bool,
+        deinit: *const fn (*anyopaque, CleanupContext) void,
+    };
+
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         create_runtime: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!ModelRuntime,
         deinit: *const fn (ctx: *anyopaque) void,
+        cold_cleanup_services: ?*const ColdCleanupServices = null,
     };
 
     pub fn createRuntime(self: *const ModelExecutor, allocator: std.mem.Allocator) !ModelRuntime {
@@ -639,6 +916,19 @@ pub const ModelExecutor = struct {
     }
 
     pub fn deinit(self: *ModelExecutor) void {
+        self.deinitWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn deinitWithBoundary(self: *ModelExecutor, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
+        self.deinitWithCleanup(.{ .boundary = boundary });
+    }
+    pub fn deinitWithCleanup(self: *ModelExecutor, cleanup_context: CleanupContext) void {
+        if (self.vtable.cold_cleanup_services) |services| {
+            if (services.accepts(self.vtable)) {
+                services.deinit(self.ptr, cleanup_context);
+                self.* = undefined;
+                return;
+            }
+        }
         self.vtable.deinit(self.ptr);
         self.* = undefined;
     }
@@ -869,4 +1159,502 @@ test "ModelExecutor reports unsupported decode when backend has no decode path" 
         .sampling = .{},
         .token_history = &.{},
     }));
+}
+
+test "resident model outputs survive runtime eviction and release owners after materialization or failure" {
+    const a = std.testing.allocator;
+    var weights = @import("../ops/native_compute.zig").WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.resident_weights.deinit(a);
+    defer weights.lazy_weights.deinit(a);
+    var compute = @import("../ops/native_compute.zig").NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const Probe = struct {
+        backend: ops.ComputeBackend,
+        references: usize = 1,
+        closed: bool = false,
+        host_only: bool = false,
+        active_cleanup: usize = 0,
+        cleanup_begins: usize = 0,
+        fn beginCleanup(ctx: *anyopaque) CloseScope {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(!self.closed);
+            self.active_cleanup += 1;
+            self.cleanup_begins += 1;
+            return .{ .ptr = ctx, .release_fn = endCleanup };
+        }
+        fn endCleanup(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(self.active_cleanup != 0);
+            self.active_cleanup -= 1;
+        }
+        fn retain(ctx: *anyopaque) OutputOwner {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.references += 1;
+            return .{ .ptr = ctx, .release = release, .begin_cleanup = beginCleanup };
+        }
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(!self.closed);
+            self.references -= 1;
+            if (self.references == 0) {
+                if (!self.host_only) std.debug.assert(self.active_cleanup != 0);
+                self.closed = true;
+            }
+        }
+        fn prefill(ctx: *anyopaque, allocator: std.mem.Allocator, _: PrefillRequest) !ModelOutput {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.host_only) return .{ .logits = try allocator.dupe(f32, &.{ 3, 5 }) };
+            return .{ .device_logits = try self.backend.fromFloat32Shape(&.{ 3, 5 }, &.{ 1, 2 }), .device_logits_backend = self.backend };
+        }
+        const vtable = ModelRuntime.VTable{ .prefill = prefill, .deinit = release, .retain_output_owner = retain };
+    };
+    for ([_]enum { materialize, fail_materialization, discard, host }{ .materialize, .fail_materialization, .discard, .host }) |mode| {
+        var probe = Probe{ .backend = compute.computeBackend(), .host_only = mode == .host };
+        var runtime_instance = ModelRuntime{ .ptr = &probe, .vtable = &Probe.vtable };
+        var output = try runtime_instance.prefill(a, .{ .input_ids = &.{1}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+        runtime_instance.deinit();
+        var output_live = true;
+        defer if (output_live) output.deinit(a);
+        try std.testing.expectEqual(mode == .host, probe.closed);
+        switch (mode) {
+            .materialize, .host => {
+                try std.testing.expectEqualSlices(f32, &.{ 3, 5 }, try output.hostLogits(a));
+                try std.testing.expect(probe.closed);
+                try std.testing.expectEqualSlices(f32, &.{ 3, 5 }, try output.hostLogits(a));
+            },
+            .fail_materialization => {
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                try std.testing.expectError(error.OutOfMemory, output.hostLogits(failing.allocator()));
+                try std.testing.expect(!probe.closed);
+                try std.testing.expect(output.owner != null);
+                // Failed numerical materialization neither arms cleanup nor
+                // retires the original resident tensor/owner.
+                try std.testing.expectEqual(@as(usize, 0), probe.cleanup_begins);
+                try std.testing.expectEqual(@as(usize, 0), probe.active_cleanup);
+            },
+            .discard => {},
+        }
+        output.deinit(a);
+        output_live = false;
+        try std.testing.expect(probe.closed);
+        try std.testing.expectEqual(@as(usize, 0), probe.references);
+        try std.testing.expectEqual(@as(usize, 0), probe.active_cleanup);
+        try std.testing.expectEqual(@as(usize, if (mode == .host) 0 else 1), probe.cleanup_begins);
+    }
+}
+
+test "ModelRuntime and ModelExecutor cold cleanup services preserve copied wrapper deinit policy" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const Probe = struct {
+        bounded: usize = 0,
+        wrapped: usize = 0,
+        raw: usize = 0,
+        nonce: u64 = 0,
+        const runtime_services: ModelRuntime.ColdCleanupServices = .{ .accepts = acceptsRuntime, .deinit = releaseBounded };
+        const executor_services: ModelExecutor.ColdCleanupServices = .{ .accepts = acceptsExecutor, .deinit = releaseBounded };
+        const runtime_table: ModelRuntime.VTable = table: {
+            var value = MockModel.runtime_vtable;
+            value.deinit = releaseRaw;
+            value.cold_cleanup_services = &runtime_services;
+            break :table value;
+        };
+        const executor_table: ModelExecutor.VTable = table: {
+            var value = MockModel.executor_vtable;
+            value.deinit = releaseRaw;
+            value.cold_cleanup_services = &executor_services;
+            break :table value;
+        };
+        fn acceptsRuntime(table: *const ModelRuntime.VTable) bool {
+            return table == &runtime_table;
+        }
+        fn acceptsExecutor(table: *const ModelExecutor.VTable) bool {
+            return table == &executor_table;
+        }
+        fn releaseBounded(ctx: *anyopaque, cleanup_context: CleanupContext) void {
+            const boundary = cleanup_context.boundary;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.bounded += 1;
+            self.nonce = if (boundary) |value| value.nonce else 0;
+        }
+        fn releaseWrapped(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.wrapped += 1;
+        }
+        fn releaseRaw(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.raw += 1;
+        }
+    };
+    var sink = try @import("../execution/retirement_sink.zig").Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    var probe = Probe{};
+    var runtime = ModelRuntime{ .ptr = &probe, .vtable = &Probe.runtime_table };
+    runtime.deinitWithBoundary(&epoch);
+    var executor = ModelExecutor{ .ptr = &probe, .vtable = &Probe.executor_table };
+    executor.deinitWithBoundary(&epoch);
+    try std.testing.expectEqual(@as(usize, 2), probe.bounded);
+    try std.testing.expectEqual(epoch.nonce, probe.nonce);
+    var runtime_wrapper = Probe.runtime_table;
+    runtime_wrapper.deinit = Probe.releaseWrapped;
+    var wrapped_runtime = ModelRuntime{ .ptr = &probe, .vtable = &runtime_wrapper };
+    wrapped_runtime.deinitWithBoundary(&epoch);
+    var executor_wrapper = Probe.executor_table;
+    executor_wrapper.deinit = Probe.releaseWrapped;
+    var wrapped_executor = ModelExecutor{ .ptr = &probe, .vtable = &executor_wrapper };
+    wrapped_executor.deinitWithBoundary(&epoch);
+    try std.testing.expectEqual(@as(usize, 2), probe.wrapped);
+    try std.testing.expectEqual(@as(usize, 2), probe.bounded);
+    var legacy_table = Probe.runtime_table;
+    legacy_table.cold_cleanup_services = null;
+    var legacy = ModelRuntime{ .ptr = &probe, .vtable = &legacy_table };
+    legacy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.raw);
+}
+
+test "OutputOwner forwards exact current cleanup epoch with ordinary release fallback" {
+    const Probe = struct {
+        ordinary: usize = 0,
+        bounded: usize = 0,
+        nonce: u64 = 0,
+        const owner_services: OutputOwner.CleanupServices = .{ .accepts = acceptsOwner, .release = releaseBounded };
+        fn acceptsOwner(value: *const OutputOwner) bool {
+            return value.release == release and value.begin_cleanup == null;
+        }
+        fn releaseCustom(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ordinary += 10;
+        }
+        fn customBegin(_: *anyopaque) CloseScope {
+            return .{};
+        }
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ordinary += 1;
+        }
+        fn releaseBounded(ctx: *anyopaque, cleanup_context: CleanupContext) void {
+            const boundary = cleanup_context.boundary;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.bounded += 1;
+            self.nonce = if (boundary) |value| value.nonce else 0;
+        }
+    };
+    var sink = try @import("../execution/retirement_sink.zig").Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    var probe = Probe{};
+    const plain = OutputOwner{ .ptr = &probe, .release = Probe.release };
+    plain.releaseWithBoundary(&epoch);
+    const managed = OutputOwner{ .ptr = &probe, .release = Probe.release, .cleanup_services = &Probe.owner_services };
+    managed.releaseWithBoundary(&epoch);
+    try std.testing.expectEqual(@as(usize, 1), probe.ordinary);
+    try std.testing.expectEqual(@as(usize, 1), probe.bounded);
+    try std.testing.expectEqual(epoch.nonce, probe.nonce);
+    var custom_release = managed;
+    custom_release.release = Probe.releaseCustom;
+    custom_release.releaseWithCleanup(.{ .boundary = &epoch });
+    try std.testing.expectEqual(@as(usize, 11), probe.ordinary);
+    try std.testing.expectEqual(@as(usize, 1), probe.bounded);
+    var custom_scope = managed;
+    custom_scope.begin_cleanup = Probe.customBegin;
+    custom_scope.releaseWithCleanup(.{ .boundary = &epoch });
+    try std.testing.expectEqual(@as(usize, 12), probe.ordinary);
+    try std.testing.expectEqual(@as(usize, 1), probe.bounded);
+}
+
+fn modelOutputBoundaryCase(allocator: std.mem.Allocator) !void {
+    const Probe = struct {
+        scopes: usize = 0,
+        frees: usize = 0,
+        releases: usize = 0,
+        free_nonce: u64 = 0,
+        owner_nonce: u64 = 0,
+        owner_inside_scope: bool = false,
+        free_outside_scope: bool = false,
+        const services: ops.ColdCleanupServices = .{ .accepts = accepts, .free = freeBounded };
+        const owner_services: OutputOwner.CleanupServices = .{ .accepts = acceptsOwner, .release = releaseBounded };
+        fn acceptsOwner(value: *const OutputOwner) bool {
+            return value.release == releaseRaw and value.begin_cleanup == begin;
+        }
+
+        const table: ops.ComputeBackend.VTable = value: {
+            var result = @import("../ops/native_compute.zig").vtable_impl;
+            result.freeTensor = freeRaw;
+            result.cold_cleanup_services = &services;
+            result.toFloat32 = materialize;
+            break :value result;
+        };
+        fn accepts(value: *const ops.ComputeBackend.VTable) bool {
+            return value == &table;
+        }
+        fn materialize(_: *anyopaque, _: ops.CT, a: std.mem.Allocator) ![]f32 {
+            return a.dupe(f32, &.{ 1, 3 });
+        }
+        fn freeRaw(ctx: *anyopaque, tensor: ops.CT) void {
+            freeBounded(ctx, tensor, .{});
+        }
+        fn freeBounded(ctx: *anyopaque, _: ops.CT, cleanup_context: CleanupContext) void {
+            const epoch = cleanup_context.boundary;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.frees += 1;
+            self.free_outside_scope = self.free_outside_scope or self.scopes == 0;
+            self.free_nonce = if (epoch) |value| value.nonce else 0;
+        }
+        fn begin(ctx: *anyopaque) CloseScope {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.scopes += 1;
+            return .{ .ptr = self, .release_fn = end };
+        }
+        fn end(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.scopes -= 1;
+        }
+        fn releaseRaw(ctx: *anyopaque) void {
+            releaseBounded(ctx, .{});
+        }
+        fn releaseBounded(ctx: *anyopaque, cleanup_context: CleanupContext) void {
+            const epoch = cleanup_context.boundary;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.releases += 1;
+            self.owner_inside_scope = self.owner_inside_scope or self.scopes != 0;
+            self.owner_nonce = if (epoch) |value| value.nonce else 0;
+        }
+        fn owner(self: *@This()) OutputOwner {
+            return .{ .ptr = self, .release = releaseRaw, .cleanup_services = &owner_services, .begin_cleanup = begin };
+        }
+    };
+    var sink = try @import("../execution/retirement_sink.zig").Ref.create();
+    defer sink.release();
+    var old = try sink.enter();
+    old.finish();
+    var current = try sink.enter();
+    defer current.finish();
+    var epoch = try current.retainEpoch();
+    defer epoch.release();
+    var probe = Probe{};
+    const backend = ops.ComputeBackend{ .ptr = &probe, .vtable = &Probe.table };
+    const token: ops.CT = @ptrFromInt(4);
+    {
+        var output = ModelOutput{ .device_logits = token, .device_logits_backend = backend, .owner = probe.owner() };
+        defer output.deinitWithBoundary(allocator, &epoch);
+        const values = try output.hostLogitsWithBoundary(allocator, &epoch);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 3 }, values);
+        try std.testing.expect(output.owner == null and output.device_logits == null);
+    }
+    {
+        var output = ModelOutput{ .prepared_tail = .{ .final_hidden = token, .backend = backend, .norm = .layer, .norm_slot = 0, .lm_head_slot = 0, .hidden_size = 2, .vocab_size = 2, .eps = 0.00001 }, .owner = probe.owner() };
+        output.deinitWithBoundary(allocator, &epoch);
+    }
+    {
+        var output = GreedyDecodeOutput{ .token_id = 3, .token_tensor = token, .token_tensor_backend = &backend, .owner = probe.owner() };
+        output.deinitWithBoundary(&epoch);
+    }
+    try std.testing.expectEqual(@as(usize, 3), probe.frees);
+    try std.testing.expectEqual(@as(usize, 3), probe.releases);
+    try std.testing.expectEqual(epoch.nonce, probe.free_nonce);
+    try std.testing.expectEqual(epoch.nonce, probe.owner_nonce);
+    try std.testing.expectEqual(@as(usize, 0), probe.scopes);
+    try std.testing.expect(!probe.owner_inside_scope and !probe.free_outside_scope);
+}
+
+test "model retained output cleanup and materialization forward current epoch after SDK protection ends" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try modelOutputBoundaryCase(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, modelOutputBoundaryCase, .{});
+}
+
+test "Model runtime exported logits sanitize request header before parent stack dies" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var endpoint = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer endpoint.deinit(a);
+    const canonical = endpoint.computeBackend();
+    const Parent = struct {
+        backend: ops.ComputeBackend,
+        var callbacks: usize = 0;
+        fn bind(_: *anyopaque, _: ?*@import("../runtime/tier/memory.zig").RunBudget) void {
+            callbacks += 1;
+        }
+        fn prefill(raw: *anyopaque, _: std.mem.Allocator, _: PrefillRequest) !ModelOutput {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .device_logits = try self.backend.fromFloat32Shape(&.{ 3, 5 }, &.{ 1, 2 }), .device_logits_backend = self.backend };
+        }
+        fn close(_: *anyopaque) void {}
+        fn execute(allocator: std.mem.Allocator, backend: ops.ComputeBackend) !ModelOutput {
+            var budget = @import("../runtime/tier/memory.zig").RunBudget.init(.{});
+            const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{} };
+            var parent = @This(){ .backend = backend };
+            parent.backend.call_context = &context;
+            parent.backend.execution_budget = &budget;
+            parent.backend.execution_budget_bind = bind;
+            parent.backend.execution_owner = 42;
+            var model = ModelRuntime{ .ptr = &parent, .vtable = &.{ .prefill = prefill, .deinit = close } };
+            return model.prefill(allocator, .{ .input_ids = &.{1}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+        }
+    };
+    Parent.callbacks = 0;
+    var output = try Parent.execute(a, canonical);
+    var owner = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    const current = CleanupContext{ .boundary = owner.epoch() };
+    defer output.deinitWithCleanup(a, current);
+    const retained = output.device_logits_backend.?;
+    try std.testing.expect(retained.ptr == canonical.ptr and retained.vtable == canonical.vtable);
+    try std.testing.expect(retained.call_context == null and retained.execution_budget == null and retained.execution_budget_bind == null and retained.execution_owner == 0);
+    retained.bindExecutionBudget();
+    retained.clearExecutionBudget();
+    const values = try output.hostLogitsWithCleanup(a, current);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 5 }, values);
+    try std.testing.expectEqual(@as(usize, 0), Parent.callbacks);
+}
+
+fn modelRequestFinishCase(a: std.mem.Allocator) !void {
+    const native = @import("../ops/native_compute.zig");
+    const operation = @import("../execution/backend_operation.zig");
+    const sink = @import("../execution/retirement_sink.zig");
+    var stable = try sink.Ref.create();
+    defer stable.release();
+    var guard = try stable.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.resident_weights.deinit(a);
+    defer weights.lazy_weights.deinit(a);
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var operation_owner: @import("../execution/operation_owner.zig").Owner = .{};
+    compute.shared_operation_owner = &operation_owner;
+    defer compute.shared_operation_owner = null;
+    const backend = compute.computeBackend();
+    var scope: operation.Scope = undefined;
+    try operation.enterInto(&backend, null, null, .managed, &scope);
+    defer scope.deinitChecked() catch @panic("request finish fixture operation teardown failed");
+    _ = try scope.bindCleanupEpoch(&epoch);
+    const token = scope.token() orelse return error.ExpectedActualNativeOperation;
+    const current: CleanupContext = .{ .boundary = &epoch, .operation = token };
+    const Probe = struct {
+        backend: ops.ComputeBackend,
+        boundary: *const sink.Epoch,
+        calls: usize = 0,
+        armed: bool = true,
+        fail: bool = false,
+        fn capabilities(_: *anyopaque) RuntimeCapabilities {
+            return .{ .state_ownership = .runtime_owned_host_cache };
+        }
+        fn accepts(table: *const ModelRuntime.VTable) bool {
+            return table == &table_value;
+        }
+        fn operationBackend(raw: *anyopaque) *const ops.ComputeBackend {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return &self.backend;
+        }
+        fn finish(raw: *anyopaque, supplied: CleanupContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(supplied.boundary == self.boundary);
+            _ = try supplied.operationFor(&self.backend);
+            self.calls += 1;
+            if (self.fail) return error.InjectedRequestAwaitFailure;
+            self.armed = false;
+        }
+        fn prefill(_: *anyopaque, _: std.mem.Allocator, _: PrefillRequest) !ModelOutput {
+            return error.UnusedFixturePrefill;
+        }
+        fn close(_: *anyopaque) void {}
+        fn resetCopy(_: *anyopaque) !void {}
+        const services = ModelRuntime.ColdCleanupServices{ .accepts = accepts, .deinit = closeWithCleanup, .finish_request = finish };
+        fn closeWithCleanup(_: *anyopaque, _: CleanupContext) void {}
+        const table_value = ModelRuntime.VTable{ .prefill = prefill, .deinit = close, .capabilities = capabilities, .operation_backend = operationBackend, .accepts_operation_backend = accepts, .cold_cleanup_services = &services };
+    };
+    const probe = try a.create(Probe);
+    defer a.destroy(probe);
+    probe.* = .{ .backend = backend, .boundary = &epoch };
+    var model = ModelRuntime{ .ptr = probe, .vtable = &Probe.table_value };
+    var request: RequestFinish = .{};
+    try request.receive(&model);
+    try request.receive(&model);
+    try request.finish(current);
+    try std.testing.expect(request.runtime == null);
+    try std.testing.expect(!probe.armed);
+    probe.armed = true;
+    probe.fail = true;
+    // This receiving call borrows the live actual Native operation. A denial
+    // is not permission to clear the runtime's uncertain pending ownership.
+    try request.receive(&model);
+    if (request.finish(current)) |_| return error.ExpectedRequestFinishFailure else |err| {
+        if (err != error.InjectedRequestAwaitFailure) return err;
+    }
+    try std.testing.expect(probe.armed and request.runtime == &model);
+    var other = ModelRuntime{ .ptr = @ptrFromInt(16), .vtable = &Probe.table_value };
+    try std.testing.expectError(error.RuntimeRequestParticipantChanged, request.receive(&other));
+    const original_context = model.ptr;
+    model.ptr = @ptrFromInt(16);
+    const changed_context = request.finish(current);
+    model.ptr = original_context;
+    try std.testing.expectError(error.RuntimeRequestParticipantChanged, changed_context);
+    try std.testing.expect(probe.armed);
+    var foreign_sink = try sink.Ref.create();
+    defer foreign_sink.release();
+    var foreign_guard = try foreign_sink.enter();
+    defer foreign_guard.finish();
+    var foreign_epoch = try foreign_guard.retainEpoch();
+    defer foreign_epoch.release();
+    try std.testing.expectError(error.BackendOperationCleanupChanged, request.finish(.{ .boundary = &foreign_epoch, .operation = token }));
+    try std.testing.expect(probe.armed and request.runtime == &model);
+    probe.fail = false;
+    try request.finish(current);
+    try std.testing.expect(!probe.armed);
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    var copied = Probe.table_value;
+    copied.reset = Probe.resetCopy;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(&copied != &Probe.table_value);
+    var foreign = ModelRuntime{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expectError(error.RuntimeRequestCleanupChanged, foreign.finishRequestWithCleanup(current));
+    // Absence is a literal no-op: no backend getter, provider or opaque cast.
+    const no_finish = ModelRuntime.VTable{ .prefill = Probe.prefill, .deinit = Probe.close };
+    var ordinary = ModelRuntime{ .ptr = @ptrFromInt(16), .vtable = &no_finish };
+    try ordinary.finishRequestWithCleanup(.{});
+    var unused_request: RequestFinish = .{};
+    try unused_request.receive(&ordinary);
+    try std.testing.expect(unused_request.runtime == null);
+    const HostAssisted = struct {
+        fn accepts(table: *const ModelRuntime.VTable) bool {
+            return table == &value;
+        }
+        const services = ModelRuntime.ColdCleanupServices{ .accepts = accepts, .deinit = Probe.closeWithCleanup, .finish_request = Probe.finish };
+        const value = ModelRuntime.VTable{ .prefill = Probe.prefill, .deinit = Probe.close, .cold_cleanup_services = &services };
+    };
+    var unsupported_role = ModelRuntime{ .ptr = @ptrFromInt(16), .vtable = &HostAssisted.value };
+    try std.testing.expectError(error.UnsupportedRuntimeRequestParticipant, unused_request.receive(&unsupported_role));
+}
+
+test "model request finish preserves actual operation epoch and uncertain state before provider retirement" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try modelRequestFinishCase(std.testing.allocator);
+}
+
+test "model request finish metadata ownership survives allocation failures" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, modelRequestFinishCase, .{});
+}
+
+test "decode continuation is lexical and invalid geometry refuses before runtime dispatch" {
+    const extras = [_]i32{ 3, -1, 17 };
+    const policy = DecodeContinuation{ .remaining_tokens = 2, .primary_stop_token = 2, .extra_stop_tokens = &extras };
+    try policy.check();
+    try std.testing.expect(!policy.isLast());
+    for ([_]i64{ 2, 3, 17 }) |token| try std.testing.expect(policy.stops(token));
+    for ([_]i64{ -1, 0, 4, 18 }) |token| try std.testing.expect(!policy.stops(token));
+    const old = DecodeRequest{ .token_id = 1, .position = 0 };
+    try old.check();
+    try std.testing.expect(old.continuation == null);
+    const invalid = DecodeRequest{ .token_id = 1, .position = 0, .continuation = .{ .remaining_tokens = 0 } };
+    try std.testing.expectError(error.InvalidDecodeContinuation, invalid.check());
 }

@@ -81,7 +81,7 @@ pub const Runtime = struct {
         const max_stages: usize = @intCast(@min(100_000, @max(512, record.sequence +| 512)));
         self.session = try Session.init(a, self.client.store(), lease, record.identity, .{ .now_fn = now }, @max(512, max_stages), 32 * 1024 * 1024);
         self.session.io = io;
-        self.session.meter = control.document_dispatch_meter;
+        self.session.meter = if (control.document_dispatch_meter) |meter| @ptrCast(@alignCast(meter)) else null;
         self.session.check_context = self;
         self.session.check_fn = check;
         return self;

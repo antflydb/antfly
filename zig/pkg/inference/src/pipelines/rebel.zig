@@ -199,17 +199,10 @@ pub const RebelPipeline = struct {
             input_ids[i] = @intCast(token_ids_i32[i]);
         }
 
-        const encoder_outputs = try self.enc_dec.encode(alloc, input_ids, seq_len);
-        defer {
-            for (encoder_outputs) |*output| output.deinit();
-            alloc.free(encoder_outputs);
-        }
-
         const enc_mask = try alloc.alloc(i64, seq_len);
         defer alloc.free(enc_mask);
         @memset(enc_mask, 1);
-
-        var gen_result = try self.enc_dec.greedyDecode(alloc, encoder_outputs, enc_mask, seq_len);
+        var gen_result = try self.enc_dec.generateMasked(alloc, input_ids, enc_mask);
         defer gen_result.deinit();
 
         return try self.tokenizer.decode(alloc, gen_result.text_ids);

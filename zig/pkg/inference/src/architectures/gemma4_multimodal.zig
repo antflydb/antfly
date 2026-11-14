@@ -19,6 +19,7 @@ const tokenizer_mod = @import("inference_tokenizer");
 const gpt_mod = @import("../models/gpt.zig");
 const gemma3_mm = @import("../pipelines/gemma3_multimodal.zig");
 const gemma4_projector = @import("gemma4_projector.zig");
+const prompt_rows = @import("../execution/decoder_prefill.zig");
 
 const ComputeBackend = ops.ComputeBackend;
 
@@ -182,6 +183,27 @@ pub fn prepareExpandedPromptEmbeddingsResident(
 ) !gemma3_mm.PreparedPrompt {
     if (!cb.supportsCopyRows2D()) return error.ResidentImageOperationUnavailable;
     return preparePromptEmbeddings(cb, allocator, tokenizer, config, expanded_token_ids, .{ .tokens_per_image = projected_images.tokens_per_image, .hidden_size = projected_images.hidden_size, .resident = projected_images.embeddings }, projected_audio);
+}
+
+/// Consume the producer's declared row source. Task/model code keeps marker
+/// and token semantics; output placement and lifetime come from its typed input.
+/// This calls the SAME numerical prompt composer used by compatibility APIs.
+pub fn prepareExpandedPromptEmbeddingsFromRows(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tokenizer: tokenizer_mod.Tokenizer,
+    config: gpt_mod.Config,
+    expanded_token_ids: []const i32,
+    projected_images: ?prompt_rows.ProjectedInputRows,
+    projected_audio: ?*const gemma4_projector.ProjectedAudio,
+) !gemma3_mm.PreparedPrompt {
+    if (projected_images) |rows| if (rows.source == .resident and !cb.supportsCopyRows2D()) return error.ResidentImageOperationUnavailable;
+    return preparePromptEmbeddings(cb, allocator, tokenizer, config, expanded_token_ids, if (projected_images) |rows| .{
+        .tokens_per_image = rows.rows_per_item,
+        .hidden_size = rows.width,
+        .host = if (rows.source == .host) rows.source.host else null,
+        .resident = if (rows.source == .resident) rows.source.resident else null,
+    } else null, projected_audio);
 }
 
 const ImageFeatures = struct {

@@ -28,19 +28,159 @@ const cuda = @import("cuda_compute.zig");
 const Callback = *const fn (*anyopaque, u64, u32, u32, u32, i64, u32, u32, u32, u32) callconv(.c) c_int;
 extern fn antfly_nvdec_open(*?*anyopaque, ?*anyopaque, *anyopaque, Callback) c_int;
 extern fn antfly_nvdec_packet(*anyopaque, ?[*]const u8, u32, i64, c_int) c_int;
-extern fn antfly_nvdec_close(*anyopaque) void;
+extern fn antfly_nvdec_close_checked(*anyopaque) c_int;
+extern fn antfly_nvdec_retirement_ready(*anyopaque, *anyopaque, *const fn (*anyopaque) callconv(.c) void) c_int;
+extern fn antfly_nvdec_detach_budget(*anyopaque, *anyopaque, *const fn (*anyopaque) callconv(.c) void, *anyopaque, *const fn (*anyopaque) callconv(.c) void) c_int;
 extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int, c_int, c_int, u32, u32, c_int) c_int;
-extern fn antfly_nvdec_finish(*anyopaque) void;
+extern fn antfly_nvdec_finish_checked(*anyopaque) c_int;
+extern fn antfly_nvdec_probe_begin(*anyopaque, u32, u32, c_int, c_int, c_int, c_int, c_int, u32, u32, c_int) c_int;
+extern fn antfly_nvdec_probe_result(*anyopaque, *Sequence) c_int;
+extern fn antfly_nvdec_expect_sequence(*anyopaque, ?*const Sequence) c_int;
+extern fn antfly_nvdec_sequence_matches(*anyopaque, *const Sequence) c_int;
+pub const Sequence = @import("video_cache_budget.zig").Sequence;
+
+/// The sole void callback adapter is a Zig-owned checked endpoint. Context's
+/// legacy callback ABI cannot report failure; never forget an uncertain handle
+/// or refund its quota when physical SDK death could not be established.
+fn closeDecoderOwned(decoder: *anyopaque) callconv(.c) void {
+    if (antfly_nvdec_close_checked(decoder) != 0) @import("antfly_platform").inference_process_supervisor.restartWorker();
+}
+fn openDecoderOwned(out: *?*anyopaque, stream: ?*anyopaque, user: *anyopaque, callback: Callback) !void {
+    const status = antfly_nvdec_open(out, stream, user, callback);
+    if (status == 0) return;
+    if (out.*) |partial| {
+        closeDecoderOwned(partial);
+        out.* = null;
+    }
+    try checkStatusCode(status);
+}
+
+/// Cold parser-only preflight, BEFORE actual model/provider ownership. This
+/// uses an independent parser and stops before the first HW picture decode;
+/// no persistent surface, stream work or consumer callback is created. The
+/// context owner stays pinned by the caller; capture legality is authoritative.
+pub const EmbeddingProbe = struct { sequence: Sequence, samples: u6 = 0, unique_frames: u6 = 0, display_width: u32 = 0, display_height: u32 = 0, raster_width: u32 = 0, raster_height: u32 = 0 };
+
+pub fn probeMp4Sequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation) !Sequence {
+    return (try probeSequence(allocator, ctx, bytes, control, preparation, false)).sequence;
+}
+pub fn probeEmbeddingMp4(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation) !EmbeddingProbe {
+    return probeSequence(allocator, ctx, bytes, control, preparation, true);
+}
+fn probeSequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation, comptime embedding: bool) !EmbeddingProbe {
+    if (!build_options.enable_cuda or builtin.os.tag != .linux) return error.UnsupportedVideoBackend;
+    if (bytes.len > 256 * 1024 * 1024) return error.VideoInputTooLarge;
+    try preparation.validate(ctx);
+    try control.check();
+    if (ctx.driver.fns.cuStreamIsCapturing == null) return error.UnsupportedCudaStageCaptureQuery;
+    if (try ctx.streamCaptureActive()) return error.EmbeddingStageBusy;
+    var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video-probe", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = control };
+    var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(true));
+    defer reader.deinit();
+    try validateTrack(reader.track);
+    const normalized = try @import("antfly_video").hevc_config.normalizeReader(allocator, &reader);
+    defer if (normalized) |config| allocator.free(config);
+    const track = reader.track;
+    const rotation = try quarterTurns(track.display_matrix);
+    const sar = try displayAspect(allocator, track);
+    const probe_frame = Frame{ .device = 0, .pitch = 0, .width = track.width, .height = track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = rotation, .sar = sar };
+    const display = try probe_frame.displaySize();
+    const raster = probe_frame.rasterSize();
+    const color = try containerColor(track.color_info);
+    if (reader.packets.len == 0) return error.EmptyVideo;
+    const end_us = try validateTimeline(track, reader.packets);
+    var samples: u6 = 0;
+    var unique_frames: u6 = 0;
+    if (embedding) {
+        const sampler = try embeddingSamplerForReader(&reader, end_us);
+        samples = @intCast(sampler.length);
+        unique_frames = sampler.uniqueFrames();
+    }
+    const codec: c_int = switch (track.codec) {
+        .avc => 4,
+        .hevc => 8,
+        .av1 => 11,
+        .mjpeg => return error.UnsupportedVideoFormat,
+    };
+    const NoFrames = struct {
+        fn call(_: *anyopaque, _: u64, _: u32, _: u32, _: u32, _: i64, _: u32, _: u32, _: u32, _: u32) callconv(.c) c_int {
+            // Probe decode/display callbacks must not reach a consumer.
+            return -1;
+        }
+    };
+    var unused: u8 = 0;
+    var decoder: ?*anyopaque = null;
+    try ctx.makeCurrent();
+    try openDecoderOwned(&decoder, null, &unused, NoFrames.call);
+    defer if (antfly_nvdec_close_checked(decoder.?) != 0) @import("antfly_platform").inference_process_supervisor.restartWorker();
+    try checkStatusCode(antfly_nvdec_probe_begin(decoder.?, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, sar.horizontal, sar.vertical, @intFromBool(track.pixel_aspect_declared)));
+    var annex: std.ArrayList(u8) = .empty;
+    defer annex.deinit(allocator);
+    switch (track.codec) {
+        .avc => try avccHeaders(allocator, &annex, track.avcc),
+        .hevc => try hvccHeaders(allocator, &annex, track.codec_config),
+        .av1 => try annex.appendSlice(allocator, track.codec_config[4..]),
+        .mjpeg => unreachable,
+    }
+    var observed: Sequence = undefined;
+    if (annex.items.len != 0) {
+        const status = antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), 0, 0);
+        if (status != 7) try checkStatusCode(status);
+        if (antfly_nvdec_probe_result(decoder.?, &observed) != 0) {
+            _ = try observed.bytes();
+            return .{ .sequence = observed, .samples = samples, .unique_frames = unique_frames, .display_width = display[0], .display_height = display[1], .raster_width = raster[0], .raster_height = raster[1] };
+        }
+        if (status == 7) return error.InvalidVideoGeometry;
+    }
+    for (reader.packets, 0..) |packet, index| {
+        try control.check();
+        var lease = try reader.readPacket(index);
+        defer lease.deinit();
+        annex.clearRetainingCapacity();
+        if (track.codec == .av1) try annex.appendSlice(allocator, lease.bytes) else try annexPacket(allocator, &annex, lease.bytes, track.nal_length_bytes);
+        const status = antfly_nvdec_packet(decoder.?, annex.items.ptr, @intCast(annex.items.len), try timestampUs(packet.pts, track.timescale), 0);
+        if (status != 7) try checkStatusCode(status);
+        if (antfly_nvdec_probe_result(decoder.?, &observed) != 0) {
+            _ = try observed.bytes();
+            return .{ .sequence = observed, .samples = samples, .unique_frames = unique_frames, .display_width = display[0], .display_height = display[1], .raster_width = raster[0], .raster_height = raster[1] };
+        }
+        if (status == 7) return error.InvalidVideoGeometry;
+    }
+    return error.InvalidVideoGeometry;
+}
+pub fn cachedSequenceMatches(ctx: *const context.CudaContext, sequence: Sequence) bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    const decoder = ctx.video_decoder_cache orelse return false;
+    return antfly_nvdec_sequence_matches(decoder, &sequence) != 0;
+}
 
 extern fn antfly_nvdec_set_budget(*anyopaque, *anyopaque, *const fn (*anyopaque, u32, u32, u32, u32) callconv(.c) c_int, *const fn (*anyopaque) callconv(.c) void) void;
 
 fn reserveDecoder(raw: *anyopaque, width: u32, height: u32, surfaces: u32, sample_bytes: u32) callconv(.c) c_int {
     const ctx: *context.CudaContext = @ptrCast(@alignCast(raw));
-    const bytes = @import("video_cache_budget.zig").envelope(width, height, surfaces) catch |err| {
+    const bytes = @import("video_cache_budget.zig").envelopeForSampleBytes(width, height, surfaces, sample_bytes) catch |err| {
         ctx.video_cache_budget.failure = err;
         return 0;
     };
-    ctx.video_cache_budget.reserve(&ctx.device_allocations, bytes * sample_bytes) catch |err| {
+    if (ctx.prepared_cache_funding) |funding| {
+        const expected = funding.decoder_sequence orelse {
+            ctx.video_cache_budget.failure = error.UnpreparedDecoderAdmission;
+            return 0;
+        };
+        if (expected.coded_width != width or expected.coded_height != height or expected.surfaces != surfaces or (if (expected.bit_depth == 10) @as(u32, 2) else @as(u32, 1)) != sample_bytes) {
+            ctx.video_cache_budget.failure = error.PreparedCacheAmountChanged;
+            return 0;
+        }
+        var token = funding.take(.{ .decoder = expected }, .{ .backend_scratch_bytes = bytes }) catch |err| {
+            ctx.video_cache_budget.failure = err;
+            return 0;
+        };
+        token.publishDecoder(&ctx.video_cache_budget, &ctx.device_allocations, bytes) catch |err| {
+            token.cancelBeforeSdk() catch @import("antfly_platform").inference_process_supervisor.restartWorker(); // No decoder creation was attempted.
+            ctx.video_cache_budget.failure = err;
+            return 0;
+        };
+    } else ctx.video_cache_budget.reserve(&ctx.device_allocations, bytes) catch |err| {
         ctx.video_cache_budget.failure = err;
         return 0;
     };
@@ -48,8 +188,78 @@ fn reserveDecoder(raw: *anyopaque, width: u32, height: u32, surfaces: u32, sampl
 }
 fn releaseDecoder(raw: *anyopaque) callconv(.c) void {
     const ctx: *context.CudaContext = @ptrCast(@alignCast(raw));
-    ctx.video_cache_budget.release();
+    if (ctx.video_callback_cleanup) |current| {
+        ctx.video_cache_budget.releaseWithCleanup(.{ .boundary = current.boundary, .outside_execution = current.outside_execution }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    } else if (ctx.prepared_cache_funding) |funding| {
+        // This is the LIVE actual invocation binding, not the cached decoder's
+        // construction epoch. SDK creation/failure cleanup runs synchronously.
+        const epoch = funding.boundary orelse @import("antfly_platform").inference_process_supervisor.restartWorker();
+        ctx.video_cache_budget.releaseWithCleanup(.{ .boundary = epoch }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    } else {
+        if (ctx.video_cache_budget.quota == .prepared) @import("antfly_platform").inference_process_supervisor.restartWorker();
+        ctx.video_cache_budget.releaseLegacyRawAfterSdkDeath() catch @import("antfly_platform").inference_process_supervisor.restartWorker(); // no inferred outside contract
+    }
 }
+
+/// Checked actual endpoint death under a caller-supplied CURRENT cleanup
+/// boundary or explicit outside contract. Quota preflight precedes every SDK
+/// action; callback sees this context only during this synchronous call.
+pub fn closeCachedDecoderWithCleanup(ctx: *context.CudaContext, current: @import("../../execution/cleanup_context.zig").Context) !void {
+    const decoder = ctx.video_decoder_cache orelse return;
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedCachedVideoDecoder;
+    if (ctx.video_decoder_release != closeDecoderOwned or ctx.video_callback_cleanup != null) return error.UnsupportedCachedVideoDecoder;
+    try ctx.video_cache_budget.validateCleanup(current);
+    try ctx.makeCurrent();
+    ctx.video_callback_cleanup = .{ .boundary = current.boundary, .outside_execution = current.outside_execution };
+    defer ctx.video_callback_cleanup = null;
+    if (antfly_nvdec_close_checked(decoder) != 0) return error.VideoDecoderRetirementFailed;
+    ctx.video_decoder_cache = null;
+    ctx.video_decoder_release = null;
+}
+
+/// A final-address carrier owns the OLD decoder budget independently of the
+/// context's newly published decoder. Its lease is parked before destruction;
+/// this C callback therefore returns only the physical opaque-envelope ledger.
+pub const DetachedDecoder = struct {
+    handle: ?*anyopaque = null,
+    budget: @import("video_cache_budget.zig").CacheBudget = .{},
+    fn released(raw: *anyopaque) callconv(.c) void {
+        const self: *DetachedDecoder = @ptrCast(@alignCast(raw));
+        std.debug.assert(!self.budget.quota.hasLease());
+        self.budget.release();
+    }
+    pub fn ready(ctx: *context.CudaContext) !void {
+        const decoder = ctx.video_decoder_cache orelse {
+            if (ctx.video_cache_budget.bytes != 0 or ctx.video_cache_budget.quota.hasLease() or ctx.video_cache_budget.physical != null) return error.InvalidCacheRetirementState;
+            return;
+        };
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedCachedVideoDecoder;
+        if (ctx.video_decoder_release != closeDecoderOwned) return error.UnsupportedCachedVideoDecoder;
+        if (antfly_nvdec_retirement_ready(decoder, ctx, releaseDecoder) == 0) return error.EmbeddingStageBusy;
+    }
+    pub fn detach(self: *DetachedDecoder, ctx: *context.CudaContext) !void {
+        std.debug.assert(self.handle == null and self.budget.bytes == 0);
+        try ready(ctx);
+        const decoder = ctx.video_decoder_cache orelse return;
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedCachedVideoDecoder;
+        if (antfly_nvdec_detach_budget(decoder, ctx, releaseDecoder, self, released) == 0) return error.CacheRetirementChanged;
+        self.handle = decoder;
+        self.budget = ctx.video_cache_budget;
+        const admission = ctx.video_cache_budget.admission;
+        ctx.video_decoder_cache = null;
+        ctx.video_decoder_release = null;
+        ctx.video_cache_budget = .{ .admission = admission };
+    }
+    pub fn clearRetired(self: *DetachedDecoder, ctx: *context.CudaContext) !void {
+        const decoder = self.handle orelse return;
+        if (comptime builtin.os.tag != .linux) return error.UnsupportedCachedVideoDecoder;
+        std.debug.assert(!self.budget.quota.hasLease());
+        try ctx.makeCurrent();
+        if (antfly_nvdec_close_checked(decoder) != 0) return error.VideoDecoderRetirementFailed;
+        self.handle = null;
+        std.debug.assert(self.budget.bytes == 0);
+    }
+};
 
 pub const max_frames = 60;
 pub const max_duration_us = 60_000_000;
@@ -318,6 +528,17 @@ pub const EmbeddingSampler = struct {
         }
         return self;
     }
+    /// Coalesced callback count for the SAME validated selected indices.
+    /// Successful decode already requires sampler.next == sampler.length.
+    pub fn uniqueFrames(self: *const EmbeddingSampler) u6 {
+        var previous: ?usize = null;
+        var count: u6 = 0;
+        for (self.indices[0..self.length]) |frame| {
+            if (previous == null or previous.? != frame) count += 1;
+            previous = frame;
+        }
+        return count;
+    }
     pub fn select(self: *EmbeddingSampler, pts: i64) !bool {
         if (self.last_us) |last| if (pts < last) return error.NonMonotonicVideoPresentation;
         self.last_us = pts;
@@ -418,20 +639,43 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     if (sampling == .embedding_gemma2) {
         state.embedding_sampler = try embeddingSamplerForReader(&reader, state.sampler.end_us);
     }
+    if (ctx.prepared_cache_funding == null and ctx.video_cache_budget.quota == .prepared) return error.UnpreparedDecoderAdmission;
+    const prepared_sequence: ?Sequence = if (ctx.prepared_cache_funding) |funding|
+        funding.decoder_sequence orelse return error.UnpreparedDecoderAdmission
+    else
+        null;
+    if (ctx.prepared_cache_funding) |funding| {
+        const epoch = funding.boundary orelse return error.InvalidPreparedCacheState;
+        if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        try ctx.video_cache_budget.validateCleanup(.{ .boundary = epoch });
+    }
     try ctx.makeCurrent();
     if (ctx.video_decoder_cache == null) {
-        try state.checkStatus(antfly_nvdec_open(&ctx.video_decoder_cache, ctx.stream, &state, DecodeState.callback));
-        ctx.video_decoder_release = antfly_nvdec_close;
+        try openDecoderOwned(&ctx.video_decoder_cache, ctx.stream, &state, DecodeState.callback);
+        ctx.video_decoder_release = closeDecoderOwned;
     }
     const decoder = ctx.video_decoder_cache;
     antfly_nvdec_set_budget(decoder.?, ctx, reserveDecoder, releaseDecoder);
     var succeeded = false;
     defer {
-        if (succeeded) antfly_nvdec_finish(decoder.?) else {
-            antfly_nvdec_close(decoder.?);
+        if (ctx.prepared_cache_funding) |funding| {
+            const epoch = funding.boundary orelse @import("antfly_platform").inference_process_supervisor.restartWorker();
+            ctx.video_cache_budget.validateCleanup(.{ .boundary = epoch }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        }
+        if (succeeded) {
+            if (antfly_nvdec_finish_checked(decoder.?) != 0) @import("antfly_platform").inference_process_supervisor.restartWorker();
+        } else {
+            if (ctx.prepared_cache_funding != null) {
+                // Consumer/copy failure may follow real stream work. Both the
+                // checked fence and actual decoder death precede currentB quota.
+                ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                if (antfly_nvdec_close_checked(decoder.?) != 0) @import("antfly_platform").inference_process_supervisor.restartWorker();
+            } else closeDecoderOwned(decoder.?);
             ctx.video_decoder_cache = null;
+            ctx.video_decoder_release = null;
         }
     }
+    if (antfly_nvdec_expect_sequence(decoder.?, if (prepared_sequence) |*sequence| sequence else null) == 0) return error.EmbeddingStageBusy;
     const codec: c_int = switch (track.codec) {
         .avc => 4,
         .hevc => 8,
@@ -668,26 +912,19 @@ fn annexPacket(a: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8,
     }
 }
 
+const PreprocessProgram = @import("embedded_module.zig").EmbeddedModule(@embedFile("video_preprocess.ptx"), .{ .patches = "video_patches", .rgb8 = "video_rgb8" });
+
 pub const Preprocessor = struct {
     ctx: *context.CudaContext,
-    module: driver.CUmodule,
-    function: driver.CUfunction,
-    rgb_function: driver.CUfunction,
+    program: PreprocessProgram,
     pub fn init(a: std.mem.Allocator, ctx: *context.CudaContext) !Preprocessor {
         _ = a;
-        try ctx.makeCurrent();
-        var module: driver.CUmodule = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, @embedFile("video_preprocess.ptx").ptr, 0, null, null));
-        errdefer _ = ctx.driver.fns.cuModuleUnload(module);
-        var function: driver.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, "video_patches"));
-        var rgb_function: driver.CUfunction = null;
-        try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rgb_function, module, "video_rgb8"));
-        return .{ .ctx = ctx, .module = module, .function = function, .rgb_function = rgb_function };
+        var program: PreprocessProgram = .{};
+        try program.init(ctx);
+        return .{ .ctx = ctx, .program = program };
     }
     pub fn deinit(self: *Preprocessor) void {
-        self.ctx.makeCurrent() catch {};
-        _ = self.ctx.driver.fns.cuModuleUnload(self.module);
+        self.program.deinit(self.ctx);
     }
     pub fn rgb8(self: *Preprocessor, compute: *cuda.CudaCompute, frame: Frame) !ops.CT {
         if (frame.device == 0 or frame.width == 0 or frame.height == 0 or frame.width > 4096 or frame.height > 4096 or frame.pitch < frame.width or frame.width % 2 != 0 or frame.height % 2 != 0) return error.InvalidVideoGeometry;
@@ -703,7 +940,7 @@ pub const Preprocessor = struct {
         args[0] = &src;
         args[1] = &dst;
         for (&sizes, 2..) |*value, i| args[i] = value;
-        try self.ctx.driver.check(self.ctx.driver.fns.cuLaunchKernel(self.rgb_function, (frame.width * frame.height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null));
+        try self.ctx.launchKernel(self.program.function(.rgb8), (frame.width * frame.height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null);
         self.ctx.noteKernelLaunch();
         return output;
     }
@@ -723,7 +960,7 @@ pub const Preprocessor = struct {
         args[1] = &dst;
         for (&sizes, 2..) |*value, i| args[i] = value;
         for (&normalization, 13..) |*value, i| args[i] = value;
-        try self.ctx.driver.check(self.ctx.driver.fns.cuLaunchKernel(self.function, (width * height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null));
+        try self.ctx.launchKernel(self.program.function(.patches), (width * height * 3 + 255) / 256, 1, 1, 256, 1, 1, 0, self.ctx.stream, &args, null);
         self.ctx.noteKernelLaunch();
         return output;
     }
@@ -732,7 +969,10 @@ pub const Preprocessor = struct {
 test "video CUDA scalar clamps preserve bounds without host transfers" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     var values: [513]f32 = undefined;
@@ -768,7 +1008,10 @@ test "video CUDA scalar clamps preserve bounds without host transfers" {
 test "video CUDA vision attention matches CPU softmax across frames and long sequences" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     for ([_][3]usize{ .{ 2, 513, 64 }, .{ 1, 33, 128 } }) |size| {
@@ -829,7 +1072,10 @@ test "video CUDA vision attention matches CPU softmax across frames and long seq
 test "video CUDA weight widening matches all FP16 and BF16 values and uploads compact bytes" {
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     const halves = try a.alloc(u16, 65536);
@@ -1249,9 +1495,8 @@ test "embeddinggemma2 sampling excludes a leading empty edit from content durati
 test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvision path" {
     if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = try cuda.CudaCompute.initWithKernelJitForProfile(a, .{}, .embedding_gemma2);
     defer compute.deinit();
-    compute.capability_profile = .embedding_gemma2;
     const cb = compute.computeBackend();
     var preprocess = try Preprocessor.init(a, &compute.ctx);
     defer preprocess.deinit();
@@ -1265,6 +1510,10 @@ test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvisi
     try buffer.copyFromHost(&compute.ctx, &nv12);
     const mean = [3]f32{ 0, 0, 0 };
     const deviation = [3]f32{ 1, 1, 1 };
+    // Same independent 256-value source oracle as the existing Module RGB
+    // fixture, not PixelScaleStorage.scale (the production implementation).
+    const source_bits = @embedFile("../../testdata/embeddinggemma2_pixel_source_bf16.bin");
+    var source_boundary_differences: usize = 0;
     for ([_]u32{ 1, 6 }) |matrix| for ([_]u32{ 0, 1 }) |full| {
         var rgb: [width * height * 3]u8 = undefined;
         const kr: f64 = if (matrix == 1) 0.2126 else 0.299;
@@ -1296,11 +1545,18 @@ test "embeddinggemma2 video CUDA RGB and bicubic patches match the CPU torchvisi
             defer a.free(actual);
             for (0..size[1] / 16) |gy| for (0..size[0] / 16) |gx| for (0..16) |py| for (0..16) |px| for (0..3) |c| {
                 const index = ((gy * (size[0] / 16) + gx) * 256 + py * 16 + px) * 3 + c;
-                const expected = 2 * (reference[c * size[0] * size[1] + (gy * 16 + py) * size[0] + gx * 16 + px] - 0.5);
+                const normalized = reference[c * size[0] * size[1] + (gy * 16 + py) * size[0] + gx * 16 + px];
+                const byte: u8 = @intFromFloat(@round(normalized * 255));
+                try std.testing.expectEqual(normalized, @as(f32, @floatFromInt(byte)) * @as(f32, 1.0 / 255.0));
+                const expected_bits = std.mem.readInt(u16, source_bits[@as(usize, byte) * 2 ..][0..2], .little);
+                const expected: f32 = @bitCast(@as(u32, expected_bits) << 16);
+                const original_f32 = 2 * (normalized - 0.5);
+                if (expected != original_f32) source_boundary_differences += 1;
                 try std.testing.expectEqual(expected, actual[index]);
             };
         }
     };
+    try std.testing.expect(source_boundary_differences > 0);
 }
 
 test {
@@ -1336,6 +1592,8 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     };
     Mock.synchronizations = 0;
     var ctx: context.CudaContext = undefined;
+    ctx.observation.store(null, .release);
+    ctx.observation_enable_failed.store(false, .release);
     ctx.ctx = @ptrFromInt(1);
     ctx.stream = @ptrFromInt(2);
     ctx.stats = .{};
@@ -1358,6 +1616,466 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     try std.testing.expectEqual(@as(usize, 1), consumer.ready);
     try std.testing.expectEqual(@as(usize, 1), Mock.synchronizations);
     try std.testing.expectEqual(error.Cancelled, state.failure.?);
+}
+
+test "CUDA detached NVDEC retirement frees old surfaces and quota without touching the actual replacement decoder budget" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Quotas = @import("cache_retirement.zig").PreparedQuotas;
+    const old_domain = try Domain.create();
+    defer old_domain.release();
+    const next_domain = try Domain.create();
+    defer next_domain.release();
+    const old_pin = old_domain.pin();
+    defer old_pin.release();
+    var compute = try cuda.CudaCompute.testing.init(a);
+    defer compute.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        gate: *@import("../../backends/session.zig").Session.ModelLifetime,
+        blocked: bool = false,
+        fn reserve(_: *anyopaque, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!usize {
+            return 1;
+        }
+        fn retain(_: *anyopaque, _: usize, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!void {}
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (!self.gate.execution_gate.tryLock()) self.blocked = true else self.gate.execution_gate.unlock();
+        }
+    };
+    const ModelOwner = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    var model_marker: u8 = 0;
+    var model: @import("../../backends/session.zig").Session.ModelLifetime = .{ .owner = &model_marker, .destroy_fn = ModelOwner.close };
+    var probe = Probe{ .gate = &model };
+    try old_domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    compute.ctx.video_cache_budget.admission = .{ .controller = &old_domain.controller, .limits = .{ .backend_limit_bytes = 256 * 1024 * 1024 }, .check_live_memory = false };
+    const Consume = struct {
+        count: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn frame(raw: *anyopaque, _: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    var consumer = Consume{};
+    const bytes = @embedFile("../../testdata/video/codecs/h264.mp4");
+    _ = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &consumer, .consume = Consume.frame, .check = Consume.check }, .embedding_gemma2);
+    try std.testing.expect(consumer.count != 0);
+    const old_bytes = compute.ctx.video_cache_budget.bytes;
+    const old_handle = compute.ctx.video_decoder_cache.?;
+    try std.testing.expect(old_bytes != 0);
+    const quotas = try Quotas.prepare(1, &old_pin); // before actual owner gate
+    var retired: DetachedDecoder = .{}; // final address through synchronous SDK close
+    var quota_owner = true;
+    defer if (quota_owner) {
+        if (quotas.issued == 0) quotas.destroyUnused() else {
+            retired.clearRetired(&compute.ctx) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            quotas.completeSdkRetirementOutside();
+            quotas.release();
+        }
+    };
+    var gate_held = false;
+    defer if (gate_held) model.execution_gate.unlock();
+    try std.testing.expect(model.execution_gate.tryLock());
+    gate_held = true;
+    try compute.ctx.synchronize();
+    try retired.detach(&compute.ctx);
+    retired.budget.quota.park(quotas);
+    model.execution_gate.unlock();
+    gate_held = false;
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(old_bytes, old_domain.controller.snapshot().backend_scratch_bytes);
+    // The original callback now names retired, never ctx's next generation.
+    compute.ctx.video_cache_budget.admission = .{ .controller = &next_domain.controller, .limits = .{ .backend_limit_bytes = 256 * 1024 * 1024 }, .check_live_memory = false };
+    consumer.count = 0;
+    _ = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &consumer, .consume = Consume.frame, .check = Consume.check }, .embedding_gemma2);
+    try std.testing.expect(consumer.count != 0 and compute.ctx.video_decoder_cache.? != old_handle);
+    const replacement = compute.ctx.video_decoder_cache;
+    const next_bytes = compute.ctx.video_cache_budget.bytes;
+    try std.testing.expect(next_bytes != 0);
+    try retired.clearRetired(&compute.ctx);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls); // quota still held by prepared roots
+    try std.testing.expectEqual(replacement, compute.ctx.video_decoder_cache);
+    try std.testing.expectEqual(next_bytes, compute.ctx.video_cache_budget.bytes);
+    try std.testing.expectEqual(next_bytes, next_domain.controller.snapshot().backend_scratch_bytes);
+    quotas.completeSdkRetirementOutside();
+    quotas.release();
+    quota_owner = false;
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(!probe.blocked);
+    try std.testing.expectEqual(@as(usize, 0), old_domain.controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(next_bytes, next_domain.controller.snapshot().backend_scratch_bytes);
+    _ = try compute.ctx.evictVideoDecoder();
+    try std.testing.expectEqual(@as(usize, 0), next_domain.controller.snapshot().backend_scratch_bytes);
+}
+
+test "CUDA unsupported video retirement refuses opaque endpoints before touching an unavailable SDK" {
+    if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
+    // Rejection-only opaque sentinel: no valid context, decoder or SDK exists.
+    // Every unsupported adapter must refuse before reading another field.
+    var ctx: context.CudaContext = undefined;
+    ctx.video_decoder_cache = @ptrFromInt(1);
+    try std.testing.expect(!cachedSequenceMatches(&ctx, undefined));
+    try std.testing.expectError(error.UnsupportedCachedVideoDecoder, closeCachedDecoderWithCleanup(&ctx, .{}));
+    try std.testing.expectError(error.UnsupportedCachedVideoDecoder, DetachedDecoder.ready(&ctx));
+    var retired: DetachedDecoder = .{};
+    try std.testing.expectError(error.UnsupportedCachedVideoDecoder, retired.detach(&ctx));
+    retired.handle = @ptrFromInt(1);
+    try std.testing.expectError(error.UnsupportedCachedVideoDecoder, retired.clearRetired(&ctx));
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(1)), ctx.video_decoder_cache);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(1)), retired.handle);
+}
+
+test "CUDA video parser preflight funds exact opaque surface envelope before decoder creation and warm failure uses actual later cleanup epoch" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const Prepared = @import("prepared_cache.zig");
+    const Memory = @import("../../runtime/tier/memory.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Session = @import("../../backends/session.zig").Session;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const a = std.testing.allocator;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var compute = cuda.CudaCompute.initWithKernelJitForProfile(a, .{}, .embedding_gemma2) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const ModelOwner = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    var model_marker: u8 = 0;
+    var model: Session.ModelLifetime = .{ .owner = &model_marker, .destroy_fn = ModelOwner.close };
+    const Probe = struct {
+        model: *Session.ModelLifetime,
+        under_gate: bool = false,
+        next: usize = 1,
+        fn check(self: *@This()) void {
+            if (!self.model.execution_gate.tryLock()) self.under_gate = true else self.model.execution_gate.unlock();
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            const id = self.next;
+            self.next += 1;
+            return id;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+    };
+    var probe: Probe = .{ .model = &model };
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const bytes = @embedFile("../../testdata/video/codecs/h264.mp4");
+    var gate_held = false;
+    var preparation: cuda.CudaCompute.CacheMetadataPreparation = undefined;
+    try std.testing.expect(model.execution_gate.tryLock());
+    gate_held = true;
+    try cuda.CudaCompute.CacheMetadataPreparation.beginInto(&preparation, &cb, &compute);
+    model.execution_gate.unlock();
+    gate_held = false;
+    defer preparation.finishOutsideExecution();
+    const before = compute.ctx.device_allocations.snapshot();
+    const sequence = try probeMp4Sequence(a, &compute.ctx, bytes, .{}, &preparation);
+    try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+    try std.testing.expect(compute.ctx.video_decoder_cache == null);
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try compute.ctx.beginStreamCapture(driver.CU_STREAM_CAPTURE_MODE_RELAXED);
+    var capturing = true;
+    defer if (capturing) {
+        const graph = compute.ctx.endStreamCapture() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        compute.ctx.destroyGraph(graph);
+    };
+    compute.ctx.debug_graph_capture_active = false;
+    try std.testing.expectError(error.EmbeddingStageBusy, probeMp4Sequence(a, &compute.ctx, bytes, .{}, &preparation));
+    const graph = try compute.ctx.endStreamCapture();
+    capturing = false;
+    compute.ctx.destroyGraph(graph);
+    try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+    preparation.finishOutsideExecution();
+    const amount = try sequence.bytes();
+    const requests = [_]Prepared.Request{.{ .decoder = sequence }};
+    const work: Prepared.Workload = .{ .requests = &requests };
+    const funding = try Prepared.Funding.create(work);
+    var funding_open = true;
+    defer {
+        if (gate_held) {
+            if (compute.ctx.prepared_cache_funding) |bound| cuda.CudaCompute.unbindCacheFunding(&cb, &compute, bound);
+            model.execution_gate.unlock();
+        }
+        if (funding_open) funding.finishOutsideExecution();
+    }
+    compute.ctx.video_cache_budget.admission = .{ .controller = &domain.controller, .limits = .{ .backend_limit_bytes = amount - 1 }, .check_live_memory = false };
+    try std.testing.expect(model.execution_gate.tryLock());
+    gate_held = true;
+    try cuda.CudaCompute.snapshotCacheFunding(&cb, &compute, funding);
+    model.execution_gate.unlock();
+    gate_held = false;
+    try std.testing.expectError(error.ResourceLimitExceeded, funding.fundOutsideExecution(&pin));
+    try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+    try std.testing.expect(compute.ctx.video_decoder_cache == null);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = amount;
+    funding.admission = compute.ctx.video_cache_budget.admission;
+    try funding.fundOutsideExecution(&pin);
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var first = try sink.enter();
+    defer {
+        if (gate_held) {
+            if (compute.ctx.prepared_cache_funding) |bound| cuda.CudaCompute.unbindCacheFunding(&cb, &compute, bound);
+            model.execution_gate.unlock();
+            gate_held = false;
+        }
+        first.finish();
+    }
+    var first_epoch = try first.retainEpoch();
+    defer first_epoch.release();
+    const ConsumerState = struct {
+        ctx: *context.CudaContext,
+        expected: []const []const u8,
+        count: usize = 0,
+        cancel: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cancel and self.count != 0) return error.Cancelled;
+        }
+        fn consume(raw: *anyopaque, frame: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.count >= self.expected.len) return error.TestUnexpectedResult;
+            const width: usize = frame.width;
+            const height: usize = frame.height;
+            const pitch: usize = frame.pitch;
+            const raw_pixels = try std.testing.allocator.alloc(u8, pitch * height * 3 / 2);
+            defer std.testing.allocator.free(raw_pixels);
+            try self.ctx.driver.check(self.ctx.driver.fns.cuMemcpyDtoHAsync(raw_pixels.ptr, frame.device, raw_pixels.len, self.ctx.stream));
+            try self.ctx.synchronize();
+            const planar = try std.testing.allocator.alloc(u8, width * height * 3 / 2);
+            defer std.testing.allocator.free(planar);
+            for (0..height) |y| @memcpy(planar[y * width ..][0..width], raw_pixels[y * pitch ..][0..width]);
+            for (0..height / 2) |y| for (0..width / 2) |x| {
+                planar[width * height + y * (width / 2) + x] = raw_pixels[pitch * height + y * pitch + x * 2];
+                planar[width * height * 5 / 4 + y * (width / 2) + x] = raw_pixels[pitch * height + y * pitch + x * 2 + 1];
+            };
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(planar, &hash, .{});
+            try std.testing.expectEqualStrings(self.expected[self.count], &std.fmt.bytesToHex(hash, .lower));
+            self.count += 1;
+        }
+    };
+    const Receipt = struct { videos: []const struct { path: []const u8, selected_yuv420_sha256: []const []const u8 } };
+    const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../../testdata/video/codecs/receipt.json"), .{ .ignore_unknown_fields = true });
+    defer receipt.deinit();
+    const expected = for (receipt.value.videos) |entry| {
+        if (std.mem.eql(u8, entry.path, "h264.mp4")) break entry.selected_yuv420_sha256;
+    } else return error.TestUnexpectedResult;
+    var state: ConsumerState = .{ .ctx = &compute.ctx, .expected = expected };
+    try std.testing.expect(model.execution_gate.tryLock());
+    gate_held = true;
+    try cuda.CudaCompute.bindCacheFunding(&cb, &compute, work, funding, &first_epoch);
+    const stats = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &state, .consume = ConsumerState.consume, .check = ConsumerState.check }, .embedding_gemma2);
+    try std.testing.expectEqual(expected.len, stats.selected_frames);
+    try std.testing.expect(cachedSequenceMatches(&compute.ctx, sequence));
+    try std.testing.expect(compute.ctx.video_cache_budget.currentCleanupPrepared());
+    cuda.CudaCompute.unbindCacheFunding(&cb, &compute, funding);
+    model.execution_gate.unlock();
+    gate_held = false;
+    funding.finishOutsideExecution();
+    funding_open = false;
+    first.finish();
+    first_epoch.release();
+    for (0..65) |_| {
+        var other = try sink.enter();
+        other.finish();
+    }
+    try std.testing.expectEqual(amount, domain.controller.snapshot().backend_scratch_bytes);
+    var last = try sink.enter();
+    defer {
+        if (gate_held) {
+            if (compute.ctx.prepared_cache_funding) |bound| cuda.CudaCompute.unbindCacheFunding(&cb, &compute, bound);
+            model.execution_gate.unlock();
+            gate_held = false;
+        }
+        last.finish();
+    }
+    var current = try last.retainEpoch();
+    defer current.release();
+    var warm = Prepared.Funding.empty();
+    state.count = 0;
+    state.cancel = true;
+    try std.testing.expect(model.execution_gate.tryLock());
+    gate_held = true;
+    try std.testing.expect(!try cuda.CudaCompute.cacheWorkloadNeedsFunding(&cb, &compute, work));
+    try cuda.CudaCompute.bindCacheFunding(&cb, &compute, work, &warm, &current);
+    try std.testing.expectError(error.Cancelled, decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &state, .consume = ConsumerState.consume, .check = ConsumerState.check }, .embedding_gemma2));
+    try std.testing.expect(compute.ctx.video_decoder_cache == null);
+    try std.testing.expectEqual(amount, domain.controller.snapshot().backend_scratch_bytes);
+    cuda.CudaCompute.unbindCacheFunding(&cb, &compute, &warm);
+    model.execution_gate.unlock();
+    gate_held = false;
+    warm.finishOutsideExecution();
+    last.finish();
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(!probe.under_gate);
+}
+
+test "CUDA video warm raw decoder upgrades same surfaces at zero spare and retires with later current B" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const Prepared = @import("prepared_cache.zig");
+    const Memory = @import("../../runtime/tier/memory.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Session = @import("../../backends/session.zig").Session;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const a = std.testing.allocator;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var compute = cuda.CudaCompute.initWithKernelJitForProfile(a, .{}, .embedding_gemma2) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const ModelOwner = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    var marker: u8 = 0;
+    var model: Session.ModelLifetime = .{ .owner = &marker, .destroy_fn = ModelOwner.close };
+    const Probe = struct {
+        model: *Session.ModelLifetime,
+        violation: bool = false,
+        calls: usize = 0,
+        fn check(self: *@This()) void {
+            if (!self.model.execution_gate.tryLock()) self.violation = true else self.model.execution_gate.unlock();
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            self.calls += 1;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+    };
+    var probe: Probe = .{ .model = &model };
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const bytes = @embedFile("../../testdata/video/codecs/h264.mp4");
+    var preparation: cuda.CudaCompute.CacheMetadataPreparation = undefined;
+    try std.testing.expect(model.execution_gate.tryLock());
+    try cuda.CudaCompute.CacheMetadataPreparation.beginInto(&preparation, &cb, &compute);
+    model.execution_gate.unlock();
+    defer preparation.finishOutsideExecution();
+    const sequence = try probeMp4Sequence(a, &compute.ctx, bytes, .{}, &preparation);
+    preparation.finishOutsideExecution();
+    const amount = try sequence.bytes();
+    compute.ctx.video_cache_budget.admission = .{ .controller = pin.controller(), .limits = .{ .backend_limit_bytes = amount }, .check_live_memory = false };
+    const Counter = struct {
+        frames: usize = 0,
+        fn consume(raw: *anyopaque, _: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.frames += 1;
+        }
+    };
+    var counter: Counter = .{};
+    const first = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &counter, .consume = Counter.consume }, .embedding_gemma2);
+    try std.testing.expect(first.selected_frames != 0 and counter.frames == first.selected_frames);
+    try std.testing.expect(compute.ctx.video_cache_budget.quota == .raw);
+    const decoder = compute.ctx.video_decoder_cache;
+    const original = compute.ctx.video_cache_budget.quota.peek().?;
+    const calls = probe.calls;
+    const requests = [_]Prepared.Request{.{ .decoder = sequence }};
+    const work: Prepared.Workload = .{ .requests = &requests };
+    const funding = try Prepared.Funding.create(work);
+    defer funding.finishOutsideExecution();
+    var held = false;
+    defer {
+        if (compute.ctx.prepared_cache_funding == funding) cuda.CudaCompute.unbindCacheFunding(&cb, &compute, funding);
+        if (held) model.execution_gate.unlock();
+    }
+    try std.testing.expect(model.execution_gate.tryLock());
+    held = true;
+    const victims = try cuda.CudaCompute.cacheWorkloadVictims(&cb, &compute, work);
+    try std.testing.expect(!victims.geometry.video);
+    try cuda.CudaCompute.snapshotCacheFunding(&cb, &compute, funding);
+    try std.testing.expect(!funding.entries[0].miss and funding.entries[0].upgrade_raw);
+    model.execution_gate.unlock();
+    held = false;
+    try funding.fundOutsideExecution(&pin);
+    try std.testing.expectEqual(calls, probe.calls);
+    var source = try Sink.Ref.create();
+    defer source.release();
+    var first_guard = try source.enter();
+    defer first_guard.finish();
+    var first_epoch = try first_guard.retainEpoch();
+    defer first_epoch.release();
+    try std.testing.expect(model.execution_gate.tryLock());
+    held = true;
+    try cuda.CudaCompute.bindCacheFunding(&cb, &compute, work, funding, &first_epoch);
+    try std.testing.expect(compute.ctx.video_cache_budget.quota == .prepared);
+    try std.testing.expect(std.meta.eql(original, compute.ctx.video_cache_budget.quota.peek().?));
+    counter.frames = 0;
+    const warm = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &counter, .consume = Counter.consume }, .embedding_gemma2);
+    try std.testing.expectEqual(first.selected_frames, warm.selected_frames);
+    try std.testing.expectEqual(decoder, compute.ctx.video_decoder_cache);
+    try std.testing.expectEqual(calls, probe.calls);
+    cuda.CudaCompute.unbindCacheFunding(&cb, &compute, funding);
+    model.execution_gate.unlock();
+    held = false;
+    first_guard.finish();
+    var last = try source.enter();
+    defer last.finish();
+    var epoch = try last.retainEpoch();
+    defer epoch.release();
+    try std.testing.expect(model.execution_gate.tryLock());
+    held = true;
+    try closeCachedDecoderWithCleanup(&compute.ctx, .{ .boundary = &epoch });
+    try std.testing.expect(compute.ctx.video_decoder_cache == null);
+    try std.testing.expectEqual(amount, domain.controller.snapshot().backend_scratch_bytes);
+    model.execution_gate.unlock();
+    held = false;
+    last.finish();
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(!probe.violation);
+}
+
+test "embedding video cold callback count matches actual coalesced sampler including repeated indices" {
+    const cases = [_]struct { frames: usize, duration: i64, samples: usize, unique: u6 }{
+        .{ .frames = 1, .duration = 5_000_000, .samples = 5, .unique = 1 },
+        .{ .frames = 9, .duration = 9_000_000, .samples = 9, .unique = 9 },
+        .{ .frames = 3, .duration = 60_000_000, .samples = 32, .unique = 3 },
+    };
+    for (cases) |case| {
+        var sampler = try EmbeddingSampler.init(case.frames, case.duration, case.duration);
+        try std.testing.expectEqual(case.samples, sampler.length);
+        try std.testing.expectEqual(case.unique, sampler.uniqueFrames());
+        var callbacks: usize = 0;
+        var samples: usize = 0;
+        for (0..case.frames) |index| if (try sampler.select(@intCast(index * @as(usize, @intCast(case.duration)) / case.frames))) {
+            callbacks += 1;
+            samples += sampler.repetitions;
+        };
+        try std.testing.expectEqual(@as(usize, case.unique), callbacks);
+        try std.testing.expectEqual(case.samples, samples);
+        try std.testing.expectEqual(sampler.length, sampler.next);
+    }
 }
 
 test "HEVC inband inspection preserves stream SAR and partial configuration color" {

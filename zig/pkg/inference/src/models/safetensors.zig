@@ -58,6 +58,7 @@ pub const Header = struct {
 
     pub fn tensorNames(self: *const Header, allocator: std.mem.Allocator) ![][]const u8 {
         var names = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer names.deinit(allocator);
         var it = self.tensors.iterator();
         while (it.next()) |entry| {
             try names.append(allocator, entry.key_ptr.*);

@@ -171,6 +171,16 @@ pub fn clampPhysicalMemoryLimits(backend: BackendType, limits: memory_policy.Lim
     return out;
 }
 
+/// Explicit provenance travels with serving/private child load policy; a
+/// populated numeric limit alone must never opt into operator-envelope sizing.
+pub fn clampPhysicalMemoryLimitsWithProcessPolicy(backend: BackendType, limits: memory_policy.Limits, process_limit: usize, provenance: memory_policy.ProcessMemoryLimitProvenance) memory_policy.Limits {
+    const bytes = cudaDeviceMemoryBytes(backend);
+    var out = memory_policy.clampDiscreteDeviceLimitsWithProcessPolicy(limits, bytes, process_limit, provenance);
+    if (bytes != 0 and cuda_unified_memory.load(.acquire))
+        out = memory_policy.clampUnifiedDeviceLimits(out, memory_policy.defaultSharedAdmissionLimitsWithProcessPolicy(process_limit, provenance).host_limit_bytes);
+    return out;
+}
+
 /// The backend that determines a session's resource domain and interruption
 /// policy.
 pub const BackendRuntime = struct {
@@ -248,6 +258,7 @@ const RequiredBackendConfig = struct {
 /// SessionManager selects the best available backend and creates sessions.
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
+    execution_diagnostics: @import("../execution/diagnostic_policy.zig").Policy = .{},
     preferred_backends: []const BackendType,
     required_backend: ?BackendType = null,
     required_backend_invalid: bool = false,
@@ -282,6 +293,7 @@ pub const SessionManager = struct {
         return .{
             .allocator = allocator,
             .preferred_backends = configuredPreferredBackends(),
+            .execution_diagnostics = @import("../execution/diagnostic_policy.zig").Policy.fromEnvironment(),
             .required_backend = required.backend,
             .required_backend_invalid = required.invalid,
         };
@@ -292,6 +304,7 @@ pub const SessionManager = struct {
         return .{
             .allocator = allocator,
             .preferred_backends = configuredPreferredBackends(),
+            .execution_diagnostics = @import("../execution/diagnostic_policy.zig").Policy.fromEnvironment(),
             .required_backend = required.backend,
             .required_backend_invalid = required.invalid,
             .io = io,
@@ -338,6 +351,19 @@ pub const SessionManager = struct {
     }
 
     pub fn loadModelSource(self: *SessionManager, source: ModelSource, shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext) !Session {
+        if (!self.execution_diagnostics.enabled) return self.loadModelSourceConfigured(source, shared_backend_ctx);
+        const observer = try @import("../execution/allocation_observer.zig").State.create(self.allocator, .from_owner_creation);
+        defer observer.release();
+        var observed = self.*;
+        observed.allocator = observer.allocator();
+        const session = try observed.loadModelSourceConfigured(source, shared_backend_ctx);
+        errdefer session.close();
+        if (!session.configureExecutionDiagnostics(true)) return error.ExecutionDiagnosticsUnavailable;
+        if (session.invocation_diagnostics) |binding| binding.diagnostics.configureExport();
+        return session;
+    }
+
+    fn loadModelSourceConfigured(self: *SessionManager, source: ModelSource, shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext) !Session {
         const model_path = source.path;
         var manifest: ?manifest_mod.ModelManifest = if (source.manifest) |provided| provided.* else manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (source.manifest == null) {
@@ -476,12 +502,14 @@ pub const SessionManager = struct {
                     continue,
                 .native => if (imported_onnx)
                     self.createImportedOnnxSession(effective_model_path, .native, shared_backend_ctx, external_base, logical_path, source.external_reader) catch |err| {
+                        if (err == error.OutOfMemory) return err;
                         std.log.err("imported onnx native session create failed for {s}: {s}", .{ effective_model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
                     }
                 else
                     self.createDirectSession(source, .native) catch |err| {
+                        if (err == error.OutOfMemory) return err;
                         std.log.err("native session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         first_err = first_err orelse err;
                         continue;
@@ -720,7 +748,7 @@ fn defaultImportedOnnxBackend() BackendType {
     return if (build_options.enable_wasm) .wasm else .native;
 }
 
-fn isOnnxFilePath(path: []const u8) bool {
+pub fn isOnnxFilePath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".onnx");
 }
 

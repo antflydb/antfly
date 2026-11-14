@@ -27,19 +27,54 @@ pub const recipe_version = model_config.recipe_version;
 pub const max_tokens = model_config.max_tokens;
 pub const output_dim: usize = 768;
 pub const Config = model_config.Config;
+
+/// Actual registered text RMS schema shared by cold Source declaration and
+/// receiving preparation. Generic backend maps never select a model recipe.
+pub fn textRmsMetadataEntries(layers: usize) !u32 {
+    const per_layer: usize = @backingInt(ops.EmbeddingModelWeight.final_norm);
+    const first_global = ops.EmbeddingModelWeight.final_norm.index(0);
+    if (layers == 0 or layers != first_global / per_layer) return error.UnsupportedEmbeddingGemma2Geometry;
+    return @intCast(ops.EmbeddingModelWeight.ple_norm.index(0) + 1);
+}
+
+/// Registered projection schema, plus distinct source slices used by the
+/// existing packed/unpacked PLE schedules. This is a metadata capacity bound,
+/// not SDK allocation credit or another numerical schedule.
+pub const TextProjectionMetadata = struct {
+    linear_entries: u32,
+    zero_widths: [5]usize,
+};
+pub fn textProjectionMetadata(cfg: Config) !TextProjectionMetadata {
+    _ = try textRmsMetadataEntries(cfg.num_hidden_layers);
+    const expected = Config{};
+    if (cfg.hidden_size != expected.hidden_size or cfg.embedding_dim != expected.embedding_dim or cfg.intermediate_size != expected.intermediate_size or cfg.per_layer_input_dim != expected.per_layer_input_dim or cfg.num_attention_heads != expected.num_attention_heads) return error.UnsupportedEmbeddingGemma2Geometry;
+    // Nine named projection roles per layer; <=one disjoint PLE slice per
+    // layer, the full PLE matrix, and the final embedding projection.
+    const named = @backingInt(ops.EmbeddingModelProjection.packed_qkv);
+    const entries = try std.math.add(usize, try std.math.mul(usize, cfg.num_hidden_layers, named + 1), 2);
+    return .{ .linear_entries = @intCast(entries), .zero_widths = .{
+        cfg.hidden_size,
+        cfg.embedding_dim,
+        cfg.num_attention_heads * cfg.headDim(0),
+        cfg.intermediate_size,
+        cfg.num_hidden_layers * cfg.per_layer_input_dim,
+    } };
+}
+
 pub const isModel = model_config.isModel;
 pub const parseConfig = model_config.parseConfig;
 
-pub fn validateWeights(allocator: std.mem.Allocator, store: anytype, cfg: Config) !void {
-    if (store.kind() != .safetensors) return error.UnsupportedEmbeddingGemma2Precision;
+/// Synchronous exact text checkpoint schema. Validation and cold metadata
+/// declaration consume this SAME inventory; no second list of weight names.
+pub fn visitTextWeights(cfg: Config, context: anytype, comptime visit: anytype) !void {
     const global = .{
         .{ "language_model.embed_tokens.weight", .{ cfg.vocab_size, cfg.hidden_size } },
         .{ "language_model.embedding_projection.weight", .{ cfg.embedding_dim, cfg.hidden_size } },
         .{ "language_model.ple.per_layer_model_projection.weight", .{ cfg.num_hidden_layers * cfg.per_layer_input_dim, cfg.hidden_size } },
     };
-    inline for (global) |entry| try requireWeight(allocator, store, entry[0], &.{ @intCast(entry[1][0]), @intCast(entry[1][1]) });
-    try requireWeight(allocator, store, "language_model.norm.weight", &.{@intCast(cfg.hidden_size)});
-    try requireWeight(allocator, store, "language_model.ple.per_layer_projection_norm.weight", &.{@intCast(cfg.per_layer_input_dim)});
+    inline for (global) |entry| try visit(context, entry[0], &.{ @intCast(entry[1][0]), @intCast(entry[1][1]) });
+    try visit(context, "language_model.norm.weight", &.{@intCast(cfg.hidden_size)});
+    try visit(context, "language_model.ple.per_layer_projection_norm.weight", &.{@intCast(cfg.per_layer_input_dim)});
     for (0..cfg.num_hidden_layers) |layer| {
         var buf: [192]u8 = undefined;
         const d = cfg.headDim(layer);
@@ -56,14 +91,54 @@ pub fn validateWeights(allocator: std.mem.Allocator, store: anytype, cfg: Config
         };
         inline for (matrices) |entry| {
             const name = try std.fmt.bufPrint(&buf, "language_model.layers.{d}.{s}", .{ layer, entry[0] });
-            try requireWeight(allocator, store, name, &.{ @intCast(entry[1]), @intCast(entry[2]) });
+            try visit(context, name, &.{ @intCast(entry[1]), @intCast(entry[2]) });
         }
         for ([_][]const u8{ "input_layernorm.weight", "post_attention_layernorm.weight", "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight", "ple_block.post_per_layer_input_norm.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight", "layer_scalar" }) |suffix| {
             const name = try std.fmt.bufPrint(&buf, "language_model.layers.{d}.{s}", .{ layer, suffix });
             const dim = if (std.mem.eql(u8, suffix, "layer_scalar")) 1 else if (std.mem.indexOf(u8, suffix, "self_attn.") != null) d else cfg.hidden_size;
-            try requireWeight(allocator, store, name, &.{@intCast(dim)});
+            try visit(context, name, &.{@intCast(dim)});
         }
     }
+}
+
+pub const TextWeightMetadata = struct {
+    entries: u32 = 0,
+    name_bytes: usize = 0,
+    shape_axes: usize = 0,
+    vector_entries: u32 = 0,
+    vector_elements: usize = 0,
+    slice_views: u32 = 0,
+};
+pub fn textWeightMetadata(cfg: Config) !TextWeightMetadata {
+    _ = try textProjectionMetadata(cfg);
+    const Counter = struct {
+        fn visit(out: *TextWeightMetadata, name: []const u8, shape: []const i64) !void {
+            out.entries = try std.math.add(u32, out.entries, 1);
+            out.name_bytes = try std.math.add(usize, out.name_bytes, name.len);
+            out.shape_axes = try std.math.add(usize, out.shape_axes, shape.len);
+            if (shape.len == 1) {
+                const width: usize = std.math.cast(usize, shape[0]) orelse return error.UnsupportedEmbeddingGemma2Geometry;
+                out.vector_entries = try std.math.add(u32, out.vector_entries, 1);
+                out.vector_elements = try std.math.add(usize, out.vector_elements, width);
+            }
+        }
+    };
+    var result = TextWeightMetadata{ .slice_views = @intCast(cfg.num_hidden_layers) };
+    try visitTextWeights(cfg, &result, Counter.visit);
+    return result;
+}
+
+pub fn validateWeights(allocator: std.mem.Allocator, store: anytype, cfg: Config) !void {
+    if (store.kind() != .safetensors) return error.UnsupportedEmbeddingGemma2Precision;
+    const Validator = struct {
+        allocator: std.mem.Allocator,
+        store: @TypeOf(store),
+        fn visit(self: *const @This(), name: []const u8, shape: []const i64) !void {
+            try requireWeight(self.allocator, self.store, name, shape);
+        }
+    };
+    const validator = Validator{ .allocator = allocator, .store = store };
+    try visitTextWeights(cfg, &validator, Validator.visit);
     if (cfg.vision) {
         try requireWeight(allocator, store, "vision_tower.patch_embedder.input_proj.weight", &.{ 768, 768 });
         try requireWeight(allocator, store, "vision_tower.patch_embedder.position_embedding_table", &.{ 2, 10240, 768 });
@@ -1987,4 +2062,59 @@ fn checkGroupedRangeTiles(cb: ComputeBackend, reference: ComputeBackend) !void {
 }
 test "embeddinggemma2 Metal disjoint grouped GEMM tiles preserve holes empty queries and window tails" {
     try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkGroupedRangeTiles);
+}
+
+test "EmbeddingGemma2 text metadata counts actual indexed RMS roles before backend work" {
+    try std.testing.expectEqual(@as(u32, 170), try textRmsMetadataEntries(24));
+    try std.testing.expectError(error.UnsupportedEmbeddingGemma2Geometry, textRmsMetadataEntries(0));
+    try std.testing.expectError(error.UnsupportedEmbeddingGemma2Geometry, textRmsMetadataEntries(23));
+}
+
+test "Gemma projection metadata enumerates actual registered and packed PLE widths" {
+    const cfg = Config{};
+    const declaration = try textProjectionMetadata(cfg);
+    try std.testing.expectEqual(@as(u32, 242), declaration.linear_entries);
+    try std.testing.expectEqualSlices(usize, &.{ 512, 768, 1024, 2048, 12288 }, &declaration.zero_widths);
+    // Every selected Metal PLE schedule uses the full projection or single
+    // layer slices for this validated checkpoint, including frame overrides.
+    for (1..max_tokens + 1) |rows| {
+        const selected_width = if (packPerLayerInputs(cfg, rows)) cfg.num_hidden_layers * cfg.per_layer_input_dim else metalLayerGroup(cfg, rows) * cfg.per_layer_input_dim;
+        try std.testing.expect(std.mem.indexOfScalar(usize, &declaration.zero_widths, selected_width) != null);
+    }
+    for (0..cfg.num_hidden_layers) |layer| {
+        try std.testing.expect(std.mem.indexOfScalar(usize, &declaration.zero_widths, cfg.num_attention_heads * cfg.headDim(layer)) != null);
+        try std.testing.expect(std.mem.indexOfScalar(usize, &declaration.zero_widths, cfg.kvHeads(layer) * cfg.headDim(layer)) != null);
+    }
+    var wrong = cfg;
+    wrong.hidden_size += 1;
+    try std.testing.expectError(error.UnsupportedEmbeddingGemma2Geometry, textProjectionMetadata(wrong));
+}
+
+test "Gemma text metadata and validation share the full exact registered checkpoint inventory" {
+    const declaration = try textWeightMetadata(.{});
+    try std.testing.expectEqual(@as(u32, 413), declaration.entries);
+    try std.testing.expectEqual(@as(usize, 632), declaration.shape_axes);
+    try std.testing.expectEqual(@as(u32, 194), declaration.vector_entries);
+    try std.testing.expectEqual(@as(usize, 76824), declaration.vector_elements);
+    try std.testing.expectEqual(@as(u32, 24), declaration.slice_views);
+    const Store = struct {
+        names: std.StringHashMap(void),
+        bytes: usize = 0,
+        fn visit(self: *@This(), name: []const u8, _: []const i64) !void {
+            try std.testing.expect(!self.names.contains(name));
+            const owned = try self.names.allocator.dupe(u8, name);
+            errdefer self.names.allocator.free(owned);
+            try self.names.put(owned, {});
+            self.bytes += name.len;
+        }
+    };
+    var inventory = Store{ .names = std.StringHashMap(void).init(std.testing.allocator) };
+    defer {
+        var names = inventory.names.keyIterator();
+        while (names.next()) |name| std.testing.allocator.free(name.*);
+        inventory.names.deinit();
+    }
+    try visitTextWeights(.{}, &inventory, Store.visit);
+    try std.testing.expectEqual(declaration.entries, inventory.names.count());
+    try std.testing.expectEqual(declaration.name_bytes, inventory.bytes);
 }

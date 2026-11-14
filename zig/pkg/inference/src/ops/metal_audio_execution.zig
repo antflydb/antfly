@@ -349,7 +349,7 @@ pub const Node = struct {
                 return (try cb.vtable.depthwiseCausalConv1dSegmented.?(cb.ptr, values[a.input].?, values[a.weight].?, values[a.starts].?, a.rows, a.dim, a.kernel_size)) orelse error.AudioScheduleRouteChanged;
             },
             .gemma4AudioLocalAttention => |a| {
-                return (try cb.vtable.gemma4AudioLocalAttention.?(cb.ptr, values[a.q].?, values[a.k].?, values[a.v].?, values[a.rel].?, values[a.q_dim_scales].?, values[a.valid].?, a.params)) orelse error.AudioScheduleRouteChanged;
+                return (try cb.vtable.regions.audio_attention.localRelative.?(cb.ptr, values[a.q].?, values[a.k].?, values[a.v].?, values[a.rel].?, values[a.q_dim_scales].?, values[a.valid].?, a.params)) orelse error.AudioScheduleRouteChanged;
             },
             .sliceLastDim => |a| {
                 return (try cb.vtable.sliceLastDim.?(cb.ptr, values[a.tensor].?, a.start, a.stop));

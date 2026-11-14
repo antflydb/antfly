@@ -1347,11 +1347,21 @@ bounded. A preparation-wave memory decline falls back through the existing
 singleton route instead of imposing a different duration limit.
 
 
-Packed-projection and graph-replay identities are versioned for grouped PLE and
-cohort graphs. Packed PLE columns feed strided fused scale/RMS directly without
-a per-layer slice allocation or copy kernel. Grouped PLE changes GEMM output geometry and requires pretrained
-vector/ranking qualification; `--require-route packed_ple` requires observed
-execution. The extended-attention identity also versions 64-row tail padding on
+The CUDA encoder keeps the complete PLE projection width before BF16 scaling
+and source RMS normalization. One admitted full bank serves every layer,
+independently of optional packed QKV/MLP projections. At 8192 rows the bank is
+192 MiB; the mandatory Session floor and retained-cache planner account it
+without subtracting earlier activation or workspace floors. The previous
+grouped scale/RMS kernel and its `packed_ple` execution counter are retired.
+The Python route parser still accepts that counter in historical reports;
+current images cannot satisfy `--require-route packed_ple`.
+
+Graph reuse compares the actual source RMS launch geometry in addition to the
+attention program. Structural compatibility alone does not qualify vendor
+GEMM arithmetic across padded and logical row counts; production vector/ranking
+checks remain required for each padded opt-in scope.
+
+The extended-attention identity also versions 64-row tail padding on
 all architectures carrying a bundled BF16 WMMA image. Defaults retain the existing
 qualified architecture restrictions. The CUDA attention differential test covers
 1/2/4-item batches, dense/prefix/holey masks, partial tiles and contexts through

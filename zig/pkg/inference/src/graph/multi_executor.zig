@@ -81,16 +81,13 @@ pub const DevicePartitionPlan = struct {
     }
 };
 
-/// Result of multi-device graph execution.
-pub const MultiExecutionResult = struct {
-    /// Output tensors (same order as graph.outputs).
+/// Owned output handles, independent of optional execution diagnostics. The
+/// caller's stats sink is invocation-local and never retained by this payload.
+pub const DeviceOutputs = struct {
     outputs: []CT,
-    /// Which device produced each output.
     output_devices: []DeviceId,
-    stats: ExecutionStats = .{},
     allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *MultiExecutionResult, mesh: *const DeviceMesh) void {
+    pub fn deinit(self: *DeviceOutputs, mesh: *const DeviceMesh) void {
         const trace = traceOutputsEnabled();
         for (self.outputs, self.output_devices, 0..) |ct, dev_id, idx| {
             var duplicate = false;
@@ -118,7 +115,21 @@ pub const MultiExecutionResult = struct {
     }
 };
 
-/// Transfer a tensor from one backend to another via CPU f32 buffer.
+/// Compatibility value result. Internal submissions write their large stats
+/// directly to a caller-owned sink rather than copying it through each layer.
+pub const MultiExecutionResult = struct {
+    outputs: []CT,
+    output_devices: []DeviceId,
+    stats: ExecutionStats = .{},
+    allocator: std.mem.Allocator,
+    pub fn deinit(self: *MultiExecutionResult, mesh: *const DeviceMesh) void {
+        var outputs = DeviceOutputs{ .outputs = self.outputs, .output_devices = self.output_devices, .allocator = self.allocator };
+        outputs.deinit(mesh);
+    }
+};
+
+/// Transfer a tensor without changing dtype. Try direct device copy first;
+/// otherwise stage its exact bytes (f32 may use the numeric host path).
 pub fn transferTensor(
     allocator: std.mem.Allocator,
     value: CT,
@@ -149,12 +160,9 @@ fn transferTensorWithKnownShape(
     const shape_i32 = try tensorShapeI32(allocator, shape_i64);
     defer allocator.free(shape_i32);
     if (trace) std.debug.print("graph_executor_transfer_stage: shape_i32={any}\n", .{shape_i32});
-    const dtype = from.tensorDType(value) catch |err| switch (err) {
-        error.UnsupportedTensorType => .f32,
-        else => return err,
-    };
+    const dtype = try from.tensorDType(value);
     switch (dtype) {
-        inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| {
+        inline .i8, .i16, .i32, .i64, .u8, .bool_, .f16, .bf16, .f64 => |tag| {
             const exported = (try from.exportTensorData(value, allocator)) orelse return error.UnsupportedTensorType;
             const bytes = switch (exported.payload) {
                 .bytes => |bytes| bytes,
@@ -220,7 +228,7 @@ fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
 /// graph node IDs. Keep values whose graph-order last consumer runs early
 /// until request cleanup; executor fusion checks also compare these IDs, so
 /// using a backwards scheduled ID as a lifetime would be unsafe.
-fn partitionLastUses(
+pub fn partitionLastUses(
     allocator: std.mem.Allocator,
     graph: *const Graph,
     plan: *const PartitionPlan,
@@ -243,6 +251,14 @@ fn partitionLastUses(
     return result;
 }
 
+fn runtimeInputDevice(mesh: *const DeviceMesh, input: RuntimeInput) !DeviceId {
+    const owner = input.source_backend orelse return 0;
+    for (mesh.devices) |device| {
+        if (device.backend.ptr == owner.ptr and device.backend.vtable == owner.vtable) return device.id;
+    }
+    return error.RuntimeInputBackendUnavailable;
+}
+
 /// Execute a partitioned graph across a device mesh.
 ///
 /// Each partition runs on its assigned device. Cross-partition edges
@@ -255,8 +271,44 @@ pub fn executeMultiDevice(
     mesh: *const DeviceMesh,
     options: ExecuteOptions,
 ) !MultiExecutionResult {
+    var stats: ExecutionStats = undefined;
+    const outputs = try executeDeviceOutputs(allocator, graph, plan, mesh, &options, &stats);
+    return .{ .outputs = outputs.outputs, .output_devices = outputs.output_devices, .allocator = outputs.allocator, .stats = stats };
+}
+
+/// Synchronous submission. Options and the writable stats sink must outlive
+/// this call; neither pointer escapes into cached plans, tensors or resources.
+pub fn executeDeviceOutputs(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    plan: *const DevicePartitionPlan,
+    mesh: *const DeviceMesh,
+    options: *const ExecuteOptions,
+    stats: *ExecutionStats,
+) !DeviceOutputs {
+    const transfer_audit = @import("../execution/transfer_audit.zig");
+    var audit = transfer_audit.Audit{ .forbid_activation_readbacks = options.activation_readbacks == .forbidden };
+    const auditing = options.collect_partition_stats or audit.forbid_activation_readbacks;
+    if (audit.forbid_activation_readbacks) for (mesh.devices) |device| {
+        try transfer_audit.validateBackend(device.kind);
+    };
+    if (auditing) try transfer_audit.begin(&audit);
+    defer if (auditing) transfer_audit.end();
+    const result = try executeMultiDeviceImpl(allocator, graph, plan, mesh, options, stats);
+    audit.recordStats(stats);
+    return result;
+}
+
+fn executeMultiDeviceImpl(allocator: std.mem.Allocator, graph: *const Graph, plan: *const DevicePartitionPlan, mesh: *const DeviceMesh, options: *const ExecuteOptions, stats: *ExecutionStats) !DeviceOutputs {
+    stats.* = .{};
     if (options.execution_control) |control| try control.check();
     const count = graph.nodeCount();
+    // Validate ownership before querying tensor metadata or consuming inputs.
+    if (options.runtime_inputs) |inputs| for (inputs) |input| {
+        if (input.node_id >= count) return error.InvalidRuntimeInputNode;
+        const device = try runtimeInputDevice(mesh, input);
+        if (mesh.device(device) == null) return error.DeviceNotFound;
+    };
     if (count == 0 or plan.base.partitions.len == 0) {
         return .{
             .outputs = try allocator.alloc(CT, 0),
@@ -275,28 +327,22 @@ pub fn executeMultiDevice(
     @memset(value_device, 0);
 
     // Build runtime input lookup.
-    var rt_map = std.AutoHashMapUnmanaged(NodeId, CT).empty;
-    defer rt_map.deinit(allocator);
-    var donated = std.AutoHashMapUnmanaged(NodeId, void).empty;
-    defer donated.deinit(allocator);
+    var runtime_input_index = try PartitionExecutor.RuntimeInputIndex.init(allocator, options.*);
+    defer runtime_input_index.deinit(allocator);
+    const rt_map = runtime_input_index.values;
+    const donated = runtime_input_index.donated;
     var owned_runtime_transfers = std.AutoHashMapUnmanaged(NodeId, void).empty;
     defer owned_runtime_transfers.deinit(allocator);
     if (options.runtime_inputs) |inputs| {
-        for (inputs, 0..) |ri, idx| {
-            try rt_map.put(allocator, ri.node_id, ri.value);
-            if (options.donate) |donate| {
-                if (idx < donate.len and donate[idx]) {
-                    try donated.put(allocator, ri.node_id, {});
-                }
-            }
+        for (inputs) |ri| {
             values[@intCast(ri.node_id)] = ri.value;
-            value_device[@intCast(ri.node_id)] = 0;
+            value_device[@intCast(ri.node_id)] = try runtimeInputDevice(mesh, ri);
         }
     }
     errdefer {
         cleanup: for (values, 0..) |maybe_value, index| {
             const value = maybe_value orelse continue;
-            if (interpreter.isBorrowedRuntimeValue(options, value)) continue;
+            if (interpreter.isBorrowedRuntimeValue(options.*, value)) continue;
             for (values[0..index]) |prior| {
                 if (prior == value) continue :cleanup;
             }
@@ -310,15 +356,15 @@ pub fn executeMultiDevice(
     defer if (!have_cache) allocator.free(reachable);
     const graph_last_use = if (options.cached_analysis) |ca| ca.last_use else try interpreter.computeLastUse(allocator, graph, reachable);
     defer if (!have_cache) allocator.free(graph_last_use);
-    const last_use = try partitionLastUses(allocator, graph, &plan.base, reachable, graph_last_use);
-    defer allocator.free(last_use);
+    const last_use = options.cached_partition_last_use orelse try partitionLastUses(allocator, graph, &plan.base, reachable, graph_last_use);
+    defer if (options.cached_partition_last_use == null) allocator.free(last_use);
+    if (last_use.len != count) return error.InvalidCachedPartitionLastUse;
 
     var runtime_shape_tracker = try interpreter.RuntimeShapeTracker.init(allocator, graph, options.cached_analysis);
     defer runtime_shape_tracker.deinit();
     if (options.runtime_inputs) |inputs| {
-        const runtime_backend = (mesh.device(0) orelse return error.DeviceNotFound).backend;
         for (inputs) |ri| {
-            if (ri.node_id >= count) continue;
+            const runtime_backend = (mesh.device(value_device[ri.node_id]) orelse return error.DeviceNotFound).backend;
             try runtime_shape_tracker.record(runtime_backend, ri.node_id, ri.value);
         }
     }
@@ -331,14 +377,14 @@ pub fn executeMultiDevice(
         owned_graph_buffer_plan = try buffer_plan_mod.build(allocator, graph, &plan.base, .{});
         break :blk &owned_graph_buffer_plan.?;
     };
-    try graph_buffer_plan.validate(graph, &plan.base);
+    if (!options.cached_buffer_plan_validated or options.cached_buffer_plan == null) try graph_buffer_plan.validate(graph, &plan.base);
 
     // Track attention layer counter across partitions.
     var attention_layer: usize = 0;
     var pair_second: ?CT = null;
     var exec_attention = options.attention;
     const collect_stats = options.collect_partition_stats or executor_stats.enabled();
-    var exec_stats: ExecutionStats = .{};
+    const exec_stats = stats;
     const trace_partitions = tracePartitionsEnabled();
 
     // Execute each partition in order.
@@ -376,7 +422,11 @@ pub fn executeMultiDevice(
                 }
                 var static_shape_buf: [ml.graph.shape.max_rank]i64 = undefined;
                 const static_shape = try graphShapeDims(graph.node(ext_in.node_id).output_shape, &static_shape_buf);
-                const transferred = try transferTensorWithKnownShape(allocator, src_val, src_entry.backend, cb, static_shape);
+                const planned_transfer = if (options.physical_frame) |frame|
+                    try frame.transfer(src_entry.backend, cb, src_val, ext_in.node_id, @intCast(part_idx))
+                else
+                    null;
+                const transferred = planned_transfer orelse try transferTensorWithKnownShape(allocator, src_val, src_entry.backend, cb, static_shape);
                 if (collect_stats) exec_stats.cross_device_transfers += 1;
                 if (collect_stats and cb.kind() == .metal and metal_partition_executor.isMetalDeviceResident(cb, transferred)) {
                     exec_stats.device_resident_transfers += 1;
@@ -406,14 +456,15 @@ pub fn executeMultiDevice(
             .graph = graph,
             .backend = cb,
             .mesh = mesh,
-            .options = options,
+            .options = options.*,
             .reachable = reachable,
             .last_use = last_use,
             .partition_plan = &plan.base,
             .buffer_plan = graph_buffer_plan,
             .owned_runtime_transfers = &owned_runtime_transfers,
+            .runtime_input_index = &runtime_input_index,
             .materialize_boundary_outputs = part.backend != .metal,
-            .stats = if (collect_stats) &exec_stats else null,
+            .stats = if (collect_stats) exec_stats else null,
             .attention = if (exec_attention) |*attn| attn else null,
             .attention_layer = &attention_layer,
             .pair_second = &pair_second,
@@ -441,7 +492,7 @@ pub fn executeMultiDevice(
             // Build per-partition ExecState.
             var exec_state = interpreter.ExecState{
                 .attention_layer = attention_layer,
-                .options = options,
+                .options = options.*,
                 .last_use = last_use,
                 .pair_second = pair_second,
                 .runtime_shapes = runtime_shape_tracker.runtimeShapes(),
@@ -533,7 +584,9 @@ pub fn executeMultiDevice(
     // Collect outputs.
     const num_outputs = graph.outputs.items.len;
     const outputs = try allocator.alloc(CT, num_outputs);
+    errdefer allocator.free(outputs);
     const output_devices = try allocator.alloc(DeviceId, num_outputs);
+    errdefer allocator.free(output_devices);
 
     for (graph.outputs.items, 0..) |out_id, idx| {
         const ct = values[@intCast(out_id)] orelse return error.MissingValue;
@@ -548,11 +601,26 @@ pub fn executeMultiDevice(
                 }
             }
         }
-        if (aliases_rt) {
+        const planned_copy = if (options.physical_frame) |frame| try frame.publishLiteralOutput(out_entry.backend, out_id, ct) else null;
+        if (planned_copy) |independent| {
+            outputs[idx] = independent;
+            values[@intCast(out_id)] = independent;
+            if (!aliases_rt) {
+                var retained_elsewhere = false;
+                for (values) |other| if (other == ct) {
+                    retained_elsewhere = true;
+                    break;
+                };
+                if (!retained_elsewhere) out_entry.backend.free(ct);
+            }
+        } else if (aliases_rt) {
             const one_data: [1]f32 = .{1.0};
             const one = try out_entry.backend.fromFloat32(&one_data);
             defer out_entry.backend.free(one);
             outputs[idx] = try out_entry.backend.multiply(ct, one);
+            // The value table is the sole rollback owner until publication.
+            // The replaced runtime handle remains borrowed from the caller.
+            values[@intCast(out_id)] = outputs[idx];
         } else {
             outputs[idx] = ct;
         }
@@ -568,7 +636,7 @@ pub fn executeMultiDevice(
     // exclusively owned device buffers before returning (see
     // copyPartitionGraphOutputsToOwnedStorage), and non-Metal partitions
     // materialize boundary outputs into owned tensors.
-    var freed_values = std.AutoHashMapUnmanaged(CT, void).empty;
+    var freed_values = std.AutoHashMapUnmanaged(CT, DeviceId).empty;
     defer freed_values.deinit(allocator);
     for (0..count) |i| {
         if (values[i] == null) continue;
@@ -590,20 +658,21 @@ pub fn executeMultiDevice(
         if (aliases_output) continue;
         if (rt_map.contains(@intCast(i)) and !donated.contains(@intCast(i)) and !owned_runtime_transfers.contains(@intCast(i))) continue;
         if (freed_values.contains(values[i].?)) continue;
-        try freed_values.put(allocator, values[i].?, {});
-        const dev = value_device[i];
-        if (mesh.device(dev)) |entry| {
-            entry.backend.free(values[i].?);
-        }
+        try freed_values.put(allocator, values[i].?, value_device[i]);
+    }
+    // Finish every fallible bookkeeping allocation before retiring any value.
+    // On error the value-table rollback still sees all original owners.
+    var retired = freed_values.iterator();
+    while (retired.next()) |entry| {
+        if (mesh.device(entry.value_ptr.*)) |device| device.backend.free(entry.key_ptr.*);
     }
 
-    if (collect_stats) executor_stats.record(exec_stats);
-    if (executor_stats.enabled()) executor_stats.print(exec_stats);
+    if (collect_stats) executor_stats.record(exec_stats.*);
+    if (executor_stats.enabled()) executor_stats.print(exec_stats.*);
 
     return .{
         .outputs = outputs,
         .output_devices = output_devices,
-        .stats = exec_stats,
         .allocator = allocator,
     };
 }
@@ -911,6 +980,30 @@ test "native partition executor transfers borrowed runtime input across devices"
     const original = try cb_a.toFloat32(input, allocator);
     defer allocator.free(original);
     try std.testing.expectEqualSlices(f32, &input_data, original);
+
+    // A resident input on a non-default device needs no upload to that same
+    // device. Its owner is independent of the parameter's proposed placement.
+    const resident_input = try cb_b.fromFloat32Shape(&input_data, &.{4});
+    defer cb_b.free(resident_input);
+    var resident_result = try executeMultiDevice(allocator, &g, &dpp, &mesh, .{
+        .runtime_inputs = &.{.{ .node_id = x, .value = resident_input, .source_backend = &cb_b }},
+        .collect_partition_stats = true,
+    });
+    defer resident_result.deinit(&mesh);
+    try std.testing.expectEqual(@as(u64, 0), resident_result.stats.runtime_input_transfers);
+    try std.testing.expectEqual(@as(u64, 0), resident_result.stats.cross_device_transfers);
+    const resident_values = try cb_b.toFloat32(resident_result.outputs[0], allocator);
+    defer allocator.free(resident_values);
+    try std.testing.expectEqualSlices(f32, output, resident_values);
+
+    var absent = cb_b;
+    absent.ptr = @ptrFromInt(4096);
+    try std.testing.expectError(error.RuntimeInputBackendUnavailable, executeMultiDevice(allocator, &g, &dpp, &mesh, .{
+        .runtime_inputs = &.{.{ .node_id = x, .value = @ptrFromInt(8), .source_backend = &absent }},
+    }));
+    try std.testing.expectError(error.InvalidRuntimeInputNode, executeMultiDevice(allocator, &g, &dpp, &mesh, .{
+        .runtime_inputs = &.{.{ .node_id = @intCast(g.nodeCount()), .value = @ptrFromInt(8) }},
+    }));
 }
 
 test "multi-executor keeps metal partition outputs resident until final readback" {
@@ -980,6 +1073,22 @@ test "multi-executor keeps metal partition outputs resident until final readback
         const expected = input_value / (1.0 + @exp(-input_value));
         try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
     }
+    const resident_input = try metal_cb.fromFloat32Shape(&input_data, &.{ 1, 4 });
+    defer metal_cb.free(resident_input);
+    const before = metal_cb.debugTimingSnapshot().provider;
+    var resident_result = try executeMultiDevice(allocator, &g, &dpp, &mesh, .{
+        .runtime_inputs = &.{.{ .node_id = x, .value = resident_input, .source_backend = &metal_cb }},
+        .collect_partition_stats = true,
+    });
+    defer resident_result.deinit(&mesh);
+    const after = metal_cb.debugTimingSnapshot().provider;
+    try std.testing.expectEqual(@as(u64, 0), resident_result.stats.runtime_input_transfers);
+    try std.testing.expectEqual(@as(u64, 0), resident_result.stats.cross_device_transfers);
+    try std.testing.expectEqual(before.metal_tensor_to_host_device_calls, after.metal_tensor_to_host_device_calls);
+    try std.testing.expect(metal_partition_executor.isMetalDeviceResident(&metal_cb, resident_result.outputs[0]));
+    const resident_values = try metal_cb.toFloat32(resident_result.outputs[0], allocator);
+    defer allocator.free(resident_values);
+    try std.testing.expectEqualSlices(f32, output, resident_values);
 }
 
 test "multi-executor metal graph outputs survive plan-slot reuse across executions" {
@@ -1112,4 +1221,65 @@ test "multi-executor retains inputs when partitions reorder independent consumer
     defer a.free(square_values);
     try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4 }, neg_values);
     try std.testing.expectEqualSlices(f32, &.{ 1, 4, 9, 16 }, square_values);
+}
+
+test "transferTensor preserves floating storage without numeric conversion" {
+    const a = std.testing.allocator;
+    var weights = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitEmptyNativeWeightStore(&weights, a);
+    var compute = native_compute.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const native = compute.computeBackend();
+    const DType = @import("../backends/tensor.zig").DType;
+    const Probe = struct {
+        dtype: DType,
+        bytes: []const u8,
+        fn kind(_: *anyopaque) contracts.BackendKind {
+            return .cuda;
+        }
+        fn dtypeOf(ctx: *anyopaque, _: CT) !DType {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.dtype;
+        }
+        fn shape(_: *anyopaque, _: CT, allocator: std.mem.Allocator) ![]i64 {
+            return allocator.dupe(i64, &.{2});
+        }
+        fn exportData(ctx: *anyopaque, _: CT, allocator: std.mem.Allocator) !?ops_mod.ExportTensorData {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return .{ .dtype = self.dtype, .payload = .{ .bytes = try allocator.dupe(u8, self.bytes) } };
+        }
+        fn numeric(_: *anyopaque, _: CT, _: std.mem.Allocator) ![]f32 {
+            return error.UnexpectedNumericConversion;
+        }
+        fn importData(ctx: *anyopaque, bytes: []const u8, dtype: ops_mod.GraphDType, _: []const i64) !?CT {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqualStrings(@tagName(self.dtype), @tagName(dtype));
+            try std.testing.expectEqualSlices(u8, self.bytes, bytes);
+            return ctx;
+        }
+        fn free(_: *anyopaque, _: CT) void {}
+    };
+    const doubles = [_]f64{ 1.0000000000000002, -1.23456789012345e100 };
+    const halves = [_]u16{ 0x7e19, 0x8000 };
+    for ([_]DType{ .f16, .bf16, .f64 }) |dtype| {
+        var probe = Probe{ .dtype = dtype, .bytes = if (dtype == .f64) std.mem.sliceAsBytes(&doubles) else std.mem.sliceAsBytes(&halves) };
+        var vtable = native.vtable.*;
+        vtable.backendKind = Probe.kind;
+        vtable.tensorDType = Probe.dtypeOf;
+        vtable.tensorShape = Probe.shape;
+        vtable.exportTensorData = Probe.exportData;
+        vtable.toFloat32 = Probe.numeric;
+        const source = ComputeBackend{ .ptr = &probe, .vtable = &vtable };
+        var target_vtable = vtable;
+        target_vtable.copyTensorFromBackend = null;
+        target_vtable.fromConstantBytes = Probe.importData;
+        target_vtable.freeTensor = Probe.free;
+        const target = ComputeBackend{ .ptr = &probe, .vtable = &target_vtable };
+        const tensor = try transferTensor(a, &probe, &source, &target);
+        defer target.free(tensor);
+        const exported = (try target.exportTensorData(tensor, a)).?;
+        defer a.free(exported.payload.bytes);
+        try std.testing.expectEqual(dtype, exported.dtype);
+        try std.testing.expectEqualSlices(u8, probe.bytes, exported.payload.bytes);
+    }
 }

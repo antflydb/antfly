@@ -21,7 +21,9 @@ const null_node = ml.graph.null_node;
 
 const clip_mod = @import("../models/clip.zig");
 const ops = @import("../ops/ops.zig");
-const graph_runtime = @import("../graph/runtime.zig");
+const executable_mod = @import("../execution/executable.zig");
+const graph_runtime = executable_mod.runtime_module;
+const ModelProgram = @import("../execution/program.zig").ModelProgram;
 const interpreter = @import("../graph/interpreter.zig");
 
 const ComputeBackend = ops.ComputeBackend;
@@ -65,13 +67,16 @@ pub fn runTextGraph(
     try appendI64RuntimeInput(cb, allocator, &rt_inputs, &owned_cts, pos_ids_node, pos_ids);
     try appendI64RuntimeInput(cb, allocator, &rt_inputs, &owned_cts, eos_indices_node, eos_indices);
 
-    var runtime = try graph_runtime.Runtime.init(allocator, &graph, cb, strategy);
-    defer runtime.deinit();
-    var result = try runtime.execute(allocator, &graph, .{ .runtime_inputs = rt_inputs.items });
-    defer result.deinit(&runtime);
+    var program = try ModelProgram.init(allocator, &graph, &.{});
+    defer program.deinit();
+    const bound_inputs = try program.remapInputs(rt_inputs.items);
+    var executable = try executable_mod.prepareWithOptions(allocator, &program, cb, strategy, .{ .input_bindings = bound_inputs });
+    defer executable.deinit();
+    var result = try executable.run(allocator, .{ .runtime_inputs = bound_inputs, .output_placement = .producer });
+    defer result.deinit(&executable.runtime);
 
     if (result.outputs.len == 0) return error.MissingGraphOutput;
-    return cb.toFloat32(result.outputs[0], allocator);
+    return result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], allocator);
 }
 
 pub fn runVisionGraph(
@@ -125,13 +130,16 @@ pub fn runVisionGraph(
     try appendI64RuntimeInput(cb, allocator, &rt_inputs, &owned_cts, cls_pos_ids_node, cls_pos_ids);
     try appendI64RuntimeInput(cb, allocator, &rt_inputs, &owned_cts, cls_indices_node, cls_indices);
 
-    var runtime = try graph_runtime.Runtime.init(allocator, &graph, cb, strategy);
-    defer runtime.deinit();
-    var result = try runtime.execute(allocator, &graph, .{ .runtime_inputs = rt_inputs.items });
-    defer result.deinit(&runtime);
+    var program = try ModelProgram.init(allocator, &graph, &.{});
+    defer program.deinit();
+    const bound_inputs = try program.remapInputs(rt_inputs.items);
+    var executable = try executable_mod.prepareWithOptions(allocator, &program, cb, strategy, .{ .input_bindings = bound_inputs });
+    defer executable.deinit();
+    var result = try executable.run(allocator, .{ .runtime_inputs = bound_inputs, .output_placement = .producer });
+    defer result.deinit(&executable.runtime);
 
     if (result.outputs.len == 0) return error.MissingGraphOutput;
-    return cb.toFloat32(result.outputs[0], allocator);
+    return result.backendFor(&executable.runtime, 0).toFloat32(result.outputs[0], allocator);
 }
 
 fn buildTextGraph(

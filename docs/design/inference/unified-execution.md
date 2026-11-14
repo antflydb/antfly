@@ -1,0 +1,394 @@
+# Inference preparation and execution
+
+GGUF, safetensors and imported ONNX models share preparation and execution
+contracts. Architecture adapters describe model semantics and checkpoint layouts;
+backends retain their tuned kernels and whole-model implementations. Deployment
+uses the existing platform and driver interfaces without an external inference
+framework.
+
+## Ownership
+
+Paths below are relative to `zig/pkg/inference/src/`.
+
+| Owner | Responsibility |
+|---|---|
+| `architectures/model_definition.zig` | Backend-independent configuration and loaded weight sources |
+| `models/session_contract.zig` | Resolved task, processor, padding, pooling, normalization and modality semantics |
+| `backends/session.zig` | Published session contracts and typed backend acquisition across wrappers |
+| `backends/compute_context.zig` | Common backend construction, exact typed imports and shared context lifetime |
+| `execution/program.zig` | Optimized IR, composed node mappings and input/output/weight/state bindings |
+| `execution/executable.zig` | Preparation, reusable execution, output placement and optional diagnostics |
+| `execution/model_candidate.zig` | Admission and dispatch of specialized whole-model implementations |
+| `execution/physical_buffers.zig` | Assigned outputs, transfers, workspace and bounded invocation frames |
+| `graph/decode_state_runtime.zig` | KV/recurrent/paged state ownership and advancement |
+
+`execution/root.zig` exposes the common `ModelProgram`, `prepare`, `Executable`
+and `BackendContext` boundary. Imported, directly constructed and traced graphs
+use the shared fixed-point optimizer. Public and state bindings follow composed
+node mappings through rewrites. Already analyzed graphs can borrow their cached
+analysis and immutable weights during shape specialization.
+
+## Execution invariants
+
+- Select a backend or specialized candidate using dtype, shape, layout, storage,
+  semantics and required features. A model candidate may decline before
+  submission; errors after submission propagate without replaying partially
+  advanced state through another implementation.
+- Separate legality from profitability. Placement accounts for computation,
+  launches and transfers while preserving exposed outputs and stateful regions.
+  Unsupported signatures fail explicitly or use an observable admitted fallback.
+- Bind eligible operations to planned physical outputs and workspace. Native
+  schedules and compatibility arenas remain available behind their existing
+  admission rules. Logical lifetimes include reordered submissions and aliases.
+- Retain storage leases for views and published results across frame reuse,
+  executable eviction and producing-session teardown. External contexts must
+  outlive values that do not retain their context themselves.
+- CUDA capture retains stable operand, output and workspace addresses. Completion
+  protects reuse and retirement; captured executables retire before their storage
+  owners. Reset and cancellation preserve the existing state/capture guards.
+- Resident stage contracts keep intermediates on their admitted backend. Explicit
+  host export reads directly from the producer. Typed transfers preserve storage
+  bytes or reject the operation; they do not silently convert through F32.
+- Diagnostics record actual dispatch, allocation/reuse, transfers and bytes,
+  cache behavior and fallback. Nested transfer audits cannot weaken an outer
+  strict policy. Planner-only assertions do not establish execution parity.
+
+## Kernel ownership and validation
+
+`ops/kernel_descriptor.zig` describes operation semantics and requirements;
+`ops/kernel_geometry.zig` shares geometry with legality checks. Backend plans
+retain SIMD/BLAS, packed quantization, native GPU schedules and profitable region
+fusions. Compile-time recipes share GGUF encoding mathematics without imposing
+one accumulation or scheduling policy on every backend.
+
+See [kernel authoring](kernel-authoring.md) for source ownership, typed schedules,
+regeneration, source identities and hardware qualification. Portable Tile model
+execution remains a prototype; its scope and commands are in
+`zig/pkg/inference/src/tile/README.md`.
+
+Preparation and lifetime regressions live with their implementation owners,
+including `execution/executable.zig`, `execution/model_candidate.zig`,
+`execution/transfer_audit.zig` and `backends/imported_onnx_session.zig`. Run focused
+scopes from the inference package with the pinned Zig compiler, for example:
+
+```sh
+zig build test-embeddinggemma2 -Dmetal=false -Dcuda=false \
+  -Dtest-filter='ModelProgram' -Dtest-filter='prepared physical'
+zig build check-kernel-ownership test-tile-kernels
+```
+
+Enable the backend under test for physical device coverage. Qualify numerical
+changes with independent references, retained native resource/schedule checks,
+and controlled baseline/candidate timing before retiring a fast path.
+
+## Remaining migration boundaries
+
+Issue [#1166](https://github.com/antflydb/antfly/issues/1166) also requests a
+complete migration of execution policy. Shared kernel ownership and the common
+preparation API do not by themselves complete these remaining requirements:
+
+- Imported ONNX and architecture graphs share the bounded specialization owner
+  in `execution/specialization_cache.zig`, with stable executable handles,
+  allocation-before-eviction admission and explicit retirement. Their limits
+  remain workload-specific. Traced resources are scoped to the exact backend
+  context; switching contexts retires device bindings while preserving semantic
+  graphs and analysis. ONNX initializers retain their shared immutable context.
+- ML interval planning, interpreter/native/Metal handle retirement and the
+  physical buffer plan share one dependency liveness analyzer in
+  `lib/ml/graph/passes/memory.zig`. Reachability, actual submission ordinals,
+  selected outputs and their lifetime bounds are explicit policy. Physical
+  backing-view propagation and conservative donation groups retain their
+  storage-specific rules. Allocation-failure tests cover interval growth and
+  transfer of interval ownership into the reusable-slot plan. Backward runtime
+  input groups share one checked remapping helper: removed nodes contribute no
+  binding, surviving inputs retain their backend owners, and invalid mappings
+  fail before allocation. Production and diagnostic Laya training share it.
+- Assigned outputs and workspace cover admitted Native/CUDA descriptors and
+  Metal's physical frame routes. Exact backend services attest each complete
+  program's input, literal, alias, kernel and workspace ownership before replacing
+  compatibility admission estimates. Unsupported regions and private temporary
+  owners retain their existing envelopes. CUDA prepared projections declare
+  supported reduced/packed conversions and vendor workspace; these declarations
+  preserve their tuned launches rather than replacing them with generic math.
+  Ordinary F32 matrix multiplication stages a dynamic RHS transpose in assigned
+  workspace and reuses the projection family's original SIMT/vendor policy.
+  The current RHS is validated on every invocation rather than treated as an
+  immutable cached weight; transpose and vendor workspace remain disjoint.
+  Eligible CUDA frames capture stable output, workspace, mutable-input and
+  immutable-literal banks. Binding roles, exact context identity, immutable
+  handle ownership and copy/launch costs gate admission. Explicit literal
+  overrides use ordinary execution without mutating captured storage. Recording
+  and instantiation failures fall back before compute submission; submission
+  errors propagate. Captures retain address leases; published outputs and foreign
+  captures prevent mutable frame reuse. Cancellation and unsupported signatures
+  retain ordinary execution with explicit replay decisions in diagnostics.
+  Learned decoder/audio arenas remain compatibility owners where their complete
+  temporary recipes have not migrated; capture alone grants no ownership credit.
+- `model_definition.zig` owns artifact loading. Native and PJRT sessions share
+  one failure-atomic host preparation path for normalization, resident/lazy
+  weights and prefetch ownership. CUDA reuses its admitted manifest snapshot
+  when opening that source, retaining early device/artifact preflight. Prefetch
+  guards are installed only after the final session owner is in place.
+  `models/load_plan.zig` derives checked artifact/tokenizer preparation peaks,
+  retained weights and run-admission geometry. `models/session_loader.zig` owns
+  primary/component backend attempts, artifact selection, construction guards,
+  preparation order and failure rollback. Serving supplies health, admission
+  limits/leases, eviction and close protection through synchronous borrowed
+  services; its callback context never becomes the loaded model owner. The
+  session's resident-preparation provider retains the actual model context
+  through wrappers while receiving the published admission/interruption policy.
+  Construction peaks remain leased until preparation succeeds; component load
+  ordering and immediate cancellation checkpoints retain their existing rules.
+  `compute_context.zig`, prepared executables and model candidates separate
+  further responsibilities. Optional specialized hooks use typed
+  operation regions (decoder, replay, relative/window attention, encoder,
+  projection, vision/audio, speculative verification and token selection).
+  Historical public method names are compatibility adapters; new implementations
+  extend operation descriptors/regions, preserving each admitted native schedule.
+  `graph/execution.Context` declares backend, model-weight adapter, execution
+  control and compiled-backend dependencies explicitly. Serving and offline
+  compilation use that same typed contract instead of pipeline-shaped structs.
+  Backend pointers are borrowed from their real owner; temporary context values
+  never become the owner of cached executors or physical bindings. Immutable
+  model configuration is borrowed, avoiding a full metadata copy per step;
+  cache keys canonicalize semantic fields, ignoring struct padding and prefix
+  allocation addresses while hashing prefix bytes. Native and Metal whole-model
+  executors share `graph/session_decoder.zig` for immutable definition ownership.
+  Definitions own configuration slices and survive executor retirement. Runtimes
+  share metadata within the same allocator lifetime or clone it into their own
+  allocator before request allocator retirement; failed migration preserves the
+  original definition. No metadata allocation or reference counting occurs per
+  decoder step. Tied heads, optional
+  scales and omitted-projection aliases live in the architecture weight adapter.
+  Self-contained Metal session runtimes have an explicit loaded-session/config,
+  KV dtype and shared-expert-cache owner key. Transient request backend wrappers
+  retire context-bound bindings while preserving that independent owner.
+  Replacement is failure-atomic; borrowed CPU/PJRT runtimes retain their stricter
+  backend lifetime. Repeated-request qualification forces distinct wrapper
+  addresses and checks logical decoder reset and exact output parity.
+  Embedding indices explicitly select host IDs or a resident tensor. Traced
+  host-ID placeholders need no materialized tensor; imported integer tensors
+  retain their resident fast path and exact integer fallback.
+- Resident stage contracts, exact typed transfers and strict readback auditing
+  are implemented. Text encoders use the session's declared resident capability
+  by default, with an explicit host override. `execution/sequence_pool.zig`
+  owns mean, CLS, max and last-token pooling, including flattened token rows,
+  masked NaNs, empty mean rows and exact integer gather fallback. It batches
+  pooling/normalization and materializes only requested final vectors. The
+  existing fused masked-mean/L2 program accepts checked generic dimensions;
+  historical Nomic request/method/native symbols remain compatibility bindings.
+  Single-row means reuse that program to normalize other pooling results.
+  No new Metal shader is needed. Prepared normalized heads skip empty batches.
+  Producers that already return final normalized host rows declare that output
+  contract explicitly; requested host vectors consume the original host ABI
+  without uploading them solely to download them through a resident wrapper.
+  Owning consumers write prefixes and normalization directly into their cold
+  output bank. Compatibility row copies declare their exact packet, input and
+  allocator-header overlap before execution; admission checks the complete
+  request against the actual retained allocator owner after trimming.
+  Before reserving a partial task floor, metadata-only preflight rejects a
+  known impossible sum of that floor and the mandatory fresh output bank.
+  This grants no quota; otherwise feasible requests retain ordinary contention
+  and each Source still admits its complete execution geometry. Token usage
+  follows successful output consumption and survives scoped wrapper teardown.
+  `execution/submission.zig` owns command scopes, preserving foreign batches,
+  cancelling only owned unsubmitted work and avoiding replay after submission
+  errors. Nine generic command callbacks live in `CommandSubmissionRegion`;
+  historical decoder methods route to the same backend implementations.
+  Declared text input planning is shared by embedding and reranking. It retains
+  input order and integer precision, supplies positions/additive attention bias,
+  and sizes input/temporary storage before allocating bias buffers. Host token
+  outputs retain pooling semantics when imported graphs flatten sequence rows.
+  CUDA max reduction uses negative infinity as its identity, including fully
+  masked rows. Retained native targets keep their existing launch resources.
+  Migrating every remaining task to resident chaining and moving all
+  KV/recurrent execution choices behind runtime owners remains incremental.
+  `graph/decode_batch.zig` now owns uniform, mixed prefill/decode and packed
+  batch metadata assembly, including per-sequence physical KV views, recurrent
+  caches and position ownership. Generation retains compatibility exports and
+  supplies typed state/geometry; batch layout does not depend on a task pipeline.
+  `graph/decoder_work.zig` owns borrowed queued prefill/decode records, resident
+  prefix geometry and validation. Bounded device bursts read an immutable token
+  budget rather than dereferencing task continuation state. Task publication and
+  stopping/streaming policy remain in generation. The physical scheduled forward
+  is owned by `graph/decoder_step_executor.zig`: it receives explicit context,
+  queued work, padding, continuation control and lane access, without a task
+  pipeline or tokenizer. It owns frame submission/readback cleanup, bounded
+  device bursts, KV reservation rollback and CUDA epoch retirement. The reader
+  epoch calls it directly; a separate task adapter publishes completed results
+  while retaining the scheduler turn and lane. A shared execution-access record
+  preserves FIFO/phase priority and cancellation-independent cleanup.
+  `execution/decoder_forward.zig` owns logits/hidden-state and compiled token
+  dispatch behind a borrowed runtime context, without task or tokenizer
+  dependencies. It derives eager query geometry from live decode state and
+  selects compiled token or logits execution. Ordinary speculative draft and
+  verification queries also use that owner for physical windows, target
+  reservation and failed-forward rollback. Host logit windows retain their
+  producer allocator; proposal acceptance and prefix selection remain task
+  policy. Resident token slots own handoff,
+  readback and cancellation-independent retirement across ordinary and pending
+  decode. A bounded acceptance cursor owns reserved-prefix accounting and KV
+  advancement for published burst tokens. Ordinary and scheduled prefill share
+  runtime post-chunk donor maintenance before publishing their cursor.
+  Generation supplies semantic eligibility, schedules turns and publishes
+  results. Positioned-prefix scheduling borrows one typed runtime request
+  rather than the generation pipeline. It retains one executor through the
+  queued chunks, shares the wait/claim/cancellation-drain protocol with ordinary
+  decode, and merges task counters once after completion. Server batching keeps
+  grouping, deadlines and publication while passing typed numerical work.
+  Native whole-model execution shares the last-logits implementation;
+  retained hidden outputs point to the real backend, never the temporary adapter.
+  `execution/decoder_storage.zig` owns pool geometry, metadata-only CUDA request
+  pools, checkpoint geometry, route capacity and lazy reservation policy. Native,
+  Metal and generation reuse it while explicitly preserving architectural versus
+  compact stored-layer layouts and host-mirror choices. Remaining specialized
+  task transitions and compatibility arenas retain their explicit owners.
+  Canonical KV owners prepare unpublished attachment, full prefill, generated-token page growth,
+  shared-tail copies, window trimming, replay reservations and view metadata
+  before committing either owner. The unchanged-ID path preserves the existing
+  table without allocation or a history copy. At reservation/page boundaries,
+  paired plans prove an unchanged combined ID prefix before copying only new
+  IDs; growth, COW, window trimming and unsynchronized views use full copies.
+  Grown host tables retain their allocating owner through state teardown;
+  generation admission declares their
+  checked host footprint and both simultaneous plans' ID-array scratch
+  separately from device scratch. Serial batches take
+  the peak after request-state death; coordinated participants add their live
+  metadata. Metadata synchronization failures propagate before publishing a new
+  view. Canonical truncation stages both owners before the final backend
+  notification and paired metadata commit. Session admission combines distinct
+  prepaid workspaces before applying explicit operator limits once. Opaque
+  providers and incompatible state transitions retain compatibility ownership; host-table
+  retention alone does not certify every device cancellation/drain endpoint.
+  Ordinary F32 attention reuses the existing physical producer: CUDA singleton
+  batch rows write directly into their output parent, and Metal cold paged
+  layers reuse their reserved page-offset storage and supplied destinations.
+  Both validate the current canonical storage before using these routes and
+  preserve their original launches and retirement owners. These ordinary
+  optimizations grant no complete-Frame or capture credit; learned private
+  decoder/audio temporary arenas retain compatibility ownership.
+  Eligible Native F32 incremental audio decoders instead prepare one authored
+  single-token schedule through the common physical pool. The architecture
+  supplies operation order and state bindings; its existing numerical forward
+  consumes the prepared views. Cross K/V projections write directly into the
+  original KV slabs, and self attention receives actual live prefixes without
+  allocating slice headers. Declared contiguous initial prompts use a separate
+  causal/multiquery schedule with the original tiled arithmetic and explicit
+  scratch. Both phase banks are funded together, with shared KV funded once;
+  undeclared or mismatched initial queries retain eager execution.
+  Managed decoders share immutable graph, descriptor, liveness and layout facts
+  through a bounded Model cache; weights, KV, Frames and execution epochs stay
+  private. Shared metadata retains its admission Domain, with final quota refunds
+  deferred through the actual retirement boundary outside execution. Retained
+  shared metadata and pending mandatory KV remain in the full request fit.
+  Cold metadata has independently admitted storage, physical banks have exact
+  additional declarations, and the old request envelope remains intact. Source
+  stamps revalidate under the Model gate; construction capabilities are consumed
+  before the cache owns its stable execution epoch. Teardown releases callbacks
+  after leaving execution. Unknown allocator contracts, reduced formats and
+  unsupported schedules retain compatibility; this migration does not certify
+  every decoder or imply performance acceptance.
+- Native decoder templates retain only backend-free placement, buffer layout and
+  output-policy facts. Graph runtime and decoder preparation use the same layout
+  builder; each decoder program creates fresh physical pools and revalidates the
+  current provider policy. It does not construct unused graph executors or a
+  device mesh. Escaping outputs retain their storage lease independently of the
+  program, graph and template lifetime.
+- `execution/speculative_activation.zig` owns predictor rounds, including draft
+  chains, logits and accepted activation handoff. The physical decoder owns
+  verification suffix geometry and pending tensor/scalar selection; task code
+  retains acceptance, grammar, stopping and streaming. Unused private adapters
+  are removed while public compatibility entries remain.
+- `execution/decoder_prefill.zig` assembles plain embedding rows once and keeps
+  hidden rows resident through projection. ColQwen document and query paths
+  export final scoring vectors. Complete source-plane and destination-namespace
+  checks precede copies; packed or opaque sources retain the host path.
+  Qwen multimodal prompts replace image rows one producer at a time without
+  exporting supported resident embeddings. Unsupported image storage converts
+  only that source, without replaying earlier producers or assembled rows.
+  Gemma prompt entrypoints share the same ordered replacement owner; nonunit
+  embedding scales preserve their original CPU arithmetic. The extra resident
+  prompt destination receives no admission credit or reduced memory floor.
+  Native and GGUF vision weights use one patch-encoder/projector definition
+  through typed format adapters. Debug captures are optional; ordinary output
+  avoids the unused normalization readback and final host-vector duplicate.
+  Host position addition, ordered pooling and native kernel schedules remain.
+  Resident projection inputs and final dense-row materialization use the shared
+  sequence-pooling owner. Tasks supply pooling, prefix width, normalization and
+  finite-output requirements; the execution owner preserves full-width resident
+  normalization before export and the original prefix-copy order.
+  Projected image inputs own a typed host/resident row source; the model producer
+  resolves placement while preserving early resident projection, later host
+  preparation and video priority. Prompt tasks consume borrowed row views through
+  the same numerical composer. Incremental-input cleanup qualifies actual session
+  pairs and supervision in its execution owner. Florence's full-prefix and
+  incremental decoder paths share architecture bindings and ordered vocabulary
+  head selection; tasks retain suppression construction, EOS and publication.
+  Eligible scalar Native F32 readers reuse the same immutable Definition cache
+  and private physical schedule. The original full task permit moves into the
+  Source owner without another KV reservation. Construction cleanup drains
+  before scheduling selection; physical retirement precedes numerical unlock
+  and metadata refunds. Reading telemetry copies actual decoder Frame counts
+  before teardown, excluding encoder and vocabulary-head execution.
+- Metal installs synchronous assigned pair/QKV regions for complete F32
+  projection heads through the production partition executor. Row-one regions
+  use the existing source ownership. One semantic descriptor recognizes independent
+  projections, the optimizer's fused pair/second-output marker and grouped
+  concat/projection/slice forms. Source preparation and assigned regions share
+  those exact node identities. Region-only heads retain physical output plans
+  without pretending to own individual primitive kernels. Public host-output,
+  host-to-resident and resident-input entrypoints consult the same provider-owned
+  preparation hint for eligible managed fixed heads. They share the existing
+  Source owner, release the FIFO selection before cold funding and reselect it
+  before execution; the hint grants no admission credit. Managed multirow
+  no-bias heads can prepare one
+  immutable packed weight/bias pair after the original compatibility call has
+  established source slots. The actual Source cold phase funds both host
+  metadata and backend roots outside execution gates, then creates a fresh
+  request-bound profile. Publication rechecks the exact source request under
+  execution and index exclusion after funding; concurrent losers refund their
+  unpublished allocation. Pre-entry source checks acquire the actual index or
+  validate the entered metadata owner. Its scope fields share the singleton HOST
+  charge. Dispatch retains the original direct GEMM/split policy
+  and waits its exact private command buffer before publishing outputs.
+  Each reuse retains its actual operation ticket, independently owned metadata
+  and cleanup boundary; SDK payload death and model-close cleanup both gate
+  refunds. Models sharing a backend and admission Domain share the same cache
+  binding, counted once by held-model conservation snapshots. Mixed graphs,
+  MPS/MPP selectors, raw receivers and direct decoder APIs retain compatibility
+  ownership. These regions receive no complete-payload quota credit.
+- CUDA prepared projections describe eligible BF16-rounded output separately
+  from F32 publication, activation conversion and vendor workspace. Cold
+  preparation loads the original widening program; dispatch retains the
+  original GEMM and widening order. This ordinary-only route preserves the
+  existing capture restriction and declines separate mutable mirror planes.
+  A witnessed RMSNorm BF16 auxiliary can supply activation rows without another
+  conversion. Allocator alignment is explicit metadata; SDK binding rechecks
+  the actual primary and auxiliary leases against the current frame. External
+  mirrors, offsets and unknown alignment retain compatibility ownership.
+- `execution/testing/model_formats.zig` compares deterministic one-layer BERT
+  and sliding-window decoder graphs loaded through real ONNX, safetensors and
+  GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU
+  reference, with a `2e-4` execution tolerance. Decoder K/V stays resident across
+  four transitions; held earlier outputs detect frame overwrites. Immutable
+  matrix packing is warmed before strict readback checks. This matrix validates
+  format equivalence; it does not benchmark packed quantized serving kernels.
+- Execution diagnostics publish one owned report for actual invocation or
+  pending-phase observations: transfers and bytes, accepted dispatch/submission
+  and wait units, specialization decisions, selected Native bodies and workers,
+  known fallback producers, and registered host/device allocation owners. Batch
+  participants and pending outcomes survive model retirement. Registered owner
+  intervals can include concurrent activity; lifetime peaks are labelled as such.
+  Successful frames and entered Native calls copy their prepared payload admission
+  coverage into the report, including the existing compatibility reason. This
+  describes prepared accounting rather than a numerical fallback or quota grant.
+  Instrumented Metal region-policy counters remain absent until their actual
+  planner runs.
+  Unobserved fallback reasons and opaque vendor/private allocation domains remain
+  unavailable. These scoped observations do not claim a whole-backend census or
+  an exclusive invocation memory peak.
+
+The issue checklist records implementation and evidence separately from remaining
+migration. Compatibility paths stay until their replacements satisfy correctness,
+residency, lifetime and performance checks. Physical L4/A100 qualification remains
+deferred; CPU, local Metal and Glowworm GB10 provide the available hardware tests.

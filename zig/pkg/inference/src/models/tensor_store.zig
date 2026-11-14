@@ -101,11 +101,17 @@ pub const TensorRangeRef = struct {
     }
 };
 
+pub const StorageVisitor = @import("../execution/storage_inventory.zig").Visitor;
+fn visitSafetensorsStorage(reader: *const @import("safetensors.zig").MMapReader, visitor: StorageVisitor) !void {
+    try visitor.visit(reader.file_bytes, if (reader.mmap_region != null) .mapped_file else if (reader.file_storage_owned) .owned_heap else .borrowed_bytes);
+}
+
 pub const TensorStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        visitStorageSpans: ?*const fn (*anyopaque, StorageVisitor) anyerror!void = null,
         kind: *const fn (*anyopaque) StoreKind,
         weightSource: *const fn (*anyopaque) anyerror!?weight_source_mod.WeightSource,
         describeTensor: *const fn (*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!LazyTensorRef,
@@ -117,6 +123,32 @@ pub const TensorStore = struct {
         ggufFile: *const fn (*anyopaque) ?*const gguf_mod.format.File,
         deinit: *const fn (*anyopaque) void,
     };
+
+    /// Exact canonical model mapping, owned until this store closes. Callers
+    /// synchronize lazy shard publication; copied/custom tables grant no pin.
+    pub fn ownsMappedStorageSpan(self: TensorStore, mapped: []const u8) bool {
+        if (self.vtable != &SafetensorsStore.vtable and self.vtable != &ShardedSafetensorsStore.vtable and
+            self.vtable != &GgufStore.vtable and self.vtable != &CompositeGlinerStore.vtable and
+            self.vtable != &CompositeProjectorStore.vtable) return false;
+        const Match = struct {
+            target: []const u8,
+            found: bool = false,
+            fn visit(ctx: *anyopaque, bytes: []const u8, class: @import("../execution/storage_inventory.zig").Class) !void {
+                const state: *@This() = @ptrCast(@alignCast(ctx));
+                if (class == .mapped_file and bytes.ptr == state.target.ptr and bytes.len == state.target.len) state.found = true;
+            }
+        };
+        var match = Match{ .target = mapped };
+        _ = self.visitStorageSpans(.{ .ptr = &match, .visit_fn = Match.visit }) catch return false;
+        return match.found;
+    }
+    /// Caller synchronizes with lazy shard opening. Custom stores report
+    /// unsupported rather than exposing a logical-size estimate as ownership.
+    pub fn visitStorageSpans(self: TensorStore, visitor: StorageVisitor) !bool {
+        const visit = self.vtable.visitStorageSpans orelse return false;
+        try visit(self.ptr, visitor);
+        return true;
+    }
 
     pub fn kind(self: TensorStore) StoreKind {
         return self.vtable.kind(self.ptr);
@@ -166,6 +198,75 @@ pub const TensorStore = struct {
         if (self.vtable != &GgufStore.vtable) return null;
         const store: *const GgufStore = @ptrCast(@alignCast(self.ptr));
         return store.rawData();
+    }
+
+    pub const NativeQuantizedSource = struct {
+        tensor_type: gguf_mod.tensor_types.TensorType,
+        raw_bytes: []const u8,
+        shape: [2]i64,
+        source_name: []const u8,
+        mmap_backed: bool,
+    };
+
+    /// Values-only geometry of the SAME mapped bytes returned by
+    /// loadQuantizedStorageRef. No payload allocation, file reopening, admission,
+    /// or preparation. The actual retained Model keeps this store/source alive;
+    /// the receiving owner must revalidate the full store and entry identities.
+    /// Packed experts/composite/custom stores retain their original path.
+    pub fn nativeQuantizedSource(self: TensorStore, ref: *const LazyTensorRef) !?NativeQuantizedSource {
+        if (self.vtable != &GgufStore.vtable or ref.packed_expert_index != null or ref.packed_expert_count != 0) return null;
+        const store: *const GgufStore = @ptrCast(@alignCast(self.ptr));
+        const source_name = ref.source_name orelse ref.name;
+        const tensor = gguf_mod.tensor_catalog.Catalog.init(&store.parsed).find(source_name) orelse return error.TensorNotFound;
+        if (!tensor.tensor_type.isQuantized() or tensor.dimensions.len != 2) return null;
+        const bytes_u64 = gguf_mod.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions) orelse return error.UnsupportedTensorType;
+        const bytes = std.math.cast(usize, bytes_u64) orelse return error.InvalidTensorShape;
+        const offset = std.math.cast(usize, tensor.data_offset) orelse return error.InvalidTensorShape;
+        const end = std.math.add(usize, offset, bytes) catch return error.InvalidTensorShape;
+        const raw = store.rawData();
+        if (end > raw.len) return error.InvalidTensorShape;
+        var shape: [2]i64 = undefined;
+        for (0..2) |i| {
+            shape[i] = std.math.cast(i64, tensor.dimensions[1 - i]) orelse return error.InvalidTensorShape;
+            if (shape[i] <= 0) return error.InvalidTensorShape;
+        }
+        return .{ .tensor_type = tensor.tensor_type, .raw_bytes = raw[offset..end], .shape = shape, .source_name = source_name, .mmap_backed = store.mmap_region != null };
+    }
+
+    /// SAME immutable mapped branch as MMapReader.readTensor, with no shard
+    /// opening/allocation/Io. Caller serializes actual shard publication and
+    /// retains this canonical Model/store through every byte/shape borrow.
+    /// An owned/copy/custom source grants no mapped-parent authority.
+    pub fn nativeTypedMappedSource(self: TensorStore, ref: *const LazyTensorRef) !?@import("../backends/tensor.zig").Tensor {
+        if (ref.quantized or ref.packed_expert_index != null or ref.packed_expert_count != 0 or ref.fused_gate_up or ref.fused_gate_up_index != 0) return null;
+        // Both attested safetensor loadTensorRef implementations consume name,
+        // not the GGUF/composite source alias. No unsliced alias transform is
+        // accepted as a full mapped tensor by this exact branch.
+        if (ref.source_name) |source_name| if (!std.mem.eql(u8, source_name, ref.name)) return null;
+        const reader = if (self.vtable == &SafetensorsStore.vtable) blk: {
+            const store: *const SafetensorsStore = @ptrCast(@alignCast(self.ptr));
+            break :blk &store.source.reader;
+        } else if (self.vtable == &ShardedSafetensorsStore.vtable) blk: {
+            const store: *const ShardedSafetensorsStore = @ptrCast(@alignCast(self.ptr));
+            const shard = store.source.index.weight_map.get(ref.name) orelse return error.TensorNotFound;
+            break :blk store.source.readers.get(shard) orelse return error.NativeTypedShardNotOpened;
+        } else return null;
+        const meta = reader.header.tensors.get(ref.name) orelse return error.TensorNotFound;
+        if (meta.dtype != .f32 and meta.dtype != .bf16 and meta.dtype != .f16) return null;
+        if (reader.mmap_region == null) return null;
+        const start = try std.math.add(u64, reader.data_offset, meta.data_start);
+        const end = try std.math.add(u64, reader.data_offset, meta.data_end);
+        if (meta.data_start > meta.data_end or end > reader.file_bytes.len) return error.InvalidOffset;
+        var elements: usize = 1;
+        for (meta.shape) |axis| {
+            if (axis < 0) return error.InvalidShape;
+            elements = try std.math.mul(usize, elements, std.math.cast(usize, axis) orelse return error.InvalidShape);
+        }
+        const bytes = try std.math.mul(usize, elements, meta.dtype.byteSize());
+        if (end - start != bytes or bytes != ref.byte_len) return error.InvalidTensorSize;
+        const raw = reader.file_bytes[@intCast(start)..@intCast(end)];
+        if (@intFromPtr(raw.ptr) % meta.dtype.byteSize() != 0) return null;
+        return .{ .data = @constCast(raw), .dtype = meta.dtype, .shape = meta.shape, .name = ref.name, .allocator = reader.allocator, .owns_data = false, .owns_shape = false, .mmap_source_bytes = reader.file_bytes };
     }
 
     pub const GlinerGgufSnapshot = struct {
@@ -220,6 +321,7 @@ pub const SafetensorsStore = struct {
     path: []const u8,
 
     const vtable = TensorStore.VTable{
+        .visitStorageSpans = @ptrCast(&visitStorageSpansImpl),
         .kind = @ptrCast(&kindImpl),
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
@@ -247,6 +349,10 @@ pub const SafetensorsStore = struct {
 
     pub fn tensorStore(self: *SafetensorsStore) TensorStore {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn visitStorageSpansImpl(self: *SafetensorsStore, visitor: StorageVisitor) !void {
+        try visitSafetensorsStorage(&self.source.reader, visitor);
     }
 
     fn kindImpl(_: *SafetensorsStore) StoreKind {
@@ -306,6 +412,7 @@ pub const ShardedSafetensorsStore = struct {
     source: *weight_source_mod.ShardedSafetensorsSource,
 
     const vtable = TensorStore.VTable{
+        .visitStorageSpans = @ptrCast(&visitStorageSpansImpl),
         .kind = @ptrCast(&kindImpl),
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
@@ -329,6 +436,11 @@ pub const ShardedSafetensorsStore = struct {
 
     pub fn tensorStore(self: *ShardedSafetensorsStore) TensorStore {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn visitStorageSpansImpl(self: *ShardedSafetensorsStore, visitor: StorageVisitor) !void {
+        var readers = self.source.readers.valueIterator();
+        while (readers.next()) |reader| try visitSafetensorsStorage(reader.*, visitor);
     }
 
     fn kindImpl(_: *ShardedSafetensorsStore) StoreKind {
@@ -394,6 +506,7 @@ pub const GgufStore = struct {
     parsed: gguf_mod.format.File,
 
     const vtable = TensorStore.VTable{
+        .visitStorageSpans = @ptrCast(&visitStorageSpansImpl),
         .kind = @ptrCast(&kindImpl),
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
@@ -490,6 +603,10 @@ pub const GgufStore = struct {
         return self.mmap_region.?.data;
     }
 
+    fn visitStorageSpansImpl(self: *GgufStore, visitor: StorageVisitor) !void {
+        if (self.mmap_region) |region| try visitor.visit(region.data, .mapped_file) else if (self.owned_bytes) |bytes| try visitor.visit(bytes, .owned_heap);
+    }
+
     fn kindImpl(_: *GgufStore) StoreKind {
         return .gguf;
     }
@@ -559,6 +676,7 @@ fn ggufGetTensor(self: *GgufStore, name: []const u8) !weight_source_mod.LoadedWe
             .raw_bytes = @constCast(raw_bytes),
             .shape = quant_shape,
             .source_name = storage_source_name,
+            .dense_workload = @import("projection_workload.zig").registered(storage_source_name),
             .raw_owned = false,
             .raw_mmap_backed = self.mmap_region != null,
             .raw_mmap_source_bytes = if (self.mmap_region != null) self.rawData() else null,
@@ -825,12 +943,6 @@ fn ggufGetPackedMoeQuantizedStorage(
     };
 }
 
-fn reversedShape(allocator: std.mem.Allocator, shape: []const i64) ![]i64 {
-    const reversed = try allocator.alloc(i64, shape.len);
-    for (0..shape.len) |i| reversed[i] = shape[shape.len - 1 - i];
-    return reversed;
-}
-
 fn normalizedShapeFromDims(allocator: std.mem.Allocator, dimensions: []const u64) ![]i64 {
     const shape = try allocator.alloc(i64, dimensions.len);
     for (0..dimensions.len) |i| shape[i] = @intCast(dimensions[dimensions.len - 1 - i]);
@@ -901,52 +1013,6 @@ fn slicePackedExpertTensor(
         .dtype = tensor.dtype,
         .shape = out_shape,
         .name = name,
-        .allocator = allocator,
-        .owns_data = true,
-        .owns_shape = true,
-    };
-}
-
-fn normalizeGgufTensorLayout(
-    allocator: std.mem.Allocator,
-    tensor: *const @import("../backends/tensor.zig").Tensor,
-) !@import("../backends/tensor.zig").Tensor {
-    const rank = tensor.shape.len;
-    if (rank < 2) return error.InvalidPackedExpertTensor;
-
-    const new_shape = try allocator.alloc(i64, rank);
-    errdefer allocator.free(new_shape);
-    for (0..rank) |i| new_shape[i] = tensor.shape[rank - 1 - i];
-
-    const elem_size = tensor.dtype.byteSize();
-    const count = elementCount(tensor.shape) orelse return error.InvalidTensorShape;
-    const new_bytes = try allocator.alloc(u8, count * elem_size);
-    errdefer allocator.free(new_bytes);
-
-    const in_strides = try computeRowMajorStrides(allocator, tensor.shape);
-    defer allocator.free(in_strides);
-    const out_strides = try computeRowMajorStrides(allocator, new_shape);
-    defer allocator.free(out_strides);
-
-    const out_indices = try allocator.alloc(usize, rank);
-    defer allocator.free(out_indices);
-    var in_indices = try allocator.alloc(usize, rank);
-    defer allocator.free(in_indices);
-
-    for (0..count) |linear_out| {
-        linearIndexToIndices(linear_out, new_shape, out_strides, out_indices);
-        for (0..rank) |i| in_indices[rank - 1 - i] = out_indices[i];
-        const in_linear = indicesToLinearIndex(in_indices, in_strides);
-        const src_start = in_linear * elem_size;
-        const dst_start = linear_out * elem_size;
-        @memcpy(new_bytes[dst_start .. dst_start + elem_size], tensor.data[src_start .. src_start + elem_size]);
-    }
-
-    return .{
-        .data = new_bytes,
-        .dtype = tensor.dtype,
-        .shape = new_shape,
-        .name = tensor.name,
         .allocator = allocator,
         .owns_data = true,
         .owns_shape = true,
@@ -1052,6 +1118,7 @@ pub const CompositeGlinerStore = struct {
     head_gguf: ?*GgufStore = null,
 
     const vtable = TensorStore.VTable{
+        .visitStorageSpans = @ptrCast(&visitStorageSpansImpl),
         .kind = @ptrCast(&kindImpl),
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
@@ -1089,6 +1156,12 @@ pub const CompositeGlinerStore = struct {
 
     pub fn tensorStore(self: *CompositeGlinerStore) TensorStore {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn visitStorageSpansImpl(self: *CompositeGlinerStore, visitor: StorageVisitor) !void {
+        try GgufStore.visitStorageSpansImpl(self.encoder, visitor);
+        if (self.head_gguf) |head| try GgufStore.visitStorageSpansImpl(head, visitor);
+        if (self.head_safetensors) |head| try SafetensorsStore.visitStorageSpansImpl(head, visitor);
     }
 
     fn kindImpl(_: *CompositeGlinerStore) StoreKind {
@@ -1213,6 +1286,7 @@ pub const CompositeProjectorStore = struct {
     projector: *GgufStore,
 
     const vtable = TensorStore.VTable{
+        .visitStorageSpans = @ptrCast(&visitStorageSpansImpl),
         .kind = @ptrCast(&kindImpl),
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
@@ -1275,6 +1349,11 @@ pub const CompositeProjectorStore = struct {
 
     fn storeFor(self: *CompositeProjectorStore, name: []const u8) *GgufStore {
         return if (self.hasProjectorTensor(name)) self.projector else self.primary;
+    }
+
+    fn visitStorageSpansImpl(self: *CompositeProjectorStore, visitor: StorageVisitor) !void {
+        try GgufStore.visitStorageSpansImpl(self.primary, visitor);
+        try GgufStore.visitStorageSpansImpl(self.projector, visitor);
     }
 
     fn kindImpl(_: *CompositeProjectorStore) StoreKind {
@@ -1414,6 +1493,7 @@ test "open sharded safetensors tensor store from manifest" {
     const store = try openFromManifest(allocator, manifest);
     defer store.deinit();
     try std.testing.expectEqual(StoreKind.safetensors, store.kind());
+    try expectMappedStorageInventory(store, allocator, 0);
 
     const source = (try store.weightSource()) orelse return error.TestUnexpectedResult;
     const names = try source.listNames(allocator);
@@ -1429,6 +1509,10 @@ test "open sharded safetensors tensor store from manifest" {
     try std.testing.expectEqual(@as(usize, 2), loaded.tensor.elementCount());
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), loaded.tensor.asFloat32()[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), loaded.tensor.asFloat32()[1], 1e-6);
+    try expectMappedStorageInventory(store, allocator, shard2.items.len);
+    var first_ref = try store.describeTensor(allocator, "tensor_a");
+    defer first_ref.deinit(allocator);
+    try expectMappedStorageInventory(store, allocator, shard1.items.len + shard2.items.len);
 }
 
 test "safetensors tensor store preserves f16 dtype" {
@@ -1471,6 +1555,7 @@ test "safetensors tensor store preserves f16 dtype" {
 
     const store = try openFromManifest(allocator, manifest);
     defer store.deinit();
+    try expectMappedStorageInventory(store, allocator, file.items.len);
     try std.testing.expectEqual(StoreKind.safetensors, store.kind());
 
     var tensor_ref = try store.describeTensor(allocator, "weights");
@@ -1558,6 +1643,7 @@ test "open gguf tensor store from manifest" {
 
     const store = try openFromManifest(allocator, manifest);
     defer store.deinit();
+    try expectMappedStorageInventory(store, allocator, data.items.len);
     try std.testing.expectEqual(StoreKind.gguf, store.kind());
     try std.testing.expect(store.ggufFile() != null);
 
@@ -1669,6 +1755,7 @@ test "open gguf checkpoint with its gemma4 audio projector from manifest" {
 
     const store = try openFromManifest(allocator, manifest);
     defer store.deinit();
+    try expectMappedStorageInventory(store, allocator, primary.items.len + projector.items.len);
     try std.testing.expectEqual(StoreKind.gguf, store.kind());
     try std.testing.expect(store.ggufFile() != null);
 
@@ -1775,6 +1862,7 @@ test "open split gliner gguf bundle from manifest" {
 
     const store = try openFromManifest(allocator, manifest);
     defer store.deinit();
+    try expectMappedStorageInventory(store, allocator, gguf_data.items.len + head_data.items.len);
     try std.testing.expectEqual(StoreKind.gguf, store.kind());
     try std.testing.expect(store.ggufFile() != null);
 
@@ -1852,4 +1940,79 @@ fn padToAlignment(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8
     const rem = data.items.len % alignment;
     if (rem == 0) return;
     try data.appendNTimes(allocator, 0, alignment - rem);
+}
+
+fn expectMappedStorageInventory(store: TensorStore, allocator: std.mem.Allocator, expected: usize) !void {
+    const inventory = @import("../execution/storage_inventory.zig");
+    var collector = inventory.Collector{ .allocator = allocator };
+    defer collector.deinit();
+    try std.testing.expect(try store.visitStorageSpans(collector.visitor()));
+    const result = try collector.finish(true);
+    try std.testing.expectEqual(@as(u64, expected), result.mapped_file_extent_bytes);
+    try std.testing.expectEqual(@as(u64, 0), result.owned_heap_payload_bytes);
+    for (collector.ranges.items) |span| {
+        if (span.class != .mapped_file) continue;
+        const pointer: [*]const u8 = @ptrFromInt(span.start);
+        const mapped = pointer[0 .. span.end - span.start];
+        try std.testing.expect(store.ownsMappedStorageSpan(mapped));
+        if (mapped.len > 1) try std.testing.expect(!store.ownsMappedStorageSpan(mapped[1..]));
+        var copied = store;
+        var copied_table = store.vtable.*;
+        copied.vtable = &copied_table;
+        try std.testing.expect(!copied.ownsMappedStorageSpan(mapped));
+    }
+    // Even a familiar kind cannot authorize a downcast for an opaque source.
+    var custom = store;
+    var table = store.vtable.*;
+    table.visitStorageSpans = null;
+    custom.vtable = &table;
+    try std.testing.expect(!try custom.visitStorageSpans(collector.visitor()));
+}
+
+test "Native canonical GGUF cold geometry is exact same immutable quantized source without payload preparation" {
+    const a = std.testing.allocator;
+    const writer = @import("../gguf/writer.zig");
+    var layout = try writer.buildLayout(a, &.{}, &.{.{ .name = "matrix.weight", .dimensions = &.{ 32, 64 }, .tensor_type = .{ .known = .Q8_0 } }});
+    defer layout.deinit(a);
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(a);
+    try bytes.appendSlice(a, layout.header_bytes);
+    const data_offset = std.mem.alignForward(usize, bytes.items.len, @intCast(layout.alignment));
+    try bytes.appendNTimes(a, 0, data_offset - bytes.items.len + 64 * 34);
+    const canonical = try GgufStore.initOwnedBytes(a, "native-cold-geometry", bytes.items);
+    const store = canonical.tensorStore();
+    defer store.deinit();
+    var ref = try store.describeTensor(a, "matrix.weight");
+    defer ref.deinit(a);
+    const geometry = (try store.nativeQuantizedSource(&ref)) orelse return error.TestUnexpectedResult;
+    var actual = (try store.loadQuantizedStorageRef(&ref)) orelse return error.TestUnexpectedResult;
+    defer actual.deinit();
+    try std.testing.expect(geometry.raw_bytes.ptr == actual.raw_bytes.ptr);
+    try std.testing.expectEqual(actual.raw_bytes.len, geometry.raw_bytes.len);
+    try std.testing.expectEqualSlices(i64, actual.shape, &geometry.shape);
+    try std.testing.expectEqualSlices(i64, &.{ 64, 32 }, &geometry.shape);
+    try std.testing.expectEqualStrings(actual.source_name.?, geometry.source_name);
+    try std.testing.expectEqual(@as(usize, 0), actual.prepared.ownedBytes());
+    // Metadata aliases of the public table cannot certify a foreign ctx.
+    var copied = store.vtable.*;
+    var forged = store;
+    forged.vtable = &copied;
+    forged.ptr = @ptrFromInt(16);
+    try std.testing.expect((try forged.nativeQuantizedSource(&ref)) == null);
+    ref.packed_expert_count = 2;
+    try std.testing.expect((try store.nativeQuantizedSource(&ref)) == null);
+}
+
+test "Native typed mapped source rejects fused expert alias and copied-table recipes before opaque access" {
+    const canonical = TensorStore{ .ptr = @ptrFromInt(16), .vtable = &SafetensorsStore.vtable };
+    for ([_]LazyTensorRef{
+        .{ .name = "weight", .fused_gate_up = true },
+        .{ .name = "weight", .fused_gate_up_index = 1 },
+        .{ .name = "weight", .packed_expert_index = 0 },
+        .{ .name = "weight", .packed_expert_count = 2 },
+        .{ .name = "alias", .source_name = "actual" },
+    }) |ref| try std.testing.expect(try canonical.nativeTypedMappedSource(&ref) == null);
+    var copied = SafetensorsStore.vtable;
+    const foreign = TensorStore{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expect(try foreign.nativeTypedMappedSource(&.{ .name = "weight" }) == null);
 }

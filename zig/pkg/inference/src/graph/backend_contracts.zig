@@ -417,6 +417,9 @@ pub const TensorDesc = struct {
     attention_storage: ?quant_matmul.AttentionStorage = null,
     view_source: ?ml.graph.NodeId = null,
     resident_backend: ?BackendKind = null,
+    /// Proven storage location for a supplied parameter. Unlike uploadability
+    /// seeding (`resident_backend`), this never predicts a future transfer.
+    current_backend: ?BackendKind = null,
     device_id: u32 = 0,
 
     pub fn init(shape: ml.graph.Shape, storage: TensorStorageClass) TensorDesc {
@@ -565,6 +568,9 @@ pub const DecoderRuntimePrepareLayerNormRequest = struct {
 };
 
 pub const DecoderRuntimeEnsureLayerNormSlotRequest = struct {
+    /// Explicit invocation scope. Zero never authorizes reuse of an unknown
+    /// source across independent calls. No ambient/TLS preparation state.
+    preparation_scope: u64 = 0,
     weight: CT,
     bias: CT,
     hidden_size: usize,
@@ -584,6 +590,9 @@ pub const DecoderRuntimePrepareRmsNormRequest = struct {
 };
 
 pub const DecoderRuntimeEnsureRmsNormSlotRequest = struct {
+    /// Explicit invocation scope. Zero never authorizes reuse of an unknown
+    /// source across independent calls. No ambient/TLS preparation state.
+    preparation_scope: u64 = 0,
     weight: CT,
     hidden_size: usize,
 };
@@ -727,6 +736,9 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
 };
 
 pub const DecoderRuntimeEnsureLinearSlotRequest = struct {
+    /// Explicit invocation scope. Zero never authorizes reuse of an unknown
+    /// source across independent calls. No ambient/TLS preparation state.
+    preparation_scope: u64 = 0,
     weight: CT,
     bias: ?CT,
     in_dim: usize,
@@ -884,6 +896,8 @@ pub const DecoderRuntimeApplyAddRequest = struct {
 };
 
 pub const DecoderRuntimeApplyAddScaleRequest = struct {
+    /// Exact assigned target; unsupported providers decline before submission.
+    output: ?CT = null,
     lhs: CT,
     rhs: CT,
     dim: usize,
@@ -891,6 +905,8 @@ pub const DecoderRuntimeApplyAddScaleRequest = struct {
 };
 
 pub const DecoderRuntimeApplyScaledAddScaleRequest = struct {
+    /// Exact assigned target; unsupported providers decline before submission.
+    output: ?CT = null,
     lhs: CT,
     rhs: CT,
     dim: usize,
@@ -899,6 +915,8 @@ pub const DecoderRuntimeApplyScaledAddScaleRequest = struct {
 };
 
 pub const DecoderRuntimeApplyMultiplyAddRequest = struct {
+    /// Exact assigned target; unsupported providers decline before submission.
+    output: ?CT = null,
     lhs: CT,
     rhs: CT,
     addend: CT,
@@ -906,6 +924,8 @@ pub const DecoderRuntimeApplyMultiplyAddRequest = struct {
 };
 
 pub const DecoderRuntimeApplyMultiplyAdd2Request = struct {
+    /// Exact assigned target; unsupported providers decline before submission.
+    output: ?CT = null,
     lhs0: CT,
     rhs0: CT,
     lhs1: CT,
@@ -955,7 +975,18 @@ pub const AttentionSinkMetadata = struct {
     }
 };
 
+/// Borrowed synchronous live rows and exact mask for an authored dense-prefix
+/// program. The supplying cache and Frame retain the actual K/V capacity CTs.
+pub const DenseAttentionPrefixBinding = struct {
+    live_key_rows: usize,
+    mask: []const i64,
+};
+
+pub const DenseAttentionRowsBinding = struct { mask: ?[]const i64 = null };
+
 pub const AttentionContext = struct {
+    dense_attention_rows: ?DenseAttentionRowsBinding = null,
+    dense_attention_prefix: ?DenseAttentionPrefixBinding = null,
     mode: AttentionMode = .dense_causal,
     total_sequence_len: usize,
     query_sequence_len: usize,
@@ -1398,6 +1429,8 @@ pub const DecoderRuntimePrefillFramePlanRequest = struct {
 };
 
 pub const DecoderRuntimeGraphCommandPlanFrameRequest = struct {
+    /// Borrowed per synchronous call only; never saved in a prepared plan.
+    cleanup: ?*const @import("../execution/cleanup_context.zig").Context = null,
     contract: DecoderRuntimeDecodeContract,
     layer_count: usize,
     rows: usize,
@@ -1510,7 +1543,7 @@ pub const NomicBertEncoderLayerRequest = struct {
     norm_eps: f32,
 };
 
-pub const NomicBertPoolNormalizeRequest = struct {
+pub const MaskedMeanNormalizeRequest = struct {
     hidden: CT,
     attention_mask: []const i64,
     batch: usize,
@@ -1518,6 +1551,9 @@ pub const NomicBertPoolNormalizeRequest = struct {
     hidden_size: usize,
     normalize: bool,
 };
+
+/// Historical source compatibility; geometry and semantics are model neutral.
+pub const NomicBertPoolNormalizeRequest = MaskedMeanNormalizeRequest;
 
 test "tensor storage classes classify host and device residency" {
     try std.testing.expect(TensorStorageClass.host_f32.isHost());

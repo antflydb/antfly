@@ -1,0 +1,149 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Semantic loading, preparation and execution boundaries. Target backends
+//! retain their specialized schedules behind these common owners.
+pub const LoadedModel = @import("../architectures/model_definition.zig").LoadedModel;
+pub const ModelProgram = @import("program.zig").ModelProgram;
+pub const Binding = @import("program.zig").Binding;
+pub const Executable = @import("executable.zig").Executable;
+pub const prepare = @import("executable.zig").prepare;
+pub const prepareWithOptions = @import("executable.zig").prepareWithOptions;
+pub const PrepareOptions = @import("executable.zig").PrepareOptions;
+pub const BackendContext = @import("../backends/compute_context.zig").BackendContext;
+pub const kernels = @import("../ops/kernel_descriptor.zig");
+pub const diagnostics = @import("diagnostics.zig");
+pub const prepareAnalyzedGraph = @import("executable.zig").prepareAnalyzedGraph;
+pub const model_candidate = @import("model_candidate.zig");
+pub const ModelCandidate = model_candidate.Candidate;
+pub const transfer_audit = @import("transfer_audit.zig");
+
+pub const decoder_forward = @import("decoder_forward.zig");
+pub const native_decoder_program = @import("native_decoder_program.zig");
+pub const decoder_storage = @import("decoder_storage.zig");
+pub const sequence_pool = @import("sequence_pool.zig");
+pub const text_inputs = @import("text_inputs.zig");
+pub const submission = @import("submission.zig");
+
+pub const reader_pool = @import("reader_pool.zig");
+pub const storage_accounting = @import("storage_accounting.zig");
+
+pub const architecture_session = @import("architecture_session.zig");
+
+pub const decoder_routes = @import("decoder_routes.zig");
+
+pub const encoder_decoder_runtime = @import("encoder_decoder_runtime.zig");
+pub const owned_incremental_input = @import("owned_incremental_input.zig");
+pub const seq2seq_runtime = @import("seq2seq_runtime.zig");
+
+pub const decoder_checkpoint = @import("decoder_checkpoint.zig");
+pub const prepared_invocation = @import("prepared_invocation.zig");
+pub const decoder_pending_step = @import("decoder_pending_step.zig");
+pub const decoder_prefill = @import("decoder_prefill.zig");
+
+pub const cached_decoder = @import("cached_decoder.zig");
+pub const decoder_stage = @import("decoder_stage.zig");
+
+pub const speculative_activation = @import("speculative_activation.zig");
+
+test {
+    _ = @import("../backends/compute_factory.zig");
+    _ = @import("decoder_forward.zig");
+    _ = @import("native_decoder_program.zig");
+    _ = @import("decoder_storage.zig");
+    _ = @import("executable.zig");
+    _ = @import("diagnostics.zig");
+    _ = @import("runtime_observation.zig");
+    _ = @import("invocation_observation.zig");
+    _ = @import("pending_observation.zig");
+    _ = @import("shared_batch_observation.zig");
+    _ = @import("assigned_kernel_route.zig");
+    _ = @import("host_ingress.zig");
+    _ = @import("../ops/physical_storage.zig");
+    _ = @import("route_selection.zig");
+}
+
+test {
+    _ = @import("region_route.zig");
+    _ = @import("region_binding.zig");
+    _ = @import("region_schedule.zig");
+    _ = @import("region_recolor.zig");
+    _ = @import("region_preparation.zig");
+    _ = @import("region_claims.zig");
+}
+
+test {
+    _ = @import("region_execution_profile.zig");
+}
+
+test {
+    _ = @import("region_lifetimes.zig");
+}
+
+pub const resource_retirement = @import("resource_retirement.zig");
+test {
+    _ = resource_retirement;
+}
+
+test {
+    _ = @import("diagnostic_export.zig");
+    _ = @import("metadata_sample.zig");
+}
+
+pub const backend_operation = @import("backend_operation.zig");
+test {
+    _ = @import("allocation_observer.zig");
+    _ = @import("allocation_registry.zig");
+    _ = @import("device_allocation_registry.zig");
+    _ = @import("invocation_report.zig");
+}
+
+test {
+    _ = backend_operation;
+}
+
+pub const operation_gate = @import("operation_gate.zig");
+test {
+    _ = operation_gate;
+}
+
+pub const operation_owner = @import("operation_owner.zig");
+test {
+    _ = operation_owner;
+}
+
+pub const retirement_sink = @import("retirement_sink.zig");
+test {
+    _ = retirement_sink;
+}
+
+test {
+    _ = @import("operation_cleanup_epoch_test.zig");
+}
+
+test {
+    _ = @import("completion_retirement.zig");
+    _ = @import("payload_charge.zig");
+}
+
+test {
+    _ = @import("retirement_sink.zig");
+    _ = @import("owned_incremental_input.zig");
+    _ = @import("source_lane.zig");
+}
+
+test {
+    _ = @import("cleanup_owner.zig");
+}

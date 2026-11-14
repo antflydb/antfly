@@ -368,6 +368,8 @@ pub const PendingWorkOptions = struct {
 };
 
 pub const StepItem = struct {
+    /// Original scheduler identity; absent only for standalone legacy callers.
+    request_id: ?RequestId = null,
     work_ptr: *anyopaque,
     phase: Phase,
     query_sequence_len: usize,
@@ -1102,6 +1104,7 @@ pub const NativeGenerateCoordinator = struct {
                 if (pending.request_id != lease.request_id) return false;
                 try out.append(allocator, .{
                     .work_ptr = pending.work_ptr,
+                    .request_id = pending.request_id,
                     .phase = .decode,
                     .query_sequence_len = 1,
                     .total_sequence_len = pending.total_sequence_len,
@@ -1121,6 +1124,7 @@ pub const NativeGenerateCoordinator = struct {
                 if (pending.request_id != lease.request_id) return false;
                 try out.append(allocator, .{
                     .work_ptr = pending.work_ptr,
+                    .request_id = pending.request_id,
                     .phase = .prefill,
                     .query_sequence_len = pending.query_sequence_len,
                     .total_sequence_len = pending.total_sequence_len,
@@ -1175,6 +1179,7 @@ pub const NativeGenerateCoordinator = struct {
             }
             try out.append(allocator, .{
                 .work_ptr = pending.work_ptr,
+                .request_id = pending.request_id,
                 .phase = .decode,
                 .query_sequence_len = 1,
                 .total_sequence_len = pending.total_sequence_len,
@@ -1206,6 +1211,7 @@ pub const NativeGenerateCoordinator = struct {
             }
             try out.append(allocator, .{
                 .work_ptr = pending.work_ptr,
+                .request_id = pending.request_id,
                 .phase = .prefill,
                 .query_sequence_len = pending.query_sequence_len,
                 .total_sequence_len = pending.total_sequence_len,

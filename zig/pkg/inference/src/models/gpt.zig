@@ -260,6 +260,34 @@ pub const Config = struct {
     /// Recurrent histories remain separately allocated for every linear layer.
     compact_qwen35_kv: bool = false,
 
+    /// Process cache identity of semantic field values, independent of padding
+    /// and the allocation holding weight_prefix. No allocation; the input configuration stays borrowed.
+    pub fn fingerprint(self: *const Config) u64 {
+        var bytes: [@sizeOf(Config)]u8 = undefined;
+        comptime var length: usize = 0;
+        inline for (@typeInfo(Config).@"struct".field_names) |name| {
+            const T = @FieldType(Config, name);
+            if (@typeInfo(T) != .pointer) {
+                canonicalConfigField(bytes[length..][0..@sizeOf(T)], &@field(self.*, name));
+                length += @sizeOf(T);
+            }
+        }
+        var hasher = std.hash.Wyhash.init(0x517cc1b727220a95);
+        hasher.update(bytes[0..length]);
+        inline for (@typeInfo(Config).@"struct".field_names) |name| {
+            const T = @FieldType(Config, name);
+            if (@typeInfo(T) == .pointer) {
+                const info = @typeInfo(T).pointer;
+                if (info.size != .slice or info.child != u8) @compileError("configuration fingerprints require explicit pointer content semantics");
+                const value = @field(self.*, name);
+                const size: u64 = @intCast(value.len);
+                hasher.update(std.mem.asBytes(&size));
+                hasher.update(value);
+            }
+        }
+        return hasher.final();
+    }
+
     pub fn effectiveKVHeads(self: Config) u32 {
         return if (self.num_key_value_heads > 0) self.num_key_value_heads else self.num_attention_heads;
     }
@@ -673,7 +701,7 @@ pub const Config = struct {
         return false;
     }
 
-    pub fn suppressTokenIds(self: Config) []const i32 {
+    pub fn suppressTokenIds(self: *const Config) []const i32 {
         return self.suppress_token_ids[0..self.suppress_token_ids_len];
     }
 
@@ -2941,6 +2969,11 @@ test "parse gemma4 multi eos and generation suppress tokens" {
     try std.testing.expectEqual(@as(usize, 2), config.suppressTokenIds().len);
     try std.testing.expectEqual(@as(i32, 258883), config.suppressTokenIds()[0]);
     try std.testing.expectEqual(@as(i32, 258882), config.suppressTokenIds()[1]);
+    // The returned slice borrows the caller, never a by-value receiver copy.
+    const borrowed = config.suppressTokenIds();
+    try std.testing.expectEqual(@intFromPtr(&config.suppress_token_ids[0]), @intFromPtr(borrowed.ptr));
+    config.suppress_token_ids[0] = 17;
+    try std.testing.expectEqual(@as(i32, 17), borrowed[0]);
 }
 
 test "parse GGUF tokenizer eos token metadata" {
@@ -3799,4 +3832,264 @@ test "LightOnOCR3 official 4B config uses grouped recurrent heads and larger vis
     try std.testing.expectEqual(@as(u32, 24), config.vision_num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 1024), config.vision_hidden_size);
     try std.testing.expect(config.isEosToken(248046));
+}
+
+/// Logical offset-norm operands used by the actual Qwen3.5 decoder. This is
+/// checkpoint/config interpretation only, not a residency or cache witness.
+/// In particular, linear_attn.norm is passed unadjusted to gated RMS norm and
+/// must never be included merely because it is a one-dimensional weight.
+pub const Qwen35OffsetNormInventory = struct {
+    config: Config,
+    final_pending: bool = true,
+    layer: usize = 0,
+    slot: u3 = 0,
+    pub const Weight = struct {
+        kind: enum { final, input, post_attention, query, key },
+        layer: usize = 0,
+        dim: usize,
+        offset: f32,
+        /// Cold value copy of getModelWeight's exact prefixed/original/bare
+        /// lookup order. No pointer into Config or a temporary formatting
+        /// buffer survives publication to a cold backend preparation owner.
+        pub fn lookupCandidates(self: Weight, config: Config) !?LookupCandidates {
+            var result: LookupCandidates = .{};
+            var logical_buffer: [256]u8 = undefined;
+            const logical = try self.logicalName(&logical_buffer);
+            if (config.weight_prefix.len != 0) {
+                // Decline the ENTIRE optional cache operand, never select a
+                // fallback name while the actual first candidate is untested.
+                if (config.weight_prefix.len > 256 - 1 - (logical.len - "model.".len)) return null;
+                var prefixed_buffer: [256]u8 = undefined;
+                const prefixed = try std.fmt.bufPrint(&prefixed_buffer, "{s}.{s}", .{ config.weight_prefix, logical["model.".len..] });
+                try result.add(prefixed);
+            }
+            try result.add(logical);
+            try result.add(logical["model.".len..]);
+            return result;
+        }
+        pub fn logicalName(self: Weight, buffer: []u8) ![]const u8 {
+            return switch (self.kind) {
+                .final => "model.norm.weight",
+                .input => std.fmt.bufPrint(buffer, "model.layers.{d}.input_layernorm.weight", .{self.layer}),
+                .post_attention => std.fmt.bufPrint(buffer, "model.layers.{d}.post_attention_layernorm.weight", .{self.layer}),
+                .query => std.fmt.bufPrint(buffer, "model.layers.{d}.self_attn.q_norm.weight", .{self.layer}),
+                .key => std.fmt.bufPrint(buffer, "model.layers.{d}.self_attn.k_norm.weight", .{self.layer}),
+            };
+        }
+    };
+    pub const LookupCandidates = struct {
+        names: [3][256]u8 = @splat(@splat(0)),
+        lengths: [3]u16 = @splat(0),
+        count: u2 = 0,
+        fn add(self: *LookupCandidates, name: []const u8) !void {
+            if (name.len == 0 or name.len > 256 or self.count == 3) return error.InvalidNormWeightName;
+            @memcpy(self.names[self.count][0..name.len], name);
+            self.lengths[self.count] = @intCast(name.len);
+            self.count += 1;
+        }
+        pub fn candidate(self: *const LookupCandidates, index: usize) []const u8 {
+            std.debug.assert(index < self.count);
+            return self.names[index][0..self.lengths[index]];
+        }
+    };
+    pub fn next(self: *Qwen35OffsetNormInventory) ?Weight {
+        if (!self.config.isQwen35() or self.config.norm_weight_offset != 1) return null;
+        if (self.final_pending) {
+            self.final_pending = false;
+            return .{ .kind = .final, .dim = self.config.hidden_size, .offset = self.config.norm_weight_offset };
+        }
+        while (self.layer < self.config.num_hidden_layers) {
+            const layer = self.layer;
+            const slot = self.slot;
+            self.slot += 1;
+            if (self.slot == 4) {
+                self.layer += 1;
+                self.slot = 0;
+            }
+            if (slot >= 2 and self.config.layerUsesQwen35LinearAttention(layer)) continue;
+            return .{ .kind = switch (slot) {
+                0 => .input,
+                1 => .post_attention,
+                2 => .query,
+                3 => .key,
+                else => unreachable,
+            }, .layer = layer, .dim = if (slot < 2) self.config.hidden_size else self.config.effectiveHeadDimForLayer(layer), .offset = self.config.norm_weight_offset };
+        }
+        return null;
+    }
+};
+
+/// Cached execution retains an independent configuration snapshot. Synchronous
+/// execution continues to borrow Config; owned snapshots copy byte-slice fields.
+pub const OwnedConfig = struct {
+    value: Config,
+
+    pub fn init(allocator: std.mem.Allocator, source: *const Config) !OwnedConfig {
+        var result = OwnedConfig{ .value = source.* };
+        var initialized: usize = 0;
+        errdefer {
+            inline for (@typeInfo(Config).@"struct".field_names, 0..) |name, index| {
+                if (@typeInfo(@FieldType(Config, name)) == .pointer) {
+                    if (index < initialized) allocator.free(@field(result.value, name));
+                }
+            }
+        }
+        inline for (@typeInfo(Config).@"struct".field_names, 0..) |name, index| {
+            const T = @FieldType(Config, name);
+            if (@typeInfo(T) == .pointer) {
+                const info = @typeInfo(T).pointer;
+                if (info.size != .slice or info.child != u8) @compileError("owned configuration requires explicit pointer ownership semantics");
+                @field(result.value, name) = try allocator.dupe(u8, @field(source.*, name));
+                initialized = index + 1;
+            }
+        }
+        return result;
+    }
+
+    pub fn deinit(self: *OwnedConfig, allocator: std.mem.Allocator) void {
+        inline for (@typeInfo(Config).@"struct".field_names) |name| {
+            if (@typeInfo(@FieldType(Config, name)) == .pointer) allocator.free(@field(self.value, name));
+        }
+        self.* = undefined;
+    }
+};
+
+// Canonicalize sub-byte integers/enums and bools, preserving float bit patterns.
+// Integer arrays copy directly; enum schedules use their full storage bytes.
+fn canonicalConfigField(destination: []u8, value: anytype) void {
+    const T = @typeInfo(@TypeOf(value)).pointer.child;
+    if (comptime std.meta.hasUniqueRepresentation(T)) {
+        @memcpy(destination, std.mem.asBytes(value));
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .bool => destination[0] = @intFromBool(value.*),
+        .int => |info| {
+            const canonical: @Int(info.signedness, @sizeOf(T) * 8) = @intCast(value.*);
+            @memcpy(destination, std.mem.asBytes(&canonical));
+        },
+        .@"enum" => |info| {
+            const canonical: @Int(@typeInfo(info.tag_type).int.signedness, @sizeOf(T) * 8) = @intCast(@backingInt(value.*));
+            @memcpy(destination, std.mem.asBytes(&canonical));
+        },
+        .float => |info| {
+            const bits: @Int(.unsigned, info.bits) = @bitCast(value.*);
+            @memcpy(destination, std.mem.asBytes(&bits));
+        },
+        .array => |info| for (0..info.len) |i| canonicalConfigField(destination[i * @sizeOf(info.child) ..][0..@sizeOf(info.child)], &value[i]),
+        else => @compileError("unsupported configuration fingerprint field " ++ @typeName(T)),
+    }
+}
+
+test "configuration fingerprints use prefix contents and ignore prefix allocation" {
+    var first_prefix = "model.".*;
+    var second_prefix = first_prefix;
+    const first = Config{ .family = .llama, .weight_prefix = &first_prefix };
+    const second = Config{ .family = .llama, .weight_prefix = &second_prefix };
+    try std.testing.expect(first.weight_prefix.ptr != second.weight_prefix.ptr);
+    try std.testing.expectEqual(first.fingerprint(), second.fingerprint());
+    const original = second.fingerprint();
+    const prefix_pointer = second.weight_prefix.ptr;
+    const prefix_length = second.weight_prefix.len;
+    second_prefix[0] = 'n';
+    try std.testing.expectEqual(prefix_pointer, second.weight_prefix.ptr);
+    try std.testing.expectEqual(prefix_length, second.weight_prefix.len);
+    try std.testing.expect(original != second.fingerprint());
+}
+
+test "configuration fingerprints ignore struct padding and retain numerical policy" {
+    var first = Config{ .family = .llama };
+    var second = first;
+    var fields: [@sizeOf(Config)]bool = @splat(false);
+    inline for (@typeInfo(Config).@"struct".field_names) |name| @memset(fields[@offsetOf(Config, name)..][0..@sizeOf(@FieldType(Config, name))], true);
+    for (fields, 0..) |field, i| if (!field) {
+        std.mem.asBytes(&first)[i] = 0xa5;
+        std.mem.asBytes(&second)[i] = 0x5a;
+    };
+    try std.testing.expectEqual(first.fingerprint(), second.fingerprint());
+    second.norm_eps *= 2;
+    try std.testing.expect(first.fingerprint() != second.fingerprint());
+    second = first;
+    second.deepseek_v4_attention_schedule[0] = .sliding_attention;
+    try std.testing.expect(first.fingerprint() != second.fingerprint());
+}
+
+fn checkOwnedConfig(allocator: std.mem.Allocator) !void {
+    var prefix = "model.".*;
+    const source = Config{ .family = .llama, .weight_prefix = &prefix };
+    const original_key = source.fingerprint();
+    var owned = try OwnedConfig.init(allocator, &source);
+    defer owned.deinit(allocator);
+    try std.testing.expect(source.weight_prefix.ptr != owned.value.weight_prefix.ptr);
+    @memset(&prefix, 'x');
+    try std.testing.expectEqualStrings("model.", owned.value.weight_prefix);
+    try std.testing.expectEqual(original_key, owned.value.fingerprint());
+}
+
+test "owned configuration survives caller mutation and every allocation failure" {
+    try checkOwnedConfig(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkOwnedConfig, .{});
+}
+
+test "Qwen35 offset norm inventory matches exact actual LightOn decoder operands without linear or vision guesses" {
+    inline for (.{ .{ "testdata/lightonocr3/config.json", @as(usize, 61), @as(usize, 49), @as(usize, 1024) }, .{ "testdata/lightonocr3/config-4b.json", @as(usize, 81), @as(usize, 65), @as(usize, 2560) } }) |case| {
+        const config = try parseConfig(std.testing.allocator, @embedFile(case[0]));
+        var inventory = Qwen35OffsetNormInventory{ .config = config };
+        var count: usize = 0;
+        var hidden: usize = 0;
+        var names = std.StringHashMapUnmanaged(void){};
+        defer {
+            var iterator = names.keyIterator();
+            while (iterator.next()) |name| std.testing.allocator.free(name.*);
+            names.deinit(std.testing.allocator);
+        }
+        while (inventory.next()) |weight| {
+            var buffer: [256]u8 = undefined;
+            const name = try weight.logicalName(&buffer);
+            try std.testing.expect(std.mem.indexOf(u8, name, "linear_attn") == null and std.mem.indexOf(u8, name, "bias") == null);
+            try std.testing.expect(!names.contains(name));
+            const owned = try std.testing.allocator.dupe(u8, name);
+            names.put(std.testing.allocator, owned, {}) catch |err| {
+                std.testing.allocator.free(owned);
+                return err;
+            };
+            try std.testing.expectEqual(@as(f32, 1), weight.offset);
+            if (weight.kind == .query or weight.kind == .key) {
+                try std.testing.expect(!config.layerUsesQwen35LinearAttention(weight.layer));
+                try std.testing.expectEqual(@as(usize, 256), weight.dim);
+            } else {
+                hidden += 1;
+                try std.testing.expectEqual(case[3], weight.dim);
+            }
+            count += 1;
+        }
+        try std.testing.expectEqual(case[1], count);
+        try std.testing.expectEqual(case[2], hidden);
+        var disabled = config;
+        disabled.norm_weight_offset = 0;
+        var absent = Qwen35OffsetNormInventory{ .config = disabled };
+        try std.testing.expect(absent.next() == null);
+    }
+}
+
+test "cold offset norm candidates own exact prefixed original and bare lookup order" {
+    var prefix = [_]u8{ 'm', 'o', 'd', 'e', 'l', '.', 'l', 'a', 'n', 'g', 'u', 'a', 'g', 'e', '_', 'm', 'o', 'd', 'e', 'l' };
+    const config = Config{ .family = .qwen3_5, .weight_prefix = &prefix };
+    const weight = Qwen35OffsetNormInventory.Weight{ .kind = .query, .layer = 3, .dim = 256, .offset = 1 };
+    const names = (try weight.lookupCandidates(config)).?;
+    @memset(&prefix, 'X');
+    try std.testing.expectEqual(@as(u2, 3), names.count);
+    try std.testing.expectEqualStrings("model.language_model.layers.3.self_attn.q_norm.weight", names.candidate(0));
+    try std.testing.expectEqualStrings("model.layers.3.self_attn.q_norm.weight", names.candidate(1));
+    try std.testing.expectEqualStrings("layers.3.self_attn.q_norm.weight", names.candidate(2));
+    const plain = (try weight.lookupCandidates(.{})).?;
+    try std.testing.expectEqual(@as(u2, 2), plain.count);
+    try std.testing.expectEqualStrings(names.candidate(1), plain.candidate(0));
+    try std.testing.expectEqualStrings(names.candidate(2), plain.candidate(1));
+}
+
+test "oversized offset norm prefix declines whole optional cache operand without selecting a fallback" {
+    const prefix: [300]u8 = @splat('x');
+    const weight = Qwen35OffsetNormInventory.Weight{ .kind = .final, .dim = 1024, .offset = 1 };
+    try std.testing.expect((try weight.lookupCandidates(.{ .family = .qwen3_5, .weight_prefix = &prefix })) == null);
 }

@@ -69,8 +69,7 @@ pub const LazyGraphProto = proto.LazyGraphProto;
 
 /// Parse an ONNX model from binary protobuf data.
 pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Model {
-    const model_proto = try proto.parseModelProto(allocator, data);
-    return Model.init(allocator, model_proto);
+    return parseWithBaseDir(allocator, data, null);
 }
 
 /// Parse an ONNX model from binary protobuf data and attach a base directory
@@ -81,8 +80,9 @@ pub fn parseWithBaseDir(
     data: []const u8,
     base_dir: ?[]const u8,
 ) !Model {
-    const model_proto = try proto.parseModelProto(allocator, data);
-    return Model.initWithBaseDir(allocator, model_proto, base_dir);
+    var model_proto = try proto.parseModelProto(allocator, data);
+    errdefer model_proto.deinit(allocator);
+    return try Model.initWithBaseDir(allocator, model_proto, base_dir);
 }
 
 /// Parse an ONNX model lazily — initializers are not parsed up front.
@@ -98,8 +98,7 @@ pub fn parseLazy(allocator: std.mem.Allocator, data: []const u8) !LazyModelProto
 /// weights. The returned Model's lifetime owns the lazy state; call
 /// `model.deinit()` to free.
 pub fn parseLazyAsModel(allocator: std.mem.Allocator, data: []const u8) !Model {
-    const lazy_model = try proto.parseLazyModelProto(allocator, data);
-    return Model.initFromLazy(allocator, lazy_model, null);
+    return parseLazyAsModelWithBaseDir(allocator, data, null);
 }
 
 /// Same as `parseLazyAsModel` but attaches a base directory so external-data
@@ -110,8 +109,9 @@ pub fn parseLazyAsModelWithBaseDir(
     data: []const u8,
     base_dir: ?[]const u8,
 ) !Model {
-    const lazy_model = try proto.parseLazyModelProto(allocator, data);
-    return Model.initFromLazy(allocator, lazy_model, base_dir);
+    var lazy_model = try proto.parseLazyModelProto(allocator, data);
+    errdefer lazy_model.deinit(allocator);
+    return try Model.initFromLazy(allocator, lazy_model, base_dir);
 }
 
 /// Check if an ONNX op type is supported by the converter.
@@ -128,4 +128,31 @@ test {
     _ = ops;
     _ = convert;
     _ = @"export";
+}
+
+fn modelParseAllocationFailureCase(allocator: std.mem.Allocator, bytes: []const u8, lazy: bool, base_dir: ?[]const u8) !void {
+    var model = if (lazy) try parseLazyAsModelWithBaseDir(allocator, bytes, base_dir) else try parseWithBaseDir(allocator, bytes, base_dir);
+    defer model.deinit();
+    try std.testing.expect(model.graph().?.nodes.len != 0);
+    const constant = try model.initializerAt(0);
+    try std.testing.expect(constant.dims.len != 0);
+    var converted = try model.convertToGraph(allocator);
+    defer converted.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), converted.output_ids.len);
+}
+test "eager and lazy model parse transfer owners only after complete indexing across all allocation failures" {
+    const ml = @import("ml");
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{4}));
+    const constant = try builder.tensorConst(&.{ 1, 2, 3, 4 }, ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try builder.add(input, constant));
+    const bytes = try @"export".exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    for ([_]bool{ false, true }) |lazy| for ([_]?[]const u8{ null, "/tmp" }) |base_dir| {
+        try modelParseAllocationFailureCase(a, bytes, lazy, base_dir);
+        try std.testing.checkAllAllocationFailures(a, modelParseAllocationFailureCase, .{ bytes, lazy, base_dir });
+    };
 }

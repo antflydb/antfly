@@ -14,12 +14,16 @@
 // limitations under the License.
 
 const std = @import("std");
+const Cleanup = @import("../../execution/cleanup_context.zig").Context;
 const block = @import("block.zig");
+const writable = @import("writable_blocks.zig");
 const block_table = @import("block_table.zig");
 const manager_mod = @import("manager.zig");
 const pool_mod = @import("pool.zig");
 const storage_mod = @import("storage.zig");
 pub const device_clone = @import("device_clone.zig");
+pub const block_copy = @import("block_copy.zig");
+pub const device_capacity = @import("device_capacity.zig");
 
 pub const SequenceId = manager_mod.SequenceId;
 
@@ -65,18 +69,57 @@ pub const PageTokenOffsets = union(enum) {
 /// Reuses the monotonically-growing logical-to-ring offset prefix for SWA.
 /// The owning backend is single-threaded; returned borrowed slices remain
 /// valid until its next cache request.
-pub const CyclicPageTableCache = struct {
+pub const PageTokenOffsetCache = struct {
     offsets: std.ArrayListUnmanaged(u32) = .empty,
     page_size_tokens: usize = 0,
     ring_page_count: usize = 0,
+    mapped_limit: usize = 0,
 
-    pub fn deinit(self: *CyclicPageTableCache, allocator: std.mem.Allocator) void {
+    /// Cold caller reserves exact bounded request geometry before gates/SDK.
+    pub fn reserveMapped(self: *PageTokenOffsetCache, allocator: std.mem.Allocator, blocks: usize) !void {
+        if (blocks == 0) return error.KvCapacityTooSmall;
+        try self.offsets.ensureTotalCapacity(allocator, blocks);
+        self.mapped_limit = blocks;
+    }
+    fn ensureMapped(self: *PageTokenOffsetCache, allocator: std.mem.Allocator, blocks: usize) !void {
+        if (blocks == 0 or (self.mapped_limit != 0 and blocks > self.mapped_limit)) return error.KvCapacityTooSmall;
+        try self.offsets.ensureTotalCapacity(allocator, blocks);
+    }
+    pub fn getMapped(self: *PageTokenOffsetCache, allocator: std.mem.Allocator, ids: []const block.KvBlockId, blocks: usize, page: usize) !PageTokenOffsets {
+        if (page == 0 or ids.len < blocks) return error.KvCapacityTooSmall;
+        // Validate the complete source before changing cached geometry/data.
+        for (ids[0..blocks]) |id| {
+            const value = std.math.mul(usize, @as(usize, id), page) catch return error.KvCapacityTooSmall;
+            if (value > std.math.maxInt(u32)) return error.KvCapacityTooSmall;
+        }
+        try self.ensureMapped(allocator, blocks);
+        self.offsets.items.len = blocks;
+        self.page_size_tokens = 0;
+        self.ring_page_count = 0; // Mapped bytes cannot satisfy an old ring key.
+        for (self.offsets.items, ids[0..blocks]) |*offset, id| offset.* = @intCast(@as(usize, id) * page);
+        return .{ .borrowed = self.offsets.items };
+    }
+    pub fn getIdentity(self: *PageTokenOffsetCache, allocator: std.mem.Allocator, blocks: usize, page: usize) !PageTokenOffsets {
+        if (blocks == 0 or page == 0) return error.KvCapacityTooSmall;
+        const last = std.math.mul(usize, blocks - 1, page) catch return error.KvCapacityTooSmall;
+        if (last > std.math.maxInt(u32)) return error.KvCapacityTooSmall;
+        try self.ensureMapped(allocator, blocks);
+        const same = self.ring_page_count == 0 and self.page_size_tokens == page;
+        const first = if (same) self.offsets.items.len else 0;
+        self.offsets.items.len = @max(if (same) self.offsets.items.len else 0, blocks);
+        for (self.offsets.items[first..], first..) |*offset, index| offset.* = @intCast(index * page);
+        self.ring_page_count = 0;
+        self.page_size_tokens = page;
+        return .{ .borrowed = self.offsets.items[0..blocks] };
+    }
+
+    pub fn deinit(self: *PageTokenOffsetCache, allocator: std.mem.Allocator) void {
         self.offsets.deinit(allocator);
         self.* = .{};
     }
 
     pub fn get(
-        self: *CyclicPageTableCache,
+        self: *PageTokenOffsetCache,
         allocator: std.mem.Allocator,
         page_size_tokens: usize,
         ring_page_count: usize,
@@ -112,6 +155,9 @@ pub const CyclicPageTableCache = struct {
         return .{ .borrowed = self.offsets.items[0..needed_blocks] };
     }
 };
+
+/// Compatibility name; one backing cache now also owns mapped/identity tables.
+pub const CyclicPageTableCache = PageTokenOffsetCache;
 
 fn fillCyclicPageTokenOffsets(offsets: []u32, page_size_tokens: usize, ring_page_count: usize, start: usize) void {
     for (offsets[start..], start..) |*offset, logical_page| {
@@ -304,12 +350,21 @@ pub const DeviceWriteHook = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Concrete physical mutation owner, called synchronously before any
+        /// logical publication. No current Epoch is stored in this hook.
+        prepareMutationWithCleanup: ?*const fn (*anyopaque, *const anyopaque, Cleanup) anyerror!void = null,
+        planCapacity: ?*const fn (*anyopaque, *const anyopaque, usize, u16, []const device_capacity.LayerGeometry, *device_capacity.Plan) anyerror!void = null,
+        growCapacity: ?*const fn (*anyopaque, *const anyopaque, *const device_capacity.Plan, *device_capacity.Claim, *const @import("../../execution/retirement_sink.zig").Epoch) anyerror!void = null,
+        deinitWithBoundary: ?*const fn (*anyopaque, std.mem.Allocator, ?*const @import("../../execution/retirement_sink.zig").Epoch) void = null,
         /// Authoritative, fenced exact-prefix readback. Unlike gatherLayerKv,
         /// this path never retries through host pool storage.
         readExactAttentionMatchKv: ?*const fn (*anyopaque, attention_match_snapshot.Range, []f32, []f32) anyerror!void = null,
         /// Clone into an empty, separately owned hook. Both bindings must remain
         /// locked by the caller. Success fences copies; failure leaves both
         /// bindings unchanged. No aliasing or implicit host fallback is allowed.
+        /// Synchronous exact COW into already-owned full-history page capacity.
+        /// Failure after submit must drain or fail closed before returning.
+        copySharedBlockPrefixes: ?*const fn (*anyopaque, *const anyopaque, block_copy.Request) anyerror!void = null,
         cloneExactPrefix: ?*const fn (ctx: *anyopaque, source: DeviceWriteHook, request: device_clone.Request) anyerror!device_clone.Result = null,
         writeLayerKvSuffix: *const fn (
             ctx: *anyopaque,
@@ -370,6 +425,7 @@ pub const DeviceWriteHook = struct {
         /// Optional notification that a sequence tail was truncated. Device
         /// coverage metadata must shrink with the logical block table so a
         /// subsequent correction/retry can rewrite the rolled-back positions.
+        /// This synchronous notification must not mutate the owner's block table.
         truncateSequence: ?*const fn (
             ctx: *anyopaque,
             sequence_id: SequenceId,
@@ -448,6 +504,10 @@ pub const DeviceWriteHook = struct {
         return score_fn(self.ctx, request);
     }
 
+    pub fn prepareMutationWithCleanup(self: DeviceWriteHook, current: Cleanup) !void {
+        if (self.vtable.prepareMutationWithCleanup) |prepare| try prepare(self.ctx, self.vtable, current);
+    }
+
     pub fn truncateSequence(self: DeviceWriteHook, sequence_id: SequenceId, retained_token_count: usize) void {
         const truncate_fn = self.vtable.truncateSequence orelse return;
         truncate_fn(self.ctx, sequence_id, retained_token_count);
@@ -500,6 +560,10 @@ pub const KvStorageRuntime = struct {
     }
 
     pub fn deinit(self: *KvStorageRuntime) void {
+        self.deinitWithBoundary(null);
+    }
+    pub fn deinitWithBoundary(self: *KvStorageRuntime, cleanup: ?*const @import("../../execution/retirement_sink.zig").Epoch) void {
+        if (cleanup != null) if (self.device_write_hook) |hook| hook.prepareMutationWithCleanup(.{ .boundary = cleanup }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         for (self.sequences.items, 0..) |_, idx| {
             self.releaseSequenceByIndex(idx) catch {};
         }
@@ -507,14 +571,21 @@ pub const KvStorageRuntime = struct {
         self.sequences.deinit(self.allocator);
         self.free_sequence_indices.deinit(self.allocator);
         self.logical_blocks_with_reservations.deinit(self.allocator);
-        if (self.device_write_hook) |hook| hook.deinit(self.allocator);
+        if (self.device_write_hook) |hook| {
+            if (hook.vtable.deinitWithBoundary) |close| close(hook.ctx, self.allocator, cleanup) else hook.deinit(self.allocator);
+        }
         self.storage.deinit(self.allocator);
     }
 
     /// Install a backend-specific device-write hook. The runtime takes
     /// ownership — `deinit` tears the hook down. Passing null clears the hook.
     pub fn setDeviceWriteHook(self: *KvStorageRuntime, hook: ?DeviceWriteHook) void {
-        if (self.device_write_hook) |existing| existing.deinit(self.allocator);
+        self.setDeviceWriteHookWithBoundary(hook, null);
+    }
+    pub fn setDeviceWriteHookWithBoundary(self: *KvStorageRuntime, hook: ?DeviceWriteHook, cleanup: ?*const @import("../../execution/retirement_sink.zig").Epoch) void {
+        if (self.device_write_hook) |existing| {
+            if (existing.vtable.deinitWithBoundary) |close| close(existing.ctx, self.allocator, cleanup) else existing.deinit(self.allocator);
+        }
         self.device_write_hook = hook;
     }
 
@@ -592,6 +663,7 @@ pub const KvStorageRuntime = struct {
         const page_size = self.storage.config.page_size_tokens;
         const reserved_capacity = (sequence_state.block_table.blocks.items.len + sequence_state.reserved_tail_blocks.items.len) * page_size;
         if (write.total_token_count > reserved_capacity) return error.KvCapacityTooSmall;
+        try self.ensureWritableRange(sequence_state, write.total_token_count - write.suffix_token_count, write.suffix_token_count);
         var enriched = write;
         enriched.device_capacity_tokens = sequence_state.initial_device_capacity_tokens;
         enriched.device_capacity_limit_tokens = sequence_state.device_capacity_limit_tokens;
@@ -691,23 +763,69 @@ pub const KvStorageRuntime = struct {
         return &self.storage;
     }
 
-    pub fn attachSequence(self: *KvStorageRuntime, pool_id: block.KvPoolId) !SequenceId {
+    /// A reserved, INACTIVE sequence slot. No numerical device endpoint may
+    /// observe it until commit; abort therefore recycles metadata without a
+    /// hook release or cleanup authority inferred from empty row geometry.
+    pub const PendingAttachment = struct {
+        runtime: *KvStorageRuntime,
+        sequence_id: SequenceId,
+        active: bool = true,
+
+        fn state(self: *@This()) *SequenceState {
+            std.debug.assert(self.active);
+            const row = &self.runtime.sequences.items[self.sequence_id - 1];
+            std.debug.assert(!row.active);
+            return row;
+        }
+        pub fn canPreparePrefillAppend(self: *@This(), count: usize) bool {
+            return self.runtime.canPreparePrefillOnState(self.state(), count);
+        }
+        pub fn preparePrefillAppend(self: *@This(), count: usize, reserve_to: usize, current: Cleanup) !writable.PreparedAppend {
+            return self.runtime.preparePrefillOnState(self.state(), count, reserve_to, current);
+        }
+        pub fn commit(self: *@This()) void {
+            self.state().active = true;
+            self.active = false;
+        }
+        pub fn abort(self: *@This()) void {
+            if (!self.active) return;
+            const row = self.state();
+            // Callers abort prepared page owners before this token. Committed
+            // plans and this token publish together without fallible work.
+            std.debug.assert(row.block_table.blocks.items.len == 0 and row.reserved_tail_blocks.items.len == 0);
+            self.runtime.free_sequence_indices.appendAssumeCapacity(self.sequence_id - 1);
+            self.active = false;
+        }
+    };
+
+    pub fn prepareAttachment(self: *KvStorageRuntime, pool_id: block.KvPoolId) !PendingAttachment {
         if (pool_id != self.storage.pool_id) return error.InvalidPoolId;
         if (self.recycledSequenceIndex()) |idx| {
             const id: SequenceId = @intCast(idx + 1);
             const seq_state = &self.sequences.items[idx];
             seq_state.id = id;
-            seq_state.active = true;
+            seq_state.active = false;
             seq_state.compacted = false;
             seq_state.initial_device_capacity_tokens = 0;
             seq_state.device_capacity_limit_tokens = 0;
             seq_state.block_table.reset();
             seq_state.reserved_tail_blocks.clearRetainingCapacity();
-            return id;
+            return .{ .runtime = self, .sequence_id = id };
         }
-        const id: SequenceId = @intCast(self.sequences.items.len + 1);
-        try self.sequences.append(self.allocator, .{ .id = id });
-        return id;
+        const next = try std.math.add(usize, self.sequences.items.len, 1);
+        const id = std.math.cast(SequenceId, next) orelse return error.KvSequenceLimitExceeded;
+        // Reserve every future retirement slot before publishing this ID.
+        // Valid retirement/reuse never allocates, including destructor cleanup.
+        try self.free_sequence_indices.ensureTotalCapacity(self.allocator, next);
+        try self.sequences.ensureUnusedCapacity(self.allocator, 1);
+        self.sequences.appendAssumeCapacity(.{ .id = id, .active = false });
+        return .{ .runtime = self, .sequence_id = id };
+    }
+
+    pub fn attachSequence(self: *KvStorageRuntime, pool_id: block.KvPoolId) !SequenceId {
+        var pending = try self.prepareAttachment(pool_id);
+        pending.commit();
+        return pending.sequence_id;
     }
 
     pub fn attachSequenceWithRetainedBlocks(self: *KvStorageRuntime, pool_id: block.KvPoolId, block_ids: []const block.KvBlockId, token_count: usize) !SequenceId {
@@ -729,6 +847,11 @@ pub const KvStorageRuntime = struct {
         sequence_state.block_table.markSharedPrefix(@intCast(block_ids.len));
         if (block_ids.len > 0) sequence_state.block_table.tail_tokens = page_size;
         return sequence_id;
+    }
+
+    pub fn releaseSequenceWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, current: Cleanup) !void {
+        if (self.device_write_hook) |hook| try hook.prepareMutationWithCleanup(current);
+        try self.releaseSequence(sequence_id);
     }
 
     pub fn releaseSequence(self: *KvStorageRuntime, sequence_id: SequenceId) !void {
@@ -782,10 +905,24 @@ pub const KvStorageRuntime = struct {
         return &self.sequences.items[idx];
     }
 
+    fn ensureWritableRange(self: *KvStorageRuntime, state: *SequenceState, first: usize, count: usize) !void {
+        return self.ensureWritableRangeUsing(state, first, count, .{});
+    }
+    fn ensureWritableRangeUsing(self: *KvStorageRuntime, state: *SequenceState, first: usize, count: usize, current: Cleanup) !void {
+        const provider: ?block_copy.Provider = if (self.device_write_hook) |hook| if (hook.vtable.copySharedBlockPrefixes) |copy| .{ .context = hook.ctx, .implementation = hook.vtable, .copy_and_wait = copy, .cleanup = current } else null else null;
+        try writable.ensureRangeWithProvider(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.allocator, first, count, state.id, self.device_write_hook == null, provider);
+    }
+
     pub fn reserveTailBlock(self: *KvStorageRuntime, sequence_id: SequenceId) !block.KvBlockId {
+        return self.reserveTailBlockWithCleanup(sequence_id, .{});
+    }
+    pub fn reserveTailBlockWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, current: Cleanup) !block.KvBlockId {
         const sequence_state = try self.sequenceMut(sequence_id);
-        if (sequence_state.block_table.last()) |last_id| {
-            if (sequence_state.block_table.tail_tokens < self.storage.config.page_size_tokens) return last_id;
+        if (sequence_state.block_table.last() != null) {
+            if (sequence_state.block_table.tail_tokens < self.storage.config.page_size_tokens) {
+                try self.ensureWritableRangeUsing(sequence_state, (sequence_state.block_table.blocks.items.len - 1) * self.storage.config.page_size_tokens, 1, current);
+                return sequence_state.block_table.last().?;
+            }
         }
         if (sequence_state.reserved_tail_blocks.items.len > 0) {
             const id = sequence_state.reserved_tail_blocks.items[0];
@@ -798,9 +935,32 @@ pub const KvStorageRuntime = struct {
             sequence_state.reserved_tail_blocks.items.len -= 1;
             return id;
         }
-        const id = try self.storage.acquire(self.allocator);
-        try sequence_state.block_table.append(self.allocator, id);
-        return id;
+        return writable.appendAcquired(&self.storage, &sequence_state.block_table, self.allocator);
+    }
+
+    /// Metadata query only. Caller pins this runtime/provider across query,
+    /// pre-admission and the separately excluded numerical growth operation.
+    pub fn planDeviceCapacity(self: *KvStorageRuntime, physical_tokens: usize) !device_capacity.Plan {
+        const geometry = try device_capacity.Geometry.dense(self.storage.config.num_layers_packed, self.storage.config.num_kv_heads, self.storage.config.head_dim);
+        return self.planDeviceCapacityFor(physical_tokens, &geometry);
+    }
+    /// Immutable decoder metadata declares actual required KV owner IDs and
+    /// head rows. Backends validate these against their concrete encoding.
+    pub fn planDeviceCapacityFor(self: *KvStorageRuntime, physical_tokens: usize, geometry: *const device_capacity.Geometry) !device_capacity.Plan {
+        if (geometry.count == 0 or geometry.count > 256) return error.DeviceKvCapacityUnsupported;
+        for (geometry.items()) |layer| if (layer.index >= self.storage.config.num_layers_packed or layer.num_kv_heads > self.storage.config.num_kv_heads or layer.head_dim > self.storage.config.head_dim) return error.InvalidDeviceCapacityLayout;
+        const hook = self.device_write_hook orelse return error.DeviceKvCapacityUnsupported;
+        const query = hook.vtable.planCapacity orelse return error.DeviceKvCapacityUnsupported;
+        var plan: device_capacity.Plan = undefined;
+        try query(hook.ctx, hook.vtable, physical_tokens, self.storage.config.page_size_tokens, geometry.items(), &plan);
+        return plan;
+    }
+    /// The claim was fully admitted BEFORE the actual numerical gate. The
+    /// explicit cleanup epoch covers that provider and its outer model gate.
+    pub fn growDeviceCapacity(self: *KvStorageRuntime, plan: *const device_capacity.Plan, claim: *device_capacity.Claim, cleanup: *const @import("../../execution/retirement_sink.zig").Epoch) !void {
+        const hook = self.device_write_hook orelse return error.DeviceKvCapacityUnsupported;
+        const grow = hook.vtable.growCapacity orelse return error.DeviceKvCapacityUnsupported;
+        try grow(hook.ctx, hook.vtable, plan, claim, cleanup);
     }
 
     pub fn reserveTokenCapacity(self: *KvStorageRuntime, sequence_id: SequenceId, token_capacity: usize) !void {
@@ -808,13 +968,16 @@ pub const KvStorageRuntime = struct {
         const sequence_state = try self.sequenceMut(sequence_id);
         const page_size: usize = self.storage.config.page_size_tokens;
         if (page_size == 0) return error.InvalidPoolId;
-        const target_blocks = std.math.divCeil(usize, token_capacity, page_size) catch return error.InvalidPoolId;
+        if (token_capacity <= sequence_state.block_table.tokenCount(@intCast(page_size))) return;
+        const logical_blocks = std.math.divCeil(usize, token_capacity, page_size) catch return error.InvalidPoolId;
+        const copies = writable.tailCopies(&self.storage, &sequence_state.block_table) orelse return error.InvalidBlockId;
+        const target_blocks = try std.math.add(usize, logical_blocks, copies);
         var available_blocks = sequence_state.block_table.blocks.items.len + sequence_state.reserved_tail_blocks.items.len;
         while (available_blocks < target_blocks) : (available_blocks += 1) {
             {
+                try sequence_state.reserved_tail_blocks.ensureUnusedCapacity(self.allocator, 1);
                 const id = try self.storage.acquire(self.allocator);
-                errdefer _ = self.storage.releaseRef(self.allocator, id) catch {};
-                try sequence_state.reserved_tail_blocks.append(self.allocator, id);
+                sequence_state.reserved_tail_blocks.appendAssumeCapacity(id);
             }
         }
     }
@@ -849,10 +1012,50 @@ pub const KvStorageRuntime = struct {
     }
 
     pub fn appendTokens(self: *KvStorageRuntime, sequence_id: SequenceId, count: u16) !void {
+        return self.appendTokensWithCleanup(sequence_id, count, .{});
+    }
+    pub fn canPrepareGeneratedAppend(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize) bool {
+        if (count == 0) return false;
+        const state = self.sequenceMut(sequence_id) catch return false;
+        const provider: ?block_copy.Provider = if (self.device_write_hook) |hook| if (hook.vtable.copySharedBlockPrefixes) |copy| .{ .context = hook.ctx, .implementation = hook.vtable, .copy_and_wait = copy } else null else null;
+        return writable.canPrepareAppend(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.device_write_hook == null, provider);
+    }
+    pub fn prepareGeneratedAppendWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize, reserve_to: usize, current: Cleanup) !writable.PreparedAppend {
+        if (!self.canPrepareGeneratedAppend(sequence_id, count)) return error.SharedKvWriteUnsupported;
+        const state = try self.sequenceMut(sequence_id);
+        const provider: ?block_copy.Provider = if (self.device_write_hook) |hook| if (hook.vtable.copySharedBlockPrefixes) |copy| .{ .context = hook.ctx, .implementation = hook.vtable, .copy_and_wait = copy, .cleanup = current } else null else null;
+        var prepared = try writable.prepareAppend(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.allocator, count, reserve_to, if (state.compacted) null else if (self.storage.config.sliding_window_size) |window| @as(usize, window) else null, sequence_id, self.device_write_hook == null, provider);
+        errdefer prepared.abort();
+        // Front retirement/reuse may invalidate a real device capture owner.
+        // Authorize and drain that mutation with the actual current B before
+        // infallible commit. Ordinary tail appends query no hook or SDK state.
+        if (prepared.drop_pages != 0) if (self.device_write_hook) |hook| try hook.prepareMutationWithCleanup(current);
+        return prepared;
+    }
+    fn canPreparePrefillOnState(self: *KvStorageRuntime, state: *SequenceState, count: usize) bool {
+        if (count == 0) return false;
+        const provider: ?block_copy.Provider = if (self.device_write_hook) |hook| if (hook.vtable.copySharedBlockPrefixes) |copy| .{ .context = hook.ctx, .implementation = hook.vtable, .copy_and_wait = copy } else null else null;
+        return writable.canPrepareAppend(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.device_write_hook == null, provider);
+    }
+    fn preparePrefillOnState(self: *KvStorageRuntime, state: *SequenceState, count: usize, reserve_to: usize, current: Cleanup) !writable.PreparedAppend {
+        const provider: ?block_copy.Provider = if (self.device_write_hook) |hook| if (hook.vtable.copySharedBlockPrefixes) |copy| .{ .context = hook.ctx, .implementation = hook.vtable, .copy_and_wait = copy, .cleanup = current } else null else null;
+        return writable.prepareAppend(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.allocator, count, reserve_to, null, state.id, self.device_write_hook == null, provider);
+    }
+    pub fn canPreparePrefillAppend(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize) bool {
+        const state = self.sequenceMut(sequence_id) catch return false;
+        return self.canPreparePrefillOnState(state, count);
+    }
+    /// Preserve the original full prompt history. Prefill never runs the
+    /// generated-decode sliding-window retirement policy.
+    pub fn preparePrefillAppendWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize, reserve_to: usize, current: Cleanup) !writable.PreparedAppend {
+        return self.preparePrefillOnState(try self.sequenceMut(sequence_id), count, reserve_to, current);
+    }
+
+    pub fn appendTokensWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, count: u16, current: Cleanup) !void {
         var remaining = count;
         const sequence_state = try self.sequenceMut(sequence_id);
         while (remaining > 0) {
-            _ = try self.reserveTailBlock(sequence_id);
+            _ = try self.reserveTailBlockWithCleanup(sequence_id, current);
             const space = self.storage.config.page_size_tokens - sequence_state.block_table.tail_tokens;
             const consumed = @min(space, remaining);
             sequence_state.block_table.tail_tokens += consumed;
@@ -873,6 +1076,8 @@ pub const KvStorageRuntime = struct {
         const value_width = self.storage.valueValuesPerToken();
         if (k_rows.len != token_count * key_width or v_rows.len != token_count * value_width) return error.InvalidKvShape;
         if (token_count > sequence_state.block_table.tokenCount(self.storage.config.page_size_tokens)) return error.KvCapacityTooSmall;
+
+        try self.ensureWritableRange(sequence_state, 0, token_count);
 
         for (0..token_count) |token_idx| {
             const block_idx = token_idx / self.storage.config.page_size_tokens;
@@ -905,6 +1110,7 @@ pub const KvStorageRuntime = struct {
         if (total_token_count > sequence_state.block_table.tokenCount(self.storage.config.page_size_tokens)) return error.KvCapacityTooSmall;
 
         const start_token = total_token_count - suffix_token_count;
+        try self.ensureWritableRange(sequence_state, start_token, suffix_token_count);
         if (actual_key_width == key_width and actual_value_width == value_width) {
             for (0..suffix_token_count) |suffix_idx| {
                 const token_idx = start_token + suffix_idx;
@@ -991,27 +1197,70 @@ pub const KvStorageRuntime = struct {
         return .{ .k = k, .v = v };
     }
 
+    /// Backend truncation is the last callback phase BEFORE either paired
+    /// metadata commit. No fallible work may follow commitBackend(). Logical
+    /// commit itself is callback/allocator-free, as with the manager owner.
+    pub const PreparedTruncate = struct {
+        logical: writable.PreparedTruncate,
+        hook: ?DeviceWriteHook,
+        sequence_id: SequenceId,
+        changed: bool,
+        backend_committed: bool = false,
+
+        pub fn futureLogicalBlockCount(self: *const @This()) usize {
+            return self.logical.futureLogicalBlockCount();
+        }
+        pub fn futureReservedBlockCount(self: *const @This()) usize {
+            return self.logical.futureReservedBlockCount();
+        }
+        pub fn futureTokenCount(self: *const @This()) usize {
+            return self.logical.futureTokenCount();
+        }
+        pub fn idsChanged(self: *const @This()) bool {
+            return self.logical.idsChanged();
+        }
+        pub fn commitBackend(self: *@This()) void {
+            if (self.backend_committed) return;
+            std.debug.assert(self.logical.active);
+            self.backend_committed = true;
+            if (self.changed) if (self.hook) |hook| hook.truncateSequence(self.sequence_id, self.futureTokenCount());
+        }
+        pub fn commit(self: *@This()) void {
+            std.debug.assert(!self.changed or self.hook == null or self.backend_committed);
+            self.logical.commit();
+        }
+        pub fn abort(self: *@This()) void {
+            std.debug.assert(!self.changed or !self.backend_committed or !self.logical.active);
+            self.logical.abort();
+        }
+    };
+
+    pub fn canPrepareTruncate(self: *KvStorageRuntime, sequence_id: SequenceId) bool {
+        _ = self.sequenceMut(sequence_id) catch return false;
+        return writable.canPrepareTruncate(&self.storage);
+    }
+    pub fn prepareTruncateWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize, current: Cleanup) !PreparedTruncate {
+        const state = try self.sequenceMut(sequence_id);
+        var logical = try writable.prepareTruncate(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.allocator, count);
+        errdefer logical.abort();
+        const before = state.block_table.tokenCount(self.storage.config.page_size_tokens); // checked by the shared plan
+        const changed = before != logical.futureTokenCount();
+        if (changed) if (self.device_write_hook) |hook| try hook.prepareMutationWithCleanup(current);
+        return .{ .logical = logical, .hook = self.device_write_hook, .sequence_id = sequence_id, .changed = changed };
+    }
+
+    pub fn truncateSequenceWithCleanup(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize, current: Cleanup) !usize {
+        if (self.device_write_hook) |hook| try hook.prepareMutationWithCleanup(current);
+        return self.truncateSequence(sequence_id, count);
+    }
+
     pub fn truncateSequence(self: *KvStorageRuntime, sequence_id: SequenceId, count: usize) !usize {
         const sequence_state = try self.sequenceMut(sequence_id);
         const page_size = self.storage.config.page_size_tokens;
         const before = sequence_state.block_table.tokenCount(page_size);
         if (count == 0 or before == 0) return 0;
 
-        const old_len = sequence_state.block_table.blocks.items.len;
-        const excess_blocks: usize = blk: {
-            if (count >= before) break :blk old_len;
-            const target = before - count;
-            const needed_blocks = (target + page_size - 1) / page_size;
-            break :blk if (old_len > needed_blocks) old_len - needed_blocks else 0;
-        };
-
-        const dropped_block_ids: []const block.KvBlockId = if (excess_blocks > 0)
-            try self.allocator.dupe(block.KvBlockId, sequence_state.block_table.blocks.items[old_len - excess_blocks .. old_len])
-        else
-            &[_]block.KvBlockId{};
-        defer if (excess_blocks > 0) self.allocator.free(dropped_block_ids);
-
-        _ = sequence_state.block_table.dropTailTokens(page_size, count);
+        const dropped_block_ids = sequence_state.block_table.dropTailTokens(page_size, count);
         const after = sequence_state.block_table.tokenCount(page_size);
         if (self.device_write_hook) |hook| hook.truncateSequence(sequence_id, after);
         for (dropped_block_ids) |block_id| {
@@ -1066,18 +1315,13 @@ pub const KvStorageRuntime = struct {
         seq_state.initial_device_capacity_tokens = 0;
         seq_state.device_capacity_limit_tokens = 0;
         seq_state.active = false;
-        self.free_sequence_indices.append(self.allocator, idx) catch {};
+        self.free_sequence_indices.appendAssumeCapacity(idx);
     }
 
     fn recycledSequenceIndex(self: *KvStorageRuntime) ?usize {
-        while (self.free_sequence_indices.pop()) |idx| {
-            if (idx < self.sequences.items.len and !self.sequences.items[idx].active) return idx;
-        }
-        // ponytail: fallback scan covers OOM while recording a released slot; keep a real freelist if this ever profiles hot.
-        for (self.sequences.items, 0..) |seq_state, idx| {
-            if (!seq_state.active) return idx;
-        }
-        return null;
+        const idx = self.free_sequence_indices.pop() orelse return null;
+        std.debug.assert(idx < self.sequences.items.len and !self.sequences.items[idx].active);
+        return idx;
     }
 };
 
@@ -1595,4 +1839,422 @@ test "LightOnOCR3 CUDA graph reservation remains within a finite retention windo
     try runtime.appendTokens(sequence, 14);
     try std.testing.expectEqual(@as(usize, 0), try runtime.trimSequenceToSlidingWindow(sequence));
     try std.testing.expectEqual(@as(?usize, 16), runtime.tokenCount(sequence));
+}
+
+test "storage runtime truncates without allocation and notifies device before releasing borrowed tail" {
+    const a = std.testing.allocator;
+    var runtime = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 });
+    defer runtime.deinit();
+    const sequence = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(sequence, 9);
+    const last = runtime.blockTable(sequence).?.blocks.items[4];
+    const Probe = struct {
+        runtime: *KvStorageRuntime,
+        last: block.KvBlockId,
+        called: bool = false,
+        fn write(_: *anyopaque, _: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) !void {
+            return error.UnsupportedOperation;
+        }
+        fn truncate(raw: *anyopaque, id: SequenceId, retained: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(retained == 2 and self.runtime.tokenCount(id).? == 2);
+            std.debug.assert(self.runtime.storage.hostPool().?.storage(self.last).?.meta.refcount == 1);
+            self.called = true;
+        }
+        fn deinit(_: *anyopaque, _: std.mem.Allocator) void {}
+        const table = DeviceWriteHook.VTable{ .writeLayerKvSuffix = write, .truncateSequence = truncate, .deinit = deinit };
+    };
+    var probe = Probe{ .runtime = &runtime, .last = last };
+    runtime.setDeviceWriteHook(.{ .ctx = &probe, .vtable = &Probe.table });
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+    runtime.allocator = failure.allocator();
+    defer runtime.allocator = a;
+    try std.testing.expectEqual(@as(usize, 7), try runtime.truncateSequence(sequence, 7));
+    try std.testing.expect(probe.called and !failure.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 4), runtime.storage.hostPool().?.free_list.items.len);
+}
+
+test "storage runtime custom retirement errors propagate without pretending rollback succeeded" {
+    const a = std.testing.allocator;
+    var runtime = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 2 });
+    defer runtime.deinit();
+    const sequence = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(sequence, 3);
+    const tail = runtime.blockTable(sequence).?.blocks.items[1];
+    const original = runtime.storage.vtable;
+    defer runtime.storage.vtable = original;
+    var altered = original.*;
+    const Failing = struct {
+        fn release(_: *anyopaque, _: std.mem.Allocator, _: block.KvBlockId) !bool {
+            return error.CustomRetirementFailure;
+        }
+    };
+    altered.releaseRef = Failing.release;
+    runtime.storage.vtable = &altered;
+    try std.testing.expectError(error.CustomRetirementFailure, runtime.truncateSequence(sequence, 1));
+    // The provider explicitly declined retirement. Its caller still owns that
+    // tail and repairs it before teardown; the error was never swallowed.
+    _ = try runtime.storage.hostPool().?.releaseRef(a, tail);
+}
+
+test "storage runtime retained prefix truncation append and suffix write isolate the source" {
+    const a = std.testing.allocator;
+    var runtime = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+    defer runtime.deinit();
+    const source = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(source, 6);
+    try runtime.writeFullLayerKv(source, 0, 6, &.{ 1, 2, 3, 4, 5, 6 }, &.{ 11, 12, 13, 14, 15, 16 });
+    const derived = try runtime.attachSequenceWithRetainedBlocks(runtime.poolId(), runtime.blockTable(source).?.blocks.items, 6);
+    _ = try runtime.truncateSequence(derived, 1);
+    {
+        var no_op = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+        runtime.allocator = no_op.allocator();
+        defer runtime.allocator = a;
+        try runtime.reserveTokenCapacity(derived, 5);
+        try std.testing.expect(!no_op.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), (try runtime.sequenceMut(derived)).reserved_tail_blocks.items.len);
+    }
+    try runtime.appendTokens(derived, 1);
+    try runtime.writeLayerKvSuffix(derived, 0, 6, 1, &.{99}, &.{100});
+    const source_values = try runtime.gatherLayerKv(a, source, 0, 6);
+    defer a.free(source_values.k);
+    defer a.free(source_values.v);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, source_values.k);
+    const derived_values = try runtime.gatherLayerKv(a, derived, 0, 6);
+    defer a.free(derived_values.k);
+    defer a.free(derived_values.v);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 99 }, derived_values.k);
+}
+
+test "storage runtime device and custom owners decline shared partial writes before mutation" {
+    const a = std.testing.allocator;
+    var runtime = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+    defer runtime.deinit();
+    const source = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(source, 6);
+    try runtime.writeFullLayerKv(source, 0, 6, &.{ 1, 2, 3, 4, 5, 6 }, &.{ 11, 12, 13, 14, 15, 16 });
+    const derived = try runtime.attachSequenceWithRetainedBlocks(runtime.poolId(), runtime.blockTable(source).?.blocks.items, 6);
+    _ = try runtime.truncateSequence(derived, 1);
+    const tail = runtime.blockTable(derived).?.last().?;
+    const original = runtime.storage.vtable;
+    var custom = original.*;
+    runtime.storage.vtable = &custom;
+    try std.testing.expectError(error.SharedKvWriteUnsupported, runtime.appendTokens(derived, 1));
+    try std.testing.expectEqual(@as(?usize, 5), runtime.tokenCount(derived));
+    try std.testing.expectEqual(tail, runtime.blockTable(derived).?.last().?);
+    runtime.storage.vtable = original;
+    const Probe = struct {
+        calls: usize = 0,
+        fn write(raw: *anyopaque, _: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+        fn deinit(_: *anyopaque, _: std.mem.Allocator) void {}
+        const table = DeviceWriteHook.VTable{ .writeLayerKvSuffix = write, .deinit = deinit };
+    };
+    var probe = Probe{};
+    runtime.setDeviceWriteHook(.{ .ctx = &probe, .vtable = &Probe.table });
+    try std.testing.expectError(error.SharedKvWriteUnsupported, runtime.appendTokens(derived, 1));
+    try std.testing.expectEqual(@as(?usize, 5), runtime.tokenCount(derived));
+    try std.testing.expectEqual(tail, runtime.blockTable(derived).?.last().?);
+    try std.testing.expectError(error.SharedKvWriteUnsupported, runtime.writeLayerKvSuffix(derived, 0, 5, 1, &.{99}, &.{100}));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    // Full shared prefixes still append a separate unique page. The ordinary
+    // device suffix path retains its existing capability and schedule.
+    const full = try runtime.attachSequenceWithRetainedBlocks(runtime.poolId(), runtime.blockTable(source).?.blocks.items, 6);
+    try runtime.appendTokens(full, 1);
+    var dummy: f32 = 7;
+    const reference = DeviceKvRef{ .handle = @ptrCast(&dummy), .byte_offset = 0, .byte_len = 4 };
+    try runtime.writeLayerKvSuffixDevice(.{ .sequence_id = full, .layer_index = 0, .total_token_count = 7, .suffix_token_count = 1, .position_offset = 0, .num_kv_heads = 1, .head_dim = 1, .sliding_window = 0, .max_inflight_tokens = 1 }, reference, reference);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    const source_values = try runtime.gatherLayerKv(a, source, 0, 6);
+    defer a.free(source_values.k);
+    defer a.free(source_values.v);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, source_values.k);
+}
+
+test "storage runtime failed tail metadata append leaves no orphaned acquired KV ref" {
+    const a = std.testing.allocator;
+    var failures: usize = 0;
+    var success = false;
+    for (0..32) |failure_index| {
+        var runtime = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+        defer runtime.deinit();
+        const sequence = try runtime.attachSequence(runtime.poolId());
+        var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = failure_index, .resize_fail_index = 0 });
+        runtime.allocator = failure.allocator();
+        defer runtime.allocator = a;
+        runtime.appendTokens(sequence, 1) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            failures += 1;
+        };
+        const state = try runtime.sequenceMut(sequence);
+        var refs: usize = 0;
+        for (runtime.storage.hostPool().?.blocks.items) |entry| refs += entry.meta.refcount;
+        try std.testing.expectEqual(state.block_table.blocks.items.len + state.reserved_tail_blocks.items.len, refs);
+        if (!failure.has_induced_failure) {
+            success = true;
+            break;
+        }
+    }
+    try std.testing.expect(success and failures != 0);
+}
+
+fn exerciseRuntimeRetiredSequenceMetadata(a: std.mem.Allocator) !void {
+    var manager = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+    defer manager.deinit();
+    const pool_id = manager.poolId();
+    var ids: [17]SequenceId = undefined;
+    for (&ids) |*id| {
+        id.* = try manager.attachSequence(pool_id);
+        try manager.appendTokens(id.*, 1);
+    }
+    try std.testing.expect(manager.free_sequence_indices.capacity >= manager.sequences.items.len);
+    const selected = [_]usize{ 2, 15, 7, 0 };
+    var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+    manager.allocator = failure.allocator();
+    defer manager.allocator = a;
+    for (0..3) |_| {
+        for (selected) |index| {
+            try manager.releaseSequence(ids[index]);
+            try manager.releaseSequence(ids[index]); // idempotent, no duplicate ID
+        }
+        try std.testing.expectEqual(selected.len, manager.free_sequence_indices.items.len);
+        for (0..selected.len) |index| {
+            const selected_index = selected[selected.len - index - 1];
+            const reused = try manager.attachSequence(pool_id);
+            try std.testing.expectEqual(ids[selected_index], reused);
+            try std.testing.expectEqual(@as(?usize, 0), manager.tokenCount(reused));
+        }
+        try std.testing.expectEqual(@as(usize, 0), manager.free_sequence_indices.items.len);
+        try std.testing.expectEqual(@as(usize, 17), manager.sequences.items.len);
+    }
+    try std.testing.expect(!failure.has_induced_failure);
+    // Reusing a retired slot preserves every unrelated live sequence.
+    try std.testing.expectEqual(@as(?usize, 1), manager.tokenCount(ids[1]));
+}
+
+test "storage runtime noncontiguous sequence retirement and reuse require no allocator calls" {
+    try exerciseRuntimeRetiredSequenceMetadata(std.testing.allocator);
+}
+test "storage runtime sequence and recycler publication unwind every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseRuntimeRetiredSequenceMetadata, .{});
+}
+
+test "storage runtime cold recycler metadata failure publishes no sequence or ID gap" {
+    const a = std.testing.allocator;
+    for (0..2) |index| {
+        var manager = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+        defer manager.deinit();
+        const pool_id = manager.poolId();
+        var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        manager.allocator = failure.allocator();
+        defer manager.allocator = a;
+        try std.testing.expectError(error.OutOfMemory, manager.attachSequence(pool_id));
+        try std.testing.expectEqual(@as(usize, 0), manager.sequences.items.len);
+        try std.testing.expectEqual(@as(usize, 0), manager.free_sequence_indices.items.len);
+        failure.fail_index = std.math.maxInt(usize);
+        const id = try manager.attachSequence(pool_id);
+        try std.testing.expectEqual(@as(SequenceId, 1), id);
+        try std.testing.expect(manager.free_sequence_indices.capacity >= manager.sequences.items.len);
+    }
+}
+
+test "storage runtime custom retirement failure preserves the active sequence and is never recycled" {
+    const a = std.testing.allocator;
+    var manager = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+    defer manager.deinit();
+    const pool_id = manager.poolId();
+    const id = try manager.attachSequence(pool_id);
+    try manager.appendTokens(id, 1);
+    const storage = manager.getPoolMut(pool_id).?;
+    const original = storage.vtable;
+    var altered = original.*;
+    const Refuse = struct {
+        fn release(_: *anyopaque, _: std.mem.Allocator, _: block.KvBlockId) !bool {
+            return error.CustomRetirementFailure;
+        }
+    };
+    altered.releaseRef = Refuse.release;
+    storage.vtable = &altered;
+    defer storage.vtable = original;
+    try std.testing.expectError(error.CustomRetirementFailure, manager.releaseSequence(id));
+    try std.testing.expect((try manager.sequenceMut(id)).active);
+    try std.testing.expectEqual(@as(usize, 0), manager.free_sequence_indices.items.len);
+    storage.vtable = original;
+    try manager.releaseSequence(id);
+    try std.testing.expectEqual(@as(usize, 1), manager.free_sequence_indices.items.len);
+}
+
+test "page token offsets share bounded scratch across mapped identity and cyclic layouts failure atomically" {
+    const a = std.testing.allocator;
+    var cache = PageTokenOffsetCache{};
+    defer cache.deinit(a);
+    const ring = try cache.get(a, 2, 2, 4, true);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 0, 2 }, ring.values());
+    try cache.reserveMapped(a, 4);
+    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const mapped = try cache.getMapped(fail.allocator(), &.{ 5, 0, 2 }, 3, 2);
+    try std.testing.expectEqualSlices(u32, &.{ 10, 0, 4 }, mapped.values());
+    const identity = try cache.getIdentity(fail.allocator(), 4, 2);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 4, 6 }, identity.values());
+    try std.testing.expectError(error.KvCapacityTooSmall, cache.getMapped(fail.allocator(), &.{ 0, 1, 2, 3, 4 }, 5, 2));
+    try std.testing.expectError(error.KvCapacityTooSmall, cache.getMapped(fail.allocator(), &.{std.math.maxInt(u32)}, 1, 2));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 4, 6 }, identity.values());
+    const restored = try cache.get(a, 2, 2, 4, true);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 0, 2 }, restored.values());
+    try std.testing.expectEqual(@as(usize, 0), fail.allocations);
+    var legacy = PageTokenOffsetCache{};
+    defer legacy.deinit(a);
+    const old = try legacy.get(a, 2, 2, 4, true);
+    var allocation_failure = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const more = try a.alloc(block.KvBlockId, legacy.offsets.capacity + 1);
+    defer a.free(more);
+    @memset(more, 0);
+    try std.testing.expectError(error.OutOfMemory, legacy.getMapped(allocation_failure.allocator(), more, more.len, 2));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 0, 2 }, old.values());
+    try std.testing.expectEqual(@as(usize, 2), legacy.ring_page_count);
+    try std.testing.expectEqual(@as(usize, 2), legacy.page_size_tokens);
+}
+
+test "prepared generated storage append authorizes front retirement before publication and skips ordinary tail hook" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn prepare(raw: *anyopaque, implementation: *const anyopaque, _: Cleanup) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (implementation != @as(*const anyopaque, @ptrCast(&table))) return error.ForeignMutationHook;
+            self.calls += 1;
+            return error.FrontMutationRefused;
+        }
+        fn write(_: *anyopaque, _: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) !void {
+            return error.UnexpectedNumericalWrite;
+        }
+        fn close(_: *anyopaque, _: std.mem.Allocator) void {}
+        const table: DeviceWriteHook.VTable = .{ .prepareMutationWithCleanup = prepare, .writeLayerKvSuffix = write, .deinit = close };
+    };
+    const a = std.testing.allocator;
+    var storage = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 1, .sliding_window_size = 4 });
+    defer storage.deinit();
+    const sequence = try storage.attachSequence(storage.poolId());
+    try storage.appendTokens(sequence, 1);
+    var probe: Probe = .{};
+    storage.setDeviceWriteHook(.{ .ctx = &probe, .vtable = &Probe.table });
+    {
+        var prepared = try storage.prepareGeneratedAppendWithCleanup(sequence, 1, 0, .{});
+        defer prepared.abort();
+        prepared.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(@as(usize, 2), storage.tokenCount(sequence).?);
+    try storage.appendTokens(sequence, 5);
+    const before = try a.dupe(block.KvBlockId, (try storage.sequenceMut(sequence)).block_table.blocks.items);
+    defer a.free(before);
+    try std.testing.expectError(error.FrontMutationRefused, storage.prepareGeneratedAppendWithCleanup(sequence, 1, 0, .{}));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 7), storage.tokenCount(sequence).?);
+    try std.testing.expectEqualSlices(block.KvBlockId, before, (try storage.sequenceMut(sequence)).block_table.blocks.items);
+}
+
+test "unpublished storage attachment abort skips hooks and full prefill publishes only after page commit" {
+    const Fixture = struct {
+        releases: usize = 0,
+        fn write(_: *anyopaque, _: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) !void {
+            return error.UnexpectedUnpublishedWrite;
+        }
+        fn release(raw: *anyopaque, _: SequenceId) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+        fn close(_: *anyopaque, _: std.mem.Allocator) void {}
+        const hook: DeviceWriteHook.VTable = .{ .writeLayerKvSuffix = write, .releaseSequence = release, .deinit = close };
+        fn check(a: std.mem.Allocator) !void {
+            var probe: @This() = .{};
+            var storage = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1, .sliding_window_size = 2 });
+            defer storage.deinit();
+            storage.setDeviceWriteHook(.{ .ctx = &probe, .vtable = &hook });
+            var abandoned = try storage.prepareAttachment(storage.poolId());
+            defer abandoned.abort();
+            const id = abandoned.sequence_id;
+            try std.testing.expect(storage.tokenCount(id) == null);
+            try std.testing.expectError(error.InvalidSequenceId, storage.sequenceMut(id));
+            {
+                var pages = try abandoned.preparePrefillAppend(21, 0, .{});
+                defer pages.abort();
+                try std.testing.expectEqual(@as(usize, 21), pages.futureTokenCount());
+                try std.testing.expect(storage.tokenCount(id) == null);
+            }
+            abandoned.abort();
+            try std.testing.expectEqual(@as(usize, 0), probe.releases);
+            var pending = try storage.prepareAttachment(storage.poolId());
+            defer pending.abort();
+            try std.testing.expectEqual(id, pending.sequence_id);
+            var pages = try pending.preparePrefillAppend(3, 0, .{});
+            defer pages.abort();
+            pages.commit();
+            const invisible_until_attachment_commit = storage.tokenCount(id) == null;
+            pending.commit();
+            try std.testing.expect(invisible_until_attachment_commit);
+            // Window2 must not trim this original three-token prefill.
+            try std.testing.expectEqual(@as(?usize, 3), storage.tokenCount(id));
+            try std.testing.expectEqual(@as(usize, 0), probe.releases);
+            try storage.releaseSequence(id);
+            try std.testing.expectEqual(@as(usize, 1), probe.releases);
+        }
+    };
+    try Fixture.check(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "prepared storage truncate notifies backend while old logical owner is coherent" {
+    const Probe = struct {
+        runtime: *KvStorageRuntime,
+        sequence: SequenceId,
+        prepares: usize = 0,
+        truncates: usize = 0,
+        refuse: bool = false,
+        violation: bool = false,
+        fn prepare(raw: *anyopaque, implementation: *const anyopaque, _: Cleanup) !void {
+            if (implementation != @as(*const anyopaque, @ptrCast(&table))) return error.ForeignMutationHook;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.prepares += 1;
+            if (self.runtime.tokenCount(self.sequence) != 23) self.violation = true;
+            if (self.refuse) return error.TruncateMutationRefused;
+        }
+        fn truncate(raw: *anyopaque, sequence: SequenceId, retained: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.truncates += 1;
+            if (sequence != self.sequence or retained != 1 or self.runtime.tokenCount(sequence) != 23) self.violation = true;
+        }
+        fn write(_: *anyopaque, _: KvSuffixWrite, _: DeviceKvRef, _: DeviceKvRef) !void {
+            return error.UnexpectedNumericalWrite;
+        }
+        fn close(_: *anyopaque, _: std.mem.Allocator) void {}
+        const table: DeviceWriteHook.VTable = .{ .prepareMutationWithCleanup = prepare, .truncateSequence = truncate, .writeLayerKvSuffix = write, .deinit = close };
+    };
+    const a = std.testing.allocator;
+    var storage = try KvStorageRuntime.init(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+    defer storage.deinit();
+    const sequence = try storage.attachSequence(storage.poolId());
+    try storage.appendTokens(sequence, 23);
+    var probe = Probe{ .runtime = &storage, .sequence = sequence };
+    storage.setDeviceWriteHook(.{ .ctx = &probe, .vtable = &Probe.table });
+    probe.refuse = true;
+    try std.testing.expectError(error.TruncateMutationRefused, storage.prepareTruncateWithCleanup(sequence, 22, .{}));
+    try std.testing.expectEqual(@as(?usize, 23), storage.tokenCount(sequence));
+    probe.refuse = false;
+    {
+        var abandoned = try storage.prepareTruncateWithCleanup(sequence, 22, .{});
+        defer abandoned.abort();
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.truncates);
+    var prepared = try storage.prepareTruncateWithCleanup(sequence, 22, .{});
+    defer prepared.abort();
+    try std.testing.expectEqual(@as(?usize, 23), storage.tokenCount(sequence));
+    prepared.commitBackend(); // still OLD coherent metadata at the endpoint
+    const old_until_logical_commit = storage.tokenCount(sequence) == 23;
+    prepared.commit(); // pure metadata publication; deferred cleanup follows
+    try std.testing.expect(old_until_logical_commit);
+    try std.testing.expectEqual(@as(?usize, 1), storage.tokenCount(sequence));
+    try std.testing.expectEqual(@as(usize, 1), probe.truncates);
+    try std.testing.expect(!probe.violation);
 }

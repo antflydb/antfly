@@ -46,8 +46,8 @@
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
 #endif
-#ifndef ANTFLY_FLASH_KERNEL
-#error "ANTFLY_FLASH_KERNEL must name the exported production entry point"
+#if !defined(ANTFLY_FLASH_KERNEL) && !defined(ANTFLY_FLASH_REFERENCE_KERNEL)
+#error "Flash template requires a production or reference entry point"
 #endif
 #ifndef ANTFLY_FLASH_HEAD_DIM
 #error "ANTFLY_FLASH_HEAD_DIM must be 256 or 512"
@@ -56,24 +56,32 @@
 #error "ANTFLY_FLASH_SLIDING_WINDOW must be 512 for HD256 or 0 for HD512"
 #endif
 
-namespace ANTFLY_FLASH_NAMESPACE {
+// antfly-flash:begin common
+#include <cuda_fp16.h>
+#include <mma.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <math.h>
+#ifndef ANTFLY_FLASH_COMMON_DEFINED
+#define ANTFLY_FLASH_COMMON_DEFINED
+namespace antfly_flash_common {
 
 using namespace nvcuda;
 
-constexpr unsigned kHeads = 8u;
-#ifdef ANTFLY_FLASH_KV_HEADS
-constexpr unsigned kKvHeads = ANTFLY_FLASH_KV_HEADS;
-#else
-constexpr unsigned kKvHeads = 1u;
-#endif
+// One source owner, with compile-time geometry per instantiation. A bundle
+// may contain both E2B and E4B; the first wrapper must not fix all later layouts.
+template <unsigned KvHeads>
+struct Geometry {
+static constexpr unsigned kHeads = 8u;
+static constexpr unsigned kKvHeads = KvHeads;
 static_assert(kKvHeads == 1u || kKvHeads == 2u, "Only Gemma E2B/E4B geometries are supported");
-constexpr unsigned kPageTokens = 16u;
-constexpr unsigned kQueryTile = kKvHeads == 2u ? 64u : 16u;
-constexpr unsigned kKeyTile = 16u;
-constexpr unsigned kThreads = 256u;
-constexpr unsigned kWarps = kThreads / 32u;
-constexpr unsigned kInvalidToken = 0xffffffffu;
-constexpr float kNegativeInfinity = -3.402823466e+38F;
+static constexpr unsigned kPageTokens = 16u;
+static constexpr unsigned kQueryTile = kKvHeads == 2u ? 64u : 16u;
+static constexpr unsigned kKeyTile = 16u;
+static constexpr unsigned kThreads = 256u;
+static constexpr unsigned kWarps = kThreads / 32u;
+static constexpr unsigned kInvalidToken = 0xffffffffu;
+static constexpr float kNegativeInfinity = -3.402823466e+38F;
 
 enum PrototypeStatus : unsigned {
     kStatusOk = 0u,
@@ -89,15 +97,15 @@ enum PrototypeStatus : unsigned {
     kStatusAddressOverflow = 10u,
 };
 
-__device__ __forceinline__ bool pointer_aligned(const void* ptr, uintptr_t alignment) {
+static __device__ __forceinline__ bool pointer_aligned(const void* ptr, uintptr_t alignment) {
     return (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1u)) == 0u;
 }
 
-__device__ __forceinline__ unsigned ceil_div_u32(unsigned value, unsigned divisor) {
+static __device__ __forceinline__ unsigned ceil_div_u32(unsigned value, unsigned divisor) {
     return value / divisor + (value % divisor != 0u ? 1u : 0u);
 }
 
-__device__ __forceinline__ unsigned physical_token(
+static __device__ __forceinline__ unsigned physical_token(
     unsigned logical_token,
     const unsigned* block_table,
     unsigned block_count,
@@ -125,7 +133,7 @@ struct VisibleRange {
     unsigned end;
 };
 
-__device__ __forceinline__ VisibleRange visible_range(
+static __device__ __forceinline__ VisibleRange visible_range(
     unsigned query_pos,
     unsigned kv_seq_len,
     unsigned kv_position_offset,
@@ -148,7 +156,7 @@ __device__ __forceinline__ VisibleRange visible_range(
 }
 
 template <int HeadDim, int SlidingWindow, bool Flash>
-__device__ bool validate_launch(
+static __device__ bool validate_launch(
     float* dst,
     const float* q,
     const unsigned char* k,
@@ -278,26 +286,9 @@ __device__ bool validate_launch(
     return true;
 }
 
-template <int HeadDim>
-__device__ __forceinline__ size_t flash_shared_bytes() {
-    // Keep this layout mirrored by the typed renderer and qualification harness.
-    if constexpr (kKvHeads == 2u) {
-        return (kQueryTile + 2u * kKeyTile) * HeadDim * sizeof(half) + 3u * kQueryTile * sizeof(float) +
-            kQueryTile * kKeyTile * sizeof(half) +
-            (kKeyTile + 1u) * sizeof(unsigned);
-    }
-    return
-        2u * kQueryTile * HeadDim * sizeof(half) + // Q tile + K/V tile
-        kQueryTile * kKeyTile * sizeof(float) +   // scores
-        kQueryTile * kKeyTile * sizeof(half) +    // probabilities
-        kWarps * kQueryTile * 16u * sizeof(float) + // per-warp WMMA scratch
-        3u * kQueryTile * sizeof(unsigned) +       // physical, begin, end
-        4u * kQueryTile * sizeof(float) +          // max, denom, alpha, beta
-        sizeof(unsigned);                          // shared error
-}
 
 template <int HeadDim, int SlidingWindow>
-__device__ void flash_prefill_body(
+static __device__ void flash_prefill_body(
     float* dst,
     const float* q,
     const unsigned char* k,
@@ -804,7 +795,7 @@ __device__ void flash_prefill_body(
 }
 
 template <int HeadDim, int SlidingWindow>
-__device__ void reference_prefill_body(
+static __device__ void reference_prefill_body(
     float* dst,
     const float* q,
     const unsigned char* k,
@@ -924,7 +915,16 @@ __device__ void reference_prefill_body(
         : 0.0f;
 }
 
-} // namespace ANTFLY_FLASH_NAMESPACE
+}; // Geometry
+
+} // namespace antfly_flash_common
+#endif
+// antfly-flash:end common
+
+#ifndef ANTFLY_FLASH_KV_HEADS
+#define ANTFLY_FLASH_KV_HEADS 1
+#endif
+using ANTFLY_FLASH_NAMESPACE = antfly_flash_common::Geometry<ANTFLY_FLASH_KV_HEADS>;
 
 #define ANTFLY_FLASH_ARGUMENTS \
     float* dst, \
@@ -963,6 +963,7 @@ __device__ void reference_prefill_body(
     key_row_bytes, base_key_row_bytes, value_row_bytes, block_count, \
     page_size_tokens, format, value_format, physical_token_capacity, decode_scalars
 
+#ifdef ANTFLY_FLASH_KERNEL
 extern "C" __global__ void
 ANTFLY_FLASH_KERNEL(
     ANTFLY_FLASH_ARGUMENTS
@@ -974,6 +975,8 @@ ANTFLY_FLASH_KERNEL(
         ANTFLY_FLASH_HEAD_DIM,
         ANTFLY_FLASH_SLIDING_WINDOW>(ANTFLY_FORWARD_ARGUMENTS, storage);
 }
+
+#endif
 
 #ifdef ANTFLY_FLASH_REFERENCE_KERNEL
 extern "C" __global__ void
