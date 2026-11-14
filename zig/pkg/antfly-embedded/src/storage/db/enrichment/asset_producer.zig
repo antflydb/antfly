@@ -67,6 +67,33 @@ pub fn supportsScalarTextProjection(kind: ProducerType, content_type: []const u8
     };
 }
 
+// Returned values belong to the caller's invocation arena.
+pub fn extractionDocuments(a: Allocator, request: Request) !?std.json.Value {
+    const input = std.mem.trim(u8, request.source_text, " \t\r\n");
+    const raw = request.source_parts_json orelse input;
+    if (std.mem.startsWith(u8, raw, "{")) {
+        const source = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .parse_numbers = false }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null, // Text may start with an ordinary literal '{'.
+        };
+        if (source == .object) if (source.object.get("documents")) |documents| return documents;
+    }
+    if (documentSourceMediaType(input, request.content_type)) |mime| {
+        const encoded = try std.json.Stringify.valueAlloc(a, [_]@import("antfly_readers").DocumentSource{.{ .id = "source", .url = input, .media_type = mime }}, .{});
+        return try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{});
+    }
+    return null;
+}
+
+pub fn documentSourceMediaType(url: []const u8, supplied: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, supplied, "application/pdf") or std.mem.eql(u8, supplied, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) return supplied;
+    if (std.mem.indexOf(u8, url, "://") == null and !std.ascii.startsWithIgnoreCase(url, "data:")) return null;
+    const path = url[0 .. std.mem.indexOfAny(u8, url, "?#") orelse url.len];
+    if (std.ascii.endsWithIgnoreCase(path, ".pdf") or std.ascii.startsWithIgnoreCase(url, "data:application/pdf;")) return "application/pdf";
+    if (std.ascii.endsWithIgnoreCase(path, ".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    return null;
+}
+
 pub const ProducerType = enum {
     copy,
     document_extraction,

@@ -18283,6 +18283,14 @@ fn indexDocumentProducerRequired(a: Allocator, item: AssetProducerBatchItem) !bo
     var parsed = try std.json.parseFromSlice(std.json.Value, a, item.config_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return false;
+    // Privacy inspects literal field text, never a document locator embedded
+    // in the primary JSON. Keep those roots in the bounded detector cohort.
+    if (parsed.value.object.contains(@import("../../../privacy/document.zig").config_key)) return false;
+    if (item.producer_type == .extractor) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        if (try asset_producer_mod.extractionDocuments(arena.allocator(), item.asRequest()) == null) return false;
+    }
     const provider = parsed.value.object.get("provider") orelse return item.producer_type == .extractor;
     return provider == .string and std.mem.eql(u8, provider.string, "antfly");
 }
