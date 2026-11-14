@@ -1334,6 +1334,7 @@ pub const RuntimeStats = struct {
     launch_linear_qkv: usize = 0,
     deberta_fused_attention_calls: usize = 0,
     deberta_fused_attention_fallbacks: usize = 0,
+    deberta_stream_f32_attention_calls: usize = 0,
     deberta_stream_f16_attention_calls: usize = 0,
     deberta_stream_f16_attention_fallbacks: usize = 0,
     deberta_stream_f16_staging_calls: usize = 0,
@@ -4073,6 +4074,8 @@ pub const CudaCompute = struct {
     /// Artifact-qualified specialty span models retain FP32 attention even
     /// when global diagnostic environment switches request reduced precision.
     qualified_span_fp32: bool = false,
+    /// Exact original Decide identity; independent of other GLiNER profiles.
+    qualified_decide_fp32: bool = false,
     laya_optimizations: bool = false,
     gliner_encoder_attention: bool = false,
     gliner_mixed_attention: bool = false,
@@ -12012,7 +12015,7 @@ fn tryCublasLtF32Linear(
     // Zero-workspace plans exclude the faster strict FP32 SGEMM schedules on
     // GB10. Reuse one bounded buffer, included in specialty request admission.
     // Allocation failure keeps the existing zero-workspace correctness path.
-    const workspace = if (self.qualified_span_fp32)
+    const workspace = if (self.qualified_span_fp32 or self.qualified_decide_fp32)
         self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("../../models/gliner_specialty_qualification.zig").cuda_matmul_workspace_bytes) catch buffer_mod.DeviceBuffer{}
     else
         buffer_mod.DeviceBuffer{};
@@ -19565,7 +19568,7 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     // The encoder composes plain linear + residual layer norm when declined.
     // Its strict FP32 cuBLASLt projection is much faster than the small fused
     // SIMT projection for these wide FFN output matrices, without extra storage.
-    if (self.qualified_span_fp32 and weight_tensor.quant_type == null) return null;
+    if ((self.qualified_span_fp32 or self.qualified_decide_fp32) and weight_tensor.quant_type == null) return null;
     const bias_tensor = tensorFromCt(bias);
     const residual_tensor = tensorFromCt(residual);
     try ensureF32(input_tensor);
@@ -26885,6 +26888,34 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
             }
         }
         self.stats.deberta_stream_f16_attention_fallbacks += 1;
+    }
+    // The L4-qualified original Decide route keeps attention entirely FP32.
+    // Missing symbols in older CUDA images retain the existing fused fallback.
+    if (self.qualified_decide_fp32 and self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
+        (attention_mode == .auto or attention_mode == .fused_f32) and head_dim == 64 and seq_len <= 512)
+    {
+        const launched = self.kernels.launchDebertaAttentionStreamF32(
+            &self.ctx,
+            device,
+            q_tensor.buffer,
+            k_tensor.buffer,
+            v_tensor.buffer,
+            q_r_tensor.buffer,
+            k_r_tensor.buffer,
+            mask_device,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable => false,
+            else => return err,
+        };
+        if (launched) {
+            self.stats.deberta_stream_f32_attention_calls += 1;
+            self.stats.launch_attention += 1;
+            return createTensor(self, device, shape, count);
+        }
     }
     if (cudaDebertaFusedAttentionEnabled(self) and seq_len <= 512) {
         const launched = self.kernels.launchDebertaAttentionFusedF32(

@@ -436,7 +436,11 @@ fn batchPool(node: *Node, transport: *Loopback, directory: []const u8, cases: []
     const retained = domain.admission.snapshot();
     var handle = node.model_manager.acquireLoadedModel(directory) orelse return error.MissingLoadedModel;
     defer handle.release();
-    for ([_]usize{ 2, 4, 8 }) |n| {
+    const decide_policy = @import("../models/gliner_decide_qualification.zig");
+    const fp32_decide = decide and (try decide_policy.require(try factory.getGlinerDecisionIdentity(handle.get().session))) == .decide_deberta;
+    const max_items: usize = if (fp32_decide) decide_policy.cuda_fp32_request_items else 8;
+    for ([_]usize{ 2, 4, 8, 9, 16, 32 }) |n| {
+        if (n > max_items) continue;
         for ([_]bool{ false, true }) |reverse| {
             const body = try batchBody(a, std.fs.path.basename(directory), cases, n, reverse);
             defer a.free(body);
@@ -447,10 +451,18 @@ fn batchPool(node: *Node, transport: *Loopback, directory: []const u8, cases: []
             try std.testing.expect(after.kernel_launches > before.kernel_launches);
             var serial_launches: usize = 0;
             for (0..n) |i| serial_launches += singleton_launches[(if (reverse) n - 1 - i else i) % cases.len];
-            try std.testing.expect(after.kernel_launches - before.kernel_launches < serial_launches);
-            // Decide has exactly one final logits readback for the whole
-            // physical batch, not one readback/encoder forward per input.
-            if (decide) try std.testing.expectEqual(before.to_float32_calls + 1, after.to_float32_calls) else try std.testing.expectEqual(before.to_float32_calls, after.to_float32_calls);
+            if (decide) {
+                const readbacks = after.to_float32_calls - before.to_float32_calls;
+                const minimum_batches = std.math.divCeil(usize, n, decide_policy.cuda_batch_items) catch unreachable;
+                // Different token-length buckets can split a physical cohort.
+                // A homogeneous cohort must fill each bounded eight-row batch.
+                if (cases.len == 1) try std.testing.expectEqual(minimum_batches, readbacks);
+                try std.testing.expect(readbacks >= minimum_batches and readbacks <= n);
+                if (readbacks < n) try std.testing.expect(after.kernel_launches - before.kernel_launches < serial_launches);
+            } else {
+                try std.testing.expect(after.kernel_launches - before.kernel_launches < serial_launches);
+                try std.testing.expectEqual(before.to_float32_calls, after.to_float32_calls);
+            }
             var parsed = try std.json.parseFromSlice(std.json.Value, a, actual, .{});
             defer parsed.deinit();
             const rows = parsed.value.object.get("data").?.array.items;
@@ -470,7 +482,7 @@ fn batchPool(node: *Node, transport: *Loopback, directory: []const u8, cases: []
         }
     }
     // Explicit over-limit batches must fail before CUDA work and preserve leases.
-    const oversized = try batchBody(a, std.fs.path.basename(directory), cases, 9, false);
+    const oversized = try batchBody(a, std.fs.path.basename(directory), cases, max_items + 1, false);
     defer a.free(oversized);
     const before = factory.getCudaRuntimeStats(handle.get().session).?;
     var rejected = try transport.request(.POST, "/ai/v1/extract", oversized);
@@ -589,10 +601,18 @@ fn distinctInputBatches(environment: [*:0]const u8, comptime role: enum { base, 
         try batchPool(&node, transport, directory, cases[7..9], false);
     } else {
         try batchPool(&node, transport, directory, cases[0..values.len], true);
+        // Also exercise full physical cohorts independently of length bucketing.
+        try batchPool(&node, transport, directory, cases[0..1], true);
     }
-    // A queued eight-item batch must cancel without launches and recover.
+    // A queued request at the model's cap must cancel without launches and recover.
     const selected = if (role == .multi) cases[4..8] else if (role == .base) cases[0..8] else cases[0..values.len];
-    const body = try batchBody(a, std.fs.path.basename(directory), selected, 8, false);
+    const cancel_items: usize = if (role == .decide) cap: {
+        var loaded = node.model_manager.acquireLoadedModel(directory) orelse return error.MissingLoadedModel;
+        defer loaded.release();
+        const policy = @import("../models/gliner_decide_qualification.zig");
+        break :cap if (try policy.require(try factory.getGlinerDecisionIdentity(loaded.get().session)) == .decide_deberta) policy.cuda_fp32_request_items else policy.cuda_batch_items;
+    } else 8;
+    const body = try batchBody(a, std.fs.path.basename(directory), selected, cancel_items, false);
     defer a.free(body);
     const expected = try responseAt(transport, "/ai/v1/extract", body);
     defer a.free(expected);

@@ -2063,8 +2063,16 @@ fn createCudaSessionWithRequiredProfile(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
-    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null;
+    // The pinned DeBERTa Decide checkpoint also consists entirely of FP32
+    // weights. Admit its short projections to the strict cuBLASLt route;
+    // the Q8 artifact keeps its independent quantized dispatch.
+    const decide_fp32 = if (native_impl.gliner_decision_identity) |identity|
+        gliner_decide_qualification.qualifiedVariant(identity) == .decide_deberta
+    else
+        false;
+    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null or decide_fp32;
     cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
+    cuda_compute.qualified_decide_fp32 = decide_fp32;
     if (model_manifest.gliner_specialty_profile) |profile| {
         std.log.info("gliner_specialty_cuda_policy profile={s} weights=f32 attention=f32 diagnostic_overrides=ignored", .{@tagName(profile)});
     }

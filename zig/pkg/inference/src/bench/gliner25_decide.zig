@@ -152,7 +152,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
         }
         if (i >= warmup) samples[i - warmup] = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
     }
-    const CudaEvidence = struct { kernel_launches: usize, h2d_bytes: usize, d2h_bytes: usize, downloads: usize };
+    const CudaEvidence = struct { kernel_launches: usize, h2d_bytes: usize, d2h_bytes: usize, downloads: usize, stream_f32_attention_calls: usize };
     const cuda_transfers: ?CudaEvidence = if (comptime factory.CudaRuntimeStats != void) blk: {
         const before = stats_before orelse break :blk null;
         factory.drainCudaProfile(pipeline.session);
@@ -161,7 +161,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
             var buffer: [768]u8 = undefined;
             std.debug.print("{s}\n", .{factory.formatCudaPrefillProfileLine(&buffer, delta)});
         }
-        break :blk .{ .kernel_launches = delta.kernel_launches, .h2d_bytes = delta.h2d_bytes, .d2h_bytes = delta.d2h_bytes, .downloads = delta.to_float32_calls };
+        break :blk .{ .kernel_launches = delta.kernel_launches, .h2d_bytes = delta.h2d_bytes, .d2h_bytes = delta.d2h_bytes, .downloads = delta.to_float32_calls, .stream_f32_attention_calls = delta.deberta_stream_f32_attention_calls };
     } else null;
     std.mem.sort(f64, samples, {}, struct {
         fn less(_: void, left: f64, right: f64) bool {
