@@ -19748,6 +19748,31 @@ pub const NativeFile = struct {
             // (`redo_folded_through`) stays truthful for `self`'s own
             // later folds.
             try self.attachFreshRedoState(io, self.header.redo_log_offset, self.header.redo_log_capacity, self.activeCheckpoint().commit_sequence, self.activeCheckpoint().redo_folded_through);
+            // `attachFreshRedoState`'s own `Writer.init` call above always
+            // resumes at `tail = 0`, correct only for the "nothing to
+            // replay yet" case its doc comment promises (a vacuum's
+            // `prepared`, never itself redo-attached). A caller that hands
+            // this a `prepared` written to directly under redo (the
+            // backup/restore-import path, not vacuum -- the exact case
+            // the comment above this block already acknowledges can leave
+            // `commit_sequence`/`redo_folded_through` genuinely different)
+            // has real, valid records already sitting in the log region
+            // between `redo_folded_through` and `commit_sequence`.
+            // `prepared.redo` -- left completely untouched above, since
+            // only `self.redo` is reset -- still holds `prepared`'s own
+            // writer at its true on-disk tail/last_sequence. Resuming at
+            // `tail = 0` instead would make this generation's very next
+            // diverted commit physically overwrite the start of that
+            // still-valid region, corrupting a reopen's replay
+            // (`recoverRedoLog`'s `NativeRedoLogCorrupt`) even though
+            // nothing had actually gone wrong on disk. `prepared.redo.
+            // writer.file` already names the post-rename fd -- the same
+            // value this function's own swap moved into `self.file` --
+            // so only the position fields need to carry over.
+            if (prepared.redo) |prepared_redo| {
+                self.redo.?.writer.tail = prepared_redo.writer.tail;
+                self.redo.?.writer.last_sequence = prepared_redo.writer.last_sequence;
+            }
         } else {
             self.manifest_commits_enabled = true;
         }
