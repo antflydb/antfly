@@ -348,6 +348,8 @@ def main():
         <= 0
     ):
         parser.error("budgets, threads, trials and deadlines must be positive")
+    if args.abort_pss_mib < 0:
+        parser.error("abort-pss-mib must be nonnegative")
     if not 0 <= args.cancel_after_ms <= 3600000:
         parser.error("cancel-after-ms must be in 0..3600000")
     for key in ("binary", "config", "models_dir", "cases", "report"):
@@ -360,7 +362,18 @@ def main():
         cases=[],
     )
     for index, case in enumerate(json.loads(args.cases.read_text())):
-        report["cases"].append(run_case(args, case, index))
+        try:
+            result = run_case(args, case, index)
+        except Exception as error:
+            # Missing fixtures/checkpoints must remain explicit failed cases;
+            # never leave a partial report looking like the complete campaign.
+            result = dict(
+                model=case.get("model"),
+                kind=case.get("kind"),
+                success=False,
+                error=str(error),
+            )
+        report["cases"].append(result)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(
             json.dumps(
