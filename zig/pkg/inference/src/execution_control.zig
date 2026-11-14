@@ -132,9 +132,10 @@ pub const InferenceExecutionControl = struct {
     admission_failure: ?*@import("runtime/tier/memory.zig").AdmissionFailure = null,
     /// Verified selection carried by value through async admission/loading.
     model_selection: ?@import("registry/model_selection.zig").Constraint = null,
-    /// The HTTP route owns a request slot; audio leaves reserve only work units.
+    /// An enclosing HTTP/direct invocation owns the logical request slot;
+    /// nested leaves and physical batches reserve weighted work only.
     /// Internal execution policy, never decoded from a public request.
-    http_request_admitted: bool = false,
+    request_slot_admitted: bool = false,
     /// Trusted document orchestration pin; never decoded from public input.
     audio_execution: ?@import("documents/audio.zig").ExecutionSnapshot = null,
     /// Trusted document allowance, consumed by every Whisper decode attempt.

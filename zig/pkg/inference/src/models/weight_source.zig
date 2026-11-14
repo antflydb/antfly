@@ -298,6 +298,7 @@ pub const SafetensorsSource = struct {
 
     fn getTensor(self: *SafetensorsSource, name: []const u8) !LoadedWeight {
         var tensor = try self.reader.readTensor(name);
+        errdefer tensor.deinit();
         // Convert f16/bf16 to f32 for computation
         if (tensor.dtype == .f16 or tensor.dtype == .bf16) {
             const converted = try convertToF32(self.reader.allocator, &tensor);
@@ -389,6 +390,7 @@ pub const ShardedSafetensorsSource = struct {
     fn getTensor(self: *ShardedSafetensorsSource, name: []const u8) !LoadedWeight {
         const resolved = try self.findTensorMeta(name);
         var tensor = try resolved.reader.readTensor(name);
+        errdefer tensor.deinit();
         if (tensor.dtype == .f16 or tensor.dtype == .bf16) {
             const converted = try convertToF32(self.allocator, &tensor);
             tensor.deinit();
@@ -461,10 +463,14 @@ pub fn loadWeightsFromMapping(
 /// Convert a dense scalar tensor to f32 for backends that keep resident weights
 /// in float buffers.
 pub fn convertToF32(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor {
-    const count = tensor.elementCount();
-    const byte_count = count * @sizeOf(f32);
-    const out_bytes = try allocator.alloc(u8, byte_count);
+    const count = try tensor.denseElementCount();
+    const byte_count = try std.math.mul(usize, count, @sizeOf(f32));
+    const out_bytes = try allocator.alignedAlloc(u8, .of(f32), byte_count);
+    errdefer allocator.free(out_bytes);
     const owned_shape = try allocator.dupe(i64, tensor.shape);
+    errdefer allocator.free(owned_shape);
+    var scan = c_file.MmapRegion.SequentialRead.begin(tensor.mmap_source_bytes, tensor.data);
+    defer scan.deinit();
     const f32_data: [*]f32 = @ptrCast(@alignCast(out_bytes.ptr));
 
     switch (tensor.dtype) {
@@ -546,6 +552,7 @@ pub fn convertToF32(allocator: std.mem.Allocator, tensor: *const Tensor) !Tensor
         .allocator = allocator,
         .owns_data = true,
         .owns_shape = true,
+        .data_alignment = .of(f32),
     };
 }
 
@@ -596,4 +603,29 @@ test "convert i64 token ordering to f32" {
 
     try std.testing.expectEqual(DType.f32, converted.dtype);
     try std.testing.expectEqualSlices(f32, &.{ 0.0, 2048.0, 262143.0 }, converted.asFloat32());
+}
+
+fn checkConversionAllocationFailures(allocator: std.mem.Allocator) !void {
+    const bits = [_]u16{ 0x3f80, 0x4000 };
+    const tensor = Tensor{ .data = @constCast(std.mem.sliceAsBytes(&bits)), .shape = &.{2}, .dtype = .bf16, .name = "weight", .allocator = allocator, .owns_data = false, .owns_shape = false };
+    var converted = try convertToF32(allocator, &tensor);
+    defer converted.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, converted.asFloat32());
+}
+
+test "dense conversion allocation failures release payload and shape" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkConversionAllocationFailures, .{});
+}
+
+test "dense conversion rejects malformed shapes and unsupported dtypes without leaking" {
+    var tensor = Tensor{ .data = @constCast(&[_]u8{ 0, 0 }), .shape = &.{-1}, .dtype = .bf16, .name = "bad", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false };
+    try std.testing.expectError(error.ShapeMismatch, convertToF32(std.testing.allocator, &tensor));
+    tensor.shape = &.{2};
+    try std.testing.expectError(error.ShapeMismatch, convertToF32(std.testing.allocator, &tensor));
+    tensor.shape = &.{ std.math.maxInt(i64), 4 };
+    try std.testing.expectError(error.ShapeMismatch, convertToF32(std.testing.allocator, &tensor));
+    tensor.dtype = .f32;
+    tensor.shape = &.{0};
+    tensor.data = &.{};
+    try std.testing.expectError(error.UnsupportedConversion, convertToF32(std.testing.allocator, &tensor));
 }

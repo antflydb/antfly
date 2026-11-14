@@ -155,6 +155,10 @@ pub fn maxPromptPrefixTokens(max_length: usize) usize {
 }
 
 pub const TranscriptionPipeline = struct {
+    /// Serial CPU execution lends its admitted estimate to physical tensor
+    /// allocations. Queued/microbatched and accelerator runs keep their own
+    /// execution ownership and must not borrow this request-local credit.
+    native_workspace: ?*@import("../backends/admitted_allocator.zig").AdmittedAllocator = null,
     batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     encoder: backends.Session,
@@ -274,13 +278,15 @@ pub const TranscriptionPipeline = struct {
         const mel_elements = std.math.mul(usize, n_mels, n_frames) catch return error.ResourceLimitExceeded;
         const mel_bytes = std.math.mul(usize, mel_elements, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
         const pcm_bytes = std.math.mul(usize, samples.len, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
-        var encoder_permit = try self.encoder.admit(.{
-            .batch = 1,
-            .sequence = n_frames,
-            .input_bytes = mel_bytes,
-            .host_preprocess_bytes = std.math.add(usize, pcm_bytes, mel_bytes) catch return error.ResourceLimitExceeded,
-        });
-        defer encoder_permit.deinit();
+        const mel_shape = [_]i64{ 1, @intCast(n_mels), @intCast(n_frames) };
+        var planned = try self.encoder.planShapes(&.{.{ .name = "input_features", .shape = &mel_shape, .dtype = .f32 }}, 1);
+        planned.sequence = @max(planned.sequence, n_frames);
+        planned.host_preprocess_bytes = std.math.add(usize, pcm_bytes, mel_bytes) catch return error.ResourceLimitExceeded;
+        // Request-owned CPU preprocessing is admitted as it allocates. The
+        // physical dispatcher decides whether execution borrows that owner or
+        // belongs to a fused batch; queued requests must not prepay idle peaks.
+        var encoder_permit: ?@import("../backends/session.zig").RunPermit = if (self.native_workspace != null) null else try self.encoder.admit(planned);
+        defer if (encoder_permit) |*permit| permit.deinit();
 
         const mel_started = platform.time.monotonicNs();
         const mel = try audio.whisperMelFromPcmSecondsMels(allocator, samples, sample_rate, context_seconds, @intCast(n_mels));
@@ -289,13 +295,12 @@ pub const TranscriptionPipeline = struct {
 
         // 1. Run encoder on [1, n_mels, n_frames] log-mel input.
         const encoder_started = platform.time.monotonicNs();
-        const mel_shape = [_]i64{ 1, @intCast(n_mels), @intCast(n_frames) };
         var mel_tensor = try backends.Tensor.initFloat32(allocator, "input_features", &mel_shape, mel);
         defer mel_tensor.deinit();
         const encoder_outputs = if (self.batch_dispatch) |dispatch|
-            try dispatch.run(allocator, self.encoder, &encoder_permit, null, &.{mel_tensor}, self.execution_control)
+            try dispatch.run(allocator, self.encoder, if (encoder_permit) |*permit| permit else null, null, &.{mel_tensor}, self.execution_control)
         else
-            try encoder_permit.runWithControl(&.{mel_tensor}, allocator, self.execution_control);
+            try @import("../server/tensor_microbatch.zig").runSerial(allocator, self.encoder, if (encoder_permit) |*permit| permit else null, &.{mel_tensor}, self.execution_control);
         defer {
             for (encoder_outputs) |*t| {
                 var mt = t.*;
@@ -304,6 +309,8 @@ pub const TranscriptionPipeline = struct {
             allocator.free(encoder_outputs);
         }
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
+        // Serial CPU outputs retain allocation credit; batched outputs retain
+        // the physical batch's output lease. Neither retains the encoder peak.
         timing.encoder_ns = platform.time.monotonicNs() -| encoder_started;
         const enc_seq_len: usize = if (encoder_outputs[0].shape.len >= 2) @intCast(encoder_outputs[0].shape[1]) else 1;
         const enc_mask = try allocator.alloc(i64, enc_seq_len);

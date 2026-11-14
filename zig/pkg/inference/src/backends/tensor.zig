@@ -240,6 +240,20 @@ pub const Tensor = struct {
         return count;
     }
 
+    /// Validate the complete dense payload before conversion or allocation.
+    /// Checkpoint dimensions and byte counts must not wrap or permit an
+    /// out-of-bounds read in optimized builds.
+    pub fn denseElementCount(self: *const Tensor) !usize {
+        var count: usize = 1;
+        for (self.shape) |dim| {
+            if (dim < 0) return error.ShapeMismatch;
+            count = std.math.mul(usize, count, std.math.cast(usize, dim) orelse return error.ShapeMismatch) catch return error.ShapeMismatch;
+        }
+        const bytes = std.math.mul(usize, count, self.dtype.byteSize()) catch return error.ShapeMismatch;
+        if (bytes != self.data.len) return error.ShapeMismatch;
+        return count;
+    }
+
     /// Return a non-owning view suitable for passing an existing tensor under
     /// a different input name. The source tensor remains responsible for its
     /// buffers and any attached lifetime hook; deinitializing the view is a
