@@ -14487,6 +14487,26 @@ pub const NativeFile = struct {
             // can never be mistaken for a later, now-truncated-away
             // generation's stale copied bytes.
             var snapshot_checkpoint = checkpoint;
+            // §9.3/§9.3a: under redo, `self.activeCheckpoint().commit_sequence`
+            // is not the real physical checkpoint on disk -- `stageMutation`'s
+            // own "track private changes" bump (its own doc comment)
+            // advances it on every ordinary, overlay-only commit so
+            // in-process callers can tell versions apart, while the real
+            // on-disk slot (and the physical tree this raw byte copy above
+            // just reproduced) stays at the last real `checkpointRedoLog`
+            // fold's sequence. Stamping the bumped value into the
+            // snapshot's own slot told a reopening `recoverRedoLog`
+            // "every record through this sequence is already in the
+            // tree," which is false under redo: every log record at or
+            // below that sequence is then treated as superseded and never
+            // replayed into the overlay, silently losing every write that
+            // only ever lived in the log (confirmed live: a reopened
+            // snapshot resolved a secret's "head" pointer back to
+            // revision 0 even though the live file it was copied from
+            // resolved it correctly). Use the real physical sequence
+            // instead, the same one `publishRedoLogState`/
+            // `checkpointRedoLog` already treat as authoritative.
+            if (self.redo) |redo| snapshot_checkpoint.commit_sequence = redo.checkpoint_sequence;
             snapshot_checkpoint.presynced = true;
             snapshot_checkpoint.manifest_page = 0;
             snapshot_checkpoint.manifest_crc = 0;
