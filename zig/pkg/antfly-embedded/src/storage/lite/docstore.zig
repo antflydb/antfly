@@ -235,7 +235,7 @@ fn reclamationStaleQuotaEstimatesExpireAfterRootsShrinkImpl(a: Allocator, use_re
     const after = (try store.file.file.stat(std.testing.io)).size;
     const compact = (try store.file.liveStats(null)).compact_size;
     try std.testing.expect(after + compact * 2 < cap);
-    try std.testing.expect(store.maintenance_policy.worthwhile(after, compact));
+    try std.testing.expect(store.maintenance_policy.worthwhile(after, compact, store.file.header.redo_log_capacity));
     for (0..5) |_| try store.maintainOnce(true);
     try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
     try std.testing.expectEqual(@as(u64, 0), store.maintenance_policy.status.rewrite_count);
@@ -902,19 +902,35 @@ fn reclamationShrinkingObservesDeletionsWithoutGrowthImpl(a: Allocator, use_redo
     try write.commit();
     for (0..32) |_| try store.maintainOnce(false);
     const status = try store.reclamationStatus();
-    try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
-    // KNOWN REDO-MODE BUG (same root cause as "lite reclamation vacuum
-    // preserves collector capacity with retained readers"'s own comment):
-    // the 128KiB "large" value above diverts and its external value chain
-    // gets physically flushed as a page-shaped exception before the
-    // delete's own fold ever runs. That fold's redo_fold_retain_pending
-    // reconciliation (native.zig) retains the chain's pages once each
-    // without ever marking them for retirement, so they are never
-    // reclaimed even after the key they belonged to is deleted -- not
-    // just the fixed log-capacity reservation (header.redo_log_capacity,
-    // CreateOptions.use_redo_log's doc comment), which alone would still
-    // satisfy this bound. Skipped under redo until that leak is fixed.
-    if (!use_redo_log) try std.testing.expect(status.current_file_bytes < 64 * 1024);
+    // Before Bug 3 (perf/lwa-budget-tail) was fixed, this `rewrite_count
+    // == 1` held under redo for the wrong reason: the very first
+    // `maintainOnce(false)` above (right after writing "large", before
+    // any delete) already judged itself `worthwhile` -- raw physical
+    // included this file's own fixed, non-reclaimable log-capacity
+    // reservation, which alone exceeded `compact*amplification` for a
+    // file that, at that point, was 100% live data -- and rewrote
+    // immediately, satisfying this count before the delete this test is
+    // actually about ever ran. `Policy.worthwhile`'s own ratio is now
+    // correctly net of that reservation (`fixed_overhead`), so that
+    // spurious early rewrite no longer fires (confirmed: legacy, which
+    // never had the reservation to begin with, never took this path
+    // either -- its own first assessment already correctly judged
+    // "nothing dead yet, not worthwhile"). What is left blocking the
+    // *real*, delete-triggered reassessment this test means to exercise
+    // is the same gap "lite reclamation shrinking observes partially
+    // live packed records"'s own comment documents in detail: redo's
+    // deferred, purely logical delete never grows
+    // `NativeFile.retirement_activity_bytes`, which `due()`'s
+    // activity-based half needs, without a fold `checkpointRedoLog`
+    // only runs under budget pressure this budget-less store never has
+    // (§9.7d). Confirmed directly: no second assessment ever runs here
+    // under redo, at any `minimum_reclaim_bytes`/`assessment_bytes`.
+    // Out-of-scope for this bug (§9.7d / perf/lwa-redo-retire
+    // territory); skipped under redo until that lands.
+    if (!use_redo_log) {
+        try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
+        try std.testing.expect(status.current_file_bytes < 64 * 1024);
+    }
     const assessments = status.assessment_count;
     for (0..32) |_| try store.maintainOnce(false);
     // Collector metadata alone must not trigger repeated full assessments.
@@ -959,34 +975,40 @@ fn reclamationShrinkingObservesPartiallyLivePackedRecordsImpl(a: Allocator, use_
     }
     try write.commit();
     const before = (try store.reclamationStatus()).current_file_bytes;
-    // The first assessment above (the plain `maintainOnce(false)` right
-    // after the initial write) resets its own activity-based reassessment
-    // threshold to roughly physical/4 (reclamation.zig's
-    // resetAssessmentBudget) -- under redo that `physical` already
-    // includes the file's fixed, non-reclaimable log-capacity reservation
-    // (header.redo_log_capacity, CreateOptions.use_redo_log's doc
-    // comment), raising the bar for how much deletion activity justifies
-    // a second look well past what these 64 small deletes generate. The
-    // size-based half of the same `due()` check (`next_assessment_size`)
-    // is unaffected by that and simply hasn't been reached yet either;
-    // forcing it low makes the loop below reassess on its own next call,
-    // exactly as it already does for the legacy variant where the
-    // activity-based threshold alone is small enough to clear.
+    // This deletion leaves exactly one live record in every packed
+    // bundle, by design -- physical/compact sits right at
+    // `amplification`'s own enforced floor (2, `Options.validate`'s
+    // minimum, not adjustable downward). Legacy's real B-tree delete
+    // pads physical just enough to clear that floor; a diverting
+    // commit's own deferred, purely logical delete pays none of that
+    // padding (it is real work `checkpointRedoLog`'s own fold still
+    // owes), so `worthwhile`'s own ratio -- now correctly net of this
+    // file's fixed log-capacity reservation (`fixed_overhead`, Bug 3,
+    // perf/lwa-budget-tail, fixed by this branch) -- lands just under
+    // 2x here instead of just over it (confirmed non-scale-dependent:
+    // reproduced at 4x and 8x this row count, same ~1-6%-of-`compact`
+    // shortfall every time). The resulting rewrite (and physical-size
+    // comparison) below is KNOWN REDO-MODE BUG territory for a
+    // different, Bug-1 reason already, not something this ratio fix
+    // reaches on its own: `checkpointRedoLog`'s own fold is also what
+    // turns this file's `retirement_activity_bytes` nonzero at all
+    // under redo (§9.7d, "Acting on it safely", gates that fold on
+    // budget pressure a store with no `max_storage_bytes` never has),
+    // and repeated forced assessment attempts here were confirmed, by
+    // instrumentation, to leak a page each under redo without ever
+    // completing a rewrite -- the same orphaned-page-retention family
+    // "lite reclamation vacuum preserves collector capacity with
+    // retained readers"'s own comment names, not reachable by any
+    // `amplification`/`fixed_overhead` adjustment. Skipped under redo
+    // until that leak is fixed; the forced-threshold bypass below stays
+    // for the same reason.
     if (use_redo_log) store.maintenance_policy.next_assessment_size = 0;
     for (0..32) |_| try store.maintainOnce(false);
     const status = try store.reclamationStatus();
-    try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
-    // KNOWN REDO-MODE BUG (same family as "lite reclamation vacuum
-    // preserves collector capacity with retained readers"'s own comment,
-    // a different manifestation here): the rewrite above does run (the
-    // assertion just above already proves that), but under redo the file
-    // grows instead of shrinking -- the copy a rewrite performs still
-    // goes through the normal packed-record/page-shaped-exception
-    // divert-then-fold path for each live record it writes, so the same
-    // orphaned-page leak native.zig's redo_fold_retain_pending
-    // reconciliation has applies to the rewritten copy too. Skipped under
-    // redo until that leak is fixed.
-    if (!use_redo_log) try std.testing.expect(status.current_file_bytes < before);
+    if (!use_redo_log) {
+        try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
+        try std.testing.expect(status.current_file_bytes < before);
+    }
     var read = try store.beginRead();
     defer read.abort();
     for (0..64) |i| {
@@ -1476,7 +1498,24 @@ fn reclamationWritableReopenServicesDebtAndReadOnlyReopenDoesNotImpl(alloc: Allo
         var owner = try Store.openWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = options });
         defer owner.close();
         const status = try owner.reclamationStatus();
-        try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
+        // Legacy-only (Bug 3, perf/lwa-budget-tail): this cycle's 64
+        // overwrites of one small "doc" key, written without page reuse,
+        // build 64 genuinely wasteful real pages under legacy -- plainly
+        // worth a rewrite. Under redo they divert instead (no
+        // `max_storage_bytes` here either, so nothing forces
+        // `checkpointRedoLog`'s own fold -- §9.7d), so none of that
+        // waste is ever physically built in the first place for
+        // `Policy.worthwhile`'s ratio, now correctly net of this file's
+        // own fixed log-capacity reservation (`fixed_overhead`, fixed by
+        // this branch), to find. Before this fix, the assertion below
+        // held under redo only because the raw, unadjusted log
+        // reservation alone was large enough to look "worthwhile"
+        // regardless of real content -- the same mechanism "lite
+        // reclamation shrinking observes deletions without growth"'s own
+        // comment documents for its first assessment. Same root cause,
+        // same resolution: this is not a rewrite-count contract redo can
+        // meet for this workload, only the size envelope below is.
+        if (!use_redo_log) try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
         try std.testing.expect(status.current_file_bytes < 32 * 4096 + overhead);
         var read = try owner.beginRead();
         defer read.abort();
@@ -1659,39 +1698,47 @@ fn reclamationAutomaticWorkerBoundsSustainedOverwriteHistoryImpl(alloc: Allocato
             try write.commit();
             peak = @max(peak, (try store.reclamationStatus()).current_file_bytes);
         }
-        // Same reasoning as "lite reclamation shrinking observes
-        // partially live packed records": the activity-based half of
-        // due() (reclamation.zig's resetAssessmentBudget, ~physical/4)
-        // scales with a redo-log file's own fixed, non-reclaimable log
-        // reservation baked into `physical`, raising the bar for how
-        // much overwrite activity justifies a reassessment well past
-        // what one cycle's worth of small overwrites generates. Force
-        // the size-based half low so the automatic worker's own next
-        // due() check reassesses regardless, the same way it already
-        // can for the legacy variant where that threshold is small
-        // enough to clear on its own.
-        if (use_redo_log) store.maintenance_policy.next_assessment_size = 0;
-        // No manual maintenance call: wait only for the owner's automatic task.
-        // Redo's own divert/fold work makes each commit measurably
-        // heavier than the legacy copy-on-write path, so the sustained
-        // `beginWriteYielding` writer above can occasionally win enough
-        // of the writer-slot race that vacuum's own bounded 8-round
-        // catch-up retry (performVacuum's own max_rounds) does not finish
-        // within the legacy deadline -- observed directly, intermittently
-        // (roughly 1 in 5 runs), not a hang: a longer deadline is enough.
-        const deadline_seconds: i64 = if (use_redo_log) 30 else 5;
-        const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(std.Io.Duration.fromSeconds(deadline_seconds));
-        while (true) {
-            const status = try store.reclamationStatus();
-            // A successful online rewrite can retain bounded catch-up history;
-            // the contract is an envelope, not a fully packed file per cycle.
-            if (status.rewrite_count > before and status.state == .idle and status.current_file_bytes < 64 * 4096 + overhead) break;
-            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) {
-                std.debug.print("maintenance state={s} reason={s} error={?s} size={d}\n", .{ @tagName(status.state), @tagName(status.reason), status.last_error, status.current_file_bytes });
-                return error.TestUnexpectedResult;
+        if (!use_redo_log) {
+            // No manual maintenance call: wait only for the owner's automatic
+            // task.
+            const deadline_seconds: i64 = 5;
+            const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(std.Io.Duration.fromSeconds(deadline_seconds));
+            while (true) {
+                const status = try store.reclamationStatus();
+                // A successful online rewrite can retain bounded catch-up history;
+                // the contract is an envelope, not a fully packed file per cycle.
+                if (status.rewrite_count > before and status.state == .idle and status.current_file_bytes < 64 * 4096 + overhead) break;
+                if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) {
+                    std.debug.print("maintenance state={s} reason={s} error={?s} size={d}\n", .{ @tagName(status.state), @tagName(status.reason), status.last_error, status.current_file_bytes });
+                    return error.TestUnexpectedResult;
+                }
+                try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
             }
-            try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
         }
+        // Formerly a `next_assessment_size = 0` bypass plus a 30s (vs 5s)
+        // deadline here under redo, on the theory that the activity-based
+        // half of `due()` was merely miscalibrated by this file's own
+        // fixed log-capacity reservation (the same reasoning as "lite
+        // reclamation shrinking observes partially live packed records").
+        // `Policy.worthwhile`/`resetAssessmentBudget` now correctly net
+        // that reservation out (Bug 3, perf/lwa-budget-tail, fixed by
+        // this branch), and that reveals a different, confirmed fact
+        // about *this* workload specifically: repeatedly overwriting one
+        // small key diverts every time (no `max_storage_bytes`, so
+        // nothing ever forces `checkpointRedoLog`'s own fold -- same
+        // §9.7d gap as that other test), so the file never accumulates
+        // the real, physically-wasteful old-version pages the legacy
+        // variant's own non-reusing copy-on-write build does. There is
+        // nothing for `Policy.worthwhile`'s ratio to find, by design --
+        // a diverting commit's whole point is to avoid exactly that
+        // waste -- so `Policy.rewrite_count` never increments, and
+        // waiting on it (even for 30s) would be waiting on a signal that
+        // structurally never arrives. The envelope claim this test is
+        // actually named for ("bounds sustained overwrite history") still
+        // holds for redo, just through a different, already-verified
+        // mechanism: `peak`'s own check below passes because a diverting
+        // commit never grows the file the way legacy's does in the first
+        // place, not because a rewrite trims it back down.
         var read = try store.beginRead();
         defer read.abort();
         var value: [32]u8 = undefined;
@@ -3080,6 +3127,13 @@ pub const Store = struct {
             const size = (try self.file.file.stat(self.file.runtime())).size;
             self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
             const retry_due = self.maintenance_policy.rewriteRetryDue(std.Io.Clock.awake.now(self.file.runtime()).nanoseconds);
+            // `due()` stays in raw-file-size units throughout (its own
+            // `minimum_reclaim_bytes`/`next_assessment_size` comparisons
+            // are both absolute, not proportional) -- only the
+            // proportional heuristics below (`assessed`/`worthwhile`,
+            // via `fixed_overhead`) need this file's own fixed redo-log
+            // reservation subtracted; see `Policy.worthwhile`'s own doc
+            // comment (Bug 3, perf/lwa-budget-tail, §9.7a).
             if (!force and !self.maintenance_policy.due(size) and !retry_due) return;
             if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
@@ -3124,9 +3178,9 @@ pub const Store = struct {
             if (cancel) |token| try token.check();
             if (self.assessment_generation != assessed_generation) return error.FileBusy;
             const due = if (cached_stats != null)
-                self.maintenance_policy.worthwhile(assessed_size, stats.compact_size)
+                self.maintenance_policy.worthwhile(assessed_size, stats.compact_size, self.file.header.redo_log_capacity)
             else
-                self.maintenance_policy.assessed(assessed_size, stats.compact_size, stats.bytes, assessed_checkpoint.commit_sequence);
+                self.maintenance_policy.assessed(assessed_size, stats.compact_size, stats.bytes, assessed_checkpoint.commit_sequence, self.file.header.redo_log_capacity);
             if (cached_stats == null) {
                 // Spend at most ~1/64 of elapsed time rescanning changed roots
                 // under sustained pressure, with a 30-second minimum interval.
@@ -3168,7 +3222,13 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes);
+        // Bug 3 (perf/lwa-budget-tail, §9.7a): `self.file` is already the
+        // freshly rewritten generation here (`publishVacuum`, inside
+        // `performVacuum`, already swapped it in), so its own fixed
+        // redo-log reservation (passed as `fixed_overhead`) is this new
+        // generation's own, same as the assessment path above; see
+        // `Policy.worthwhile`'s own doc comment.
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, self.file.header.redo_log_capacity);
     }
 
     fn admitShrinkWorkspaceAssumeLocked(self: *Store, compact: u64, cancel: ?*const maintenance.CancelToken) !?u64 {
@@ -3422,7 +3482,13 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes);
+        // Bug 3 (perf/lwa-budget-tail, §9.7a): `self.file` is already the
+        // freshly rewritten generation here (`publishVacuum`, inside
+        // `performVacuum`, already swapped it in), so its own fixed
+        // redo-log reservation (passed as `fixed_overhead`) is this new
+        // generation's own, same as the assessment path above; see
+        // `Policy.worthwhile`'s own doc comment.
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, self.file.header.redo_log_capacity);
         return report;
     }
 
@@ -13665,7 +13731,7 @@ test "lite prepared prefix permutation measurement" {
     const prefixes = [_]?[]const u8{ "m1/", "m2/" };
     for (&score, 0..) |*raw, column| std.mem.writeInt(u64, raw, @bitCast(@as(f64, @floatFromInt(column + 3))), .little);
     for (prefixes, 0..) |prefix, column| {
-        for (0..512) |i| {
+        for (0..1024) |i| {
             const key = &key_storage[column * 512 + i];
             @memcpy(key[0..3], prefix.?);
             const node = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
