@@ -20,6 +20,10 @@ pub const Config = struct {
     /// Execution preference enabled by the measured GLiNER decision path.
     /// Checkpoint parsing leaves other ModernBERT callers unchanged.
     metal_f16_weight_mirrors: bool = false,
+    /// GLiDE execution preferences, set only by architectures/glide_encoder.zig.
+    /// Every other ModernBERT caller leaves them off, so its routes and
+    /// numerics are unchanged.
+    glide: GlideExecution = .{},
     laya: ?@import("../models/laya.zig").Config = null,
     vocab_size: u32 = 50368,
     hidden_size: u32 = 768,
@@ -56,6 +60,20 @@ pub const Config = struct {
     /// projections. HuggingFace ModernBERT checkpoints instead have a single
     /// bias-free Wqkv tensor and bias-free norms/output projection.
     checkpoint_layout: CheckpointLayout = .separate_qkv_with_bias,
+};
+
+pub const GlideExecution = struct {
+    /// Row-segment attention through the F16-staged per-row flash kernel.
+    f16_row_attention: bool = false,
+    /// BF16 checkpoint linears prepared as F16 slots on the TensorOps route.
+    f16_linears: bool = false,
+    /// Under an execution control, the encoder normally submits its Metal
+    /// frame every two layers so cancellation is observed mid-forward. Each
+    /// submit/wait costs ~0.5 ms and lets the GPU downclock between frames,
+    /// which dominates short forwards. Forwards with fewer padded tokens than
+    /// this run as one frame (control is still checked before and after).
+    /// 0 keeps the two-layer cadence for every forward.
+    single_frame_below_tokens: u32 = 0,
 };
 
 pub const CheckpointLayout = enum {

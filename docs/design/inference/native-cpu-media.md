@@ -66,6 +66,70 @@ source/metadata/output quota from rejecting legal vision or decoder workspace,
 and avoids charging the execution lease again through the document allocator.
 Output-copy allocation failures roll back every completed result item.
 
+Encoded-reader preparation has its own process-admitted allocation owner,
+including manifest and tokenizer metadata, independent of document quotas.
+Session-backed readers borrow an execution view using the execution heap; their
+loaded metadata and teardown remain with the original reader. Multi-stage
+execution applies that allocator to nested recognizers as well. Moondream has
+no managed session execution lease, so its actual allocations remain admitted
+throughout reading, and a separate weight lease covers its mapped checkpoint
+until model teardown. Generative readers use the resident model's bound manifest
+rather than reopening and rescanning tokenizer metadata before generation.
+Warm direct generation also clones the publication-checked cached manifest;
+cold requests use admitted manifest discovery. LightOn cohort and continuous
+workers each admit prompt planning before the execution lease, returning that
+temporary credit before decoder allocation. Moondream's configuration probe
+propagates allocation errors instead of misclassifying contention as unsupported
+model artifacts.
+
+Image preparation admission does not depend on a GPU execution lane. Ordinary
+vision readers share the bounded codec/resampling path, with separate ownership
+for the final pixel tensor and codec scratch. Flattened-patch readers admit
+source decoding and patch preparation. Multi-stage decoding, regional crops,
+detection/layout resizing and CTC preprocessing use the existing allocation-based
+preparation scope, retaining only live pixels when execution starts. Each phase
+returns unused capacity before acquiring model execution resources.
+
+Codec scratch is allocated lazily: solid-color, nearest and bilinear paths
+reserve no slab when they need no scratch. Sizing forecasts are advisory; denied
+headroom falls back to actual allocation demand. Capacity is reused across batch
+waves, with growth bounded by the aggregate physical cap. Speculative admission
+failures are discarded after a successful fallback. Scratch admission refusals
+also narrow a concurrent batch after every worker joins. Each retry measures its
+own demand; a rejected wider wave cannot poison a serial retry. Backing-allocation
+OOM stays terminal. Admission failure precedes the backing allocation and retains its policy/pressure identity.
+
+Prepared model inputs borrow the allocation owner's proven payload range and
+stack-owned shape for the synchronous invocation. They do not clone pixels,
+patches, masks or stage inputs onto an unadmitted execution heap. Storage-domain
+provenance supplies the existing session input-residency credit; execution owns
+only the remaining model workspace and output lease. Output admission retires
+execution peaks after a forward, independently of the preparation lifetime.
+
+Synchronous child preparation scopes include live ancestors in feasibility
+without charging their leases again. Source decoding, regional crops, resized
+pixels and codec slab growth therefore cannot hide an intrinsically oversized
+request behind several individually valid leases. Slab growth includes both
+prior slab capacity and prepared pixels. A stable aggregate policy failure stays
+permanent; reservations held by an unrelated request remain retryable contention.
+Node-owned metadata and prompt-planning allocation growth follows the same rule:
+its retained capacity participates in feasibility, while only the delta is charged.
+
+Multi-stage post-processing borrows the live detector heatmap plane. Masks,
+connected-component maps, layout/order scratch, and accumulated region metadata
+use an admitted document scope. Model output leases participate in feasibility
+without becoming free allocator credit; shared output owners are counted once.
+Resized inputs retire before post-processing, scratch slack retires at stage
+boundaries, and only compact results are copied to the caller's output allocator.
+
+Boolean broker cancellation callbacks retain their first typed checkpoint
+failure atomically until the synchronous caller joins. The retained checkpoint
+control propagates through nested LightOn vision, prefill and page brokers as
+well as direct encoded-reader dispatch; boolean adapters cannot bypass capture.
+The encoded-reader boundary restores that error instead of reporting generic cancellation for an
+expired deadline or a one-shot checkpoint failure. Successful completion also
+checks this retained failure before copying results to the caller.
+
 CPU automatic scratch is a fraction of the safe process pool. Explicit caps,
 total host/combined budgets and live memory pressure still apply. Preflight
 failures record requested scratch, limiting policy and current reservations using
@@ -270,6 +334,45 @@ core-fix snapshot, rather than the executable above. It returned the correct
 18.320 s of prefill and 33.850 s of decode, with 65 tokens observed before the
 deadline. This validates the failure diagnostics but is not complete-page
 qualification. Dense-page CPU fallback remains unqualified.
+
+## Encoded-reader ownership and concurrency
+
+Loader metadata, decoded images and retained preprocessing allocations form one
+request ancestry for admission feasibility. Their bytes remain charged exactly
+once; carrying ancestry into each model forward distinguishes an intrinsically
+oversized request from contention with other requests. Different admission
+domains never lend capacity to each other.
+
+CTC forwards retain an opaque execution reservation until resident outputs and
+backend buffers are destroyed. Post-processing has a separate admitted owner:
+resident logits may belong to an imported backend's persistent allocator, so
+forward capacity is never loaned to text decoding. Additional host allocations
+include the full live host/device execution residency in feasibility. Exported
+logits borrow their tensor view instead of making another copy.
+
+Completed multistage OCR transfers its allocation owner and text to the reader.
+The reader builds its final region array once, retaining text and label pointers.
+Result cleanup releases storage and leases together, independently of model
+lifetime. The final wrapper severs synchronous loader ancestry after conversion
+and UTF-8 sanitation; subsequent result allocations use a frozen host policy.
+
+Ordinary encoder/decoder readers admit decoder masks, token buffers, and output
+text, borrowing prepared tensors instead of cloning them every token. Result
+parsing transfers the output owner and retains typed allocation failures.
+Prompt planning includes pinned model residency, and Moondream's mapped-weight
+lease participates in preparation feasibility until reader teardown. Ordering
+fallback applies only to explicit unsupported-operation errors; arbitrary
+checkpoint failures propagate through direct pipeline APIs too.
+
+Allocation owners enforce a single reservation domain and cache their retained
+host total. Regional result transfers and ancestor queries do not repeatedly
+walk all earlier leases; trimming stops after available slack is exhausted.
+
+Preprocessing remembers a geometry-weighted concurrency ceiling after a failed
+wave. Equal-size pages retain the proven width instead of repeatedly doubling
+and replaying work. Smaller pages can recover parallelism within the learned
+capacity. This is a request-local scheduling hint: actual allocation admission
+remains authoritative and cancellation is checked between attempts.
 
 ## Adoption
 

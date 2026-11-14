@@ -108,6 +108,16 @@ const ComponentConstruction = struct {
         }
         if (man.nativeCompanionPath()) |path| try self.artifacts().verifyPath(path);
         if (adapter) |selected| try self.artifacts().verifyPath(selected.weights);
+        // GLiDE heads read their readout and decision config beside
+        // config.json during construction; authenticate them like weights.
+        if (man.glide_declared) if (man.config_path) |config| if (std.fs.path.dirname(config)) |root| {
+            const glide_mod = @import("../models/glide.zig");
+            for ([_][]const u8{ glide_mod.readout_file, glide_mod.decision_config_file }) |name| {
+                const path = try std.fs.path.join(self.artifacts().allocator, &.{ root, name });
+                defer self.artifacts().allocator.free(path);
+                try self.artifacts().verifyPath(path);
+            }
+        };
     }
     fn finish(self: *ComponentConstruction) !void {
         try self.artifacts().verify();
@@ -5958,14 +5968,31 @@ pub const ModelManager = struct {
     pub fn admitHostPreflight(self: *ModelManager, bytes: usize) !runtime.tier.memory.AdmissionLease {
         return self.admitHostPreflightChecked(bytes, true);
     }
+    pub fn admitHostPreflightOwned(self: *ModelManager, bytes: usize, owned_bytes: usize) !runtime.tier.memory.AdmissionLease {
+        return self.admitHostPreflightOwnedWithResidency(bytes, owned_bytes, .{});
+    }
+
+    pub fn admitHostPreflightOwnedWithResidency(self: *ModelManager, bytes: usize, owned_bytes: usize, required: runtime.tier.memory.Residency) !runtime.tier.memory.AdmissionLease {
+        return self.admitHostPreflightOwnedChecked(bytes, owned_bytes, required, true);
+    }
+
     fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
+        return self.admitHostPreflightOwnedChecked(bytes, 0, .{}, check_live_memory);
+    }
+
+    fn admitHostPreflightOwnedChecked(self: *ModelManager, bytes: usize, owned_bytes: usize, required: runtime.tier.memory.Residency, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const domain = self.resource_domain.?;
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
-        const request = runtime.tier.memory.AdmissionRequest{ .backend_class = .cpu, .limits = domain.admission_limits, .amounts = .{ .host_scratch_bytes = bytes } };
-        return domain.admission.tryAcquireWithPressure(.cpu, request.limits, request.amounts, check_live_memory, &pressure) catch |err| {
+        const request = runtime.tier.memory.AdmissionRequest{
+            .backend_class = .cpu,
+            .limits = domain.admission_limits,
+            .amounts = .{ .host_scratch_bytes = bytes },
+            .required_residency = try required.merge(.fromAmounts(.cpu, .{ .host_scratch_bytes = owned_bytes })),
+        };
+        return domain.admission.tryAcquireRequestsWithPressure(&.{request}, check_live_memory, &pressure) catch |err| {
             if (err == error.ResourceTemporarilyUnavailable and self.reclaimHostCache(bytes) != 0) {
-                return domain.admission.tryAcquireWithPressure(.cpu, request.limits, request.amounts, check_live_memory, &pressure) catch |retry_err| {
+                return domain.admission.tryAcquireRequestsWithPressure(&.{request}, check_live_memory, &pressure) catch |retry_err| {
                     self.logRunAdmissionDenied(retry_err, pressure, &.{request});
                     return retry_err;
                 };
@@ -6884,6 +6911,21 @@ pub const ModelManager = struct {
     fn physicalRunLimits(self: *const ModelManager, backend_class: runtime.tier.memory.BackendClass, limits: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
         if (backend_class != .gpu) return limits;
         return backends.clampPhysicalMemoryLimits(.cuda, limits, self.process_memory_limit_bytes);
+    }
+
+    /// A session run denied for capacity does not evict idle models the way a
+    /// load admission does. A model can load into a domain with only a few
+    /// bytes to spare and then have its every run denied while an idle model
+    /// stays resident. Reclaim one idle (handle-free, unpinned) model or cache
+    /// for a caller about to retry its run; false when nothing is reclaimable.
+    pub fn reclaimIdleForRun(self: *ModelManager, backend: backends.BackendType) bool {
+        spinLock(&self.eviction_lock);
+        defer self.eviction_lock.unlock();
+        const pressure: runtime.tier.memory.AdmissionPressure = if (backend == .native)
+            .{ .domain_host = .cpu }
+        else
+            .{ .domain_backend = .gpu };
+        return self.reclaimOneForAdmission(pressure);
     }
 
     fn acquireAmountsWithEviction(
@@ -7973,10 +8015,36 @@ pub const ModelManager = struct {
     }
 
     pub fn copyCachedEmbeddingGemma2ManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        return self.copyCachedManifestWhere(allocator, model_dir, control, struct {
+            fn matches(man: *const manifest_mod.ModelManifest) bool {
+                return man.embedding_style == .embedding_gemma2;
+            }
+        }.matches);
+    }
+
+    /// Warm GLiDE decisions reuse the loaded generation's manifest instead of
+    /// re-reading the checkpoint sidecars on every request. Execution pins and
+    /// verifies its own generation independently.
+    pub fn copyCachedGlideManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        return self.copyCachedManifestWhere(allocator, model_dir, control, struct {
+            fn matches(man: *const manifest_mod.ModelManifest) bool {
+                return man.glide_declared;
+            }
+        }.matches);
+    }
+
+    /// Clone a warm model's manifest under a short cache pin when it matches.
+    fn copyCachedManifestWhere(
+        self: *ModelManager,
+        allocator: std.mem.Allocator,
+        model_dir: []const u8,
+        control: InferenceExecutionControl,
+        comptime matches: fn (*const manifest_mod.ModelManifest) bool,
+    ) !?manifest_mod.ModelManifest {
         var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
         defer handle.release();
         const model = handle.get();
-        if (model.manifest.embedding_style != .embedding_gemma2) return null;
+        if (!matches(&model.manifest)) return null;
         return try model.manifest.clone(allocator);
     }
 
@@ -7988,11 +8056,11 @@ pub const ModelManager = struct {
     }
 
     pub fn copyCachedGenerationManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
-        var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
-        defer handle.release();
-        const model = handle.get();
-        if (model.manifest.model_type != .generator) return null;
-        return try model.manifest.clone(allocator);
+        return self.copyCachedManifestWhere(allocator, model_dir, control, struct {
+            fn matches(man: *const manifest_mod.ModelManifest) bool {
+                return man.model_type == .generator;
+            }
+        }.matches);
     }
 
     /// Pin one handle for every currently published model. Callers may release
@@ -10080,9 +10148,10 @@ pub const ModelManager = struct {
         // Embedding checkpoints can ship their decoder backbone's chat
         // template, but embedding execution never uses it. Qwen rerankers use
         // their explicit scoring templates instead of this general chat path.
+        // GLiDE decision prompts use a fixed wrapper (pipelines/glide_prompt.zig).
         var chat_template_failed = false;
         const needs_chat_template = man.model_type != .embedder and
-            !man.isQwen3TextReranker() and !man.isQwen3VlReranker();
+            !man.isQwen3TextReranker() and !man.isQwen3VlReranker() and !man.glide_declared;
         const chat_template_source: ?[]const u8 = if (man.isLightOnOcr3())
             lightonocr3_reader.chat_template
         else
@@ -11885,6 +11954,9 @@ fn estimateBaseModelLoadAdmission(
         if (try session_factory.glinerBoundaryResidentLoadAmounts(man, weights)) |resident| {
             return .{ .peak = resident.peak, .resident = resident.resident };
         }
+        if (try session_factory.glideDecoderResidentLoadAmounts(man, weights)) |resident| {
+            return .{ .peak = resident.peak, .resident = resident.resident };
+        }
     }
     if (backend_runtime.backend == .metal or backend_runtime.backend == .cuda) {
         const config = if (backend_runtime.backend == .cuda)
@@ -12370,13 +12442,15 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
     // MissingRequiredWeights, and callers were being told the file did not exist.
     var first_err: ?anyerror = null;
     var laya_resident_attempted = false;
-    const laya_packed = man.hasCapability("typed_decisions") and session_factory.isPackedLayaModel(manager.allocator, construction_root);
+    // GLiDE checkpoints also grant typed_decisions; only Laya has resident kernels.
+    const laya_candidate = man.hasCapability("typed_decisions") and !man.glide_declared;
+    const laya_packed = laya_candidate and session_factory.isPackedLayaModel(manager.allocator, construction_root);
     for (effective_backends) |backend| {
         if (source_session_manager.gliner_cuda_precision != null and backend != .cuda) continue;
         // Once opted-in Metal residency is attempted, preserve its actionable
         // admission/load error rather than silently publishing a CPU session.
         if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
-        if (backend == .metal and man.hasCapability("typed_decisions") and !laya_packed and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
+        if (backend == .metal and laya_candidate and !laya_packed and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
         if (control) |active| try active.check();
         if (modelBackendIsUnhealthy(manager, model_dir, backend)) {
             rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
@@ -12394,6 +12468,12 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
             backend != .metal and backend != .cuda)
         {
             rememberPreferredLoadError(&first_err, error.A4bRequiresGpu);
+            continue;
+        }
+        // GLiDE decoders require Metal or CUDA. Skip CPU backends before artifact
+        // verification and load admission reserve their weights.
+        if (man.glide_declared and man.glide_backbone == .decoder and backend != .metal and backend != .cuda) {
+            rememberPreferredLoadError(&first_err, error.GlideDecoderRequiresGpu);
             continue;
         }
         if (source_session_manager.kernel_jit.mode.failClosed() and

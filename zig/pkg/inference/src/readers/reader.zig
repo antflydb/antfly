@@ -125,10 +125,7 @@ const VisionLoadedReader = struct {
         var raw = try self.core.readRaw(image_data, forwarded);
         defer raw.deinit();
 
-        var parsed = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
-        parsed.completion = raw.completion;
-        parsed.completion_tokens = raw.completion_tokens;
-        return parsed;
+        return self.parseRaw(&raw, normalized_prompt);
     }
 
     pub fn readBatch(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
@@ -158,6 +155,21 @@ const VisionLoadedReader = struct {
         return self.parseRawBatch(raw_batch, normalized_prompt);
     }
 
+    fn parseRaw(self: *VisionLoadedReader, raw: *@import("../pipelines/reading.zig").ReadResult, normalized_prompt: ?[]const u8) !Result {
+        const allocator = if (raw.storage != null) raw.allocator else self.allocator;
+        var parsed = parseOutput(allocator, self.parser_kind, raw.text, normalized_prompt) catch |err| return if (raw.storage) |storage| storage.scope.failure(err) else err;
+        parsed.completion = raw.completion;
+        parsed.completion_tokens = raw.completion_tokens;
+        if (raw.storage) |storage| {
+            const Owned = @import("../pipelines/preprocessing_memory.zig").Owned;
+            allocator.free(raw.text);
+            raw.text = &.{};
+            raw.storage = null;
+            parsed.lifetime = .{ .context = storage, .release = Owned.release, .detach_preparation = Owned.detachPreparation };
+        }
+        return parsed;
+    }
+
     fn parseRawBatch(
         self: *VisionLoadedReader,
         raw_batch: @import("../pipelines/reading.zig").ReadBatchResult,
@@ -179,10 +191,8 @@ const VisionLoadedReader = struct {
             self.allocator.free(out);
         }
 
-        for (raw_results, 0..) |raw, i| {
-            out[i] = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
-            out[i].completion = raw.completion;
-            out[i].completion_tokens = raw.completion_tokens;
+        for (raw_results, 0..) |*raw, i| {
+            out[i] = try self.parseRaw(raw, normalized_prompt);
             filled += 1;
         }
         return .{
@@ -230,16 +240,33 @@ const native_moondream = struct {
         model_manager: *model_manager_mod.ModelManager,
         control: ?InferenceExecutionControl,
     ) !LoadedReader {
-        _ = model_manager;
         if (control) |active| try active.check();
         if (!try probe(allocator, model_path)) return error.UnsupportedMoondreamArtifacts;
-        return .{ .moondream = try NativeMoondreamLoadedReader.loadFromDirWithControl(allocator, model_path, control, session_manager.io) };
+        const io = if (control) |active| active.io orelse session_manager.io orelse std.Options.debug_io else session_manager.io orelse std.Options.debug_io;
+        var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, io, model_path, if (control) |active| if (active.model_selection) |selected| .{ .publication = selected.publication } else null else null);
+        defer artifacts.deinit();
+        const weights_path = (try artifacts.resolve(@import("../pipelines/moondream.zig").weights_file)) orelse return error.NoDenseWeightSource;
+        defer allocator.free(weights_path);
+        const file = try std.Io.Dir.openFileAbsolute(io, weights_path, .{});
+        defer file.close(io);
+        const weight_bytes = std.math.cast(usize, try file.length(io)) orelse return error.ResourceLimitExceeded;
+        var lease = try model_manager.admitHostWeights(weight_bytes);
+        errdefer lease.release();
+        const owner = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator);
+        var binding = if (owner) |o| if (lease.controller) |controller| try o.requireResidency(controller, .fromLease(lease)) else null else null;
+        errdefer if (binding) |*held| held.deinit();
+        var reader = try NativeMoondreamLoadedReader.loadFromDirWithControl(allocator, model_path, control, io);
+        reader.preparation_residency = binding;
+        reader.weight_lease = lease;
+        return .{ .moondream = reader };
     }
 };
 
 const NativeMoondreamLoadedReader = struct {
     allocator: std.mem.Allocator,
     core: moondream_reader_mod.LoadedMoondreamReader,
+    weight_lease: ?@import("../runtime/tier/memory.zig").AdmissionLease = null,
+    preparation_residency: ?@import("../backends/admitted_allocator.zig").AdmittedAllocator.ResidencyBinding = null,
 
     pub fn loadFromDirWithControl(
         allocator: std.mem.Allocator,
@@ -255,6 +282,8 @@ const NativeMoondreamLoadedReader = struct {
 
     pub fn deinit(self: *NativeMoondreamLoadedReader) void {
         self.core.deinit();
+        if (self.preparation_residency) |*binding| binding.deinit();
+        if (self.weight_lease) |*lease| lease.release();
     }
 
     pub fn read(self: *NativeMoondreamLoadedReader, image_data: []const u8, options: ReadOptions) !Result {
@@ -430,6 +459,7 @@ pub const LoadedReader = union(enum) {
         };
         errdefer result.deinit();
         try sanitizeResultUtf8(&result);
+        result.detachPreparation();
         return result;
     }
 
@@ -459,7 +489,41 @@ pub const LoadedReader = union(enum) {
         }
         for (batch.results) |*result| try sanitizeResultUtf8(result);
         if (options.execution_control) |control| try control.check();
+        for (batch.results) |*result| result.detachPreparation();
         return batch;
+    }
+
+    /// Metadata belongs to the loaded reader's allocator. Session-backed work
+    /// has its own admission lease and uses a reclaiming execution allocator.
+    /// Moondream has no session lease, so its allocation owner remains active.
+    pub const WorkspaceBatch = struct {
+        batch: BatchResult,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *@This()) void {
+            for (self.batch.results) |*result| result.deinit();
+            self.allocator.free(self.batch.results);
+        }
+    };
+
+    pub fn readBatchInWorkspace(self: *LoadedReader, work: std.mem.Allocator, image_datas: []const []const u8, options: ReadOptions, preparation: ?*const @import("../backends/admitted_allocator.zig").AdmittedAllocator) !WorkspaceBatch {
+        // A borrowed execution view must never be deinitialized as a model:
+        // model/tokenizer/dictionary ownership remains with the original reader.
+        var execution = self.*;
+        switch (execution) {
+            .vision => |*reader| {
+                reader.allocator = work;
+                reader.core.allocator = work;
+                reader.core.preparation_owner = preparation;
+            },
+            .multistage => |*reader| {
+                reader.allocator = work;
+                reader.pipeline = reader.pipeline.executionView(work);
+                reader.pipeline.preparation_owner = preparation;
+            },
+            .moondream => {},
+        }
+        return .{ .batch = try execution.readBatchReported(image_datas, options), .allocator = execution.resultAllocator() };
     }
 
     pub fn readBorrowedRasterBatchReported(
@@ -478,7 +542,10 @@ pub const LoadedReader = union(enum) {
             allocator.free(batch.results);
         }
         if (batch.results.len != rasters.len) return error.InvalidReadResultCount;
-        for (batch.results) |*result| try sanitizeResultUtf8(result);
+        for (batch.results) |*result| {
+            try sanitizeResultUtf8(result);
+            result.detachPreparation();
+        }
         return batch;
     }
 
@@ -713,7 +780,11 @@ fn sanitizeUtf8Alloc(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
 }
 
 fn sanitizeOwnedUtf8(allocator: std.mem.Allocator, value: *[]const u8) !void {
-    if (try sanitizeUtf8Alloc(allocator, value.*)) |sanitized| {
+    const replacement = sanitizeUtf8Alloc(allocator, value.*) catch |err| {
+        const owner = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator);
+        return if (err == error.OutOfMemory and owner != null) owner.?.admission_error orelse err else err;
+    };
+    if (replacement) |sanitized| {
         allocator.free(value.*);
         value.* = sanitized;
     }
@@ -1275,4 +1346,112 @@ test "OCR reader families retain decoder budgets and manual overrides" {
     var multistage: LoadedReader = .{ .multistage = undefined };
     try std.testing.expectEqual(@as(?usize, null), try multistage.resolveMaxTokens(null, 4096));
     try std.testing.expectEqual(@as(?usize, 128), try multistage.resolveMaxTokens(128, 64));
+}
+
+test "reader execution workspace leaves metadata ownership and session teardown with loader" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        closes: usize = 0,
+        calls: usize = 0,
+        fn run(raw: *anyopaque, _: []const backends.Tensor, alloc: std.mem.Allocator) ![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.alloc(backends.Tensor, 0);
+        }
+        fn controlled(raw: *anyopaque, inputs: []const backends.Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(raw, inputs, alloc);
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+    };
+    var fake = Fake{};
+    var metadata = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var reader = LoadedReader{ .multistage = .{
+        .allocator = metadata.allocator(),
+        .pipeline = .{
+            .allocator = metadata.allocator(),
+            .detector = .{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .runWithControl = Fake.controlled, .inputInfo = Fake.info, .outputInfo = Fake.info, .backend = Fake.backend, .close = Fake.close } },
+            .detection_preprocess = .{ .width = 2, .height = 2 },
+            .post_processor = .{ .db = .{ .threshold = 0.3, .box_threshold = 0.5, .unclip_ratio = 1.5, .min_box_area = 1, .max_candidates = 10 } },
+        },
+    } };
+    var batch = try reader.readBatchInWorkspace(a, &.{@import("antfly_documents").fixtures.get("one-pixel.png")}, .{}, null);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.closes);
+    try std.testing.expectEqual(@as(usize, 1), batch.batch.results.len);
+    try std.testing.expectEqualStrings("", batch.batch.results[0].text);
+    reader.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fake.closes);
+    // Compact results have independent lifetime after loader teardown.
+    batch.deinit();
+}
+
+test "reader Moondream mapped weights are admitted before checkpoint construction" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"moondream1\"}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = "{}" });
+    const weights = try a.alloc(u8, 4096);
+    defer a.free(weights);
+    @memset(weights, 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = weights });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    var initial = try manager.admitHostPreflight(1);
+    initial.release();
+    manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 1024, .scratch_limit_bytes = 1024 };
+    // Invalid checkpoint bytes must never be parsed: the mapping itself cannot
+    // fit, even though these metadata allocations use an unrestricted test heap.
+    try std.testing.expectError(error.ResourceLimitExceeded, native_moondream.load(a, path, &manager.session_manager, &manager, .{ .io = std.testing.io }));
+    try std.testing.expectEqual(@as(usize, 0), manager.resource_domain.?.admission.snapshot().hostTotalBytes());
+}
+
+test "reader sanitation preserves admitted result policy failure" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    var owner = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = std.testing.allocator, .session = .{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1600, .scratch_limit_bytes = 1600 }, .static_workspace_bytes = 1, .check_live_memory = false } } };
+    defer owner.deinit();
+    const a = owner.allocator();
+    const text = try a.alloc(u8, 1024);
+    @memset(text, 0xff);
+    var result = Result{ .text = text, .allocator = a };
+    defer result.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, sanitizeResultUtf8(&result));
+    try std.testing.expect(result.text.ptr == text.ptr);
+}
+
+fn checkVisionOwnedParsing(a: std.mem.Allocator) !void {
+    const Preparation = @import("../pipelines/preprocessing_memory.zig");
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024, .scratch_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+    const storage = try Preparation.Owned.create(a, session, null, null);
+    var raw = @import("../pipelines/reading.zig").ReadResult{ .allocator = try storage.scope.allocator(), .text = &.{}, .storage = storage };
+    defer raw.deinit();
+    raw.text = try raw.allocator.dupe(u8, "hello");
+    try storage.publish();
+    var reader = VisionLoadedReader{ .allocator = a, .parser_kind = .pix2struct, .core = undefined };
+    var result = try reader.parseRaw(&raw, null);
+    defer result.deinit();
+    result.detachPreparation();
+    try std.testing.expect(raw.storage == null);
+    try std.testing.expect(result.lifetime != null);
+    try std.testing.expectEqualStrings("hello", result.text);
+}
+
+test "reader vision parsing transfers admitted output storage and unwinds all failures" {
+    try checkVisionOwnedParsing(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkVisionOwnedParsing, .{});
 }

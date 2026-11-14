@@ -373,39 +373,29 @@ pub const LoadedMultiStageReader = struct {
     }
 
     pub fn read(self: *LoadedMultiStageReader, image_data: []const u8, options: reader_types.ReadOptions) !reader_types.Result {
-        var ocr_result = try self.pipeline.runWithControl(image_data, options.execution_control);
-        defer ocr_result.deinit();
+        return takeResult(try self.pipeline.runWithControl(image_data, options.execution_control));
+    }
 
-        const text = try self.allocator.dupe(u8, ocr_result.full_text);
-        errdefer self.allocator.free(text);
-
-        var regions = std.ArrayListUnmanaged(reader_types.Region).empty;
-        errdefer {
-            for (regions.items) |*region| region.deinit(self.allocator);
-            regions.deinit(self.allocator);
-        }
-
-        for (ocr_result.regions) |region| {
-            const region_text = try self.allocator.dupe(u8, region.text);
-            errdefer self.allocator.free(region_text);
-            const label = if (region.label) |value| try self.allocator.dupe(u8, value) else null;
-            errdefer if (label) |value| self.allocator.free(value);
-            try regions.append(self.allocator, .{
-                .text = region_text,
-                .bbox = region.bbox,
-                .confidence = @floatCast(if (region.rec_confidence != 0) region.rec_confidence else region.confidence),
-                .label = label,
-                // Detection post-processors scale these boxes back to the
-                // original decoded input raster before the Reader boundary.
-                .coordinate_space = .image_pixels_top_left,
-            });
-        }
-
-        return .{
-            .text = text,
-            .regions = try regions.toOwnedSlice(self.allocator),
-            .allocator = self.allocator,
+    fn takeResult(value: multistage_ocr.MultiStageOCRResult) !reader_types.Result {
+        var result = value;
+        var transferred = false;
+        defer if (!transferred) result.deinit();
+        const allocator = result.allocator;
+        const regions = allocator.alloc(reader_types.Region, result.regions.len) catch |err| return result.storage.?.scope.failure(err);
+        for (result.regions, regions) |region, *output| output.* = .{
+            .text = region.text,
+            .bbox = region.bbox,
+            .confidence = @floatCast(if (region.rec_confidence != 0) region.rec_confidence else region.confidence),
+            .label = region.label,
+            .coordinate_space = .image_pixels_top_left,
         };
+        allocator.free(result.regions);
+        for (result.layout) |*region| region.deinit(allocator);
+        allocator.free(result.layout);
+        const storage = result.storage.?;
+        try storage.scope.trim();
+        transferred = true;
+        return .{ .text = result.full_text, .regions = regions, .allocator = allocator, .lifetime = .{ .context = storage, .release = @import("../pipelines/preprocessing_memory.zig").Owned.release, .detach_preparation = @import("../pipelines/preprocessing_memory.zig").Owned.detachPreparation } };
     }
 };
 
@@ -903,4 +893,49 @@ test "detection stage keeps loaded preprocessor size while recognition still fol
     try std.testing.expectEqual(@as(u32, 640), recognition.width);
     try std.testing.expectEqual(@as(u32, 48), recognition.height);
     try std.testing.expect(recognition.dynamic_width);
+}
+
+fn checkOwnedResultTransfer(a: std.mem.Allocator) !void {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Preparation = @import("../pipelines/preprocessing_memory.zig");
+    var controller = memory.AdmissionController{};
+    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+    var model = try controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = 16 * 1024 }, false);
+    defer model.release();
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024, .scratch_limit_bytes = 64 * 1024 }, .required_residency = model.amounts, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var metadata = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = a, .session = session };
+    defer metadata.deinit();
+    _ = try metadata.allocator().alloc(u8, 4096);
+    try metadata.trim();
+    const owned = try Preparation.Owned.create(a, session, null, &metadata);
+    var handed = false;
+    errdefer if (!handed) Preparation.Owned.release(owned);
+    const work = try owned.scope.allocator();
+    const text = try work.dupe(u8, "hello world");
+    const regions = try work.alloc(multistage_ocr.RecognizedRegion, 1);
+    regions[0] = .{ .bbox = .{ 0, 0, 10, 10 }, .text = try work.dupe(u8, "hello"), .label = try work.dupe(u8, "Caption") };
+    const saved_region = regions[0].text.ptr;
+    try owned.publish();
+    handed = true;
+    var result = try LoadedMultiStageReader.takeResult(.{ .allocator = work, .full_text = text, .regions = regions, .storage = owned });
+    defer result.deinit();
+    try std.testing.expect(result.text.ptr == text.ptr);
+    try std.testing.expect(result.regions[0].text.ptr == saved_region);
+    try std.testing.expectEqualStrings("Caption", result.regions[0].label.?);
+    try std.testing.expect(controller.snapshot().hostTotalBytes() > 0);
+    // Before detachment, model residency is still intrinsic to conversion.
+    try std.testing.expectError(error.OutOfMemory, result.allocator.alloc(u8, 48 * 1024));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, owned.scope.failure(error.OutOfMemory));
+    result.detachPreparation();
+    try std.testing.expect(owned.scope.owner.parent == null);
+    metadata.deinit();
+    // The frozen result policy never consults the old reader's model vtable
+    // or the synchronous metadata owner after its storage has been released.
+    const scratch = try result.allocator.alloc(u8, 128);
+    result.allocator.free(scratch);
+}
+
+test "multistage reader transfers text without cloning and owns post-reader cleanup" {
+    try checkOwnedResultTransfer(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkOwnedResultTransfer, .{});
 }
