@@ -9228,6 +9228,22 @@ pub const NativeFile = struct {
         // Intermediate mutations may increment their private sequence many
         // times. The outer transaction publishes exactly one new generation.
         next.commit_sequence = original.checkpoints[original.active_checkpoint].commit_sequence + 1;
+        // perf/lwa-lease-fold: same stamp, same reason, as
+        // `commitTransactionWithDurability`'s own two sites (see
+        // `redo_folded_through`'s own doc comment) -- this function
+        // builds and fingerprints `next`/`published` itself, bypassing
+        // that shared commit path entirely, so it needs its own copy of
+        // the same rule or the certificate it seals here fingerprints a
+        // `redo_folded_through` one behind the value the *actual*
+        // publish (this function's own `self.commitTransaction()`
+        // caller, which does go through the shared path and applies the
+        // identical stamp there) ends up writing to the real on-disk
+        // slot -- `inheritAllocatorCertificate`'s byte-for-byte replay of
+        // this same fingerprint formula then disagrees with what is
+        // actually on disk on every subsequent open, for a reason that
+        // has nothing to do with the ownership the certificate exists to
+        // attest.
+        if (self.redo == null or self.redo.?.checkpointing) next.redo_folded_through = next.commit_sequence;
         const next_root = try self.writeCatalogRoot(&pages, record, try editor.finish(&pages), root_page);
         if (root == .index) next.index_catalog_root_page = next_root else next.catalog_root_page = next_root;
         next.free_map_root_page = try pages.allocate();
