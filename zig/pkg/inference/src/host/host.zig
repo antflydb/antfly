@@ -65,6 +65,14 @@ pub const LinkedInferenceState = struct {
     /// states leave this null and dispatch directly to `node`.
     read_encoded_images_override: ?ReadEncodedImagesHandler = null,
     read_raster_images_override: ?ReadRasterImagesHandler = null,
+    /// Observe the fully decoded request at its dispatch site. This field and
+    /// both probes disappear from production builds.
+    chunk_request_probe: if (@import("builtin").is_test) ?ChunkRequestProbe else void = if (@import("builtin").is_test) null else {},
+};
+
+const ChunkRequestProbe = struct {
+    context: *anyopaque,
+    inspect: *const fn (*anyopaque, inference.server.chunk_response.Request, chunking_types.Config) anyerror!void,
 };
 
 /// Stable, ref-counted copy of the standalone resource-owner capability. The
@@ -1648,6 +1656,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 defer if (cursor) |value| alloc.free(value);
                 var request = try nativeModelChunkRequest(state.node.config.chunking_limits, input, cfg, if (output_config) |value| value.value else null, target.execute orelse true);
                 request.continuation = cursor;
+                if (@import("builtin").is_test) if (state.chunk_request_probe) |probe| try probe.inspect(probe.context, request, cfg);
                 var page = try state.node.chunkModelPageDirect(alloc, state.io, execution_control, request, .{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null });
                 defer page.deinit(alloc);
                 if (cfg.replay) |position| if (!std.mem.eql(u8, position.plan_id, page.plan_id) or !std.mem.eql(u8, position.source_fingerprint, page.source_fingerprint) or !std.mem.eql(u8, position.source_version, page.source_version)) return error.StaleChunkContinuation;
@@ -1656,6 +1665,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             const result = if (selected_target) |target| aware: {
                 const wire = inference.server.chunk_response;
                 const model_request = try nativeModelChunkRequest(state.node.config.chunking_limits, input, cfg, if (output_config) |value| value.value else null, target.execute orelse true);
+                if (@import("builtin").is_test) if (state.chunk_request_probe) |probe| try probe.inspect(probe.context, model_request, cfg);
                 const model_target = wire.Target{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null };
                 if (cfg.replay) |replay| {
                     break :aware try state.node.replayModelChunkDirect(alloc, state.io, execution_control, model_request, model_target, replay.plan_id, replay.source_fingerprint, replay.ordinal);
@@ -4337,6 +4347,124 @@ test "linked embedding large image parity across public and grouped inputs" {
         }
         try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     }
+}
+
+test "native model chunk configured ceilings survive the real provider ABI" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var out: ?*anyopaque = null;
+    const handle = try linkedInferenceCreate(&.{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = root.ptr,
+        .data_dir_len = root.len,
+        .models_dir = .init(root),
+        .ml_dir = .init(root),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{}"),
+        .executor = .init(&io),
+        .out_handle = &out,
+    });
+    defer linkedInferenceDestroy(handle);
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    const Probe = struct {
+        state: *LinkedInferenceState,
+        calls: usize = 0,
+        fn inspect(raw: *anyopaque, request: inference.server.chunk_response.Request, cfg: chunking_types.Config) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqualDeep(self.state.node.config.chunking_limits, request.limits);
+            try std.testing.expectEqual(self.state.node.config.chunking_limits.max_working_bytes, request.max_working_bytes);
+            try std.testing.expectEqual(cfg.max_chunks, request.max_chunks);
+            try std.testing.expectEqual(cfg.page, request.allow_partial);
+            try std.testing.expectEqual(cfg.page and cfg.observe_only, request.observe_only);
+            try std.testing.expectEqual(cfg.embedding.?.execute.?, request.execute);
+            try std.testing.expectEqual(request.execute, request.execute_outputs);
+            try std.testing.expect(request.native_content and !request.include_content);
+            try std.testing.expectEqual(@as(i64, 8 * std.time.ns_per_s), request.policy.window_ns);
+            try std.testing.expectEqualStrings("file:///unused/fixture.mp4", request.input.source.uri);
+            try std.testing.expectEqualStrings("source-version", request.input.source.version);
+            try std.testing.expectEqualStrings(if (cfg.replay != null) "source-version" else "", request.source_version);
+            if (cfg.page and cfg.replay != null) {
+                try std.testing.expectEqualStrings("plan:7", request.continuation.?);
+            } else try std.testing.expect(request.continuation == null);
+            try std.testing.expectEqualStrings("embedding", request.outputs.?.boundary_model);
+            try std.testing.expectEqual(@as(usize, 2), request.outputs.?.targets.len);
+            for (request.outputs.?.targets) |target| try std.testing.expectEqual(request.execute, target.execute);
+            // Stop only at the model boundary. ABI decoding, named output
+            // merging, policy conversion and each real call site have run.
+            return error.ChunkRequestObserved;
+        }
+    };
+    var probe = Probe{ .state = state };
+    state.chunk_request_probe = .{ .context = &probe, .inspect = Probe.inspect };
+    for ([_]usize{ 128, 512, 1024 }) |mib| {
+        state.node.config.chunking_limits.max_working_bytes = mib * 1024 * 1024;
+        state.node.config.chunking_limits.max_chunks = 8192;
+        state.node.config.chunking_limits.max_index_packets = 2_000_000;
+        state.node.config.chunking_limits.remote_fetched_bytes = 1024 * 1024 * 1024;
+        for ([_]bool{ false, true }) |page| {
+            for ([_]bool{ false, true }) |replay| {
+                for ([_]bool{ false, true }) |execute| {
+                    const outputs = try std.json.Stringify.valueAlloc(a, inference_chunker.outputs.Config{
+                        .boundary_model = "embedding",
+                        .targets = &.{
+                            .{ .name = "embedding", .kind = .embedding, .model = "fixture-embedder", .dimensions = 768, .execute = execute },
+                            .{ .name = "speech", .kind = .transcribe, .model = "fixture-transcriber", .required = false, .execute = execute },
+                        },
+                    }, .{});
+                    defer a.free(outputs);
+                    const request = try std.json.Stringify.valueAlloc(a, ChunkInputRequest{
+                        .model = "fixed",
+                        .input = .{ .source = .{ .uri = "file:///unused/fixture.mp4", .mime_type = "video/mp4", .version = "source-version", .version_kind = .strong_etag, .length = 1 } },
+                        .config = .{
+                            .provider = .antfly,
+                            .page = page,
+                            .observe_only = page and !replay and !execute,
+                            .max_chunks = 2,
+                            .embedding = .{ .model = "fixture-embedder", .dimensions = 768, .execute = execute },
+                            .outputs_json = outputs,
+                            .policy = .{ .window_ns = 8 * std.time.ns_per_s },
+                            .replay = if (replay) .{ .plan_id = "plan", .source_fingerprint = "source", .source_version = "source-version", .ordinal = 7 } else null,
+                        },
+                    }, .{});
+                    defer a.free(request);
+                    var response: ?*anyopaque = null;
+                    var json: inference_bridge.String = undefined;
+                    const before = probe.calls;
+                    try std.testing.expectError(error.ChunkRequestObserved, linkedInferenceInvokeProvider(&.{
+                        .abi_version = inference_bridge.abi_version,
+                        .handle = handle,
+                        .operation = @backingInt(inference_bridge.ProviderOperation.chunk_input),
+                        .request_json = .init(request),
+                        .deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s,
+                        .has_deadline = 1,
+                        .out_response_handle = &response,
+                        .out_response_json = &json,
+                    }));
+                    try std.testing.expectEqual(before + 1, probe.calls);
+                    try std.testing.expect(response == null);
+                    try std.testing.expectEqual(@as(usize, 0), state.node.inference_admission.inFlightUnits());
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 24), probe.calls);
 }
 
 test "standalone chunk minimum content survives the real provider ABI" {

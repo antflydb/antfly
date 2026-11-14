@@ -5819,6 +5819,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone inference host placement",
             "standalone chunk minimum content",
             "native model chunk requests inherit configured ceilings",
+            "native model chunk configured ceilings survive the real provider ABI",
             "native call policy is scoped",
             "memory admission diagnostics retain",
             "session manager load clones preserve",
