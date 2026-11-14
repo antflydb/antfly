@@ -17159,6 +17159,17 @@ pub const NativeFile = struct {
             // durability barrier. Readers on this handle see the new roots;
             // reopening after a crash sees the previous complete checkpoint.
             if (changed) {
+                // Whether this commit's own deferred, non-durable append
+                // below can still go ahead -- `false` only in the one edge
+                // case handled after this block: even the page-shaped
+                // flush below could not free enough room for the minimal
+                // tracking entry (a live reader pin blocking every
+                // `checkpointRedoLog` reclaim attempt, same edge case
+                // `publishCheckpoint`'s own "page-shaped only" branch
+                // documents). Declared before the `if (self.redo)` below
+                // so the no-redo case (this stays `true`, unused) and the
+                // redo case agree on one flag the code after both reads.
+                var try_ride_along_append = true;
                 if (self.redo) |*redo| {
                     // Same preemptive check as `publishCheckpoint`'s own
                     // redo branch (see that comment for the full
@@ -17217,52 +17228,79 @@ pub const NativeFile = struct {
                         }
                         redo.shared.removePages(std.heap.page_allocator, self.runtimeIo(), pages);
                         redo.pending.clearRetainingCapacity();
+                        // §9 (redo log full under a reader pin): mirrors
+                        // `publishCheckpoint`'s own re-check after the
+                        // identical page-shaped flush -- this commit's own
+                        // page-shaped content is already flushed above, so
+                        // `pendingRecordLen()` is down to the bare tracking
+                        // minimum, which can still exceed `remaining()` if
+                        // a live reader pin has kept every
+                        // `checkpointRedoLog` call from ever physically
+                        // reclaiming log bytes. Falling through to
+                        // `redo.appendRecord` regardless -- what this used
+                        // to do -- would surface the log's own
+                        // `error.LogFull` directly, uncaught, on a commit
+                        // that is not actually uncertain, merely out of
+                        // room to log its own non-durable tracking entry.
+                        try_ride_along_append = redo.pendingRecordLen() <= redo.writer.remaining();
                     }
                 }
-                const was_durable_header_null = self.durable_header == null;
-                if (self.durable_header == null) self.durable_header = previous;
-                // §9.3: a ride-along redo-log commit still appends -- just
-                // like a ride-along copy-on-write commit still physically
-                // writes its pages today (`PageWriteBatch.flushCount`
-                // already ran, diverted, inside `flushTransactionWrites`
-                // above) -- but never syncs. The next commit whose own
-                // `durable` promotes a shared group covers it, exactly as
-                // §3.2a already describes for pages.
-                //
-                // Append (when a redo log backs this file) *before*
-                // publishing `next` into `self.header`, and let a failed
-                // append propagate without ever having touched the header.
-                // The reverse order (publish `self.header` first, append
-                // second -- what this used to do) left `self.header`'s
-                // `commit_sequence` permanently ahead of `redo.writer
-                // .last_sequence` the moment an append failed for any
-                // reason (`error.LogFull`, a transient I/O fault, ...):
-                // nothing here or in `commitTransactionWithDurability`'s
-                // own `errdefer` ever rolled the header back, so every
-                // later commit on this same file instance computed its own
-                // next sequence from the now-wrongly-advanced header --
-                // and could then never equal `redo.writer.last_sequence +
-                // 1` again. One ordinary transient append failure turned
-                // into a one-way ratchet: every subsequent commit,
-                // foreground or background, permanently failed with
-                // `error.SequenceOutOfOrder` (surfacing as the far less
-                // specific `error.OutcomeUnknown`), not a retryable,
-                // one-off error a caller's own retry could ever clear.
-                // Reproduced by "crash sweep: graph add-index mid-scenario"
-                // (gr_idx's/body_text's own background ride-along catch-up
-                // commits), independent of any crash or injected fault --
-                // the uncrashed discovery pass alone could hit it.
-                if (self.redo) |*redo| {
-                    try redo.appendRecord(self.allocator, next.commit_sequence, CompactCheckpoint.fromCheckpointSlot(next));
+                if (try_ride_along_append) {
+                    const was_durable_header_null = self.durable_header == null;
+                    if (self.durable_header == null) self.durable_header = previous;
+                    // §9.3: a ride-along redo-log commit still appends -- just
+                    // like a ride-along copy-on-write commit still physically
+                    // writes its pages today (`PageWriteBatch.flushCount`
+                    // already ran, diverted, inside `flushTransactionWrites`
+                    // above) -- but never syncs. The next commit whose own
+                    // `durable` promotes a shared group covers it, exactly as
+                    // §3.2a already describes for pages.
+                    //
+                    // Append (when a redo log backs this file) *before*
+                    // publishing `next` into `self.header`, and let a failed
+                    // append propagate without ever having touched the header.
+                    // The reverse order (publish `self.header` first, append
+                    // second -- what this used to do) left `self.header`'s
+                    // `commit_sequence` permanently ahead of `redo.writer
+                    // .last_sequence` the moment an append failed for any
+                    // reason (`error.LogFull`, a transient I/O fault, ...):
+                    // nothing here or in `commitTransactionWithDurability`'s
+                    // own `errdefer` ever rolled the header back, so every
+                    // later commit on this same file instance computed its own
+                    // next sequence from the now-wrongly-advanced header --
+                    // and could then never equal `redo.writer.last_sequence +
+                    // 1` again. One ordinary transient append failure turned
+                    // into a one-way ratchet: every subsequent commit,
+                    // foreground or background, permanently failed with
+                    // `error.SequenceOutOfOrder` (surfacing as the far less
+                    // specific `error.OutcomeUnknown`), not a retryable,
+                    // one-off error a caller's own retry could ever clear.
+                    // Reproduced by "crash sweep: graph add-index mid-scenario"
+                    // (gr_idx's/body_text's own background ride-along catch-up
+                    // commits), independent of any crash or injected fault --
+                    // the uncrashed discovery pass alone could hit it.
+                    if (self.redo) |*redo| {
+                        try redo.appendRecord(self.allocator, next.commit_sequence, CompactCheckpoint.fromCheckpointSlot(next));
+                    }
+                    self.header.checkpoints[self.header.active_checkpoint] = next;
+                    recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
+                        next.commit_sequence,
+                        was_durable_header_null,
+                        self.durable_header.?.checkpoints[self.durable_header.?.active_checkpoint].commit_sequence,
+                    });
+                    return;
                 }
-                self.header.checkpoints[self.header.active_checkpoint] = next;
-                recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
-                    next.commit_sequence,
-                    was_durable_header_null,
-                    self.durable_header.?.checkpoints[self.durable_header.?.active_checkpoint].commit_sequence,
-                });
-            }
-            return;
+                // §9: even the minimal tracking entry has nowhere to go
+                // (a live reader pin blocking every reclaim attempt) --
+                // rather than fail this commit outright with the log's own
+                // `error.LogFull`, fall through past this whole
+                // `deferred_publication` block to the ordinary durable
+                // path below (`publishCheckpoint`'s own ReadView-aware,
+                // already-protected fallback), paying this one commit's
+                // own sync instead of losing the write. `next`/`changed`
+                // are untouched above, so that path sees exactly the same
+                // state a non-deferred caller's commit would have.
+            } else return;
         }
         if (changed) {
             recoveryDebugLog("durable commit commit_sequence={d} durable_header_was_set={}", .{ next.commit_sequence, self.durable_header != null });
@@ -31280,6 +31318,83 @@ test "lite redo log checkpoints automatically once the log nears its capacity" {
         defer a.free(got);
         try std.testing.expectEqualStrings(&value_buf, got);
     }
+}
+
+test "lite redo log ride-along commits never fail as OutcomeUnknown when a pinned reader blocks reclaim" {
+    // §9 invariant: a full redo log must never fail a commit as
+    // OutcomeUnknown. `checkpointRedoLog`'s fold moves the logical
+    // overlay into real pages, but a live cross-process reader pin on an
+    // older sequence still blocks the log's own *byte* reclaim
+    // (`pinned_below`, `publishCheckpoint`'s own doc comment, and "lite
+    // redo log checkpointer defers log reclaim while a cross-process
+    // reader is pinned behind it" above) -- folding keeps working, but
+    // `remaining()` never recovers, so ordinary durable commits alone can
+    // still drive the log to genuinely, persistently full. Every commit
+    // below keeps its own logical_pending non-empty (an ordinary document
+    // write always diverts its own root mutation), so each one takes the
+    // already-protected "fold, then skip the append entirely" branch
+    // (ed767ba951) -- this exercises that path repeatedly, continuously,
+    // under both the durable and the ride-along (non-durable) commit
+    // shapes, with reclaim permanently blocked, rather than the narrower
+    // "logical_pending empty, page-shaped flush alone still doesn't fit"
+    // edge case `commitTransactionWithDurability`'s own ride-along branch
+    // handles with its matching re-check (added alongside this test,
+    // mirroring `publishCheckpoint`'s sibling branch) -- that edge case
+    // needs a ride-along commit with nothing of its own to divert (only
+    // flushing an earlier commit's pending durable_header), which this
+    // test does not construct. Before that re-check existed, a ride-along
+    // commit could fall through to `redo.appendRecord` unconditionally
+    // once its own page-shaped flush ran, surfacing the log's own
+    // `error.LogFull` directly instead of making room.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-pinned-log-full.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 16 * 1024);
+    defer file.close();
+    try file.beginTransaction();
+    try file.putDocument("seed", "seed-value");
+    try file.commitTransaction();
+
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer reader.close();
+    try reader.refreshCrossProcessRedoOverlay(); // pins behind "seed", blocking all later byte reclaim.
+
+    var value_buf: [512]u8 = undefined;
+    @memset(&value_buf, 'v');
+    var key_buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+        try file.beginTransaction();
+        try file.putDocument(key, &value_buf);
+        // Alternate durable (pays its own sync, folds opportunistically
+        // at the 25%-remaining backstop, but the fold cannot reclaim any
+        // log bytes while `reader` stays pinned) and ride-along (no
+        // backstop of its own) commits -- both must keep succeeding once
+        // the log is genuinely, persistently full.
+        try file.commitTransactionWithDurability(i % 2 == 0, null);
+    }
+    try file.beginTransaction();
+    try file.putDocument("final", "final-value");
+    try file.commitTransaction();
+
+    try std.testing.expect((try file.check()).valid);
+    const seed = (try file.getDocumentAlloc(a, "seed")).?;
+    defer a.free(seed);
+    try std.testing.expectEqualStrings("seed-value", seed);
+    i = 0;
+    while (i < 400) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+        const got = (try file.getDocumentAlloc(a, key)).?;
+        defer a.free(got);
+        try std.testing.expectEqualStrings(&value_buf, got);
+    }
+    const final = (try file.getDocumentAlloc(a, "final")).?;
+    defer a.free(final);
+    try std.testing.expectEqualStrings("final-value", final);
 }
 
 test "lite redo log document scan merges the overlay across put, overwrite, delete and a checkpoint boundary" {

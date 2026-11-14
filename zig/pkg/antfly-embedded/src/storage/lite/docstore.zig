@@ -1866,6 +1866,23 @@ pub const Store = struct {
     ride_along_pending_count: usize = 0,
     ride_along_pending_bytes: usize = 0,
     ride_along_last_enqueue_ns: i96 = 0,
+    /// §9: last time *any* mutation (ride-along or not) was enqueued on
+    /// this store, updated unconditionally by `enqueueRequest` -- unlike
+    /// `ride_along_last_enqueue_ns` above, which only ever moves for a
+    /// ride-along member. `maybeCheckpointRedoLogOnIdleTurn`'s own "idle"
+    /// trigger needs this broader signal: an ordinary (non-ride-along)
+    /// foreground write never touches `ride_along_last_enqueue_ns` at
+    /// all, so gating the opportunistic fold on that field alone would
+    /// treat a store under continuous foreground-only write load as
+    /// permanently idle. Guarded by `commit_mutex`, same as the
+    /// `ride_along_*` fields above.
+    last_mutation_enqueue_ns: i96 = 0,
+    /// §9: last time `maybeCheckpointRedoLogOnIdleTurn` actually ran a
+    /// fold (attempted or not -- see that function's own comment), so its
+    /// own idle debounce also covers "since the last fold", not just
+    /// "since the last commit". Guarded by `lockStoreExclusive`, same as
+    /// every other field that function reads/writes.
+    last_redo_fold_ns: i96 = 0,
     /// Count of currently-queued, not-yet-drained members with
     /// `ride_along = false` -- i.e. every member with no backstop of its
     /// own. A ride-along member left queued when a leader stops early
@@ -3609,10 +3626,12 @@ pub const Store = struct {
         // WS1's reuse-frontier hook -- to lead on its behalf.
         const become_leader = !self.commit_draining and !ride_along;
         if (become_leader) self.commit_draining = true;
+        const now_ns = std.Io.Clock.awake.now(io).nanoseconds;
+        self.last_mutation_enqueue_ns = now_ns;
         if (ride_along) {
             self.ride_along_pending_count +|= 1;
             self.ride_along_pending_bytes +|= plan.estimated_bytes;
-            self.ride_along_last_enqueue_ns = std.Io.Clock.awake.now(io).nanoseconds;
+            self.ride_along_last_enqueue_ns = now_ns;
         } else {
             self.non_ride_along_pending_count +|= 1;
         }
@@ -3890,27 +3909,44 @@ pub const Store = struct {
         const io = self.file.runtime();
         var overlay_entries: u64 = 0;
         for (0..3) |root_idx| overlay_entries += redo.shared.count(io, @intCast(root_idx));
-        // Idle: this call only happens on `rideAlongFlushLoop`'s own
-        // periodic wake, which already implies nothing more pressing woke
-        // it sooner -- any non-empty overlay reaching this point has had at
-        // least one full `ride_along_idle_ns` tick with no other reason to
-        // run, so it is cheap to clear opportunistically rather than
-        // leaving it to grow (and the next reopen's replay to cover)
-        // indefinitely.
-        const has_overlay_work = overlay_entries != 0 or redo.shared.pagesCount(io) != 0;
+        // Idle (§9: background checkpoints run when idle, or when the log
+        // is more than 50% full): this call runs on every one of
+        // `rideAlongFlushLoop`'s wakes, not only the full periodic
+        // `ride_along_idle_ns` ones -- the loop's own `ride_along_wake` can
+        // also be `.set()` early, for an unrelated reason (a ride-along
+        // byte threshold, `forceDrainDurable`, ...), and this function used
+        // to treat every one of those wakes as proof of idleness too,
+        // folding the whole log whenever the overlay merely happened to be
+        // non-empty. For any live workload the overlay is essentially never
+        // perfectly empty between wakes, so that fired far more often than
+        // the batched design intends -- confirmed live via WS4-for-dense/
+        // WS4-for-graph's own commit-count regression. Idle now means what
+        // the ride-along branch above already means by it: nothing
+        // enqueued for a full `ride_along_idle_ns`, checked against
+        // `last_mutation_enqueue_ns` (every enqueue, not just a ride-along
+        // one -- see that field's own doc comment) -- and debounced against
+        // `last_redo_fold_ns` too, so a fold's own settling on one wake
+        // doesn't immediately re-trigger on the very next, early-woken one.
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+        const last_activity_ns = @max(self.last_mutation_enqueue_ns, self.last_redo_fold_ns);
+        const idle_long_enough = now -| last_activity_ns >= @as(i96, @intCast(self.ride_along_idle_ns));
+        const has_overlay_work = idle_long_enough and (overlay_entries != 0 or redo.shared.pagesCount(io) != 0);
         // Threshold: byte usage past the halfway point, well before the
         // emergency 25%-remaining backpressure (`maybeAutoCheckpointRedoLog`)
-        // would ever fire. Checked independently of `has_overlay_work`: a
-        // commit's own external-value pages count against the log's *byte*
-        // capacity, a different axis than the logical_overlay *entry*
-        // count above, so this catches a byte-heavy-but-entry-light backlog
-        // the entry count alone would not flag.
+        // would ever fire. Checked independently of `has_overlay_work` (and
+        // of idleness -- real capacity pressure folds immediately, exactly
+        // as before this change): a commit's own external-value pages
+        // count against the log's *byte* capacity, a different axis than
+        // the logical_overlay *entry* count above, so this catches a
+        // byte-heavy-but-entry-light backlog the entry count alone would
+        // not flag.
         const threshold_due = redo.writer.remaining() < redo.writer.capacity / 2;
         if (!has_overlay_work and !threshold_due) return;
         // AssumeLocked: this whole function runs under `lockStoreExclusive`
         // above, which locks the same `self.mutex` `recordMaintenanceError`
         // itself would try to lock -- see that function's own comment.
         self.file.checkpointRedoLog() catch |err| self.recordMaintenanceErrorAssumeLocked(err);
+        self.last_redo_fold_ns = now;
     }
 
     /// Enqueue `plan` and return a ticket resolved once its group is durable.
