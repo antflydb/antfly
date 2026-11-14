@@ -14299,7 +14299,29 @@ pub const NativeFile = struct {
         var updated_report = report.*;
         try destination.beginTransaction();
         errdefer destination.abortTransaction();
-        const checkpoint = self.activeCheckpoint();
+        // §9.7c (ReadView): pin one (checkpoint, mark) pair for this whole
+        // catch-up round instead of reading `self.activeCheckpoint()` once
+        // and re-deriving the overlay mark from it at each key
+        // (`redoOverlayEntry`'s own `readMark` -- "checkpoint.commit_sequence
+        // == activeCheckpoint().commit_sequence" -- compares against
+        // whatever `activeCheckpoint()` returns *at that moment*, not what
+        // it returned when this round started). The non-final-round caller
+        // (`Store.applyResidualVacuumChanges`, unlike its AssumeLocked
+        // sibling) releases the store mutex before calling this, so a
+        // concurrent foreground commit publishing a real checkpoint
+        // partway through this round's own loop would otherwise flip that
+        // comparison mid-copy and silently resolve later keys in the same
+        // round against a different, inconsistent mark than earlier ones.
+        // `ReadView.open` also pins the shared overlay and this inode's
+        // reader table for the capture's duration, same retention
+        // guarantee every other multi-key read gets -- a per-call-site
+        // `redoOverlayEntry(root_kind, self.activeCheckpoint(), key)` (this
+        // function's own prior fix) got the *value* right but reimplemented
+        // the merge inline instead of going through the one primitive
+        // §9.7c exists to make that mistake impossible to repeat.
+        var view = try ReadView.open(self, self.runtimeIo());
+        defer view.release(self.runtimeIo());
+        const checkpoint = view.checkpoint;
         inline for (0..3) |root| {
             const Mutation = if (root == 2) DocumentMutation else CatalogMutation;
             const map = capture.keys[root];
@@ -14341,9 +14363,14 @@ pub const NativeFile = struct {
                     // or an online vacuum silently drops every write that
                     // landed after the last checkpoint but before this
                     // catch-up round copied it (`entry.value` is owned by
-                    // `self.allocator` per `redoOverlayEntry`'s own doc
+                    // `self.allocator` per `redoOverlayEntryAt`'s own doc
                     // comment and must be freed once `copied` is built).
-                    const overlay_entry = try self.redoOverlayEntry(root_kind, checkpoint, key);
+                    // `view.mark`, not a freshly re-derived one: every key
+                    // in this round resolves against the exact same pinned
+                    // snapshot `view` captured at this function's entry,
+                    // regardless of whatever `self.activeCheckpoint()` does
+                    // concurrently while this loop runs unlocked.
+                    const overlay_entry = try self.redoOverlayEntryAt(root_kind, view.mark, key);
                     defer if (overlay_entry) |entry| self.allocator.free(entry.value);
                     if (overlay_entry) |entry| {
                         if (!entry.is_delete) record = entry;
