@@ -14914,8 +14914,12 @@ pub const ApiHttpServer = struct {
             error.PreDecisionDeadlineExceeded => return error.DeadlineExceeded,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
-            error.ResourceBudgetExceeded,
+            error.StorageDescriptorPressure,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
             error.PersistentDescriptorAdmissionExhausted,
+            => return error.StorageDescriptorPressure,
+            error.ResourceBudgetExceeded,
             error.TextMergeBackpressureTimeout,
             error.TextMergeBackpressureUnavailable,
             error.TextMergeRuntimeShutdown,
@@ -15034,6 +15038,9 @@ pub const ApiHttpServer = struct {
             error.ReadUnavailable,
             => return error.ReadUnavailable,
             error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
+            error.StorageDescriptorPressure,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
             error.PersistentDescriptorAdmissionExhausted,
             error.PortableImportPublicationInProgress,
             error.PortableImportRecoveryRequired,
@@ -15439,6 +15446,9 @@ pub const ApiHttpServer = struct {
                 error.ReadUnavailable,
                 => return error.ReadUnavailable,
                 error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
+                error.StorageDescriptorPressure,
+                error.ProcessFdQuotaExceeded,
+                error.SystemFdQuotaExceeded,
                 error.PersistentDescriptorAdmissionExhausted,
                 error.StorageBusy,
                 error.StorageKernelOwnerStaleDescriptor,
@@ -15520,6 +15530,9 @@ pub const ApiHttpServer = struct {
             error.ReadUnavailable,
             => return error.ReadUnavailable,
             error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
+            error.StorageDescriptorPressure,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageBusy,
             error.StorageKernelOwnerStaleDescriptor,
@@ -15636,6 +15649,9 @@ pub const ApiHttpServer = struct {
             error.ReadUnavailable,
             => return error.ReadUnavailable,
             error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
+            error.StorageDescriptorPressure,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageBusy,
             error.StorageKernelOwnerStaleDescriptor,
@@ -18761,6 +18777,9 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.HAReadWaitForApply,
             error.HAReadWaitForMetadata,
+            error.StorageDescriptorPressure,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
             error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
@@ -18787,6 +18806,9 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.HAReadWaitForApply,
             error.HAReadWaitForMetadata,
+            error.StorageDescriptorPressure,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
             error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
@@ -18855,7 +18877,7 @@ pub const ApiHttpServer = struct {
             error.DeadlineExceeded, error.PreDecisionDeadlineExceeded => error.DeadlineExceeded,
             error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary, error.NotLeader, error.LeaderUnavailable => error.NotLeader,
             error.PreparedGenerationChanged, error.TopologyChanged, error.TableTransitionActive, error.TxnAborted, error.IntegrityCatalogChanged => error.Conflict,
-            error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded, error.BackendRuntimeShuttingDown => error.Backpressured,
+            error.StorageDescriptorPressure, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded, error.BackendRuntimeShuttingDown => error.Backpressured,
             error.InvalidIndexMaintenance, error.InvalidBatchRequest, error.InvalidTxnRequest => error.InvalidIndexMaintenance,
             error.TableNotFound, error.IndexNotFound => error.NotFound,
             error.MethodNotAllowed => error.MethodNotAllowed,
@@ -18893,7 +18915,7 @@ pub const ApiHttpServer = struct {
             error.GraphMetricActionPartialOutcome,
             => return error.Conflict,
             error.LeaderUnavailable, error.UnknownGroup => return error.NotLeader,
-            error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded, error.BackendRuntimeShuttingDown => return error.Backpressured,
+            error.StorageDescriptorPressure, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded, error.BackendRuntimeShuttingDown => return error.Backpressured,
             error.InvalidGraphMetricAction => return error.InvalidGraphMetricAction,
             error.TableNotFound, error.IndexNotFound, error.MetricNotReady => return error.NotFound,
             else => {
@@ -23835,7 +23857,7 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
             error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
-            error.StorageBusy, error.StorageOwnerAdmissionPending, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.ConcurrencyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
+            error.StorageBusy, error.StorageOwnerAdmissionPending, error.StorageDescriptorPressure, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.ConcurrencyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
@@ -43100,6 +43122,23 @@ test "api http server routes table batches through the batch commit hook" {
         try std.testing.expectEqualStrings("1", pressured.header("Retry-After").?);
         try std.testing.expect(std.mem.indexOf(u8, pressured.body, "table_backpressured") != null);
     }
+    const descriptor_pressures = [_]anyerror{ error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.PersistentDescriptorAdmissionExhausted, error.StorageDescriptorPressure };
+    for (descriptor_pressures) |pressure| {
+        writes.commit_error = pressure;
+        const calls_before = writes.batch_commit_calls;
+        var descriptor_pressure = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = batch_body,
+        });
+        defer descriptor_pressure.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 503), descriptor_pressure.status);
+        try std.testing.expectEqualStrings("1", descriptor_pressure.header("Retry-After").?);
+        try std.testing.expect(std.mem.indexOf(u8, descriptor_pressure.body, "storage_descriptor_pressure") != null);
+        try std.testing.expect(std.mem.indexOf(u8, descriptor_pressure.body, "RLIMIT_NOFILE") != null);
+        try std.testing.expectEqual(calls_before + 1, writes.batch_commit_calls);
+    }
     writes.commit_error = error.EnrichmentWorkerFailed;
     var repair_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -43132,7 +43171,7 @@ test "api http server routes table batches through the batch commit hook" {
     defer legacy_pending_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), legacy_pending_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, legacy_pending_resp.body, "\"status\":\"committed_pending\"") != null);
-    try std.testing.expectEqual(@as(usize, 12), writes.batch_commit_calls);
+    try std.testing.expectEqual(@as(usize, 12) + descriptor_pressures.len, writes.batch_commit_calls);
     for ([_]anyerror{ error.StorageBusy, error.GenerationTransitionActive }) |unavailable| {
         writes.commit_error = unavailable;
         const calls_before = writes.batch_commit_calls;
