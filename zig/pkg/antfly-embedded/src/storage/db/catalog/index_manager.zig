@@ -2786,6 +2786,44 @@ pub const IndexManager = struct {
             self.observeWorkingBytes();
         }
 
+        const ScoringPolicy = enum { best_effort, exact_candidates, complete_snapshot };
+        const ScoringScope = struct {
+            session: *DenseVectorLoadSession,
+            cache_vectors: bool,
+            cache_decoded_vectors: bool,
+
+            fn deinit(scope: *@This()) void {
+                scope.session.clearNativeVectorLocations();
+                scope.session.cache_vectors = scope.cache_vectors;
+                scope.session.cache_decoded_vectors = scope.cache_decoded_vectors;
+            }
+        };
+
+        /// All query entry points share one visibility/retention transition.
+        /// Keep existing snapshots, retire probes at the query boundary, and
+        /// acquire a primary snapshot lazily only if scoring needs fallback.
+        fn beginScoring(self: *@This(), policy: ScoringPolicy) ScoringScope {
+            const scope = ScoringScope{ .session = self, .cache_vectors = self.cache_vectors, .cache_decoded_vectors = self.cache_decoded_vectors };
+            self.clearNativeVectorLocations();
+            if (policy != .best_effort) {
+                if (self.txn_override == null) {
+                    if (self.read_txn) |*txn| if (txn.probe != null) {
+                        self.recycleRawReadState();
+                        // These independent copies came from the old probe;
+                        // they cannot substitute for the new visibility cut.
+                        var it = self.vector_cache.iterator();
+                        while (it.next()) |entry| self.context.manager.alloc.free(entry.value_ptr.*);
+                        self.vector_cache.clearRetainingCapacity();
+                        self.vector_cache_bytes = 0;
+                        self.observeWorkingBytes();
+                    };
+                }
+                self.cache_vectors = false;
+                if (policy == .complete_snapshot) self.cache_decoded_vectors = false;
+            }
+            return scope;
+        }
+
         fn recycleRawReadStateIfNeeded(self: *@This()) void {
             if (!self.recycle_raw_reads) return;
             if (self.raw_cache_key_bytes +| self.raw_read_value_bytes >= self.rawReadLimitBytes()) {
@@ -19589,29 +19627,13 @@ pub const IndexManager = struct {
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
-        var native_location_session: ?*DenseVectorLoadSession = null;
-        var previous_cache_vectors: bool = false;
-        var previous_cache_decoded_vectors: bool = false;
+        var scoring_scope: ?DenseVectorLoadSession.ScoringScope = null;
         if (active_dense_vector_load_session) |session| {
             if (entry.vector_loader_context != null and session.context == entry.vector_loader_context.?) {
-                session.clearNativeVectorLocations();
-                previous_cache_vectors = session.cache_vectors;
-                previous_cache_decoded_vectors = session.cache_decoded_vectors;
-                if ((req.search_effort orelse 0) >= 1) {
-                    // Query entry is a safe boundary to discard a prior probe's
-                    // borrowed values. Exact fallback needs one stable snapshot.
-                    if (session.read_txn) |*txn| if (txn.probe != null) session.recycleRawReadState();
-                    session.cache_vectors = false;
-                    session.cache_decoded_vectors = false;
-                }
-                native_location_session = session;
+                scoring_scope = session.beginScoring(if ((req.search_effort orelse 0) >= 1) .complete_snapshot else .best_effort);
             }
         }
-        defer if (native_location_session) |session| {
-            session.clearNativeVectorLocations();
-            session.cache_vectors = previous_cache_vectors;
-            session.cache_decoded_vectors = previous_cache_decoded_vectors;
-        };
+        defer if (scoring_scope) |*scope| scope.deinit();
 
         return try entry.index.searchWithRequest(req);
     }
@@ -19643,29 +19665,13 @@ pub const IndexManager = struct {
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
-        var native_location_session: ?*DenseVectorLoadSession = null;
-        var previous_cache_vectors: bool = false;
-        var previous_cache_decoded_vectors: bool = false;
+        var scoring_scope: ?DenseVectorLoadSession.ScoringScope = null;
         if (active_dense_vector_load_session) |session| {
             if (entry.vector_loader_context != null and session.context == entry.vector_loader_context.?) {
-                session.clearNativeVectorLocations();
-                previous_cache_vectors = session.cache_vectors;
-                previous_cache_decoded_vectors = session.cache_decoded_vectors;
-                if ((req.search_effort orelse 0) >= 1) {
-                    // Query entry is a safe boundary to discard a prior probe's
-                    // borrowed values. Exact fallback needs one stable snapshot.
-                    if (session.read_txn) |*txn| if (txn.probe != null) session.recycleRawReadState();
-                    session.cache_vectors = false;
-                    session.cache_decoded_vectors = false;
-                }
-                native_location_session = session;
+                scoring_scope = session.beginScoring(if ((req.search_effort orelse 0) >= 1) .complete_snapshot else .best_effort);
             }
         }
-        defer if (native_location_session) |session| {
-            session.clearNativeVectorLocations();
-            session.cache_vectors = previous_cache_vectors;
-            session.cache_decoded_vectors = previous_cache_decoded_vectors;
-        };
+        defer if (scoring_scope) |*scope| scope.deinit();
 
         return try entry.index.searchProfiledRequest(req);
     }
@@ -19749,11 +19755,8 @@ pub const IndexManager = struct {
             if (entry.vector_loader_context == null or session.context != entry.vector_loader_context.?) break :blk null;
             break :blk session;
         };
-        const previous_cache_vectors = if (exact_load_session) |session| session.cache_vectors else false;
-        if (exact_load_session) |session| session.cache_vectors = false;
-        defer {
-            if (exact_load_session) |session| session.cache_vectors = previous_cache_vectors;
-        }
+        var scoring_scope: ?DenseVectorLoadSession.ScoringScope = if (exact_load_session) |session| session.beginScoring(.exact_candidates) else null;
+        defer if (scoring_scope) |*scope| scope.deinit();
 
         var results = try hbc_mod.SearchResults.initCapacity(
             self.alloc,
@@ -49482,11 +49485,13 @@ test "exact direct document fallback bounds waves and preserves transient snapsh
     var vectors: [count][2]f32 = undefined;
     var names: [count][32]u8 = undefined;
     var items: [count]hbc_mod.BatchInsertItem = undefined;
+    var ids: [count]u64 = undefined;
     const padding: [4096]u8 = @splat('x');
     for (&items, &vectors, &names, 0..) |*item, *vector, *name, row| {
         const doc_key = try std.fmt.bufPrint(name, "doc:{d:0>4}", .{row});
         vector.* = .{ @floatFromInt(row), 0 };
-        item.* = .{ .vector_id = row + 1, .metadata = doc_key, .vector = vector };
+        ids[row] = row + 1;
+        item.* = .{ .vector_id = ids[row], .metadata = doc_key, .vector = vector };
         const key = try internal_keys.documentKeyAlloc(alloc, doc_key);
         defer alloc.free(key);
         const body = try std.fmt.allocPrint(alloc, "{{\"embedding\":[{d},0],\"padding\":\"{s}\"}}", .{ row, &padding });
@@ -49515,12 +49520,19 @@ test "exact direct document fallback bounds waves and preserves transient snapsh
     const previous = IndexManager.active_dense_vector_load_session;
     IndexManager.active_dense_vector_load_session = &session;
     defer IndexManager.active_dense_vector_load_session = previous;
-    for ([_]bool{ false, true }) |profiled| {
-        var hits = if (profiled) blk: {
-            const result = try manager.searchDenseEntryProfiledWithRequest(entry, .{ .query = &.{ 0, 0 }, .k = 10, .search_effort = 1, .load_metadata = false });
-            try std.testing.expectEqual(@as(u64, count), result.profile.exact_vectors_scored);
-            break :blk result.results;
-        } else try manager.searchDenseEntryWithRequest(entry, .{ .query = &.{ 0, 0 }, .k = 10, .search_effort = 1, .load_metadata = false });
+    const Routes = struct {
+        fn search(m: *IndexManager, dense: *IndexManager.DenseIndex, route: usize, candidates: []const u64) !hbc_mod.SearchResults {
+            const req = hbc_mod.SearchRequest{ .query = &.{ 0, 0 }, .k = 10, .search_effort = if (route == 2) 0.5 else 1, .filter_ids = candidates, .load_metadata = false };
+            return switch (route) {
+                0 => try m.searchDenseEntryWithRequest(dense, req),
+                1 => (try m.searchDenseEntryProfiledWithRequest(dense, req)).results,
+                2 => (try m.exactScoreDenseEntryWithRequest(dense, req)).results,
+                else => unreachable,
+            };
+        }
+    };
+    for (0..3) |route| {
+        var hits = try Routes.search(&manager, entry, route, &ids);
         defer hits.deinit();
         try std.testing.expectEqual(@as(usize, 10), hits.getHits().len);
         for (hits.getHits(), 0..) |hit, row| {
@@ -49534,6 +49546,39 @@ test "exact direct document fallback bounds waves and preserves transient snapsh
         try std.testing.expectEqual(@as(usize, 0), session.raw_cache.count());
         try std.testing.expectEqual(@as(usize, 0), session.vector_cache.count());
         try std.testing.expectEqual(backend_types.Namespace.BlockCacheAdmission.retain, session.block_cache_admission);
+    }
+    // Retire an existing current-tip probe for each entry point. Seed its
+    // request cache too: promoting the transaction alone must not allow an
+    // old cached vector to override the new snapshot's document value.
+    for (0..3) |route| {
+        try primary.put(changed_key, "{\"embedding\":[0,0]}");
+        var probe_session: IndexManager.DenseVectorLoadSession = .{
+            .context = entry.vector_loader_context.?,
+            .working_slice = .dense_search_working_set,
+            .read_txn = try primary.beginProbeTxn(),
+            .recycle_raw_reads = false,
+        };
+        defer probe_session.deinit();
+        _ = try probe_session.get(&primary, changed_key);
+        try probe_session.cacheVector(1, &vectors[0]);
+        try std.testing.expect(probe_session.raw_cache.count() > 0);
+        try primary.put(changed_key, "{\"embedding\":[9999,0]}");
+        const outer_session = IndexManager.active_dense_vector_load_session;
+        IndexManager.active_dense_vector_load_session = &probe_session;
+        defer IndexManager.active_dense_vector_load_session = outer_session;
+        var hits = try Routes.search(&manager, entry, route, &ids);
+        defer hits.deinit();
+        try std.testing.expectEqual(@as(usize, 10), hits.getHits().len);
+        for (hits.getHits(), 0..) |hit, row| {
+            try std.testing.expectEqual(@as(u64, row + 2), hit.vector_id);
+            try std.testing.expectEqual(@as(f32, @floatFromInt((row + 1) * (row + 1))), hit.distance);
+        }
+        try std.testing.expect(probe_session.read_txn != null and probe_session.read_txn.?.read != null);
+        try std.testing.expect(probe_session.cache_vectors and probe_session.cache_decoded_vectors);
+        try std.testing.expectEqual(@as(u64, 0), probe_session.raw_read_value_bytes);
+        try std.testing.expectEqual(@as(u64, 0), probe_session.vector_cache_bytes);
+        try std.testing.expectEqual(@as(usize, 0), probe_session.raw_cache.count());
+        try std.testing.expectEqual(@as(usize, 0), probe_session.vector_cache.count());
     }
 }
 

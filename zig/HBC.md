@@ -77,7 +77,10 @@ resolved metadata are reused rather than fetched twice. Primary-store fallback
 also owns resolved payloads in admitted per-wave scratch: it retains one read
 snapshot and source-version lease, rather than retaining every payload in the
 transaction arena. Direct-document vector fields use the same wave-scoped
-read policy. Cache-residency transitions preserve captured primary snapshots.
+read policy. Shared query-entry scopes and cache-residency transitions preserve
+captured primary snapshots. Exact entry retires a prior probe and its cached
+copies before acquiring a new visibility cut. HBC, profiled HBC, and filtered
+exact scoring use this same scope and restore retention policies on exit.
 A complete native source generation needs only its immutable generation lease;
 a primary read snapshot is acquired lazily if fallback requires it. Exact scans
 do not populate decoded-vector residency. Candidate-only exact scoring keeps
