@@ -7819,6 +7819,69 @@ pub const NativeFile = struct {
         try self.checkpointRedoLog();
     }
 
+    /// perf/lwa-bulk-alloc: a log-full fold (`checkpointRedoLogNested`,
+    /// called from both `commitTransactionWithDurability`'s own
+    /// ride-along path and `publishCheckpoint`'s durable path, right
+    /// before this function runs at each call site) builds its own
+    /// transaction from `self.header` exactly as it stands at that
+    /// moment -- this *commit's own* pre-commit checkpoint, since both
+    /// callers reset `self.header = previous`/restore the durable
+    /// snapshot before deciding whether to fold, so a failure partway
+    /// through still has something consistent to fall back to. That base
+    /// is correct for the ordinary case, where every one of this
+    /// commit's mutations is sitting unbuilt in `redo.shared` and the
+    /// fold is about to apply all of them for the first time.
+    ///
+    /// `RedoCommitState.large_txn_fallback_bytes`'s own real-build
+    /// fallback breaks that assumption: once a sufficiently large batch
+    /// pushes `logical_pending` past the threshold mid-transaction,
+    /// `flushTransactionWrites` stops diverting and builds real,
+    /// ledger-backed pages for the rest of this same commit instead --
+    /// published transiently into `self.header` via `publishCheckpoint`'s
+    /// own `self.transaction_header != null` early-return branch, *before*
+    /// the caller's later reset throws that update away. `proposed` (the
+    /// caller's own local checkpoint candidate, captured before the
+    /// reset) still names those roots; nothing else does. Folding on the
+    /// reset, pre-commit roots instead publishes a tree holding only the
+    /// newly-folded logical mutations, silently orphaning every page the
+    /// real-build fallback already wrote for this same commit -- not an
+    /// allocator inconsistency (those pages are real, ledger-tracked,
+    /// already on disk), but outright data loss: every key the fallback
+    /// build wrote is simply absent from the published tree.
+    ///
+    /// A no-op when `proposed`'s own tree roots already match the
+    /// current (reset) checkpoint's -- the overwhelmingly common case,
+    /// where this commit never took the real-build fallback and the
+    /// fold's usual base is already correct. Otherwise installs
+    /// `proposed` as the new base, but not its `commit_sequence`: kept at
+    /// the current (pre-commit) value, so the fold's own `next
+    /// .commit_sequence = previous.commit_sequence + 1` lands on exactly
+    /// the sequence this commit itself would have published. Also
+    /// flushes whatever page-shaped writes (an external value chain
+    /// staged while this same commit's earlier, still-diverting portion
+    /// ran) are still sitting in `redo.shared`'s overlay: the fold's own
+    /// flush, a few lines into `checkpointRedoLogWithDurability`, only
+    /// looks there, and has no way to re-derive them from `proposed`.
+    fn installRealBuildRootsBeforeFold(self: *NativeFile, redo: *RedoCommitState, proposed: CheckpointSlot) !void {
+        const current = self.activeCheckpoint();
+        if (proposed.document_index_root_page == current.document_index_root_page and
+            proposed.document_root_page == current.document_root_page and
+            proposed.catalog_root_page == current.catalog_root_page and
+            proposed.index_catalog_root_page == current.index_catalog_root_page and
+            proposed.namespace_directory_root_page == current.namespace_directory_root_page) return;
+        const io = self.runtimeIo();
+        const staged_pages = try redo.shared.snapshotAllPagesAlloc(std.heap.page_allocator, io);
+        defer {
+            for (staged_pages) |p| std.heap.page_allocator.free(p.bytes);
+            std.heap.page_allocator.free(staged_pages);
+        }
+        for (staged_pages) |p| try self.file.writePositionalAll(io, p.bytes, p.page_id * @as(u64, self.header.page_size));
+        redo.shared.removePages(std.heap.page_allocator, io, staged_pages);
+        var installed = proposed;
+        installed.commit_sequence = current.commit_sequence;
+        self.header.checkpoints[self.header.active_checkpoint] = installed;
+    }
+
     pub fn checkpointRedoLog(self: *NativeFile) anyerror!void {
         return self.checkpointRedoLogWithDurability(true);
     }
@@ -18991,6 +19054,16 @@ pub const NativeFile = struct {
                             // this would leave them staged forever,
                             // growing unboundedly across every later
                             // commit.
+                            //
+                            // perf/lwa-bulk-alloc: `next` (not yet
+                            // installed into `self.header` -- the reset
+                            // above restored `previous`) may already
+                            // carry real pages this same commit's own
+                            // large-transaction fallback built; see
+                            // `installRealBuildRootsBeforeFold`'s own doc
+                            // comment for why the fold below must start
+                            // from those, not from the reset snapshot.
+                            try self.installRealBuildRootsBeforeFold(redo, next);
                             try self.checkpointRedoLogNested();
                             redo.logical_pending.clearRetainingCapacity();
                             redo.pending.clearRetainingCapacity();
@@ -19643,6 +19716,16 @@ pub const NativeFile = struct {
                     // -- unlike the page-shaped branch below, nothing
                     // here still needs the log to fit anything
                     // afterward.
+                    //
+                    // perf/lwa-bulk-alloc: `checkpoint` may already carry
+                    // real pages this same commit's own large-transaction
+                    // fallback built, published only transiently into
+                    // `self.header` (the durable-swap restore above threw
+                    // that update away); see
+                    // `installRealBuildRootsBeforeFold`'s own doc comment
+                    // for why the fold below must start from those, not
+                    // from whatever `self.header` holds right now.
+                    try self.installRealBuildRootsBeforeFold(redo, checkpoint);
                     try self.checkpointRedoLogNested();
                     redo.logical_pending.clearRetainingCapacity();
                     redo.pending.clearRetainingCapacity();
@@ -35055,4 +35138,87 @@ test "lite redo log bulk-built document index over max_keys passes check() after
         defer a.free(value);
         try std.testing.expectEqualSlices(u8, mutation.value, value);
     }
+}
+
+// perf/lwa-bulk-alloc: one transaction that mixes a handful of individual
+// `putDocument` calls (small enough to stay under `RedoCommitState
+// .large_txn_fallback_bytes` and divert logically) with a batch large
+// enough to cross that threshold once flushed (so its own
+// `flushTransactionWrites` chunk falls back to a real, non-diverting
+// build partway through the same transaction). A log too small to hold
+// the whole commit's logical part then forces `publishCheckpoint`'s own
+// log-full nested fold. Covers both the roomy-log case (an ordinary
+// append, no nested fold) and the log-full case, so any divergence
+// between the two isolates a bug in the nested fold itself rather than
+// in `putDocumentBatch`'s diverting-vs-real choice.
+fn expectMixedBatchCommitSurvivesCheckAndReopen(name: []const u8, log_capacity: u64) !void {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, name);
+    defer a.free(path);
+
+    const solo_count = 40;
+    const bulk_count = 1200;
+    try std.testing.expect(bulk_count >= TransactionWrites.max_keys);
+    const keys = try a.alloc([16]u8, solo_count + bulk_count);
+    defer a.free(keys);
+    const values = try a.alloc([256]u8, solo_count + bulk_count);
+    defer a.free(values);
+    for (values) |*value| @memset(value, 'v');
+    const mutations = try a.alloc(DocumentMutation, bulk_count);
+    defer a.free(mutations);
+    for (mutations, 0..) |*mutation, i| {
+        const idx = solo_count + i;
+        mutation.* = .{ .key = try std.fmt.bufPrint(&keys[idx], "bulk-{d:0>11}", .{i}), .value = &values[idx] };
+    }
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, log_capacity);
+    errdefer file.close();
+    try file.beginTransaction();
+    for (0..solo_count) |i| {
+        const key = try std.fmt.bufPrint(&keys[i], "solo-{d:0>11}", .{i});
+        try file.putDocument(key, &values[i]);
+    }
+    try file.putDocumentBatch(mutations);
+    try file.commitTransaction();
+
+    try std.testing.expect((try file.check()).valid);
+    for (0..solo_count) |i| {
+        var buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "solo-{d:0>11}", .{i});
+        const value = (try file.getDocumentAlloc(a, key)) orelse return error.TestExpectedEqual;
+        defer a.free(value);
+        try std.testing.expectEqualSlices(u8, &values[i], value);
+    }
+    for (mutations) |mutation| {
+        const value = (try file.getDocumentAlloc(a, mutation.key)) orelse return error.TestExpectedEqual;
+        defer a.free(value);
+        try std.testing.expectEqualSlices(u8, mutation.value, value);
+    }
+    file.close();
+
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    try std.testing.expect((try reopened.check()).valid);
+    for (0..solo_count) |i| {
+        var buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "solo-{d:0>11}", .{i});
+        const value = (try reopened.getDocumentAlloc(a, key)) orelse return error.TestExpectedEqual;
+        defer a.free(value);
+        try std.testing.expectEqualSlices(u8, &values[i], value);
+    }
+    for (mutations) |mutation| {
+        const value = (try reopened.getDocumentAlloc(a, mutation.key)) orelse return error.TestExpectedEqual;
+        defer a.free(value);
+        try std.testing.expectEqualSlices(u8, mutation.value, value);
+    }
+}
+
+test "lite redo log mixed solo-and-bulk commit survives a log-full nested fold" {
+    try expectMixedBatchCommitSurvivesCheckAndReopen("redo-bulk-alloc-logfull.aflite", 8 * 1024);
+}
+
+test "lite redo log mixed solo-and-bulk commit reads back when the log has room" {
+    try expectMixedBatchCommitSurvivesCheckAndReopen("redo-bulk-alloc-roomy.aflite", 4 * 1024 * 1024);
 }
