@@ -519,6 +519,15 @@ pub const Client = struct {
 
     pub fn initWithMemoryPolicy(plugin_path: [:0]const u8, policy: ?MemoryPolicy) PjrtError!Client {
         if (policy) |bounded| if (bounded == .cuda) try validateBoundedCudaEnvironment();
+        var visible = [_]i64{0};
+        var options: [6]c.NamedValue = undefined;
+        const option_count: usize = if (policy) |bounded| switch (bounded) {
+            .cpu => 0,
+            .cuda => |limit| count: {
+                options = try cudaClientOptions(limit.capacity_bytes, limit.device_bytes, &visible);
+                break :count options.len;
+            },
+        } else 0;
         // Load plugin shared library
         var lib = std.DynLib.open(plugin_path) catch return PjrtError.PluginLoadFailed;
         errdefer lib.close();
@@ -540,16 +549,10 @@ pub const Client = struct {
         // Create client (empty options = defaults)
         var create_args: c.ClientCreateArgs = std.mem.zeroes(c.ClientCreateArgs);
         create_args.struct_size = @sizeOf(c.ClientCreateArgs);
-        var visible = [_]i64{0};
-        var options: [6]c.NamedValue = undefined;
-        if (policy) |bounded| switch (bounded) {
-            .cpu => {},
-            .cuda => |limit| {
-                options = try cudaClientOptions(limit.capacity_bytes, limit.device_bytes, &visible);
-                create_args.create_options = @ptrCast(&options);
-                create_args.num_options = options.len;
-            },
-        };
+        if (option_count != 0) {
+            create_args.create_options = @ptrCast(&options);
+            create_args.num_options = option_count;
+        }
         try checkError(api, api.clientCreate(&create_args));
 
         const client_handle = create_args.client orelse return PjrtError.PjrtApiError;
@@ -571,12 +574,17 @@ pub const Client = struct {
         if (devices_args.num_addressable_devices == 0) return PjrtError.NoDevices;
         const device = devices_args.addressable_devices.?[0] orelse return PjrtError.NoDevices;
 
-        return .{
+        const result = Client{
             .api = api,
             .handle = client_handle,
             .device = device,
             .lib = lib,
         };
+        if (policy) |bounded| switch (bounded) {
+            .cpu => if (!try result.isCpu()) return error.UnsupportedPjrtFeature,
+            .cuda => if (!std.ascii.eqlIgnoreCase(try result.platformName(), "cuda")) return error.UnsupportedPjrtFeature,
+        };
+        return result;
     }
 
     pub fn deinit(self: *Client) void {
@@ -772,11 +780,15 @@ pub const Client = struct {
     ///   2. ~/.termite/pjrt/<os>-<arch>/pjrt_c_api_cpu_plugin.dylib (or .so)
     ///   3. If neither resolves to an existing file, returns error.PjrtPluginNotFound
     pub fn initFromEnv(allocator: std.mem.Allocator) !Client {
+        return initFromEnvWithMemoryPolicy(allocator, null);
+    }
+
+    pub fn initFromEnvWithMemoryPolicy(allocator: std.mem.Allocator, policy: ?MemoryPolicy) !Client {
         const plugin_path = try resolvePjrtPluginPath(allocator);
         defer allocator.free(plugin_path);
         const plugin_path_z = try allocator.dupeSentinel(u8, plugin_path, 0);
         defer allocator.free(plugin_path_z);
-        return Client.init(plugin_path_z);
+        return Client.initWithMemoryPolicy(plugin_path_z, policy);
     }
 
     /// Upload f32 data to a specific device, returning a Buffer handle.
@@ -893,7 +905,7 @@ test "end-to-end: compile and execute HLO add via PJRT CPU plugin" {
     const alloc = std.testing.allocator;
 
     // Load CPU plugin — skip test gracefully if not found
-    var client = Client.initFromEnv(alloc) catch |err| switch (err) {
+    var client = Client.initFromEnvWithMemoryPolicy(alloc, .cpu) catch |err| switch (err) {
         error.PjrtPluginNotFound => return error.SkipZigTest,
         else => return err,
     };
@@ -1191,6 +1203,11 @@ test "bounded CUDA clients reject allocator environment overrides before plugin 
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[1], "false", 1));
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[2], "0", 1));
     try validateBoundedCudaEnvironment();
+    for ([_]Client.MemoryPolicy{
+        .{ .cuda = .{ .capacity_bytes = 0, .device_bytes = 8 * 1024 * 1024 } },
+        .{ .cuda = .{ .capacity_bytes = 4 * 1024 * 1024, .device_bytes = 0 } },
+        .{ .cuda = .{ .capacity_bytes = 8 * 1024 * 1024, .device_bytes = 4 * 1024 * 1024 } },
+    }) |policy| try std.testing.expectError(error.InvalidMemoryStats, Client.initWithMemoryPolicy("missing-provider", policy));
 }
 
 test "execution owns all native outputs and completion events across host allocation failures" {

@@ -23,6 +23,8 @@ pub const Provider = struct {
     compiled_context: ?compiled.AttachContext = null,
 };
 
+const ParameterStore = if (@import("build_options").enable_pjrt) @import("../graph/pjrt_parameters.zig").Store else opaque {};
+
 const Frame = struct {
     backend: ops.ComputeBackend,
     executable: executable.Executable,
@@ -150,7 +152,7 @@ const Entries = @import("specialization_cache.zig").Cache(Key, *Entry, Entry.key
 pub const Cache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     entries: Entries = Entries.init(4),
-    parameters: ?*@import("../graph/pjrt_parameters.zig").Store = null,
+    parameters: ?*ParameterStore = null,
     identity: ?Provider = null,
 
     fn sameProvider(a: Provider, b: Provider) bool {
@@ -166,10 +168,10 @@ pub const Cache = struct {
     pub fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
         for (self.entries.entries.items) |entry| entry.release();
         self.entries.deinit(allocator);
-        if (self.parameters) |parameters| {
+        if (comptime @import("build_options").enable_pjrt) if (self.parameters) |parameters| {
             parameters.deinit();
             allocator.destroy(parameters);
-        }
+        };
     }
     fn acquire(self: *Cache, allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input) !*Entry {
         const key = try capture.specializationKey(forward, inputs);
@@ -182,23 +184,28 @@ pub const Cache = struct {
             }
         } else self.identity = provider;
         if (resolved_provider.compiled_context) |*context| if (context.requested_backend == .pjrt) {
-            const client: *@import("pjrt").pjrt.Client = @ptrCast(@alignCast(context.pjrt_client orelse {
-                self.mutex.unlock();
-                return error.MissingPjrtClient;
-            }));
-            if (self.parameters == null) {
-                const parameters = allocator.create(@import("../graph/pjrt_parameters.zig").Store) catch |err| {
+            if (comptime @import("build_options").enable_pjrt) {
+                const client: *@import("pjrt").pjrt.Client = @ptrCast(@alignCast(context.pjrt_client orelse {
                     self.mutex.unlock();
-                    return err;
-                };
-                parameters.* = .init(allocator, client);
-                self.parameters = parameters;
-            }
-            if (self.parameters.?.client != client) {
+                    return error.MissingPjrtClient;
+                }));
+                if (self.parameters == null) {
+                    const parameters = allocator.create(ParameterStore) catch |err| {
+                        self.mutex.unlock();
+                        return err;
+                    };
+                    parameters.* = .init(allocator, client);
+                    self.parameters = parameters;
+                }
+                if (self.parameters.?.client != client) {
+                    self.mutex.unlock();
+                    return error.ForeignCompiledProvider;
+                }
+                context.pjrt_parameter_store = @ptrCast(self.parameters.?);
+            } else {
                 self.mutex.unlock();
-                return error.ForeignCompiledProvider;
+                return error.PjrtNotEnabled;
             }
-            context.pjrt_parameter_store = @ptrCast(self.parameters.?);
         };
         if (self.entries.get(key)) |hit| {
             _ = hit.retain();
@@ -466,12 +473,20 @@ const TestPooling = struct {
         const provider = Provider{ .context = &source, .create = TestProvider.create, .import = TestProvider.import, .compiled_context = if (client) |actual| .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = actual } else null };
         var cache = Cache{};
         defer cache.deinit(a);
-        const outputs = try cache.run(a, provider, .{ .context = &source, .fingerprint = 0, .output_names = &.{"embedding"}, .run = forward }, &.{ .{ .tensor = input }, .{ .tensor = mask, .specialize = true } }, a, null);
+        const outputs = try cache.run(a, provider, .{ .context = &source, .fingerprint = 0, .output_names = &.{"embedding"}, .run = forward }, &.{ .{ .tensor = input }, .{ .tensor = mask } }, a, null);
         defer a.free(outputs);
         defer for (outputs) |*output| output.deinit();
         const want = [_]f32{ 1 / @sqrt(@as(f32, 5)), 2 / @sqrt(@as(f32, 5)), 2 / @sqrt(@as(f32, 13)), 3 / @sqrt(@as(f32, 13)) };
         try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, outputs[0].shape);
         for (want, outputs[0].asFloat32()) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
+        const bits: []i64 = @alignCast(std.mem.bytesAsSlice(i64, mask.data));
+        bits[2] = 0;
+        const changed = try cache.run(a, provider, .{ .context = &source, .fingerprint = 0, .output_names = &.{"embedding"}, .run = forward }, &.{ .{ .tensor = input }, .{ .tensor = mask } }, a, null);
+        defer a.free(changed);
+        defer for (changed) |*output| output.deinit();
+        const changed_want = [_]f32{ want[0], want[1], 0.6, 0.8 };
+        for (changed_want, changed[0].asFloat32()) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
+        try std.testing.expectEqual(@as(u64, 1), cache.entries.stats.builds);
     }
 };
 

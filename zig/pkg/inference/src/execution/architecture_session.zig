@@ -379,15 +379,30 @@ pub fn createNativeSessionWithOptions(allocator: std.mem.Allocator, model_path: 
 /// Host preparation selects the final owner before installing prefetch guards.
 /// CUDA upload retains packed encoder storage and materializes weights that
 /// would otherwise be lazy; ordinary execution retains its CPU policy.
-const HostPreparation = host_weights.HostPreparation;
+const HostSessionOptions = struct {
+    backend: enum { native, pjrt } = .native,
+    weights: host_weights.HostPreparation = .{},
+    pjrt_memory_policy: ?PjrtSessionOptions.MemoryPolicy = null,
+};
 
-fn openHostSession(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride, preparation: HostPreparation) !Session {
+pub const PjrtSessionOptions = struct {
+    /// Backend-neutral quantities; the optional SDK boundary converts them.
+    pub const MemoryPolicy = union(enum) {
+        cpu,
+        cuda: struct { capacity_bytes: usize, device_bytes: usize },
+    };
+    task_override: ?TaskOverride = null,
+    /// Explicit provider allocator policy, fixed before client creation.
+    memory_policy: ?PjrtSessionOptions.MemoryPolicy = null,
+};
+
+fn openHostSession(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride, preparation: HostSessionOptions) !Session {
     var loaded_model = try model_definition.LoadedModel.open(allocator, model_path);
     defer loaded_model.deinit();
     return prepareLoadedHostSession(allocator, loaded_model.manifest.source_root orelse model_path, &loaded_model, override, preparation);
 }
 
-fn openHostSessionFromManifest(allocator: std.mem.Allocator, model_path: []const u8, manifest: *const manifest_mod.ModelManifest, preparation: HostPreparation) !Session {
+fn openHostSessionFromManifest(allocator: std.mem.Allocator, model_path: []const u8, manifest: *const manifest_mod.ModelManifest, preparation: HostSessionOptions) !Session {
     var loaded_model = try model_definition.LoadedModel.fromManifest(allocator, model_path, manifest);
     defer loaded_model.deinit();
     return prepareLoadedHostSession(allocator, loaded_model.manifest.source_root orelse model_path, &loaded_model, null, preparation);
@@ -395,7 +410,7 @@ fn openHostSessionFromManifest(allocator: std.mem.Allocator, model_path: []const
 
 /// Consumes the loaded source's weights, retaining its metadata until return.
 /// Both host backends use the same normalization, residency and cleanup path.
-fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8, loaded_model: *model_definition.LoadedModel, override: ?TaskOverride, preparation: HostPreparation) !Session {
+fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8, loaded_model: *model_definition.LoadedModel, override: ?TaskOverride, preparation: HostSessionOptions) !Session {
     if (preparation.backend == .pjrt) {
         if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
         // Do not publish a compiled target whose production forward has no
@@ -409,14 +424,14 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
             else => return error.UnsupportedModelProgram,
         }
     }
-    var prepared = try host_weights.prepare(allocator, model_path, loaded_model, preparation);
+    var prepared = try host_weights.prepare(allocator, model_path, loaded_model, preparation.weights);
     defer prepared.deinit();
     const mf = loaded_model.manifest;
     const arch_config = prepared.architecture;
     const boundary_identity = prepared.boundary_identity;
     const gliner_decision_identity = prepared.decision_identity;
     const task = sessionTaskForModelType(mf.model_type, override);
-    const glide_head = try loadGlideHead(allocator, mf, model_path, arch_config, if (preparation.intent == .device_upload) .cuda else .native);
+    const glide_head = try loadGlideHead(allocator, mf, model_path, arch_config, if (preparation.weights.intent == .device_upload) .cuda else .native);
     var glide_head_owned = true;
     errdefer if (glide_head_owned) if (glide_head) |head| destroyGlideHead(allocator, head);
     const impl = try allocator.create(ArchSession);
@@ -449,7 +464,11 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
     // Client ownership transfers directly to the session; all subsequent
     // failures close it together with the native weight inventory.
     if (build_options.enable_pjrt and preparation.backend == .pjrt) {
-        impl.backend_data.pjrt.client = try pjrt_lib.pjrt.Client.initFromEnv(allocator);
+        const policy: ?pjrt_lib.pjrt.Client.MemoryPolicy = if (preparation.pjrt_memory_policy) |value| switch (value) {
+            .cpu => .cpu,
+            .cuda => |limit| .{ .cuda = .{ .capacity_bytes = limit.capacity_bytes, .device_bytes = limit.device_bytes } },
+        } else null;
+        impl.backend_data.pjrt.client = try pjrt_lib.pjrt.Client.initFromEnvWithMemoryPolicy(allocator, policy);
     }
     const host_data = switch (preparation.backend) {
         .native => &impl.backend_data.native,
@@ -478,12 +497,16 @@ pub fn createPjrtSession(allocator: std.mem.Allocator, model_path: []const u8) !
 }
 
 pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
-    if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
-    return openHostSession(allocator, model_path, override, .{ .backend = .pjrt });
+    return createPjrtSessionWithOptions(allocator, model_path, .{ .task_override = override });
 }
 
-test "host preparation shares native and PJRT ownership and unwinds allocation failures" {
-    if (!build_options.enable_native or build_options.enable_pjrt) return error.SkipZigTest;
+pub fn createPjrtSessionWithOptions(allocator: std.mem.Allocator, model_path: []const u8, options: PjrtSessionOptions) !Session {
+    if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
+    return openHostSession(allocator, model_path, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy });
+}
+
+test "host preparation shares execution and device-upload ownership and unwinds allocation failures" {
+    if (!build_options.enable_native) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -500,7 +523,7 @@ test "host preparation shares native and PJRT ownership and unwinds allocation f
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(path);
     const Check = struct {
-        fn run(a: std.mem.Allocator, model_path: []const u8, preparation: HostPreparation, gpt2: bool) !void {
+        fn run(a: std.mem.Allocator, model_path: []const u8, preparation: HostSessionOptions, gpt2: bool) !void {
             var loaded = try model_definition.LoadedModel.open(a, model_path);
             defer loaded.deinit();
             var session = try prepareLoadedHostSession(a, model_path, &loaded, .classifier, preparation);
@@ -519,16 +542,16 @@ test "host preparation shares native and PJRT ownership and unwinds allocation f
             try std.testing.expectEqualSlices(u8, if (gpt2) std.mem.asBytes(&[_]f32{ 1, 5, 2, 6, 3, 7, 4, 8 }) else std.mem.asBytes(&[_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 }), weight.tensor.data);
         }
     };
-    for ([_]HostPreparation{ .{}, .{ .backend = .pjrt }, .{ .intent = .device_upload } }) |preparation|
+    for ([_]HostSessionOptions{ .{}, .{ .weights = .{ .intent = .device_upload } } }) |preparation|
         try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ path, preparation, false });
-    // GPT-2 safetensors Conv1D storage needs the same transpose for PJRT's
-    // native fallback as for direct CPU execution.
+    // GPT-2 safetensors Conv1D normalization is independent of the final
+    // execution target, including a prepared device upload.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"gpt2\",\"n_embd\":2,\"n_layer\":1,\"n_head\":1,\"n_inner\":4,\"vocab_size\":2}" });
     const gpt_header = "{\"h.0.attn.c_attn.weight\":{\"dtype\":\"F32\",\"shape\":[2,4],\"data_offsets\":[0,32]}}";
     @memset(bytes[8 .. 8 + padded_len], ' ');
     @memcpy(bytes[8..][0..gpt_header.len], gpt_header);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = &bytes });
-    for ([_]HostPreparation{ .{}, .{ .backend = .pjrt } }) |preparation|
+    for ([_]HostSessionOptions{ .{}, .{ .weights = .{ .intent = .device_upload } } }) |preparation|
         try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ path, preparation, true });
 }
 
@@ -8015,7 +8038,18 @@ fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std
     const client = if (comptime build_options.enable_pjrt) if (self.backend_data.pjrt.client) |*value| @as(*anyopaque, @ptrCast(value)) else return error.MissingPjrtClient else return error.PjrtNotEnabled;
     const declared = try allocator.alloc(@import("capture.zig").Input, inputs.len);
     defer allocator.free(declared);
-    for (inputs, declared) |input, *value| value.* = .{ .tensor = input, .specialize = std.mem.eql(u8, input.name, "attention_mask") or std.mem.eql(u8, input.name, "encoder_attention_mask") or std.mem.eql(u8, input.name, "output_dimensions") };
+    // Segment/window metadata still has a value-dependent authored layout.
+    // Dense/relative attention consumes the declared mask tensor directly.
+    const specialize_masks = switch (self.arch_config) {
+        .bert, .deberta, .whisper, .gliner => false,
+        .gliner_boundary => |cfg| cfg.encoder.family != .deberta,
+        else => true,
+    };
+    for (inputs, declared) |input, *value| value.* = .{
+        .tensor = input,
+        .specialize = std.mem.eql(u8, input.name, "output_dimensions") or
+            (specialize_masks and (std.mem.eql(u8, input.name, "attention_mask") or std.mem.eql(u8, input.name, "encoder_attention_mask"))),
+    };
     return self.captured_programs.run(self.allocator, .{
         .context = self,
         .create = createProgramFrame,
@@ -21188,7 +21222,7 @@ pub fn createSessionFromManifest(
 ) !Session {
     return switch (backend) {
         .native => openHostSessionFromManifest(allocator, model_path, manifest, .{}),
-        .pjrt => openHostSessionFromManifest(allocator, model_path, manifest, .{ .backend = .pjrt }),
+        .pjrt => if (comptime build_options.enable_pjrt) openHostSessionFromManifest(allocator, model_path, manifest, .{ .backend = .pjrt }) else error.PjrtNotEnabled,
         .metal => createGpuHostedSessionWithTaskOverride(allocator, model_path, null, .metal, jit, load_context, a4b, manifest),
         .cuda => blk: {
             if (precision) |value| {
@@ -21645,4 +21679,12 @@ test "model program Llama and Qwen3 hidden frontends execute through PJRT with d
             for (want, actual[0].asFloat32()) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-5);
         }
     }
+}
+
+test "host preparation rejects explicit PJRT when provider support is disabled" {
+    if (comptime build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.PjrtNotEnabled, createPjrtSession(a, "/never-opened"));
+    const manifest = manifest_mod.ModelManifest{ .allocator = a };
+    try std.testing.expectError(error.PjrtNotEnabled, createSessionFromManifest(a, "/never-opened", &manifest, .pjrt, .{}, .dynamic, null, null, false));
 }

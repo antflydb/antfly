@@ -1080,13 +1080,13 @@ pub const PreparedDeviceWeights = struct {
         return head;
     }
     pub fn deinit(self: *PreparedDeviceWeights) void {
+        if (comptime !build_options.enable_metal) return;
         if (self.glide_head) |head| {
             host_weights.destroyGlideHead(self.weights.allocator, head);
             self.glide_head = null;
         }
         if (!self.owns_weights) return;
         self.owns_weights = false;
-        if (comptime !build_options.enable_metal) return;
         backend_factory.closeMetalWeights(self.weights.allocator, &self.weights);
     }
     pub fn takeWeights(self: *PreparedDeviceWeights) GpuHostedData {

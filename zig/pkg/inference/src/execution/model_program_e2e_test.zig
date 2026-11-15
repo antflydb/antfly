@@ -65,7 +65,7 @@ test "model program real GLiNER25 Deberta backbone PJRT outputs match native" {
     if (!platform.env.getenvBool("ANTFLY_GLINER25_PJRT_QUALIFICATION")) return error.SkipZigTest;
     const a = std.testing.allocator;
     const requests = [_][3]i64{ .{ 1, 2, 3 }, .{ 1, 3, 2 } };
-    const mask = [_]i64{ 1, 0, 1 };
+    const masks = [_][3]i64{ .{ 1, 1, 1 }, .{ 1, 0, 1 } };
     var expected: [requests.len][]f32 = undefined;
     var initialized: usize = 0;
     defer for (expected[0..initialized]) |value| a.free(value);
@@ -75,7 +75,7 @@ test "model program real GLiNER25 Deberta backbone PJRT outputs match native" {
         for (requests, 0..) |values, index| {
             var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 3 }, &values);
             defer ids.deinit();
-            var visibility = try Tensor.initInt64(a, "attention_mask", ids.shape, &mask);
+            var visibility = try Tensor.initInt64(a, "attention_mask", ids.shape, &masks[index]);
             defer visibility.deinit();
             const outputs = try session.runWithControl(&.{ ids, visibility }, a, .{ .native_call_policy = .in_process });
             defer a.free(outputs);
@@ -86,10 +86,10 @@ test "model program real GLiNER25 Deberta backbone PJRT outputs match native" {
     }
     const session = try factory.createPjrtSessionWithTaskOverride(a, model, .generic);
     defer session.close();
-    for (requests, expected) |values, want| {
+    for (requests, expected, 0..) |values, want, index| {
         var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 3 }, &values);
         defer ids.deinit();
-        var visibility = try Tensor.initInt64(a, "attention_mask", ids.shape, &mask);
+        var visibility = try Tensor.initInt64(a, "attention_mask", ids.shape, &masks[index]);
         defer visibility.deinit();
         const outputs = try session.runWithControl(&.{ ids, visibility }, a, .{ .native_call_policy = .in_process });
         defer a.free(outputs);

@@ -20,7 +20,7 @@ const factory = internal.architectures.session_factory;
 const pipeline = internal.pipelines.embedding_gemma2;
 const Bounded = internal.runtime.bounded_allocator.BoundedAllocator;
 
-const Backend = enum { native, metal, pjrt };
+const Backend = enum { native, metal, cuda, pjrt };
 const Session = internal.backends.Session;
 const Tensor = internal.backends.Tensor;
 
@@ -51,6 +51,8 @@ pub fn main(init: std.process.Init) !void {
     var suite_path: ?[]const u8 = null;
     var output: ?[]const u8 = null;
     var backend: Backend = .metal;
+    var pjrt_capacity: usize = 0;
+    var pjrt_device_bytes: usize = 0;
     var warmups: usize = 2;
     var iterations: usize = 20;
     var long_iterations: usize = 5;
@@ -60,10 +62,11 @@ pub fn main(init: std.process.Init) !void {
         if (i + 1 >= args.len) return error.MissingArgument;
         const key = args[i];
         const value = args[i + 1];
-        if (std.mem.eql(u8, key, "--model")) model = value else if (std.mem.eql(u8, key, "--suite")) suite_path = value else if (std.mem.eql(u8, key, "--output")) output = value else if (std.mem.eql(u8, key, "--case")) try selected.append(a, value) else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--iterations")) iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--long-iterations")) long_iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--backend")) {
+        if (std.mem.eql(u8, key, "--pjrt-capacity-bytes")) pjrt_capacity = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--pjrt-device-bytes")) pjrt_device_bytes = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--model")) model = value else if (std.mem.eql(u8, key, "--suite")) suite_path = value else if (std.mem.eql(u8, key, "--output")) output = value else if (std.mem.eql(u8, key, "--case")) try selected.append(a, value) else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--iterations")) iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--long-iterations")) long_iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--backend")) {
             backend = std.meta.stringToEnum(Backend, value) orelse return error.InvalidBackend;
         } else return error.UnknownArgument;
     }
+    if ((pjrt_capacity == 0) != (pjrt_device_bytes == 0) or (backend != .pjrt and pjrt_capacity != 0)) return error.InvalidPjrtMemoryPolicy;
     if (iterations == 0 or iterations > 100 or long_iterations == 0 or long_iterations > 100 or warmups > 100) return error.InvalidIterations;
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, suite_path orelse return error.MissingSuite, a, .limited(16 * 1024 * 1024));
     const parsed = try std.json.parseFromSlice(Suite, a, bytes, .{ .ignore_unknown_fields = true });
@@ -77,10 +80,11 @@ pub fn main(init: std.process.Init) !void {
     }
     const metal = backend == .metal;
     const session = switch (backend) {
-        .metal => try factory.createMetalSession(a, model orelse return error.MissingModel),
+        .metal => if (comptime @import("build_options").enable_metal) try factory.createMetalSession(a, model orelse return error.MissingModel) else return error.MetalNotEnabled,
         .native => try factory.createNativeSession(a, model orelse return error.MissingModel),
+        .cuda => if (comptime @import("build_options").enable_cuda) try factory.createCudaSession(std.heap.c_allocator, model orelse return error.MissingModel) else return error.CudaNotEnabled,
         // Frames retain this allocator, so request temporaries must be reusable.
-        .pjrt => try factory.createPjrtSession(std.heap.c_allocator, model orelse return error.MissingModel),
+        .pjrt => try factory.createPjrtSessionWithOptions(std.heap.c_allocator, model orelse return error.MissingModel, .{ .memory_policy = if (pjrt_capacity != 0) .{ .cuda = .{ .capacity_bytes = pjrt_capacity, .device_bytes = pjrt_device_bytes } } else null }),
     };
     defer session.close();
     if (!metal) factory.attachIo(session, init.io);
@@ -128,15 +132,15 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("encoder {s}: {d} samples, host peak {d}\n", .{ case.name, n, peak });
     }
     if (measurements.items.len == 0) return error.NoCases;
-    const report = try std.json.Stringify.valueAlloc(a, .{ .version = 1, .timing_scope = "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback", .backend = @tagName(backend), .memory_scope = "tracked Antfly host workspace; provider heaps excluded", .compiled_call_includes_public_session = backend == .pjrt, .warmups = warmups, .vm_counters_available = @import("build_options").enable_metal, .cases = measurements.items }, .{ .whitespace = .indent_2 });
+    const report = try std.json.Stringify.valueAlloc(a, .{ .version = 1, .timing_scope = "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback", .backend = @tagName(backend), .memory_scope = "tracked Antfly host workspace; provider heaps excluded", .call_includes_public_session = backend == .pjrt or backend == .cuda, .compiled_call_includes_public_session = backend == .pjrt, .cuda_policy = factory.getEmbeddingGemma2CudaPolicy(session), .pjrt_pool_cap_bytes = pjrt_capacity, .pjrt_device_bytes = pjrt_device_bytes, .warmups = warmups, .vm_counters_available = @import("build_options").enable_metal, .cases = measurements.items }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output orelse return error.MissingOutput, .data = report });
 }
 
 const Iteration = struct { vector: []f32, elapsed: u64, memory: Memory = .{} };
 fn measureIteration(session: Session, allocator: std.mem.Allocator, cfg: anytype, case: Case, mask: []const i64, backend: Backend) !Iteration {
-    if (backend == .pjrt) {
+    if (backend == .pjrt or backend == .cuda) {
         const started = try now();
-        const vector = try compiledVector(session, allocator, case, mask);
+        const vector = try sessionVector(session, allocator, case, mask);
         return .{ .vector = vector, .elapsed = try now() - started };
     }
     var permit = try session.admit(.{ .batch = 1, .sequence = case.token_ids.len, .workspace_bytes = if (backend == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 768 * 4 });
@@ -154,7 +158,7 @@ fn measureIteration(session: Session, allocator: std.mem.Allocator, cfg: anytype
     };
     return .{ .vector = vector, .elapsed = elapsed, .memory = memory };
 }
-fn compiledVector(session: Session, allocator: std.mem.Allocator, case: Case, mask: []const i64) ![]f32 {
+fn sessionVector(session: Session, allocator: std.mem.Allocator, case: Case, mask: []const i64) ![]f32 {
     const shape = [_]i64{ 1, @intCast(case.token_ids.len) };
     const dimensions = [_]i64{@intCast(case.dimensions)};
     const inputs = [_]Tensor{
@@ -165,7 +169,7 @@ fn compiledVector(session: Session, allocator: std.mem.Allocator, case: Case, ma
     const outputs = try session.runWithControl(&inputs, allocator, .{ .native_call_policy = .in_process });
     defer allocator.free(outputs);
     defer for (outputs) |*output| output.deinit();
-    if (outputs.len != 1 or outputs[0].dtype != .f32 or !outputs[0].owns_data or !std.mem.eql(i64, outputs[0].shape, &.{ 1, @intCast(case.dimensions) })) return error.InvalidCompiledEmbeddingOutput;
+    if (outputs.len != 1 or outputs[0].dtype != .f32 or !outputs[0].owns_data or !std.mem.eql(i64, outputs[0].shape, &.{ 1, @intCast(case.dimensions) })) return error.InvalidSessionEmbeddingOutput;
     const vector = outputs[0].asFloat32Mut();
     outputs[0].owns_data = false;
     return vector;

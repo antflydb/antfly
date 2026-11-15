@@ -264,7 +264,6 @@ fn layaQ8Weight(allocator: std.mem.Allocator, store: tensor_store_mod.TensorStor
 /// CUDA upload retains packed encoder storage and materializes weights that
 /// would otherwise be lazy; ordinary execution retains its CPU policy.
 pub const HostPreparation = struct {
-    backend: enum { native, pjrt } = .native,
     intent: enum { execute, device_upload } = .execute,
 };
 

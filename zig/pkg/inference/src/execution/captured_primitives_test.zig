@@ -164,8 +164,8 @@ fn qualify(kind: Kind) !void {
             if (kind == .relative) {
                 try inputs.append(a, .{ .tensor = try numbers(a, "query_relative", &.{ 5, 4 }, -1) });
                 try inputs.append(a, .{ .tensor = try numbers(a, "key_relative", &.{ 5, 4 }, 3) });
-                try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, &.{ 1, 0, 1, 0, 0, 0 }), .specialize = true });
-            } else if (kind != .causal and kind != .gqa) try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, &.{ 1, 0, 1, 1, 1, 0 }), .specialize = true });
+                try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, &.{ 1, 0, 1, 0, 0, 0 }) });
+            } else if (kind != .causal and kind != .gqa) try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, &.{ 1, 0, 1, 1, 1, 0 }) });
             if (kind == .sdpa_bias) try inputs.append(a, .{ .tensor = try numbers(a, "bias", &.{ 2, 3, 3 }, -1) });
         },
     }
@@ -173,7 +173,16 @@ fn qualify(kind: Kind) !void {
     defer reference.deinit();
     var cache = prepared.Cache{};
     defer cache.deinit(a);
-    for (0..if (kind == .marker_head) @as(usize, 2) else 1) |iteration| {
+    const dynamic_mask = switch (kind) {
+        .relative, .sdpa_heads, .sdpa_token, .sdpa_bias, .cross => true,
+        else => false,
+    };
+    for (0..if (kind == .marker_head or dynamic_mask) @as(usize, 3) else 1) |iteration| {
+        if (dynamic_mask and iteration != 0) {
+            const input = &inputs.items[if (kind == .relative) @as(usize, 5) else 3].tensor;
+            const mask: []i64 = @alignCast(std.mem.bytesAsSlice(i64, input.data));
+            @memcpy(mask, if (iteration == 1) &[_]i64{ 1, 1, 1, 1, 1, 1 } else &[_]i64{ 0, 1, 1, 1, 0, 1 });
+        }
         if (kind == .marker_head and iteration == 1) @as([*]i64, @ptrCast(@alignCast(inputs.items[1].tensor.data.ptr)))[0] = 1;
         const expected = try Fixture.forward(&source, &reference, a, inputs.items);
         defer a.free(expected);
@@ -186,7 +195,7 @@ fn qualify(kind: Kind) !void {
         try std.testing.expectEqual(values.len, actual[0].asFloat32().len);
         for (values, actual[0].asFloat32()) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
     }
-    if (kind == .marker_head) try std.testing.expectEqual(@as(usize, 1), cache.entries.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), cache.entries.stats.builds);
 }
 
 test "captured primitive PJRT biased strided conv1d matches native" {

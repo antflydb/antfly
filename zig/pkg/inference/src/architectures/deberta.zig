@@ -792,13 +792,12 @@ fn embeddings(
     errdefer cb.free(normed);
 
     // Multiply by attention mask (DeBERTa-v3 zeros out padding embeddings).
-    if (allAttentionMaskOnes(attention_mask, total)) return normed;
+    if (cb.kind() != .graph and allAttentionMaskOnes(attention_mask, total)) return normed;
 
     if (cb.kind() == .graph) {
-        const values = try allocator.alloc(f32, total);
-        defer allocator.free(values);
-        for (attention_mask[0..total], values) |bit, *value| value.* = @floatFromInt(bit);
-        const linear = try cb.fromFloat32Shape(values, &.{ @intCast(total), 1 });
+        const typed = (try cb.fromConstantBytes(std.mem.sliceAsBytes(attention_mask[0..total]), .i64, &.{ @intCast(total), 1 })) orelse return error.UnsupportedTensorType;
+        defer cb.free(typed);
+        const linear = (try cb.tryConvertDType(typed, .f32)) orelse return error.UnsupportedTensorType;
         defer cb.free(linear);
         const broadcast = try cb.primBroadcastInDim(linear, &.{ @intCast(total), H }, &.{ 0, 1 }, &.{ @intCast(total), 1 });
         defer cb.free(broadcast);

@@ -186,6 +186,19 @@ pub const TracingCompute = struct {
         return null;
     }
 
+    /// Keep declared mask bytes as a typed operand; only undeclared metadata
+    /// becomes a constant. Expanded attention layouts stay in the graph.
+    fn maskVisibility(self: *TracingCompute, mask: []const i64, batch: usize, sequence: usize) !struct { node: NodeId, dynamic: bool } {
+        if (mask.len != try std.math.mul(usize, batch, sequence)) return error.InvalidAttentionMask;
+        for (mask) |bit| if (bit != 0 and bit != 1) return error.InvalidAttentionMask;
+        const shape = Shape.init(.i64, &.{ @intCast(batch), @intCast(sequence) });
+        const runtime = try self.runtimeInput(std.mem.sliceAsBytes(mask), .i64, shape);
+        const value = runtime orelse try self.typedConstant(std.mem.sliceAsBytes(mask), shape);
+        var builder = Builder.init(&self.graph);
+        const zero = try self.broadcastNode(try builder.scalarConst(.i64, 0), &.{}, shape);
+        return .{ .node = try self.lessNode(zero, value, shape), .dynamic = runtime != null };
+    }
+
     pub fn markOutput(self: *TracingCompute, value: CT) !NodeId {
         var owned = false;
         for (self.handles.items) |handle| if (@as(CT, @ptrCast(handle)) == value) {
@@ -280,6 +293,7 @@ pub const TracingCompute = struct {
         .maskedMeanBatch = &maskedMeanBatchOp,
         .tensorShape = &tensorShapeOp,
         .tensorDType = &tensorDTypeOp,
+        .convertDType = &convertDTypeOp,
         .takeRows = &takeRowsOp,
         .zeroTensor = &zeroTensorOp,
         .reshape2d = &reshape2dOp,
@@ -571,30 +585,24 @@ pub const TracingCompute = struct {
         if (batch == 0 or sequence == 0 or width == 0 or dimensions == 0 or dimensions > width) return error.InvalidInputShape;
         const rows = try std.math.mul(usize, batch, sequence);
         if (mask) |values| if (values.len != rows) return error.InvalidInputShape;
-        const flags = try tc.allocator.alloc(f32, rows);
-        defer tc.allocator.free(flags);
-        const counts = try tc.allocator.alloc(f32, batch);
-        defer tc.allocator.free(counts);
-        @memset(counts, 0);
-        for (flags, 0..) |*flag, row| {
-            const active = if (mask) |values| values[row] else 1;
-            if (active != 0 and active != 1) return error.InvalidAttentionMask;
-            flag.* = @floatFromInt(active);
-            counts[row / sequence] += flag.*;
-        }
-        for (counts) |count| if (count == 0) return error.EmptyEmbeddingInput;
+        if (mask) |values| for (0..batch) |row| {
+            var active: usize = 0;
+            for (values[row * sequence ..][0..sequence]) |bit| {
+                if (bit != 0 and bit != 1) return error.InvalidAttentionMask;
+                active += @intFromBool(bit != 0);
+            }
+            if (active == 0) return error.EmptyEmbeddingInput;
+        };
         var builder = Builder.init(&tc.graph);
         const shape3 = Shape.init(.f32, &.{ @intCast(batch), @intCast(sequence), @intCast(width) });
         const shaped = try builder.reshape(nodeIdFromCT(input), shape3);
-        const flags_loc = try tc.graph.internConstant(flags);
         const flags_shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(sequence) });
-        const flags_node = try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = flags_loc.offset, .data_len = flags_loc.len } }, .output_shape = flags_shape });
+        const comparison = if (mask) |values| (try tc.maskVisibility(values, batch, sequence)).node else try tc.broadcastNode(try tc.typedConstant(&.{1}, Shape.init(.bool_, &.{})), &.{}, Shape.init(.bool_, flags_shape.dims[0..flags_shape.rank()]));
+        const flags_node = try builder.convertDtype(comparison, .f32);
         const zero = try builder.scalarConst(.f32, 0);
-        const comparison = try tc.graph.addNode(.{ .op = .{ .less_than = {} }, .output_shape = Shape.init(.bool_, flags_shape.dims[0..flags_shape.rank()]), .inputs = .{ try tc.broadcastNode(zero, &.{}, flags_shape), flags_node, null_node, null_node }, .num_inputs = 2 });
         const selected = try tc.graph.addNode(.{ .op = .{ .where_select = {} }, .output_shape = shape3, .inputs = .{ try tc.broadcastNode(comparison, &.{ 0, 1 }, Shape.init(.bool_, shape3.dims[0..shape3.rank()])), shaped, try tc.broadcastNode(zero, &.{}, shape3), null_node }, .num_inputs = 3 });
         const sums = try builder.reshape(try builder.reduceSum(selected, &.{1}), Shape.init(.f32, &.{ @intCast(batch), @intCast(width) }));
-        const counts_loc = try tc.graph.internConstant(counts);
-        const count_node = try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = counts_loc.offset, .data_len = counts_loc.len } }, .output_shape = Shape.init(.f32, &.{@intCast(batch)}) });
+        const count_node = try builder.reshape(try builder.reduceSum(flags_node, &.{1}), Shape.init(.f32, &.{@intCast(batch)}));
         const mean_shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(width) });
         var result = try builder.div(sums, try tc.broadcastNode(count_node, &.{0}, mean_shape));
         if (dimensions != width) result = try builder.sliceLastDim(result, 0, @intCast(dimensions));
@@ -619,6 +627,12 @@ pub const TracingCompute = struct {
         return switch (dtype) {
             inline else => |tag| @field(@import("../backends/tensor.zig").DType, @tagName(tag)),
         };
+    }
+
+    fn convertDTypeOp(ctx: *anyopaque, value: CT, target: ops.GraphDType) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return try tc.makeHandle(try builder.convertDtype(nodeIdFromCT(value), target));
     }
 
     fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
@@ -931,18 +945,16 @@ pub const TracingCompute = struct {
         const negative = try tc.broadcastNode(try builder.scalarConst(.f32, -std.math.inf(f32)), &.{}, score_shape);
         var empty_row = false;
         if (mask.len != 0) {
-            const flags = try tc.allocator.alloc(u8, try std.math.mul(usize, bh, keys));
-            defer tc.allocator.free(flags);
+            const visibility = try tc.maskVisibility(mask, batch, keys);
             for (0..batch) |item| {
                 var active: usize = 0;
-                for (mask[item * keys ..][0..keys], 0..) |valid, index| {
-                    if (valid != 0 and valid != 1) return error.InvalidAttentionMask;
-                    active += @intFromBool(valid != 0);
-                    for (0..heads) |head| flags[(item * heads + head) * keys + index] = @intCast(valid);
-                }
+                for (mask[item * keys ..][0..keys]) |valid| active += @intFromBool(valid != 0);
                 empty_row = empty_row or active == 0;
             }
-            const visible = try tc.typedConstant(flags, Shape.init(.bool_, &.{ @intCast(bh), @intCast(keys) }));
+            // Dynamic masks can introduce an empty row after capture.
+            empty_row = empty_row or visibility.dynamic;
+            const expanded = try tc.broadcastNode(visibility.node, &.{ 0, 2 }, Shape.init(.bool_, &.{ @intCast(batch), @intCast(heads), @intCast(keys) }));
+            const visible = try builder.reshape(expanded, Shape.init(.bool_, &.{ @intCast(bh), @intCast(keys) }));
             score = try tc.selectNode(try tc.broadcastNode(visible, &.{ 0, 2 }, Shape.init(.bool_, score_shape.dims[0..score_shape.rank()])), score, negative, score_shape);
             const value_shape = tc.graph.node(value).output_shape;
             const value_zero = try tc.broadcastNode(try builder.scalarConst(.f32, 0), &.{}, value_shape);
@@ -1159,16 +1171,11 @@ pub const TracingCompute = struct {
         }
         const qkv = try builder.concat(try builder.concat(content[0], content[1], 0), content[2], 0);
         const qrkr = try builder.concat(relative[0], relative[1], 0);
-        // Only a linear visibility vector enters the constant pool. The graph
-        // expresses its expanded score layout, allowing compiled fusion.
-        const visibility = try tc.allocator.alloc(f32, rows);
-        defer tc.allocator.free(visibility);
-        for (mask, visibility) |bit, *value| {
-            if (bit != 0 and bit != 1) return error.InvalidAttentionMask;
-            value.* = if (bit == 0) -std.math.inf(f32) else 0;
-        }
-        const location = try tc.graph.internConstant(visibility);
-        const keys = try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = location.offset, .data_len = location.len } }, .output_shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(seq_len) }) });
+        const visibility = try tc.maskVisibility(mask, batch, seq_len);
+        const key_shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(seq_len) });
+        const zero = try tc.broadcastNode(try builder.scalarConst(.f32, 0), &.{}, key_shape);
+        const negative = try tc.broadcastNode(try builder.scalarConst(.f32, -std.math.inf(f32)), &.{}, key_shape);
+        const keys = try tc.selectNode(visibility.node, zero, negative, key_shape);
         const expanded = try tc.broadcastNode(keys, &.{ 0, 3 }, Shape.init(.f32, &.{ @intCast(batch), @intCast(num_heads), @intCast(seq_len), @intCast(seq_len) }));
         const bias = try builder.reshape(expanded, Shape.init(.f32, &.{ @intCast(batch * num_heads), @intCast(seq_len), @intCast(seq_len) }));
         const output = try tc.graph.addNode(.{
