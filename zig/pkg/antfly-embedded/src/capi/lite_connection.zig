@@ -1845,6 +1845,94 @@ pub const Owner = struct {
     /// stable across any number of swaps.
     test_cumulative_sync_calls: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
 
+    /// A retiring generation rejects further publication once nothing else
+    /// still needs it writable -- except a `WriterLane`-admitted call still
+    /// mid-flight on it. `WriterLane.checkout`'s own doc comment: a pinned
+    /// root's `lane_pins` is kept nonzero "for as long as this call might
+    /// still touch it, including while its own ticket is still
+    /// outstanding" -- that outstanding ticket is exactly a
+    /// `sync_level: .enrichments`/`.full_index` write's own derived-
+    /// visibility wait (WS3's `releaseWriterLaneBeforeWait`/`leave`), which
+    /// keeps driving further writes against this same table (group-source
+    /// slices, enrichment production) for as long as it runs, with none of
+    /// the connection-level locks held across that wait. A concurrent
+    /// `refresh` -- a sibling write, or the maintenance owner's own
+    /// republish via `PreparedPublication.acquireStore`/`.current()`,
+    /// entirely unrelated to this call's own progress -- can retire and
+    /// mark read-only the exact generation that pinned write is still
+    /// using. That is not just a flaky retry: a write that lands in the gap
+    /// between the retirement decision and the store actually flipping
+    /// read-only hits `error.ReadOnly` well-behaved (see
+    /// `group_source_owner.Owner.step`'s own tolerance for it), but one
+    /// that free-rides on this instance's now-superseded writer-base
+    /// bookkeeping can reach `NativeFile.publishCheckpoint`'s backstop --
+    /// "stale writer base reached publishCheckpoint" -- which is a hard
+    /// panic, not a retryable error, by design (its own doc comment: by the
+    /// time a stale instance reaches publication it may have already reused
+    /// pages out of its own stale free map). `collectRetired` already treats
+    /// a nonzero `lane_pins` as a reason this generation cannot be destroyed
+    /// yet; extend that same deferral to the read-only marking that
+    /// precedes destruction. Called again from `collectRetired` once the
+    /// matching pin clears, in case this generation is still sitting in
+    /// `self.retired` by then.
+    pub fn markRetiredReadOnlyIfIdle(retired: *h.Handle) void {
+        // Only a generation `refresh`'s slow path has already replaced
+        // (`previous.lease_snapshot = true`, set at the same point it is
+        // pushed onto `self.retired`) is ever eligible: the live
+        // `self.current` must never be marked read-only here, including
+        // when this is called again from a later sweep that finds the
+        // pin's own root was never actually retired in the first place.
+        if (!retired.lease_snapshot) return;
+        if (retired.maintenance_references != 0 or retired.immutable_query_borrows != 0 or retired.lane_pins.load(.acquire) != 0) return;
+        const store = retired.owned_lite_backend.?.native_docstore.?;
+        if (store.read_only) return;
+        store.read_only = true;
+        store.file.read_only = true;
+    }
+
+    /// Request a retiring generation's resident background workers --
+    /// `DB.startResidentBackgroundWorkersIfNeeded`'s own `group_source_owner`
+    /// scheduler registration and each table's `enrichment_runtime` worker
+    /// -- to stop driving new writes against it, without blocking this
+    /// `refresh` call on either.
+    ///
+    /// Why non-blocking is the only safe option here: both workers are
+    /// `.producer`-class tasks on the *same* `maintenanceScheduler` this
+    /// refresh may itself be running under (a resident worker's own pass
+    /// can call `Owner.refresh` again, e.g. via `PreparedPublication.
+    /// acquireStore`/`.current()`, to republish against the live
+    /// generation). `group_source_owner.Owner.stop`/`EnrichmentRuntime.stop`
+    /// both join the in-flight task (`MaintenanceScheduler.Handle.await`/
+    /// `Io.Future.await`) before returning. If this function's caller holds
+    /// `self.gate.mutex` (every `refresh` caller does -- see this struct's
+    /// own doc comment) and that join is waiting on a task that is itself
+    /// blocked re-entering `Owner.refresh` for the *same* mutex, this
+    /// deadlocks: the join never returns because the task it is waiting on
+    /// can never acquire the lock the joiner already holds. (An earlier,
+    /// fully-blocking version of this fix hit exactly that, observed as the
+    /// test run stalling for tens of seconds inside this exact call chain.)
+    /// A bare, atomic "please stop" store has no such hazard: it only ever
+    /// touches memory already safely synchronized by the task's own
+    /// `step`/`workerStep` re-checking it at the top of its *next* turn --
+    /// never this thread blocking on that check happening.
+    ///
+    /// The actual join -- the one that frees `self.registration`/`self.future`
+    /// and is safe to block on -- happens later, from `DB.close` (via
+    /// `tables.closeAll`/`closeHandle`), reached only once `collectRetired`
+    /// decides nothing else references this generation at all (not even a
+    /// pinned cursor or an in-flight `lane_pins` write): by then, the worker
+    /// this function asked to stop has long since seen `stopping`/
+    /// `shutdown_requested` at the top of its own turn and gone idle, so
+    /// that later join has nothing live left to wait on and cannot
+    /// recursively call `refresh` either. A fresh registration starts the
+    /// next time `replacement`'s own table is (re)opened
+    /// (`tables.get`/`openTable`), so no caller is ever left without a
+    /// resident worker once one is actually needed again.
+    fn stopResidentBackgroundWorkersNonBlocking(database: *h.db_mod.DB) void {
+        database.group_source_owner.stopping.store(true, .release);
+        if (database.enrichment_runtime) |runtime| runtime.beginTeardown();
+    }
+
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
     /// uses its pinned generation without reopening the connection.
@@ -2004,11 +2092,21 @@ pub const Owner = struct {
             self.retired.appendAssumeCapacity(previous);
             previous.lease_snapshot = true;
             // Cursor continuation can only read this generation. Make every
-            // namespace's shared native store reject publication immediately.
-            if (previous.maintenance_references == 0 and previous.immutable_query_borrows == 0) {
-                previous.owned_lite_backend.?.native_docstore.?.read_only = true;
-                previous.owned_lite_backend.?.native_docstore.?.file.read_only = true;
-            }
+            // namespace's shared native store reject publication immediately
+            // -- except for a write this same retirement must not pull the
+            // floor out from under: `markRetiredReadOnlyIfIdle`'s own doc
+            // comment.
+            markRetiredReadOnlyIfIdle(previous);
+            // Likewise, tell every resident background worker this
+            // generation ever started that it is retiring, so it stops
+            // attempting new writes against it instead of racing the
+            // store's own read-only transition or this generation's
+            // superseded writer-base bookkeeping -- see
+            // `stopResidentBackgroundWorkersNonBlocking`'s own doc comment
+            // for why this must stay non-blocking.
+            stopResidentBackgroundWorkersNonBlocking(&previous.db);
+            var retiring_tables = previous.embedded_tables.valueIterator();
+            while (retiring_tables.next()) |table| stopResidentBackgroundWorkersNonBlocking(&table.*.db);
         }
         // Child table handles outlive snapshots. Drop borrowed producers before
         // collectRetired releases their old provider (even if addresses are reused).
@@ -2171,6 +2269,16 @@ pub const Owner = struct {
                 break :retained false;
             };
             if (retained) {
+                // Still kept alive for some other reason (a lingering
+                // cursor, an allocator-verification reference, ...), but a
+                // `lane_pins` deferral that was the only thing blocking
+                // `markRetiredReadOnlyIfIdle` at retirement time may have
+                // cleared since: every `collectRetired` call (reached from
+                // `refresh`, itself called under the same lock this
+                // generation was retired under) is a correct place to
+                // recheck it, without a separate, independently-locked call
+                // site at pin-release time.
+                markRetiredReadOnlyIfIdle(retired);
                 i += 1;
             } else {
                 _ = self.retired.swapRemove(i);
@@ -6884,6 +6992,108 @@ test "capi native sibling connection's refresh sees a redo-only commit without a
     const value = try after.owned_lite_backend.?.native_docstore.?.file.getDocumentAlloc(a, "sibling-redo");
     defer if (value) |bytes| a.free(bytes);
     try std.testing.expect(value != null);
+}
+
+// perf/lwa-enrich-visibility: `Owner.refresh()`'s retirement block used to
+// mark a superseded generation read-only (`previous.owned_lite_backend.?.
+// native_docstore.?.read_only = true`) whenever `maintenance_references ==
+// 0 and immutable_query_borrows == 0` -- never checking `lane_pins` at all.
+// `WriterLane.checkout`'s own doc comment says a pinned root's `lane_pins`
+// is kept nonzero "for as long as this call might still touch it, including
+// while its own ticket is still outstanding" -- exactly a `sync_level:
+// .enrichments`/`.full_index` write's own derived-visibility wait (WS3's
+// `releaseWriterLaneBeforeWait`), which keeps driving further writes
+// against this same generation with no connection-level lock held across
+// it. A concurrent `refresh` (a sibling write, or the maintenance owner's
+// own republish) could retire and mark read-only the exact generation that
+// pinned write was still using, surfacing live as
+// `test_grouped_sources_drive_downstream_graph`'s table-scoped variants
+// intermittently failing `ANTFLY_STALLED` with the underlying cause
+// `error.ReadOnly`, or escalating into native.zig's "stale writer base
+// reached publishCheckpoint" panic once a write actually landed in the
+// gap. Fixed by `markRetiredReadOnlyIfIdle` deferring the marking (and
+// `collectRetired` rechecking it once the pin clears).
+test "capi native refresh during a lane-pinned write does not mark that generation read-only" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("lane-pin-refresh-readonly");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+
+    // Simulate a lane-eligible mutation's own admission
+    // (`enterCapturedHandleWithDeadline`'s `WriterLane.checkout` call):
+    // `pinned_root.lane_pins` is now nonzero, exactly as it is for the
+    // whole span of a real write's own derived-visibility wait. This also
+    // holds the lane's own kernel-level lease, so forcing staleness via an
+    // *external* sibling writer (the shape the test above uses) would
+    // contend with that same lease (`lockWriterPathWithIo` would return
+    // `error.WouldBlock`) rather than reproducing the actual bug, which
+    // needs no second writer at all -- only a second *caller* of
+    // `Owner.refresh()` while this pin is outstanding (exactly
+    // `PreparedPublication.acquireStore`/`.current()`'s own call from the
+    // maintenance owner's republish pass). Force the identical slow-path
+    // decision `refresh()`'s own fast-path check makes
+    // (`!needsOutcomeReconciliation(current)`) the cheap way: flip one of
+    // the three flags that function reads directly, no lock or second
+    // writer required.
+    const pinned_root = try owner.writer_lane.checkout(connection, .mutation);
+    try std.testing.expect(pinned_root.lane_pins.load(.acquire) > 0);
+    const store = pinned_root.owned_lite_backend.?.native_docstore.?;
+    pinned_root.sql_decision_uncertain = true;
+    // A second, independent reason this generation cannot be fully reaped
+    // yet (`collectRetired`'s own retention check, not
+    // `markRetiredReadOnlyIfIdle`'s -- `query_borrows`, unlike
+    // `immutable_query_borrows`, only gates the former): without it,
+    // checking the lane pin in below would make `collectRetired` destroy
+    // `pinned_root` outright (nothing else references it in this test),
+    // leaving no handle left to assert the read-only marking landed on.
+    pinned_root.query_borrows += 1;
+
+    // `refresh()` must retire `pinned_root` (a fresh generation reopens
+    // from durable state, the ordinary reconciliation path for an
+    // uncertain decision) but must not mark it read-only while this
+    // call's own lane pin is still outstanding.
+    const after = try owner.refresh();
+    try std.testing.expect(after != pinned_root);
+    try std.testing.expect(!store.read_only);
+    try std.testing.expect(!store.file.read_only);
+
+    // Not just an unchecked flag: the write path itself still succeeds
+    // through the pinned generation while the pin holds.
+    try store.file.putDocument("still-writable-while-pinned", "{\"text\":\"ok\"}");
+
+    // Checking the lane in (`leaveWithRegistry`'s own `WriterLane.checkin`
+    // call, which hands the kernel lease onward and detaches the
+    // connection) and unpinning (that same function's *separate*
+    // `lane_pinned_root.lane_pins.fetchSub(1, .release)`, run after
+    // `checkin` -- `WriterLane.checkin` itself never touches `lane_pins`
+    // at all, by design: see `WriterLane.checkout`'s own doc comment,
+    // "the caller... must decrement it exactly once, in
+    // `leaveWithRegistry`") together simulate a real write's own call
+    // finishing after its derived-visibility wait resolves. Only once
+    // both have happened should the deferred marking land, via
+    // `collectRetired`'s own recheck -- the retired generation stays
+    // writable only for as long as the write it was protecting is still
+    // outstanding, not forever.
+    owner.writer_lane.checkin(connection, store);
+    _ = pinned_root.lane_pins.fetchSub(1, .release);
+    owner.collectRetired();
+    try std.testing.expect(store.read_only);
+    try std.testing.expect(store.file.read_only);
+    pinned_root.query_borrows -= 1;
+    owner.collectRetired();
 }
 
 /// Every fork-based test below waits on a real second OS process across
