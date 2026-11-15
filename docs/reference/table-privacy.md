@@ -360,5 +360,8 @@ source deletion or generation proves it retired, or explicit repair resolves the
 missing state. Workers park instead of polling the same failed window; source or
 producer commits and explicit repair notifications wake them, including repairs
 at the same replay sequence. Ordinary query visibility waits do not wake an
-unchanged missing-input window. Reopening retries retained debt. This applies to
+unchanged missing-input window. Continuing writes also respect a bounded retry
+backoff; they cannot cause a blocked window to replay at the write rate. A retry
+requires both a notification and an elapsed deadline, so idle workers do not
+poll. Reopening retries retained debt. This applies to
 full-text consumers as well as vector consumers.
