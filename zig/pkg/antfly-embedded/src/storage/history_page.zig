@@ -20,6 +20,11 @@ const std = @import("std");
 const history = @import("committed_history.zig");
 const control = @import("history_consumer.zig");
 const frame = history.frame;
+pub const max_source_bytes = frame.max_bytes;
+/// Private retained physical identity to lossless authored document key.
+pub fn documentId(a: std.mem.Allocator, physical: []const u8) ![]u8 {
+    return (try @import("internal_keys.zig").decodeStoredDocumentRowKeyAlloc(a, physical)) orelse error.ChangefeedCapabilityUnsupported;
+}
 pub const Position = struct {
     /// Fully consumed frames. A nonzero event resumes inside sequence + 1.
     sequence: u64 = 0,

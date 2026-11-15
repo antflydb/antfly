@@ -44266,6 +44266,10 @@ fn implementationTests() type {
             try std.testing.expectError(error.OnlineSourceScopeChanged, raft_db.nativeHistoryConsumerControl(.{ .enroll = grant }));
         }
 
+        test "native history consumer control document provider preserves authorized historical replay" {
+            try @import("../metadata/native_changefeed_delivery_test.zig").run();
+        }
+
         test "native history consumer control adapter recovers metadata and root after lost progress replies" {
             const root_adapter = @import("../metadata/native_changefeed_root.zig");
             const control = @import("../metadata/changefeed_control.zig");

@@ -457,6 +457,39 @@ legacy envelopes/cursor identity, continuation replay and tampering, ACK/reopen,
 Raft snapshot installation with pending continuation/cleanup, maximum root fanout,
 and rejection of deeply nested unknown metadata before digest traversal.
 
+## Native document delivery provider
+
+`metadata/native_changefeed_delivery.zig` now joins retained native pages,
+authorized historical image projection and durable receipt coordination. It
+emits a versioned document envelope with feed-scoped event/transaction/version
+identities, immutable table IDs, lossless UTF-8/base64url keys, projected
+before/after rows, and explicit page-versus-transaction completion. Feed versions
+are not document conditional-write tokens. Mutable table display names and
+private source positions are not part of event payloads.
+
+Replay uses the original recorded interval and continuation. A no-data heartbeat
+replays as a heartbeat even after a new commit arrives. Byte/event limits cannot
+silently repartition an issued delivery. Private visibility continuation permits
+a filtered empty final page to complete a previously visible transaction while
+entirely filtered transactions emit no public transaction boundary. Payload byte
+counts are checked before output allocation; iterative JSON emission preserves
+exact numbers and arbitrary nesting without the formatter's fixed-depth stack.
+
+The provider requires a policy implementation that verifies the principal,
+replication privilege, live table/root-set incarnation and policy revision, and
+authorizes/redacts both historical images. The current source is a single local
+JSON document root with explicit `root_local` capture evidence. It rejects
+coordinated/legacy transactions, relational tuples, object/lake roots, bootstrap
+and lifecycle requests pending their separate qualified implementations. These
+are remaining implementation obligations, not substituted completion criteria.
+
+A real native-store plus real metadata-store integration checks lost delivery
+reply followed by a live-row update, exact historical replay, field exclusion,
+partial-frame completion, filtered leave/enter, completely hidden transactions,
+heartbeat replay after a later commit, revocation before cursor inspection, and
+rejection of unqualified coordinated completion. Production policy/root routing,
+HTTP/SQL/pgwire exposure, distributed outcome proofs and bootstrap remain required.
+
 ## Remaining implementation phases
 
 1. Finish root history tests, prepared credit accounting and native integration.
