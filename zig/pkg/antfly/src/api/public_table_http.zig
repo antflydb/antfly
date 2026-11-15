@@ -417,6 +417,7 @@ pub const TableApi = struct {
         ReadUnavailable,
         StorageReadTemporarilyUnavailable,
         InternalFailure,
+        ResourceBudgetExceeded,
     };
 
     pub const ExecuteDocumentArtifactManifestsError = error{
@@ -2716,6 +2717,16 @@ pub fn handleDocumentArtifactManifest(
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
         error.StorageReadTemporarilyUnavailable => return try storageReadTemporarilyUnavailableOwnedResponse(alloc),
+        error.ResourceBudgetExceeded => return .{
+            .status = 413,
+            .json = true,
+            .body = try std.json.Stringify.valueAlloc(alloc, .{
+                .code = "inspection_limit_exceeded",
+                .retryable = false,
+                .message = "Dense index inspection exceeds supported limits; use a smaller source or recipe.",
+                .limits = db_mod.types.dense_index_inspection_limits,
+            }, .{}),
+        },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest lookup failed") },
     };
     defer manifest.deinit(alloc);
@@ -6550,6 +6561,7 @@ test "public document artifact manifest handler returns summary and raw state" {
         ) TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
             if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
+            if (std.mem.eql(u8, artifact_name, "oversized")) return error.ResourceBudgetExceeded;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
             return makeManifest(alloc, doc_key, artifact_name);
         }
@@ -6574,6 +6586,15 @@ test "public document artifact manifest handler returns summary and raw state" {
             };
         }
     };
+
+    var limited = try handleDocumentArtifactManifest(std.testing.allocator, "docs", "doc:a", "oversized", .{ .detail = .raw }, Backend.iface());
+    defer limited.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 413), limited.status);
+    const limit_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, limited.body, .{});
+    defer limit_json.deinit();
+    try std.testing.expectEqualStrings("inspection_limit_exceeded", limit_json.value.object.get("code").?.string);
+    try std.testing.expect(!limit_json.value.object.get("retryable").?.bool);
+    try std.testing.expectEqual(@as(i64, 512), limit_json.value.object.get("limits").?.object.get("scan_visits").?.integer);
 
     var resp = try handleDocumentArtifactManifest(
         std.testing.allocator,

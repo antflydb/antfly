@@ -722,6 +722,9 @@ from .geo_shape_query import GeoShapeQuery
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
+from .get_document_artifact_manifest_response_413 import GetDocumentArtifactManifestResponse413
+from .get_document_artifact_manifest_response_413_code import GetDocumentArtifactManifestResponse413Code
+from .get_document_artifact_manifest_response_413_limits import GetDocumentArtifactManifestResponse413Limits
 from .get_namespace_table_privacy_response_403 import GetNamespaceTablePrivacyResponse403
 from .get_namespace_table_privacy_response_412 import GetNamespaceTablePrivacyResponse412
 from .get_namespace_table_privacy_response_422 import GetNamespaceTablePrivacyResponse422
@@ -3416,6 +3419,9 @@ __all__ = (
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
+    "GetDocumentArtifactManifestResponse413",
+    "GetDocumentArtifactManifestResponse413Code",
+    "GetDocumentArtifactManifestResponse413Limits",
     "GetNamespaceTablePrivacyResponse403",
     "GetNamespaceTablePrivacyResponse412",
     "GetNamespaceTablePrivacyResponse422",

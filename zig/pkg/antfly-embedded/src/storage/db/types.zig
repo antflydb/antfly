@@ -5713,3 +5713,15 @@ fn testResolverDiagnosticOwnership(a: Allocator) !void {
 test "resolver diagnostics cloning owns every textual fence under allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testResolverDiagnosticOwnership, .{});
 }
+
+/// Fixed administrator inspection limits, shared by storage and HTTP errors.
+pub const dense_index_inspection_limits = .{
+    .producers = 16,
+    .vectors = 128,
+    .float_values = 65536,
+    .source_bytes = 1048576,
+    .identity_bytes = 4096,
+    .producer_config_bytes = 1048576,
+    .scan_visits = 512,
+    .scan_bytes = 2097152,
+};

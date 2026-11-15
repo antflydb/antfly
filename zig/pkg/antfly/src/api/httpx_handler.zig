@@ -2665,6 +2665,7 @@ pub const AntflyApiHandler = struct {
     /// this is only the shared wire projection at the `httpx` boundary.
     fn sharedInternalHttpErrorSpec(err: anyerror) ?InternalHttpErrorSpec {
         return switch (err) {
+            error.ResourceBudgetExceeded => .{ .status = 413, .message = "inspection limit exceeded" },
             error.IndexGenerationMismatch => .{
                 .status = 409,
                 .message = "IndexGenerationMismatch",
@@ -12343,6 +12344,8 @@ const SchemaReconcileWriteSource = struct {
 };
 
 test "typed internal HTTP errors preserve conflict semantics" {
+    const limit = AntflyApiHandler.sharedInternalHttpErrorSpec(error.ResourceBudgetExceeded).?;
+    try std.testing.expectEqual(@as(u16, 413), limit.status);
     const transition = AntflyApiHandler.sharedInternalHttpErrorSpec(error.GenerationTransitionActive).?;
     try std.testing.expectEqual(@as(u16, 503), transition.status);
     try std.testing.expectEqualStrings("GenerationTransitionActive", transition.message);
