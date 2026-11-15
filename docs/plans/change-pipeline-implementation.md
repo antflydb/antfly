@@ -1637,6 +1637,38 @@ They never submit a control or advance an ACK. Qualification log:
 and recovery, production root registration, full public delivery and the rest
 of the long-term issue contracts remain required.
 
+## In progress: durable pending root-control ownership
+
+Feed roots now carry an optional bounded exact-request journal. Preparing stores
+command bytes, original immutable fence, table locator and their length-framed
+SHA-256 identity, together with metadata sequence, ownership epoch and grant.
+The owner must validate the typed command/fence before preparing; storing opaque
+bytes does not grant permission to dispatch arbitrary commands. A unique actor
+must durably transition prepared to dispatching before network submission.
+Dispatching survives restart as ambiguous, even if a later grant read is absent.
+An accepted response records the original positive term/index; mismatched actors,
+stale intent sequences, replacement receipts and repeated begin are rejected.
+Only a never-dispatched prepared intent may currently be cancelled.
+
+These transitions use the ordinary revision/epoch-fenced metadata command path.
+Decoder protocol 98 prevents older members from discarding the journal. Pending
+work prevents root rebind, grant replacement, enrollment-result application,
+reclamation-result application and release. Close/reset retain the exact request
+for recovery, and final cleanup cannot discard it. The 8 MiB state bound still
+applies; each command/fence/table is additionally bounded to 4096/16384/1024 bytes.
+Legacy states may omit the optional field; parsing verifies their stored digest.
+
+The next integration must validate and persist terminal results, atomically fold
+their metadata effects, and reconcile ambiguous submissions through actual root
+state without manufacturing original command receipts. The journal alone does
+not yet dispatch production root controls or resolve accepted work, and is not
+registered as a public feed capability. Qualification passed:
+`zig build changefeed-control-test -j2` (including real metadata snapshot install
+and reopen plus existing native root-adapter checks), and the final standalone
+metadata suite (31 checks, including legacy omitted journal fields, monotonic
+intent stamps and idempotent accepted-receipt recording). Logs:
+`root-control-recovery-test.log`, `root-control-metadata-final-test.log`.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

@@ -45641,6 +45641,16 @@ test "metadata changefeed control snapshot preserves enrollment authority and pe
     write.mutation = .{ .issue = delivery };
     const issue_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
     write.expected_revision = 5;
+    const intent_payload: changefeed_control.root_intent.Payload = .{ .command = "{\"version\":1,\"operation\":\"submit\"}", .fence = "{\"root\":7}", .table = "docs" };
+    write.mutation = .{ .root_control = .{ .namespace = namespace, .operation = .{ .prepare = .{ .ownership_epoch = 1, .grant_sequence = 2, .payload = intent_payload } } } };
+    const prepare_control_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 6;
+    write.mutation = .{ .root_control = .{ .namespace = namespace, .operation = .{ .begin = .{ .sequence = 6, .actor = @splat(3) } } } };
+    const begin_control_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 7;
+    write.mutation = .{ .root_control = .{ .namespace = namespace, .operation = .{ .accepted = .{ .sequence = 6, .actor = @splat(3), .receipt = .{ .term = 9, .index = 700 } } } } };
+    const accepted_control_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 8;
     write.mutation = .close;
     const close_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
     const entries = try raft_state_machine.encodeCommittedEntries(scratch, &.{
@@ -45650,10 +45660,13 @@ test "metadata changefeed control snapshot preserves enrollment authority and pe
         .{ .term = 1, .index = 4, .entry_type = .normal, .data = enroll_command },
         .{ .term = 1, .index = 5, .entry_type = .normal, .data = seal_command },
         .{ .term = 1, .index = 6, .entry_type = .normal, .data = issue_command },
-        .{ .term = 1, .index = 7, .entry_type = .normal, .data = close_command },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = prepare_control_command },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = begin_control_command },
+        .{ .term = 1, .index = 9, .entry_type = .normal, .data = accepted_control_command },
+        .{ .term = 1, .index = 10, .entry_type = .normal, .data = close_command },
     });
-    try source.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 7, .entries_bytes = entries });
-    var prepared = (try source.snapshotBuilder().prepareSnapshot(group, 7)) orelse return error.TestUnexpectedResult;
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 10, .entries_bytes = entries });
+    var prepared = (try source.snapshotBuilder().prepareSnapshot(group, 10)) orelse return error.TestUnexpectedResult;
     defer prepared.deinit();
     var materialized = try prepared.materialize(a);
     defer materialized.deinit(a);
@@ -45661,7 +45674,9 @@ test "metadata changefeed control snapshot preserves enrollment authority and pe
         .bytes => |bytes| bytes,
         .artifact => return error.TestUnexpectedResult,
     };
-    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group, 7, snapshot));
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group, 10, snapshot));
+    target.deinit();
+    target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
     const expected = try source.getChangefeedControl(a, group, write.id);
     defer a.free(expected);
     const installed = try target.getChangefeedControl(a, group, write.id);
@@ -45676,6 +45691,12 @@ test "metadata changefeed control snapshot preserves enrollment authority and pe
     try std.testing.expectEqualStrings("AQ", parsed.value.latest_provider_context);
     try std.testing.expectEqualStrings("AQ", parsed.value.cursors[0].provider_context);
     try std.testing.expectEqual(@as(u64, 2), parsed.value.roots[0].grant_sequence);
+    const pending = parsed.value.roots[0].pending_control.?;
+    try std.testing.expectEqual(.accepted, pending.stage);
+    try std.testing.expectEqual(@as(u64, 6), pending.sequence);
+    try std.testing.expectEqualDeep((changefeed_control.root_intent.Receipt{ .term = 9, .index = 700 }), pending.receipt.?);
+    try std.testing.expectEqualStrings(intent_payload.command, pending.payload.command);
+    try std.testing.expectEqualStrings(intent_payload.fence, pending.payload.fence);
 }
 
 test "metadata changefeed control logical slot survives reopen snapshot failover and lost confirmation reply" {

@@ -127,7 +127,8 @@ const std = @import("std");
 /// Version 95 persists slot spool cleanup checkpoints before capacity release.
 /// Version 96 freezes preflight wire identity and single-use spool build grants.
 /// Version 97 binds publication sets and atomically renews confirmed slot feedback.
-pub const current_version: u16 = 97;
+/// Version 98 retains exact pending root-control attempts and their receipts.
+pub const current_version: u16 = 98;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;
