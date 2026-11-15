@@ -1714,6 +1714,7 @@ pub const ApiHttpServerConfig = struct {
     routed_raft_batch_writer: ?internal_group_operations.RoutedRaftBatchWriter = null,
     native_history_control: ?@import("history_control_operations.zig").Port = null,
     native_history_page: ?@import("history_page_operations.zig").Port = null,
+    native_history_grant: ?@import("history_grant_operations.zig").Port = null,
     /// Borrowed metadata receipt/topology notification generation. It affects
     /// only scheduling; every resumed owner operation revalidates its fences.
     restore_owner_progress_generation: ?*const std.atomic.Value(u64) = null,

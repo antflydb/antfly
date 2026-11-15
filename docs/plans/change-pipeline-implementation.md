@@ -1605,6 +1605,38 @@ Routed HTTP observation,
 durable pending-control reconciliation and production root registration are
 still required.
 
+## Specified routed HTTP grant observation
+
+The internal API now specifies
+`POST /groups/{group_id}/tables/{table_name}/history/grant-v1`; full API/SDK
+regeneration passed. The 4096-byte request contains version and immutable grant
+identity. Its response binds that identity to the private ordered-read contract
+(raft authority and positive lower bound 1); the receiver internally enforces
+the stronger current frozen ReadIndex. Neither a missing nor an unbound grant
+is a reservation or proof that an in-flight control can never commit.
+
+The shared native/linked route registrar enforces prebuffering limits. The
+handler requires a signed service credential even in legacy migration mode and
+returns `Cache-Control: no-store`. Typed errors preserve consumer conflicts
+separately from topology changes and resynchronization. The bounded client
+validates status/code/version, catalog acknowledgement, media type, response
+binding and observation inequalities, and withholds results after cancellation.
+
+The data runtime routes grants through the same immutable-fence/deadline/lane
+selection as controls and pages; receivers stay local-only. The real native
+Raft fixture observes both active and absent grants after an unconfirmed remote
+control, then recovers its original receipt and checks the live log index. That
+proves observation must not propose another command or overwrite the outcome.
+All thirteen focused HTTP/ingress/client tests and all five real native Raft
+integration checks pass without leaks. The real integration exposed transient
+ReadUnavailable during page admission; page and grant receivers now retry only
+transient read admission under one original deadline (at most five seconds),
+preserving the route and identity and obtaining a fresh ReadIndex each attempt.
+They never submit a control or advance an ACK. Qualification log:
+`history-grant-http-retry-test.log`. Durable pending-control ownership
+and recovery, production root registration, full public delivery and the rest
+of the long-term issue contracts remain required.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

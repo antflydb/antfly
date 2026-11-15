@@ -19,6 +19,80 @@ tags:
     x-displayName: Hot Standby Replication
     description: Runtime-to-runtime hot-standby replication protocol.
 paths:
+  /groups/{group_id}/tables/{table_name}/history/grant-v1:
+    post:
+      tags: [retained-history]
+      operationId: observeNativeRetainedHistoryGrant
+      summary: Observe retained consumer admission without proposing a command
+      description: |
+        Signed service-only read, including during legacy migration. Requires an
+        immutable catalog route fence. The owner establishes a current leader
+        ReadIndex and validates its frozen owner/route before and after reading.
+        Returns actual authority/floor/lease state at that cut without binding,
+        enrollment, renewal, ACK, collection or receipt mutation. Unbound/absent
+        are observations, not reservations or proof that an in-flight command
+        can never commit. An observation is never a command receipt or ACK grant.
+        Responses bind the exact identity to the private raft read contract
+        (wire version 1, raft authority, minimum applied index 1); the receiver
+        internally requires the stronger current ReadIndex cut.
+        Request and response bodies are each limited to 4096 bytes.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryGrantRequest'}
+      responses:
+        '200':
+          description: Request-bound current grant observation, never a mutation confirmation.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantReply'}
+        '400':
+          description: Invalid request or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantError'}
+        '401':
+          description: Missing or invalid signed service authority.
+        '403':
+          description: Internal service authority required.
+        '409':
+          description: Retention scope, consumer policy or topology conflicts; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '500':
+          description: Corrupt observation or internal owner failure.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryGrantError'}
   /groups/{group_id}/tables/{table_name}/history/page-v1:
     post:
       tags: [retained-history]
@@ -262,6 +336,18 @@ components:
           schema:
             type: string
   schemas:
+    NativeHistoryGrantIdentity:
+      {"type":"object","additionalProperties":false,"properties":{"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"authority":{"$ref":"#/components/schemas/NativeHistoryDigest"},"consumer":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"definition":{"$ref":"#/components/schemas/NativeHistoryDigest"},"sequence":{"type":"integer","format":"uint64","minimum":1},"policy_revision":{"type":"integer","format":"uint64","minimum":1}},"required":["namespace","authority","consumer","definition","sequence","policy_revision"]}
+    NativeHistoryGrantActive:
+      {"type":"object","additionalProperties":false,"properties":{"grant":{"type":"integer","format":"uint64","minimum":1},"consumer":{"$ref":"#/components/schemas/NativeHistoryConsumer"},"limit":{"type":"integer","format":"uint64","minimum":1}},"required":["grant","consumer","limit"]}
+    NativeHistoryGrantObservation:
+      {"oneOf":[{"type":"object","additionalProperties":false,"properties":{"unbound":{"type":"object","additionalProperties":false,"properties":{},"required":[]}},"required":["unbound"]},{"type":"object","additionalProperties":false,"properties":{"absent":{"type":"integer","format":"uint64","minimum":0}},"required":["absent"]},{"type":"object","additionalProperties":false,"properties":{"retired":{"type":"integer","format":"uint64","minimum":0}},"required":["retired"]},{"type":"object","additionalProperties":false,"properties":{"active":{"$ref":"#/components/schemas/NativeHistoryGrantActive"}},"required":["active"]},{"type":"object","additionalProperties":false,"properties":{"other_grant":{"$ref":"#/components/schemas/NativeHistoryGrantActive"}},"required":["other_grant"]}],"description":"Active requires the exact requested grant. Other_grant is not confirmation of it. Absent floor is below the requested sequence; retired floor is at or above it."}
+    NativeHistoryGrantRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"identity":{"$ref":"#/components/schemas/NativeHistoryGrantIdentity"}},"required":["version","identity"]}
+    NativeHistoryGrantReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"observation":{"$ref":"#/components/schemas/NativeHistoryGrantObservation"}},"required":["version","request_digest","observation"]}
+    NativeHistoryGrantError:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"code":{"type":"string","enum":["invalid_request","resynchronization_required","consumer_conflict","topology_changed","unsupported","unavailable","corrupt_observation","internal_error"]}},"required":["version","code"]}
     NativeHistoryPosition:
       {"type":"object","additionalProperties":false,"required":["sequence","event"],"properties":{"sequence":{"type":"integer","format":"uint64","minimum":0},"event":{"type":"integer","format":"uint32","minimum":0}}}
     NativeHistoryPageRead:

@@ -184,6 +184,40 @@ pub const NativeHistoryGrant = struct {
     }
 };
 
+pub const NativeHistoryGrantActive = struct {
+    grant: u64,
+    consumer: NativeHistoryConsumer,
+    limit: u64,
+};
+
+pub const NativeHistoryGrantError = struct {
+    version: i64,
+    code: []const u8,
+};
+
+pub const NativeHistoryGrantIdentity = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    consumer: NativeHistoryConsumerId,
+    definition: NativeHistoryDigest,
+    sequence: u64,
+    policy_revision: u64,
+};
+
+/// Active requires the exact requested grant. Other_grant is not confirmation of it. Absent floor is below the requested sequence; retired floor is at or above it.
+pub const NativeHistoryGrantObservation = std.json.Value;
+
+pub const NativeHistoryGrantReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    observation: NativeHistoryGrantObservation,
+};
+
+pub const NativeHistoryGrantRequest = struct {
+    version: i64,
+    identity: NativeHistoryGrantIdentity,
+};
+
 pub const NativeHistoryNamespace = []const i64;
 
 pub const NativeHistoryOutcome = std.json.Value;
