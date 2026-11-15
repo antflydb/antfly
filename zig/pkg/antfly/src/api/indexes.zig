@@ -94,6 +94,15 @@ pub fn addIndexToTableIndexesJsonWithIo(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidCreateIndexRequest;
+    if (root.get(index_name)) |existing| {
+        if (!try equivalentIndexConfigValues(alloc, index_name, existing, config.value))
+            try @import("antfly_local_sources").api_index_metadata.aliases.ensureUnreferenced(alloc, current_indexes_json, index_name);
+    }
+    if (root.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |aliases| {
+        if (aliases != .object) return error.InvalidTableIndexMetadata;
+        if (aliases.object.contains(index_name)) return error.IndexAliasNameConflict;
+    }
+
     const stored_config = storedIndexConfigForMutationAlloc(
         alloc,
         io,
@@ -197,6 +206,7 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
+    try @import("antfly_local_sources").api_index_metadata.aliases.ensureUnreferenced(alloc, current_indexes_json, index_name);
     try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
     if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
@@ -460,6 +470,7 @@ pub fn validateArtifactEnrichmentsForTableIndexesJson(
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(indexes_json), .{});
     defer parsed.deinit();
     try validateArtifactIndexReferences(alloc, parsed.value, enrichments);
+    try @import("antfly_local_sources").api_index_metadata.aliases.validateReferences(parsed.value);
 }
 
 /// Validate only properties that can be decided from one create-index request.
@@ -774,7 +785,7 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
     const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
     var state = try lake.parse(alloc, table.lake_index_catalog_json);
     defer state.deinit();
-    const desired = lake.desiredFingerprint(table);
+    const desired = try lake.desiredFingerprint(alloc, table);
     const failure = if (state.value.failure) |value| if (std.mem.eql(u8, &value.desired, &desired)) value else null else null;
     const published: ?u64 = if (state.value.published) |value| published: {
         if (!std.mem.eql(u8, &value.signature.desired, &desired)) break :published null;
@@ -11380,7 +11391,7 @@ test "external lake native interrupted publication is pending while integrity an
     var config = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"full_text\"}", .{});
     defer config.deinit();
     var table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "events", .indexes_json = "{\"body_text\":{\"type\":\"full_text\"}}" };
-    const desired = lake.desiredFingerprint(table);
+    const desired = try lake.desiredFingerprint(a, table);
     const pending_errors = [_][]const u8{ "ConcurrencyUnavailable", "ResourceTemporarilyUnavailable", "SystemResources", "ProcessFdQuotaExceeded", "SystemFdQuotaExceeded", "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "NameServerFailure", "ConnectionReset", "ConnectionResetByPeer", "ConnectionAborted", "ConnectionTimedOut", "ConnectionTimeout", "BrokenPipe", "ConnectionClosed", "ConnectionRefused", "Closed", "NotConnected", "EndOfStream", "UnexpectedEof", "ReadFailed", "WriteFailed", "RecvFailed", "SendFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable" };
     const terminal_errors = [_][]const u8{ "ArtifactIntegrityMismatch", "SqlProgramLimitExceeded", "TlsBadRecordMac", "TlsAlert", "AccessDenied", "Unauthorized", "PreconditionFailed" };
     for (pending_errors ++ terminal_errors, 0..) |reason, i| {

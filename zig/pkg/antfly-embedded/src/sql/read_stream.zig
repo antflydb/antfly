@@ -744,6 +744,7 @@ pub const Stream = struct {
     settings: ?*@import("setting_catalog.zig").View = null,
     parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
     context: runtime.Context,
+    attribution: runtime.IndexAttribution = undefined,
     cursor: ?catalog.Cursor = null,
     spool: ?*Spool = null,
     stream_manager: ?*@import("spill.zig").Manager = null,
@@ -839,6 +840,9 @@ pub const Stream = struct {
         execution_limits.parameter_cells = null;
         execution_limits.parameter_owner = null;
         self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("decision_eval.zig").scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = execution_limits, .typed_output = true };
+        self.attribution = try runtime.IndexAttribution.init(arena, binding);
+        if (backend.index_attribution) |host| host.bind(host.ptr, self.attribution.observer());
+        errdefer if (backend.index_attribution) |host| host.bind(host.ptr, null);
         const params = if (self.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else try arena.dupe(Json, parameters);
         self.context.parameters = params;
         try @import("decision_eval.zig").validateStatement(arena, self.context.backend.decision_provider, binding, params);
@@ -882,6 +886,7 @@ pub const Stream = struct {
             if (binding.aggregate) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
             if (binding.window) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
             if (external or (backend.execution_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or binding.table == null) {
+                if (backend.index_attribution) |host| host.bind(host.ptr, null);
                 if (self.parameter_invocation) |invocation| invocation.deinitFrame();
                 if (self.settings) |view| view.deinit();
                 self.arena.deinit();
@@ -992,6 +997,7 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
+        if (self.context.backend.index_attribution) |host| host.bind(host.ptr, null);
         const owner = self.owner;
         if (self.parallel) |pipeline| pipeline.close();
         if (self.pending_columns) |page| page.deinit();
@@ -1127,7 +1133,7 @@ pub const Stream = struct {
         }
         self.emitted += read;
         self.exhausted = spool.index == spool.count();
-        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .columns = self.context.binding.columns, .rows = rows[0..read], .sql_nulls = flags[0..read], .command_tag = "SELECT" } };
+        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .resolved_indexes = self.attribution.value(), .columns = self.context.binding.columns, .rows = rows[0..read], .sql_nulls = flags[0..read], .command_tag = "SELECT" } };
     }
     fn columnProgram(self: *Stream, a: std.mem.Allocator, program: *const @import("scalar.zig").Program, page: catalog.ColumnPage) ![]const @import("scalar.zig").Datum {
         if (try @import("vector_eval.zig").evaluateDictionaryColumns(a, program, page, self.context.binding.scalars.columns, self.context.parameters)) |encoded| {
@@ -1468,7 +1474,7 @@ pub const Stream = struct {
             }
             if (bytes >= self.context.limits.page_bytes) break;
         }
-        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .columns = self.context.binding.columns, .rows = rows.items, .sql_nulls = flags.items, .command_tag = "SELECT" } };
+        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .resolved_indexes = self.attribution.value(), .columns = self.context.binding.columns, .rows = rows.items, .sql_nulls = flags.items, .command_tag = "SELECT" } };
     }
     fn columnsEligible(self: *Stream) bool {
         const cursor = self.cursor orelse return false;
@@ -1598,6 +1604,7 @@ pub const Stream = struct {
             self.cursor = null;
         }
         return .{ .arena = arena, .exhausted = self.exhausted, .output = .{
+            .resolved_indexes = self.attribution.value(),
             .columns = self.context.binding.columns,
             .rows = rows.items,
             .sql_nulls = flags.items,
@@ -2970,4 +2977,23 @@ test "SQL owned streams release allocator capability after delivery decline and 
     var calls: usize = 0;
     try std.testing.expect((try Stream.openOwned(.{ .allocator = std.testing.allocator, .ptr = &calls, .release = Case.release }, fixture.backend(), &compiled, &.{}, .{})) == null);
     try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "index alias SQL attribution detaches when streaming declines" {
+    const Host = struct {
+        bound: ?@import("cypher").backend.IndexObserver = null,
+        fn bind(ptr: *anyopaque, sink: ?@import("cypher").backend.IndexObserver) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.bound = sink;
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{};
+    var host: Host = .{};
+    var backend = fixture.backend();
+    backend.index_attribution = .{ .ptr = &host, .bind = Host.bind };
+    var compiled = try compiler.compile(a, "SELECT count(*) FROM docs", .{});
+    defer compiled.deinit();
+    try std.testing.expect((try Stream.open(a, backend, &compiled, &.{}, .{})) == null);
+    try std.testing.expect(host.bound == null);
 }

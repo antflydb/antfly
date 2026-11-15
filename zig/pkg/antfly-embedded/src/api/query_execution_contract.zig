@@ -3458,6 +3458,12 @@ pub fn encodeQueryRequestWithGraphWireMode(
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
+    if (req.index_alias_fences.len != 0) {
+        try appendJsonFieldName(alloc, &out, &first, "_index_alias_fences");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, req.index_alias_fences, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
     if (req.native_query_cut) |cut| {
         try appendJsonFieldName(alloc, &out, &first, "_native_cut");
         const encoded = try std.json.Stringify.valueAlloc(alloc, cut.forDeadline(req.execution_deadline_ns), .{});

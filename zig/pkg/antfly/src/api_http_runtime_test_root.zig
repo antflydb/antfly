@@ -140,3 +140,8 @@ test "httpx inference gateway source discovery" {
 test "linear merge discovery" {
     _ = @import("api/linear_merge.zig");
 }
+
+test "index alias object runtime discovery" {
+    _ = @import("api/sql_execution.zig");
+    _ = @import("api/object_table_runtime.zig");
+}

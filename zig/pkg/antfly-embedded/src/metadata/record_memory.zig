@@ -24,6 +24,7 @@ pub fn freeTable(alloc: std.mem.Allocator, record: records.TableRecord) void {
     alloc.free(record.schema_json);
     alloc.free(record.read_schema_json);
     alloc.free(record.indexes_json);
+    alloc.free(record.query_indexes_json);
     alloc.free(record.replication_sources_json);
     alloc.free(record.placement_role);
     alloc.free(record.restore_backup_id);
