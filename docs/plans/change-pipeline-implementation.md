@@ -1446,6 +1446,32 @@ Raft/native-owner checks pass without leaks. Full
 `make generate` also passed. This does not yet register a production feed root, route controls remotely,
 implement a remote retained-page API, or satisfy the public feed/client contracts.
 
+## In progress: bounded authenticated history control client
+
+`ApiHttpClient.fetchGroupHistoryControl` preserves the specified private
+submit/recover union instead of replaying ordinary batch endpoints. It validates
+route/namespace and local cancellation before transport, percent-encodes table
+names, signs with internal service authority, and propagates the original
+remaining budget (capped at five seconds) and cancellation token. Request and
+response bodies remain bounded to 4096 bytes.
+
+The client makes exactly one transport attempt. Any transport failure or
+non-200 status returns an unconfirmed result, retaining the original recovery
+receipt. Missing/wrong route acknowledgement, malformed or mismatched results,
+and any outcome marker also prevent confirmation. A valid reply can preserve a
+newly accepted submission receipt without certifying its outcome. Cancellation
+after a reply similarly preserves a valid receipt while withholding confirmation.
+Known typed rejections are resolved results, never successful ACK permission.
+
+Focused qualification uses a signed request executor to verify the exact
+operation, maximum-width receipt coordinates, encoded table path, byte limits,
+timeout, cancellation and route fence. It exercises success/rejection, lost
+transport, invalid/mismatched replies, missing acknowledgements, contradictory
+and empty markers, and every specified HTTP error status. All seven focused
+HTTP/ingress/client tests pass without leaks. This is the remote
+transport boundary; production root registration, bounded leader routing and
+remote retained-page delivery remain required before public feed capability.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

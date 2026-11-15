@@ -2667,6 +2667,76 @@ pub const ApiHttpClient = struct {
         return self.fetchGroupBatchWithForwarding(base_uri, group_id, table_name, body, timeout_ms, null, null, null);
     }
 
+    /// One authenticated attempt only. Any failure after entering transport is
+    /// unconfirmed, including malformed success replies. Recovery retains its
+    /// original receipt and is never rewritten into submission.
+    pub fn fetchGroupHistoryControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        input: @import("../data/history_control_wire.zig").Request,
+        fence: route_metadata_api.CatalogRouteFence,
+        context: @import("antfly_local_sources").api_operation.RequestContext,
+    ) !@import("../data/history_control_wire.zig").Response {
+        const wire = @import("../data/history_control_wire.zig");
+        try context.ensureActive();
+        if (self.internal_service == null) return error.Unauthorized;
+        try fence.validate();
+        if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], fence.route.identity_namespace.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], fence.route.identity_namespace.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], fence.route.identity_namespace.range_id, .big);
+        try input.validate(namespace);
+        const encoded_table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_table, routes.Routes.history_control_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > wire.max_bytes) return error.InvalidHistoryControlWire;
+        const route_json = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
+        defer self.alloc.free(route_json);
+        if (route_json.len > 16384) return error.InvalidCatalogRouteFence;
+        try context.ensureActive();
+        const timeout_ms = @min(try context.remainingTimeoutMs() orelse route_metadata_api.catalog_route_default_deadline_ms, 5000);
+        var timeout_buffer: [10]u8 = undefined;
+        const timeout_text = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout_ms});
+        var cancellation: http_common.RequestCancellation = .{ .borrowed_token = context.cancellation };
+        const unknown: wire.Response = .{ .version = 1, .receipt = input.receipt };
+        var response = self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+            .headers = &.{
+                .{ .name = route_metadata_api.catalog_route_fence_header, .value = route_json },
+                .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = timeout_text },
+            },
+            .timeout_ms = timeout_ms,
+            .cancellation = &cancellation,
+            .max_response_bytes = wire.max_bytes,
+        }) catch return unknown;
+        defer response.deinit(self.alloc);
+        if (response.status != 200) return unknown;
+        const route_ack = response.header(route_metadata_api.catalog_route_fence_ack_header) orelse return unknown;
+        if (!std.mem.eql(u8, route_ack, route_metadata_api.catalog_route_fence_ack_value)) return unknown;
+        var result = wire.decodeResponse(self.alloc, response.body, input) catch return unknown;
+        if (response.header(internal_batch_forwarding.outcome_header) != null) {
+            // Every marker, including an invalid empty value, prevents
+            // confirmation; status/body cannot override transport ambiguity.
+            result.outcome = null;
+        }
+        context.ensureActive() catch {
+            result.outcome = null;
+            return result;
+        };
+        return result;
+    }
+
     pub fn fetchGroupBatchWithForwarding(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -6821,4 +6891,77 @@ test "privacy reprocess transport preserves pending catalog retries without acce
     try std.testing.expectEqual(error.ArtifactPublicationPending, remoteArtifactReprocessError(503, "artifact publication pending"));
     try std.testing.expectEqual(error.UnexpectedHttpStatus, remoteArtifactReprocessError(500, "artifact publication pending"));
     try std.testing.expectEqual(error.UnexpectedHttpStatus, remoteArtifactReprocessError(503, "internal server error"));
+}
+
+test "history control client makes one signed bounded attempt and never replays recovery" {
+    const a = std.testing.allocator;
+    const wire = @import("../data/history_control_wire.zig");
+    const secret = "history-client-service-secret-long-enough";
+    const Fake = struct {
+        const Mode = enum { success, reject, missing_ack, marker, empty_marker, invalid, lost, unavailable, wrong_receipt };
+        mode: Mode = .success,
+        calls: usize = 0,
+        status: u16 = 503,
+        expected: wire.Request,
+        namespace: [24]u8,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("http://node:8080/internal/v1/groups/17/tables/docs%2Ftenant/history/control-v1", request.uri);
+            try std.testing.expectEqual(@as(?usize, wire.max_bytes), request.max_response_bytes);
+            try std.testing.expect(request.timeout_ms.? > 0 and request.timeout_ms.? <= 5000);
+            try std.testing.expect(request.cancellation != null);
+            try std.testing.expectEqualDeep(self.expected, try wire.decodeRequest(alloc, request.body, self.namespace));
+            try std.testing.expect(request.header(route_metadata_api.catalog_route_fence_header) != null);
+            try internal_service_auth.verifyToken(alloc, request.header(internal_service_auth.header_name).?, .{ .secret = secret, .issuer = "history-test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (self.mode == .lost) return error.ConnectionResetByPeer;
+            if (self.mode == .unavailable) return http_route_helpers.textResponseWithHeaders(alloc, self.status, "unavailable", &.{});
+            if (self.mode == .invalid) return http_route_helpers.textResponseWithHeaders(alloc, 200, "{}", &.{.{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = "1" }});
+            var reply: wire.Response = .{ .version = 1, .receipt = self.expected.receipt orelse .{ .term = 2, .index = 3 }, .outcome = .{ .applied = .{} } };
+            if (self.mode == .reject) reply.outcome = .{ .rejected = .checkpoint_conflict };
+            if (self.mode == .wrong_receipt) reply.receipt.?.index -= 1;
+            const encoded = try std.json.Stringify.valueAlloc(alloc, reply, .{});
+            defer alloc.free(encoded);
+            return http_route_helpers.textResponseWithHeaders(alloc, 200, encoded, if (self.mode == .missing_ack) &.{} else if (self.mode == .marker or self.mode == .empty_marker) &.{
+                .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = "1" },
+                .{ .name = internal_batch_forwarding.outcome_header, .value = if (self.mode == .empty_marker) "" else internal_batch_forwarding.outcome_unknown_v1 },
+            } else &.{.{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = "1" }});
+        }
+    };
+    const fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 17, .big);
+    std.mem.writeInt(u64, namespace[16..24], 19, .big);
+    var input: wire.Request = .{ .version = 1, .operation = .recover, .receipt = .{ .term = std.math.maxInt(u64), .index = std.math.maxInt(u64) }, .command = .{ .collect = .{ .namespace = namespace, .authority = @splat(2) } } };
+    var fake: Fake = .{ .expected = input, .namespace = namespace };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.Unauthorized, client.fetchGroupHistoryControl("http://node:8080", 17, "docs/tenant", input, fence, .{}));
+    _ = client.withInternalServiceAuth(secret, "history-test");
+    try std.testing.expectError(error.InvalidCatalogRouteFence, client.fetchGroupHistoryControl("http://node:8080", 18, "docs/tenant", input, fence, .{}));
+    try std.testing.expectError(error.DeadlineExceeded, client.fetchGroupHistoryControl("http://node:8080", 17, "docs/tenant", input, fence, .{ .deadline_ns = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    for ([_]Fake.Mode{ .success, .reject, .missing_ack, .marker, .empty_marker, .invalid, .lost, .unavailable, .wrong_receipt }) |mode| {
+        fake.mode = mode;
+        const calls = fake.calls;
+        const result = try client.fetchGroupHistoryControl("http://node:8080", 17, "docs/tenant", input, fence, .{});
+        try std.testing.expectEqual(calls + 1, fake.calls);
+        try std.testing.expectEqualDeep(input.receipt, result.receipt);
+        try std.testing.expectEqual(mode == .success or mode == .reject, result.confirmed());
+        if (mode == .reject) try std.testing.expectEqual(.checkpoint_conflict, result.outcome.?.rejected);
+    }
+    fake.mode = .unavailable;
+    for ([_]u16{ 400, 401, 403, 409, 413, 500, 501, 503 }) |status| {
+        fake.status = status;
+        const result = try client.fetchGroupHistoryControl("http://node:8080", 17, "docs/tenant", input, fence, .{});
+        try std.testing.expectEqualDeep(input.receipt, result.receipt);
+        try std.testing.expect(!result.confirmed());
+    }
+    input.operation = .submit;
+    input.receipt = null;
+    fake.expected = input;
+    fake.mode = .lost;
+    const lost_submit = try client.fetchGroupHistoryControl("http://node:8080", 17, "docs/tenant", input, fence, .{});
+    try std.testing.expectEqual(null, lost_submit.receipt);
+    try std.testing.expect(!lost_submit.confirmed());
 }
