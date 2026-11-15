@@ -5013,15 +5013,20 @@ pub const PathWriterLock = struct {
     }
 
     /// Like `othersWaiting`, but true only for a waiter in a genuinely
-    /// different *process* -- see `Region.othersWaitingAcrossProcesses`.
-    /// Unlike `othersWaiting`, this process's own background maintenance
-    /// worker (or any other same-process caller that reaches the region
-    /// through a path other than the one holding this lease) never
-    /// counts, since its own ticket is tagged with this same process's
-    /// id. Callers that would otherwise treat their own maintenance work
-    /// as a hostile waiter -- starving it by never releasing, since it
-    /// only ever shows up as "someone is queued" and never actually goes
-    /// away on its own -- use this instead.
+    /// different *process*, or a different in-process `Owner` (a
+    /// distinct `Region.open`, so a distinct `own_liveness_slot`) -- see
+    /// `Region.othersWaitingAcrossProcesses`. Unlike `othersWaiting`,
+    /// this process's own maintenance worker reusing *this exact*
+    /// handoff-shared lease/region never counts, since its ticket is
+    /// tagged with this same opener's pid and liveness slot both.
+    /// Callers that would otherwise treat their own maintenance work as
+    /// a hostile waiter -- starving it by never releasing, since it
+    /// only ever shows up as "someone is queued" and never actually
+    /// goes away on its own -- use this instead. A genuinely separate
+    /// `Owner` in this process (its own `Region.open`, its own liveness
+    /// slot) still counts as foreign here, exactly as a cross-process
+    /// waiter would: it cannot make the same zero-cost same-process
+    /// progress a handoff caller can, so it needs the same bounded wait.
     pub fn othersWaitingAcrossProcesses(self: *const PathWriterLock, own_pid: u32) bool {
         if (self.region) |region| return region.othersWaitingAcrossProcesses(own_pid);
         return true;

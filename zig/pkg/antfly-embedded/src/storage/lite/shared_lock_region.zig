@@ -1300,15 +1300,29 @@ pub const Region = struct {
 
     /// Like `othersWaiting`, but true only if at least one *currently
     /// live* queued ticket belongs to a different process than
-    /// `own_pid` -- `PathWriterLock.othersWaitingAcrossProcesses`'s own
-    /// query, for a caller (`WriterLane`'s own `checkin`) that must not
-    /// treat its own same-process callers (reaching the queue through a
-    /// different path) as a hostile waiter to release for, the same
-    /// distinction `writer_queue.zig`'s own per-ticket pid byte made.
-    /// Scans every outstanding ticket (bounded by `max_readers`, same as
-    /// every other scan in this file), skipping ones already known
-    /// abandoned or dead -- a ticket that will never actually show up to
-    /// claim the lease should not count as "someone is waiting" either.
+    /// `own_pid`, *or* to a different in-process opener of this same
+    /// region (a distinct `Region.open` -- distinguished by
+    /// `own_liveness_slot`, unique per open, same `claimLivenessSlot`
+    /// identity `isSlotDead` below already keys dead-process detection
+    /// on) -- `PathWriterLock.othersWaitingAcrossProcesses`'s own query,
+    /// for a caller (`WriterLane`'s own `checkin`) that must not treat
+    /// its own same-process, same-opener callers (reaching the queue
+    /// through a different code path on the very same `Region` handle)
+    /// as a hostile waiter to release for, the same distinction
+    /// `writer_queue.zig`'s own per-ticket pid byte made. A second,
+    /// independent `Owner` in this same process (for example a
+    /// read-only connection opened with incompatible options, which
+    /// gets its own `Region.open` and its own liveness slot) is not
+    /// that caller: it genuinely cannot make progress until this lease
+    /// lets go, and relying on `maintainParkedLease`'s idle timer alone
+    /// to ever serve it starves it exactly as a cross-process waiter
+    /// would be starved without this same check -- confirmed live as
+    /// `TestLiteCAPI`'s "snapshot with open transaction" timing out in
+    /// `fairWriterLockWithIo`. Scans every outstanding ticket (bounded
+    /// by `max_readers`, same as every other scan in this file),
+    /// skipping ones already known abandoned or dead -- a ticket that
+    /// will never actually show up to claim the lease should not count
+    /// as "someone is waiting" either.
     pub fn othersWaitingAcrossProcesses(self: *const Region, own_pid: u32) bool {
         const hdr = self.header();
         const head = hdr.writer_ticket_head.load(.monotonic);
@@ -1327,7 +1341,7 @@ pub const Region = struct {
             // yet) -- not a foreign waiter to report either way; whoever
             // is transitioning it will finish the job.
             if (owner == 0) continue;
-            if (holderPid(owner) == own_pid) continue;
+            if (holderPid(owner) == own_pid and holderLivenessSlot(owner) == self.own_liveness_slot) continue;
             if (self.isSlotDead(holderLivenessSlot(owner))) continue;
             return true;
         }
@@ -3395,6 +3409,56 @@ test "shared lock region: othersWaitingAcrossProcesses distinguishes a foreign t
     region.releaseWriter();
     same_pid_thread.join();
     try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pid, 2000));
+}
+
+// Regression for `TestLiteCAPI`'s "snapshot with open transaction" timing
+// out in `fairWriterLockWithIo`: unlike the sibling test above (which
+// shares one `Region` instance, so the same-pid waiter is reached "through
+// a different caller" on the exact same opener), this opens a *second*,
+// independent `Region.open` on the same path -- the same shape a second
+// in-process `Owner` with incompatible open options (for example a
+// read-only connection) gets. Same pid, but a distinct `own_liveness_slot`
+// per open, so it must count as a foreign waiter: it cannot make the
+// zero-cost same-process progress a true same-opener caller can, and
+// relying solely on `maintainParkedLease`'s idle timer to ever serve it
+// starves it exactly as an unrecognized cross-process waiter would be.
+test "shared lock region: othersWaitingAcrossProcesses treats a different in-process Owner's ticket as foreign too" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-foreign-owner.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region1 = try Region.open(a, io, db_path);
+    defer region1.close();
+    var region2 = try Region.open(a, io, db_path);
+    defer region2.close();
+    try std.testing.expect(region1.own_liveness_slot != region2.own_liveness_slot);
+
+    const pid: u32 = @bitCast(std.c.getpid());
+    try std.testing.expect(region1.tryAcquireWriterFair(pid)); // ticketless hold; nobody queued yet.
+
+    const OtherOwnerWaiter = struct {
+        fn run(r: *Region, waiter_pid: u32) void {
+            const thread_io = std.testing.io;
+            _ = r.acquireWriterFairBounded(thread_io, waiter_pid, Io.Clock.now(.awake, thread_io).addDuration(.fromSeconds(10)), null) catch return;
+            r.releaseWriter();
+        }
+    };
+    var other_owner_thread = try std.Thread.spawn(.{}, OtherOwnerWaiter.run, .{ &region2, pid });
+
+    // Give the thread a real chance to be genuinely queued, same margin
+    // the sibling test above uses.
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try std.testing.expect(region1.othersWaiting());
+    try std.testing.expect(region1.othersWaitingAcrossProcesses(pid));
+
+    region1.releaseWriter();
+    other_owner_thread.join();
 }
 
 test "shared lock region: tryAcquireWriterFair succeeds uncontended and refuses when anyone is queued" {
