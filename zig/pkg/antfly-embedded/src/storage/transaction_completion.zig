@@ -120,9 +120,19 @@ pub const Resolution = struct {
     commit_version: u64,
     source_position: Digest,
     outcome: Outcome,
-    pub fn validate(self: Resolution, manifest: Manifest, participant: Participant) !void {
+    pub fn validate(self: Resolution, manifest: Manifest) !void {
         try manifest.validate();
-        try self.validateBound(manifest.digest(), manifest.commit_version, participant);
+        var low: usize = 0;
+        var high = manifest.participants.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            switch (std.mem.order(u8, &manifest.participants[mid].namespace, &self.namespace)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => return self.validateBound(manifest.digest(), manifest.commit_version, manifest.participants[mid]),
+            }
+        }
+        return error.InvalidTxnRecord;
     }
     fn validateBound(self: Resolution, manifest_digest: Digest, commit_version: u64, participant: Participant) !void {
         if (!same(self.namespace, participant.namespace) or !same(self.owner_fence, participant.owner_fence) or !same(self.manifest_digest, manifest_digest) or self.commit_version != commit_version) return error.InvalidTxnRecord;
@@ -208,6 +218,10 @@ test "transaction completion requires exact frozen members including positive ze
     };
     const certificate: Certificate = .{ .manifest = manifest, .resolutions = &resolutions };
     try certificate.validate();
+    try resolutions[0].validate(manifest);
+    var foreign = resolutions[0];
+    foreign.namespace = @splat(20);
+    try std.testing.expectError(error.InvalidTxnRecord, foreign.validate(manifest));
     const bytes = try encode(a, certificate);
     defer a.free(bytes);
     var decoded = try parse(a, bytes);
