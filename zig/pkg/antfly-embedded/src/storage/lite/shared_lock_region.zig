@@ -389,6 +389,21 @@ fn ticketSlotOwner(word: u128) u64 {
 /// at open, long before it ever claims or releases reader pin slots).
 pub const RegionError = error{ RegionUnavailable, RegionCorrupt, LivenessSlotsExhausted };
 
+/// §8.4's dead-writer recovery callback, bundled with whatever context it
+/// needs (a plain `*anyopaque`, this module's own usual pattern for a
+/// caller-supplied callback -- see e.g. `visitIndexValue`'s `context`/
+/// `visit` pair in `native.zig`): `run(ctx)` is meant to be `native.zig`'s
+/// own existing on-disk checkpoint validation (`recoverActiveCheckpoint`
+/// and friends), reused as-is, not reimplemented here. Passed to
+/// `recoverDeadWriter` directly, or threaded through
+/// `acquireWriterFairBounded`'s own `recovery` parameter so a stuck
+/// waiter can run it the moment it proves the current holder dead,
+/// instead of only once its own deadline has fully expired.
+pub const DeadWriterRecovery = struct {
+    ctx: ?*anyopaque = null,
+    run: *const fn (ctx: ?*anyopaque) anyerror!void,
+};
+
 /// §8.4: `fcntl(F_SETLK)` *byte-range* record locking -- a different
 /// primitive from this module's one whole-file `flock` at setup, declared
 /// here because liveness specifically needs per-byte-range granularity
@@ -756,10 +771,11 @@ pub const Region = struct {
         return probeDead(self.fd_entry.fd, livenessByteOffset(self.header().max_readers, slot_index));
     }
 
-    /// Scans liveness slots `[0, max_readers)` for the first one this
-    /// process can claim, holding it for the rest of this `Region`
-    /// handle's lifetime. Called once per handle, from `openSized`,
-    /// never from the per-commit acquire/claim paths.
+    /// Scans liveness slots `[0, max_readers)`, starting from a per-process
+    /// offset (see below), for the first one this process can claim,
+    /// holding it for the rest of this `Region` handle's lifetime. Called
+    /// once per handle, from `openSized`, never from the per-commit
+    /// acquire/claim paths.
     ///
     /// Skips any index already in `entry.claimed_slots` *before* trying
     /// `fcntl` at all: `fcntl` locks are process-scoped, so a second
@@ -770,11 +786,58 @@ pub const Region = struct {
     /// `fd_registry_mutex` for the whole scan keeps two concurrent same-
     /// process claims (different threads, same `FdEntry`) from racing
     /// each other onto the same index between the check and the trylock.
+    ///
+    /// §8.4's liveness probe identifies a holder purely by slot *index*
+    /// (`writer_holder`/a reader slot's `generation`/a ticket's own owner
+    /// word all pack `(pid, liveness_slot)`, never anything that
+    /// survives the slot being reused) -- deliberately, since there is no
+    /// kernel primitive tying a slot index to the process that last held
+    /// it once that process is gone. A scan that always starts at index 0
+    /// turns that into a real hazard: the *very call* checking whether
+    /// some other holder is dead (§8.4's own `recoverDeadWriter` path,
+    /// `native.zig`'s `fairWriterLockWithIo`) itself opens a fresh
+    /// `Region` and claims a fresh liveness slot to do so -- and in any
+    /// small-scale system (a handful of opens total, the common case
+    /// right after a crash: a repro, a freshly started process, a test)
+    /// the index a dead process just freed is deterministically the
+    /// *first* free one any subsequent scan-from-0 finds. The checking
+    /// process then holds that exact index itself, making the stale word
+    /// it was trying to judge read as "alive" forever -- not because the
+    /// original holder is alive, but because the checker is now squatting
+    /// on its old seat. Starting from a per-process hash of the pid
+    /// instead spreads claims across the whole range, so this specific
+    /// collision is a roughly `1/max_readers` chance instead of
+    /// systematic -- mixed with the current time too (not just the pid),
+    /// so a caller that retries a whole fresh `Region.open()` after a
+    /// collision (`native.zig`'s own capi admission retry loop,
+    /// `db.zig`'s `enterBeforeDeadline`) draws independently each time
+    /// rather than deterministically repeating the same losing scan.
+    /// This is a mitigation, not a closed race: a byte-range-only
+    /// liveness proof has no slot-reuse generation counter to check
+    /// instead (unlike the reader table's own `generation` field, which
+    /// still only guards against *pid* reuse, a different hazard). See
+    /// native.zig's "lite fair writer lock recovers promptly from a
+    /// killed writer's stale lease" for the regression this closes in
+    /// the production path (`fairWriterLockWithIo`), which retries its
+    /// own fresh acquisition attempts for exactly this reason.
     fn claimLivenessSlot(io: Io, entry: *FdEntry, max_readers: u32) RegionError!u32 {
         fd_registry_mutex.lockUncancelable(io);
         defer fd_registry_mutex.unlock(io);
-        var i: u32 = 0;
-        next_index: while (i < max_readers) : (i += 1) {
+        // Mixes in the current time, not just the pid: a process that
+        // retries this whole open (its own first claim having collided
+        // with a just-freed slot some *other* stale word still names --
+        // see this function's own doc comment) must not deterministically
+        // redo the exact same losing scan every time; a fixed per-pid-only
+        // seed would. `Io.Clock`, not a syscall-backed wall clock, since
+        // this already runs under `fd_registry_mutex` and must not add a
+        // second kind of blocking call to every single open.
+        const pid = antfly_platform.process.currentId() orelse 0;
+        const now_ns: u64 = @truncate(@as(u96, @bitCast(Io.Clock.awake.now(io).nanoseconds)));
+        const seed = (@as(u64, pid) *% 2654435761) ^ (now_ns *% 0x9E3779B97F4A7C15);
+        const start: u32 = @intCast(seed % max_readers);
+        var scanned: u32 = 0;
+        next_index: while (scanned < max_readers) : (scanned += 1) {
+            const i = (start + scanned) % max_readers;
             for (entry.claimed_slots.items) |claimed| {
                 if (claimed == i) continue :next_index;
             }
@@ -1311,7 +1374,38 @@ pub const Region = struct {
     /// same distinction `writer_queue.zig`'s own `queue_turn` (a real
     /// turn) versus `queue_watch` (an idle-queue bypass) used to carry on
     /// the returned lease itself before this design moved off it.
-    pub fn acquireWriterFairBounded(self: *Region, io: Io, pid: u32, deadline: Io.Timestamp) error{ Timeout, Canceled }!bool {
+    ///
+    /// `recovery`, when non-null, makes this call §8.4-aware: once this
+    /// ticket genuinely owns the turn (phase 2 below) but `writer_holder`
+    /// is still held, each wait step is bounded by the short
+    /// `dead_ticket_check_step_ms` poll (not the full `deadline`) so a
+    /// *dead* holder's word gets probed (`writerHolderDead`) promptly
+    /// instead of only once, at the bitter end, when this call's own
+    /// deadline finally expires -- the difference between one later
+    /// writer paying the full busy-timeout once and every later writer
+    /// paying it forever (the dead holder never calls `releaseWriter`, so
+    /// nothing else ever clears the word). On a proven-dead holder,
+    /// `recoverDeadWriter(recovery)` runs the caller-supplied recovery
+    /// (meant to be `native.zig`'s own on-disk checkpoint validation,
+    /// §8.4's own "existing code reused, not new recovery logic") and, on
+    /// success, clears the word and retries the CAS immediately -- no
+    /// extra wait. `error.WriterHolderStillAlive` from a losing race
+    /// against this same ticket's own earlier recovery attempt (or a
+    /// holder that was merely slow, not dead, and has since released
+    /// normally) is swallowed: the loop just re-checks `tryAcquireWriter`
+    /// and keeps waiting if it still fails. `null` (every pre-existing
+    /// caller, including every test in this file) reproduces the exact
+    /// prior behavior and cost -- one bounded wait for the whole
+    /// `deadline`, no extra liveness probes.
+    ///
+    /// Only one process can ever be probing/recovering through this path
+    /// at a time: the FIFO ticket already guarantees at most one claimant
+    /// has `head == my_ticket` (phase 2) at once, so there is no
+    /// concurrent-recovery race to guard against here -- see this
+    /// function's own module-level liveness doc (§8.4) and
+    /// `recoverDeadWriter`'s own re-check of `writerHolderDead` right
+    /// before running `recovery`.
+    pub fn acquireWriterFairBounded(self: *Region, io: Io, pid: u32, deadline: Io.Timestamp, recovery: ?DeadWriterRecovery) !bool {
         const hdr = self.header();
         if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return false;
         const my_ticket: u32 = while (true) {
@@ -1344,6 +1438,15 @@ pub const Region = struct {
                 self.advanceHeadPastAbandoned();
                 return true;
             }
+            if (recovery) |rec| {
+                if (self.writerHolderDead()) {
+                    self.recoverDeadWriter(rec) catch |err| switch (err) {
+                        error.WriterHolderStillAlive => {},
+                        else => return err,
+                    };
+                    continue;
+                }
+            }
             if (Io.Clock.now(.awake, io).compare(.gte, deadline)) {
                 // Our own turn, but we're giving it up: step aside
                 // ourselves, exactly like a real win's own advance, just
@@ -1352,7 +1455,11 @@ pub const Region = struct {
                 return error.Timeout;
             }
             const epoch = hdr.writer_release_epoch.load(.acquire);
-            countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, deadline) catch return error.Canceled;
+            const wait_deadline = if (recovery != null) blk: {
+                const step_deadline = Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(dead_ticket_check_step_ms));
+                break :blk if (step_deadline.compare(.lt, deadline)) step_deadline else deadline;
+            } else deadline;
+            countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, wait_deadline) catch return error.Canceled;
         }
     }
 
@@ -1558,9 +1665,9 @@ pub const Region = struct {
     /// obstruction, it does not itself take the lock for the caller
     /// (the two are kept separate so a caller mid-wait on a ticket
     /// doesn't have its own turn skipped by a recovering bystander).
-    pub fn recoverDeadWriter(self: *Region, recovery: *const fn () anyerror!void) !void {
+    pub fn recoverDeadWriter(self: *Region, recovery: DeadWriterRecovery) !void {
         if (!self.writerHolderDead()) return error.WriterHolderStillAlive;
-        try recovery();
+        try recovery.run(recovery.ctx);
         const hdr = self.header();
         hdr.writer_holder.store(0, .release);
         if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) {
@@ -3144,10 +3251,9 @@ test "shared lock region: a kill -9'd writer is detected dead and recovered" {
     try std.testing.expect(region.writerHolderDead());
 
     const recovery = struct {
-        ran: bool = false,
-        fn run() anyerror!void {}
+        fn run(_: ?*anyopaque) anyerror!void {}
     };
-    try region.recoverDeadWriter(&recovery.run);
+    try region.recoverDeadWriter(.{ .run = &recovery.run });
     try std.testing.expect(!region.writerHolderDead()); // word is clear now, nothing to probe
 
     // The lock is usable again after recovery.
@@ -3249,7 +3355,7 @@ test "shared lock region: othersWaitingAcrossProcesses distinguishes a foreign t
             // a real OS thread with no `reapBounded`-style external
             // force-kill available if something is ever actually wrong,
             // so the bound has to come from the call itself.
-            _ = r.acquireWriterFairBounded(thread_io, pid, Io.Clock.now(.awake, thread_io).addDuration(.fromSeconds(10))) catch return;
+            _ = r.acquireWriterFairBounded(thread_io, pid, Io.Clock.now(.awake, thread_io).addDuration(.fromSeconds(10)), null) catch return;
             r.releaseWriter();
         }
     };
@@ -3330,19 +3436,19 @@ test "shared lock region: acquireWriterFairBounded succeeds once free and times 
     const pid: u32 = 4242;
     // Uncontended: succeeds well within a generous deadline, and reports
     // that correctly (not contended).
-    try std.testing.expectEqual(false, try region.acquireWriterFairBounded(io, pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5))));
+    try std.testing.expectEqual(false, try region.acquireWriterFairBounded(io, pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)), null));
     // Still held by `pid`'s own hold above (never released): a short
     // deadline against a genuinely busy word must time out, bounded,
     // not hang.
     const short_deadline = std.Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(100));
-    try std.testing.expectError(error.Timeout, region.acquireWriterFairBounded(io, pid + 1, short_deadline));
+    try std.testing.expectError(error.Timeout, region.acquireWriterFairBounded(io, pid + 1, short_deadline, null));
     region.releaseWriter();
     // Free again: a fresh bounded acquire succeeds, proving the timed-out
     // attempt above didn't leave the region in a bad state. Uncontended
     // again: the previous attempt's own phase-2 timeout already stepped
     // itself aside (advancing head to match tail) before returning, so
     // nothing is left queued for this call to find.
-    try std.testing.expectEqual(false, try region.acquireWriterFairBounded(io, pid + 1, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5))));
+    try std.testing.expectEqual(false, try region.acquireWriterFairBounded(io, pid + 1, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)), null));
     region.releaseWriter();
 }
 
@@ -3430,7 +3536,7 @@ test "shared lock region: an abandoned ticket does not wedge an earlier or a lat
         var sig: [1]u8 = .{1};
         _ = std.c.write(ready2_fds[1], @ptrCast(&sig), 1);
         const deadline = std.Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(100));
-        const result = region.acquireWriterFairBounded(io, my_pid, deadline);
+        const result = region.acquireWriterFairBounded(io, my_pid, deadline, null);
         var report: [1]u8 = .{if (result) |_| 0 else |_| 1};
         _ = std.c.write(timedout2_fds[1], @ptrCast(&report), 1);
         std.c._exit(0);
@@ -3462,7 +3568,7 @@ test "shared lock region: an abandoned ticket does not wedge an earlier or a lat
     // Child 1's own release just advanced head past ticket 1's abandoned
     // flag. The region must be left in a sane, usable state -- not
     // wedged -- for whoever comes next.
-    _ = try region.acquireWriterFairBounded(io, own_pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)));
+    _ = try region.acquireWriterFairBounded(io, own_pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)), null);
     region.releaseWriter();
 }
 
@@ -3742,7 +3848,7 @@ test "shared lock region: the ticket ring refuses to grow past max_readers outst
     // instead time out once the deadline passes, ring still exactly as
     // full as it was.
     const third_deadline = Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(200));
-    try std.testing.expectError(error.Timeout, region.acquireWriterFairBounded(io, own_pid, third_deadline));
+    try std.testing.expectError(error.Timeout, region.acquireWriterFairBounded(io, own_pid, third_deadline, null));
     try std.testing.expectEqual(@as(u64, 2), region.header().writer_ticket_tail.load(.monotonic));
 
     // Release: child 0 wins, advances head past its own ticket, frees
