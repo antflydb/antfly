@@ -551,6 +551,7 @@ pub const VTable = struct {
     provisionNativeHistoryAuthority: *const fn (self: *DB, expected_namespace: [24]u8) Outcome(void),
     applyOrderedHistoryConsumerControl: *const fn (*DB, @import("history_consumer.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("history_ordered.zig").Outcome),
     orderedHistoryPage: *const fn (*DB, std.mem.Allocator, @import("history_page.zig").Request, u64) Outcome(@import("history_page.zig").Page),
+    orderedHistoryOutcome: *const fn (*DB, std.mem.Allocator, @import("history_ordered.zig").Lookup) Outcome(@import("history_ordered.zig").Outcome),
 };
 pub const Boundary = callback.Boundary(VTable);
 pub const FieldLayout = extern struct { name: [*:0]const u8, type_name: [*:0]const u8, offset: usize, size: usize, alignment: usize };

@@ -1266,6 +1266,32 @@ control submission/result recovery, remote transport, topology/history lineage
 transfer and production provider registration remain required. This method does
 not advertise public feed capability or replace the coherent bootstrap work.
 
+## In progress: read-only retention outcome recovery
+
+`DB.orderedHistoryOutcome` recovers an exact original command result without
+reapplying enrollment, ACK, retirement or collection. A typed lookup binds the
+command, term/index and a leader read cut at or beyond that entry. It validates
+Raft authority, namespace, the ordinary applied marker and the authenticated
+latest history receipt in one stable transaction. Original results survive
+intervening row writes. Conflicting payloads/terms fail closed; missing or
+superseded receipts return an explicit unknown/superseded outcome rather than
+success. Lookup never writes a marker or repeats collection. A recovered result
+proves original execution, not current lease validity; the owner must still
+validate the live definition/grant and permissions before using it.
+
+Compiled-owner ABI 94 exposes this through bounded strict JSON requests and
+bounded typed outcome responses, with the same buffer ownership discipline as
+the ordered control operation. Qualification covers successful recovery before
+and after reopen, payload and term conflicts, lagging cuts, malformed cut bounds,
+recovery of deterministic rejection, supersession and old ABI header rejection.
+A physical corruption check confirms recovery rejects a damaged receipt. Log:
+`zig/ordered-history-read-only-outcome-qualification.log`.
+
+The routed control proposer still needs all-applying-member protocol activation,
+original route/descriptor admission, exact proposal outcome waiting and fenced
+read-only result recovery. Public feed registration remains pending; this
+lookup is private and does not turn an unknown result into permission to ACK.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

@@ -4567,6 +4567,26 @@ pub fn storageOwnerOrderedHistoryControlJson(
     return .ok;
 }
 
+pub fn storageOwnerOrderedHistoryOutcome(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.request_json.len > 4096 or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const ordered = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered;
+    var parsed = std.json.parseFromSlice(ordered.Lookup, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    defer parsed.deinit();
+    const outcome = handle.db.orderedHistoryOutcome(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, outcome, .{}) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
 pub fn storageOwnerOrderedHistoryPage(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,

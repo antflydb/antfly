@@ -44,10 +44,29 @@ test "compiled ordered history pages preserve cut bounds and owned images across
     defer a.free(enrollment);
     var enrolled = try owner.orderedHistoryControlJson("docs", enrollment, 1, 1);
     enrolled.deinit();
+    var lookup: source.history_ordered.Lookup = .{ .command = .{ .enroll = grant }, .entry = .{ .term = 1, .index = 1 }, .minimum_applied_index = 1 };
+    const original = try owner.orderedHistoryOutcome(a, "docs", lookup);
+    try std.testing.expectEqual(@as(u64, 1), original.applied.consumer.?.epoch);
+
     const mutation = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(a, .{ .writes = &.{.{ .key = "one", .value = "{\"v\":1}" }} });
     defer a.free(mutation);
     var written = try applyRaftEntryEventually(&owner, "docs", mutation, 1, 2);
     written.deinit();
+    lookup.minimum_applied_index = 2;
+    try std.testing.expectEqualDeep(original, try owner.orderedHistoryOutcome(a, "docs", lookup));
+    var wrong = lookup;
+    wrong.command.enroll.sequence += 1;
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, owner.orderedHistoryOutcome(a, "docs", wrong));
+    wrong = lookup;
+    wrong.entry.term += 1;
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, owner.orderedHistoryOutcome(a, "docs", wrong));
+    wrong = lookup;
+    wrong.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.orderedHistoryOutcome(a, "docs", wrong));
+    wrong = lookup;
+    wrong.entry.index = 3;
+    try std.testing.expectError(error.InvalidHistoryAdmission, owner.orderedHistoryOutcome(a, "docs", wrong));
+
     const request: source.history_page.Request = .{ .reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = 1, .grant = grant.sequence, .definition = grant.definition }, .after = .{}, .now_seconds = 100 };
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.orderedHistoryPage(a, "docs", request, 3));
     try std.testing.expectError(error.InvalidHistoryAdmission, owner.orderedHistoryPage(a, "docs", request, 0));
@@ -71,9 +90,27 @@ test "compiled ordered history pages preserve cut bounds and owned images across
     try std.testing.expectEqualDeep(page.header, replay.header);
     try std.testing.expectEqualDeep(page.events, replay.events);
     try std.testing.expectEqualDeep(page.next, replay.next);
+    try std.testing.expectEqualDeep(original, try owner.orderedHistoryOutcome(a, "docs", lookup));
+    // Recovery itself never advances the native entry marker.
+    wrong = lookup;
+    wrong.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.orderedHistoryOutcome(a, "docs", wrong));
+    const rejected_command: source.history_consumer.Command = .{ .acknowledge = .{ .reference = request.reference, .previous = 0, .next = 99 } };
+    const rejected_json = try std.json.Stringify.valueAlloc(a, rejected_command, .{});
+    defer a.free(rejected_json);
+    var rejected = try owner.orderedHistoryControlJson("docs", rejected_json, 1, 3);
+    rejected.deinit();
+    const recovered_rejection = try owner.orderedHistoryOutcome(a, "docs", .{ .command = rejected_command, .entry = .{ .term = 1, .index = 3 }, .minimum_applied_index = 3 });
+    try std.testing.expectEqual(.checkpoint_conflict, recovered_rejection.rejected);
+    lookup.minimum_applied_index = 3;
+    try std.testing.expectEqual(.superseded, try owner.orderedHistoryOutcome(a, "docs", lookup));
+
     var response: abi.OwnedBytes = .{};
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_history_page(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));
     try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_history_outcome(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+
     try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_history_page(owner.handle, &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") }, &response));
     try std.testing.expectEqual(@as(u64, 0), response.len);
 }

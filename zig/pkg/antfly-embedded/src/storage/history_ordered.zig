@@ -134,6 +134,10 @@ pub fn load(txn: anytype) !?Record {
     };
     return try Record.decode(raw);
 }
+/// Read-only result recovery after a proposer loses its response. The owner
+/// supplies a leader read cut at or beyond the original committed entry.
+pub const Lookup = struct { command: control.Command, entry: Entry, minimum_applied_index: u64 };
+
 pub fn replay(txn: anytype, namespace: [24]u8, entry: Entry, command: [32]u8) !Outcome {
     const record = try load(txn) orelse return .superseded;
     if (!std.mem.eql(u8, &record.namespace, &namespace)) return error.HistoryResynchronizationRequired;

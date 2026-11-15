@@ -25,7 +25,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 91 fences selected-role merge-readiness projection responses.
 // Version 92 adds ordered history control and its stable retention failures.
 // Version 93 adds bounded binary retained-history pages at an ordered read cut.
-pub const abi_version: u32 = 93;
+// Version 94 adds read-only exact retained-history outcome recovery.
+pub const abi_version: u32 = 94;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1981,7 +1982,14 @@ pub extern fn antfly_storage_owner_ordered_history_control_json(
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
-/// Private read request JSON contains a history page request and required cut;
+/// Read-only exact outcome lookup; request and response are bounded typed JSON.
+pub extern fn antfly_storage_owner_ordered_history_outcome(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Private page request JSON contains the retained position and required cut;
 /// the response is the bounded HPG1 binary page envelope, not JSON.
 pub extern fn antfly_storage_owner_ordered_history_page(
     owner: ?*anyopaque,

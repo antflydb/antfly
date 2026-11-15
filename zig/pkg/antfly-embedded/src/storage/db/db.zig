@@ -26033,17 +26033,39 @@ pub const DB = struct {
         const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
         if (!std.mem.eql(u8, &namespace, &request.reference.namespace)) return error.HistoryResynchronizationRequired;
         _ = try @import("../source_authority.zig").require(&txn, kind, namespace);
-        if (kind == .raft) {
-            const marker = txn.get(&internal_keys.ordered_document_applied_entry_key) catch |err| switch (err) {
-                error.NotFound => return error.StorageReadTemporarilyUnavailable,
-                else => return err,
-            };
-            if (marker.len != ordered_apply_receipt_value_len or
-                std.mem.readInt(u64, marker[0..8], .little) == 0 or
-                std.mem.readInt(u64, marker[8..16], .little) == 0) return error.CorruptOrderedApplyReceipt;
-            if (std.mem.readInt(u64, marker[8..16], .little) < minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
-        }
+        if (kind == .raft) _ = try orderedHistoryReadCut(&txn, minimum_applied_index);
         return @import("../history_page.zig").read(allocator, &txn, request);
+    }
+
+    fn orderedHistoryReadCut(txn: anytype, minimum_applied_index: u64) !OrderedApplyReceipt {
+        const marker = txn.get(&internal_keys.ordered_document_applied_entry_key) catch |err| switch (err) {
+            error.NotFound => return error.StorageReadTemporarilyUnavailable,
+            else => return err,
+        };
+        if (marker.len != ordered_apply_receipt_value_len) return error.CorruptOrderedApplyReceipt;
+        const cut: OrderedApplyReceipt = .{ .term = std.mem.readInt(u64, marker[0..8], .little), .index = std.mem.readInt(u64, marker[8..16], .little) };
+        if (cut.term == 0 or cut.index == 0) return error.CorruptOrderedApplyReceipt;
+        if (cut.index < minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
+        return cut;
+    }
+
+    /// Recover a typed receipt without reapplying a command or advancing a
+    /// marker. Missing/superseded outcomes never certify successful admission.
+    pub fn orderedHistoryOutcome(self: *DB, allocator: std.mem.Allocator, recovery: ordered_history.Lookup) !OrderedHistoryOutcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedHistoryOutcome", .{ self, allocator, recovery });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (recovery.entry.term == 0 or recovery.entry.index == 0) return error.InvalidOrderedApplyReceipt;
+        if (recovery.minimum_applied_index < recovery.entry.index) return error.InvalidHistoryAdmission;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &recovery.command.namespace())) return error.HistoryResynchronizationRequired;
+        const fingerprint = try ordered_history.fingerprint(allocator, recovery.command);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        const cut = try orderedHistoryReadCut(&txn, recovery.minimum_applied_index);
+        if (cut.index == recovery.entry.index and cut.term != recovery.entry.term) return error.ConflictingOrderedApplyReceipt;
+        return ordered_history.replay(&txn, namespace, recovery.entry, fingerprint);
     }
 
     /// Capability probe for the single-root native destination adapter. Raft

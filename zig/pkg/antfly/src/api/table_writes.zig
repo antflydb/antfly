@@ -40485,6 +40485,7 @@ fn implementationTests() type {
             corrupt[48] ^= 1;
             try db.core.store.putBatch(&.{.{ .key = ordered.key, .value = corrupt }}, &.{});
             try std.testing.expectError(error.HistoryCorrupt, db.applyOrderedHistoryConsumerControl(.{ .enroll = fresh }, .{ .term = 1, .index = 8 }, false));
+            try std.testing.expectError(error.HistoryCorrupt, db.orderedHistoryOutcome(a, .{ .command = .{ .enroll = fresh }, .entry = .{ .term = 1, .index = 8 }, .minimum_applied_index = 8 }));
             try db.core.store.putBatch(&.{.{ .key = ordered.key, .value = stored }}, &.{});
             for ([_]u64{ 9, 10 }) |index| try db.applyOrderedCommittedMutation(.{ .writes = &.{.{ .key = "one", .value = "{\"v\":2}" }} }, .{ .term = 1, .index = index }, false);
             const fresh_ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = renewed.applied.consumer.?.epoch, .grant = fresh.sequence, .definition = grant.definition };
