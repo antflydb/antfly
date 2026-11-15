@@ -1231,7 +1231,16 @@ pub const WriterLane = struct {
                 // Cold path: nothing parked yet. Do the full admission
                 // dance exactly as a non-lane call would, then keep the
                 // result in the lane instead of handing it back per-call.
-                var lease: ?native.PathWriterLock = connection.acquire() catch |err| {
+                // `acquireForOwnCheckout`, not plain `acquire`: this call
+                // already holds `checked_out` for *this* checkout (just
+                // set, above) and already knows `self.parked` is `null`
+                // (the lane's own `while` loop above took the
+                // `self.parked != null` branch instead whenever it was
+                // not) -- going through the ordinary `acquire` ->
+                // `acquirePathLeaseAssumeLocked` -> `WriterLane.
+                // waitParkedForStore` path would make this exact call wait
+                // on the very flag only its own return can ever clear.
+                var lease: ?native.PathWriterLock = connection.acquireForOwnCheckout() catch |err| {
                     self.mutex.lockUncancelable(io);
                     self.checked_out = false;
                     self.mutex.unlock(io);
@@ -1325,6 +1334,39 @@ pub const WriterLane = struct {
         return lease;
     }
 
+    /// Like `takeParkedForRoot`, but ignores `last_root` entirely: the
+    /// parked lease is a kernel-level `flock`-style advisory lock on this
+    /// path's own file descriptor, valid regardless of which in-memory
+    /// generation (`Handle`/root) it happened to be parked against -- a
+    /// root mismatch only means whatever cached state a caller's own
+    /// metadata refresh relies on might be stale, never that the *lease*
+    /// itself is unsafe to reuse (the same reasoning `takeParkedForStore`'s
+    /// own doc comment already applies to the exact-match case).
+    ///
+    /// `acquireMaintenancePathLeaseAssumeLocked` needs this specifically:
+    /// `takeParkedForRoot(self.current)`'s exact-root match can legitimately
+    /// miss right after a foreground commit moves `self.current` to a new
+    /// root while the lane's own `last_root` still names the one that
+    /// commit's own write parked its lease against (`checkout`'s own "no
+    /// self-replacement" fast path deliberately keeps `last_root` stable
+    /// across back-to-back commits rather than chasing every refresh).
+    /// Falling through to a fresh kernel acquisition on that miss
+    /// self-conflicts with this exact lease forever -- nothing else is
+    /// running to ever release it -- the same self-deadlock
+    /// `takeParkedForRoot` already exists to prevent for the exact-match
+    /// case, just missed by its stricter check. Prefer the exact-root
+    /// match first wherever a caller has a root to check at all (skips a
+    /// same-process generation swap it would otherwise need to detect and
+    /// handle itself); fall back to this only once that has already missed.
+    pub fn takeParkedAnyRoot(self: *WriterLane) ?native.PathWriterLock {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const lease = self.parked orelse return null;
+        self.parked = null;
+        return lease;
+    }
+
     /// Like `takeParkedForStore`, but when nothing is parked *yet* only
     /// because this same process's lane is still between `checkout` and
     /// `checkin` (`checked_out`), wait for it instead of handing the
@@ -1340,6 +1382,15 @@ pub const WriterLane = struct {
     /// floor expires with the lane still checked out (a caller is then
     /// free to fall through to its own ordinary, busy_timeout_ms-governed
     /// path) or if nothing was ever checked out in the first place.
+    ///
+    /// Never reached from `WriterLane.checkout`'s own cold path -- that
+    /// path calls `Connection.acquireForOwnCheckout` instead precisely to
+    /// avoid landing here and waiting on the very `checked_out` flag only
+    /// its own return could ever clear (see that function's own doc
+    /// comment; observed live as `TestSQLConformance` hanging on a `DROP
+    /// INDEX`, admission retrying that self-wait forever). Every other
+    /// caller here is a different, genuinely waiting admission, for which
+    /// this wait is correct.
     pub fn waitParkedForStore(self: *WriterLane, connection: *Connection, deadline: i96) ?native.PathWriterLock {
         if (self.takeParkedForStore(connection)) |lease| return lease;
         const io = h.handleLockIo();
@@ -2111,6 +2162,18 @@ pub const Owner = struct {
     /// other reason to ever let go of -- the region-mode shape of the
     /// same self-deadlock `takeParkedForStore` already guards the
     /// regular write path against.
+    ///
+    /// NOTE (perf/lwa-go-busy): a same-process self-conflict here (
+    /// `takeParkedForRoot(self.current)` missing because a commit just
+    /// moved `self.current` while the lane's own `last_root` lagged, and
+    /// this call's own gate-holding block then waiting out the fresh
+    /// acquisition's full budget with every other admission on this path
+    /// stuck behind it) is real and still open -- see `WriterLane.
+    /// takeParkedAnyRoot`. A first attempt at fixing it here (trying
+    /// `takeParkedAnyRoot` before falling through, and dropping
+    /// `self.gate.mutex` around the fresh acquisition) regressed
+    /// `TestConcurrentCallsOnOneHandle` badly enough to revert before
+    /// root-causing why; not reapplied. Left as follow-up work.
     fn acquireMaintenancePathLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         if (self.stopping.load(.acquire)) return error.Canceled;
         const io = h.handleLockIo();
@@ -3293,7 +3356,7 @@ pub const Owner = struct {
         // its connection-local busy policy when another process wins the
         // writer lease during the detached proof. Background turns stay
         // nonblocking and yield to that writer instead of consuming its budget.
-        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked() else self.withReadRegistrationBatch(try self.tryWriterLeaseAssumeLocked());
+        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked(false) else self.withReadRegistrationBatch(try self.tryWriterLeaseAssumeLocked());
         var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         if (self.current) |current| {
@@ -3524,14 +3587,33 @@ pub const Connection = struct {
     }
 
     pub fn acquire(self: *Connection) !native.PathWriterLock {
-        return self.acquireWithMaintenance(false);
+        return self.acquireWithMaintenance(false, false);
     }
 
     pub fn acquireForMaintenance(self: *Connection) !native.PathWriterLock {
-        return self.acquireWithMaintenance(true);
+        return self.acquireWithMaintenance(true, false);
     }
 
-    fn acquireWithMaintenance(self: *Connection, manual_maintenance: bool) !native.PathWriterLock {
+    /// Like `acquire`, but for `WriterLane.checkout`'s own cold path only
+    /// -- see its own call site's comment. That path has already marked
+    /// `writer_lane.checked_out = true` for *this* checkout, under the
+    /// lane's mutex, an instant before calling this, so `writer_lane.
+    /// parked` is necessarily `null` already (the lane's own `while`
+    /// loop took the `self.parked != null` branch instead whenever it
+    /// was not) and nothing else can set `checked_out` in between.
+    /// Skipping `WriterLane.waitParkedForStore` here is not an
+    /// optimization: calling it would make this exact call wait on the
+    /// very flag only its own return can ever clear, which is the bug
+    /// `checked_out`'s own doc comment describes (observed live as
+    /// `TestSQLConformance` hanging on a `DROP INDEX`, admission retrying
+    /// this self-wait forever). Everything else `acquirePathLeaseAssumeLocked`
+    /// does (the retained-lease reuse, and the real kernel acquisition for
+    /// a write-mode connection) still applies unchanged.
+    pub fn acquireForOwnCheckout(self: *Connection) !native.PathWriterLock {
+        return self.acquireWithMaintenance(false, true);
+    }
+
+    fn acquireWithMaintenance(self: *Connection, manual_maintenance: bool, skip_lane_wait: bool) !native.PathWriterLock {
         const io = h.handleLockIo();
         const gate_started = std.Io.Clock.awake.now(io).nanoseconds;
         self.gate.mutex.lockForLease(io, self.storeIdentity());
@@ -3543,7 +3625,7 @@ pub const Connection = struct {
         }
         errdefer self.gate.mutex.unlock(io);
         if (manual_maintenance) self.owner.maintenance_activity.wait(io, &self.gate.mutex);
-        return self.acquirePathLeaseAssumeLocked();
+        return self.acquirePathLeaseAssumeLocked(skip_lane_wait);
     }
 
     fn admissionDeadline(self: *const Connection) i96 {
@@ -3564,7 +3646,7 @@ pub const Connection = struct {
         return true;
     }
 
-    fn acquirePathLeaseAssumeLocked(self: *Connection) !native.PathWriterLock {
+    fn acquirePathLeaseAssumeLocked(self: *Connection, skip_lane_wait: bool) !native.PathWriterLock {
         const io = h.handleLockIo();
         const deadline = self.admissionDeadline();
         // Writers take FIFO turns across processes. An expired budget still
@@ -3587,13 +3669,18 @@ pub const Connection = struct {
             // staging, not parked yet), wait for its imminent `checkin`
             // instead of falling straight through to a fresh acquisition
             // that would only ever self-conflict with it -- see that
-            // function's own doc comment.
-            if (self.owner.writer_lane.waitParkedForStore(self, deadline)) |held| {
+            // function's own doc comment. Skipped entirely when
+            // `skip_lane_wait` (see `Connection.acquireForOwnCheckout`):
+            // `WriterLane.checkout`'s own cold path is this call's only
+            // caller in that case, and it already knows `parked` is
+            // `null` and `checked_out` is its own -- waiting here would
+            // just be waiting on itself.
+            if (!skip_lane_wait) if (self.owner.writer_lane.waitParkedForStore(self, deadline)) |held| {
                 var lease = held;
                 stats.recordAcquired(.handoff, 0);
                 lease.startHold(stats);
                 return self.owner.withReadRegistrationBatch(lease);
-            }
+            };
             const started = std.Io.Clock.awake.now(io).nanoseconds;
             if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| {
                 // Tests observe the point where admission would start waiting:
@@ -3683,7 +3770,7 @@ pub const Connection = struct {
             }
             defer self.owner.allocator_proof_mutex.unlock(io);
             if (waited) {
-                lease.* = try self.acquirePathLeaseAssumeLocked();
+                lease.* = try self.acquirePathLeaseAssumeLocked(false);
                 root = try self.owner.refresh();
             }
             if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) {
@@ -3692,7 +3779,7 @@ pub const Connection = struct {
                 if (!try self.owner.retainMaintenanceTurnAssumeLocked()) return error.FileBusy;
                 defer self.owner.releaseMaintenanceTurnAssumeLocked();
                 try self.owner.verifyAllocatorAssumeLocked(lease, self);
-                if (lease.* == null) lease.* = try self.acquirePathLeaseAssumeLocked();
+                if (lease.* == null) lease.* = try self.acquirePathLeaseAssumeLocked(false);
                 root = try self.owner.refresh();
                 // Another process may move the tip during the detached walk.
                 // Do not repeat whole-file proofs while holding this
@@ -6872,6 +6959,93 @@ test "capi native recovery agenda repeated compaction invalidates a clean metada
         try std.testing.expect(refreshed.sql_ddl_recovery_needed);
         try std.testing.expectError(error.SqlStatementReadUnavailable, @import("sql_ddl.zig").requireRecovered(refreshed, &refreshed.db, "default"));
     }
+}
+
+// Regression: a brand-new, independently-opened connection's own stable
+// snapshot used to fail `FileBusy` right after a vacuum or compact on a
+// *different* (writer) connection to the same path -- nothing to do with
+// an open transaction, despite how the bug first surfaced (lite_cgo_test.go
+// "snapshot with open transaction"; reproduced with just a write, a vacuum,
+// and a fresh reader, no transaction at all). Root cause:
+// `NativeFile.replaceWithPreparedGeneration`'s `inode_lock.rebind` only
+// lazily invalidates this process's own cached `shared_lock_region` for
+// the new inode; the sidecar itself keeps the *previous* generation's
+// stamped `db_inode` until something reopens it. A fresh reader's own
+// `Region.open` then finds that stale stamp and, by design, refuses to
+// rebuild it ("shared lock region refuses a db_inode mismatch instead of
+// rebuilding under a live peer") -- forcing the legacy flock fallback,
+// which self-conflicts forever with the writer's own parked `WriterLane`
+// lease (pid-keyed foreign-waiter fairness never treats a same-process
+// reader as foreign). Fixed at the source by `Store.
+// reopenRegionAfterGenerationSwap` (eagerly reopens the region the moment
+// nothing in this process still holds the retired generation -- right
+// after `vacuumWithCancel`'s own `performVacuum` call returns, by which
+// point its `image.deinit()` has already run).
+test "capi native fresh readonly connection takes a stable snapshot after vacuum" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("vacuum-snapshot-fresh-reader", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+
+    var vacuum_out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&vacuum_out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_vacuum_json(fixture.id, &vacuum_out));
+
+    // A brand-new connection, opened fresh *after* the vacuum's generation
+    // swap -- never the writer's own handle, which would just reuse its
+    // already-current region.
+    const reader = try open(fixture.path, .{ .profile = .native, .open_mode = .query_readonly, .no_sync = true }, false);
+    const reader_id = try api.publishHandle(reader);
+    defer api.antfly_db_close(reader_id);
+
+    const snapshot_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}-snapshot.aflite", .{fixture.path}, 0);
+    defer std.testing.allocator.free(snapshot_path);
+    var snapshot_out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&snapshot_out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_copy_stable_snapshot_json(reader_id, snapshot_path, false, &snapshot_out));
+}
+
+// Regression: `WriterLane.checkout`'s cold path marks the lane checked out
+// (`checked_out = true`) *before* calling `connection.acquire()` to
+// actually establish the lease -- so that same call's own
+// `acquirePathLeaseAssumeLocked` -> `waitParkedForStore` used to see its
+// *own* checkout as "someone else is checked out" and wait on a flag only
+// its own return could ever clear, burning its entire wait budget on every
+// single cold checkout (observed live: `TestSQLConformance` hanging on a
+// `DROP INDEX` right after a run of `CREATE INDEX` statements, the
+// admission retry loop re-entering this exact self-wait forever). Fixed by
+// `Connection.acquireForOwnCheckout`: the cold path uses it instead of
+// plain `acquire`, skipping `WriterLane.waitParkedForStore` entirely for
+// this one call (it already knows `parked` is `null` and owns
+// `checked_out` itself). `busy_timeout_ms` is deliberately large here so a
+// regression would show up as this test hanging for the lane's own floor,
+// not failing fast -- the elapsed-time assertion is the real check.
+test "capi native cold lane checkout never waits on its own checkout" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var tmp = try api.TestDirectory.init("cold-checkout-self-wait");
+    defer tmp.cleanup();
+    const io = h.handleLockIo();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/database.aflite", .{tmp.path()});
+    defer std.testing.allocator.free(path);
+
+    const handle = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 60_000 }, true);
+    defer h.closeHandle(handle);
+    const connection = handle.lite_connection.?;
+    const owner = connection.owner;
+    // Stop the background maintenance worker: this test isolates the
+    // cold-path self-wait, not legitimate maintenance contention.
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    const root = try owner.writer_lane.checkout(connection, .mutation);
+    const elapsed_ns = std.Io.Clock.awake.now(io).nanoseconds - started;
+    owner.writer_lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+    try std.testing.expect(elapsed_ns < 100 * std.time.ns_per_ms);
 }
 
 // docs/design/lite-performance/throughput-profile.md §6: a sustained
