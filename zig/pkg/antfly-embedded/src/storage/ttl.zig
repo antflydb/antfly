@@ -55,6 +55,21 @@ pub const document_version_watermark_key = "\x00\x00__metadata__:document_versio
 /// durable batch revision from both the allocator and legacy rows being changed.
 /// Deletions advance the watermark too, preventing delete/reinsert ABA.
 pub fn nextDocumentVersion(store: anytype, a: Allocator, wall: u64, writes: anytype, deletes: []const []const u8) !?u64 {
+    var txn = if (comptime @TypeOf(store) == *DocStore) try store.beginProbeTxn() else blk: {
+        var backend = store;
+        break :blk try backend.beginProbe();
+    };
+    defer txn.abort();
+    return try nextDocumentVersionTxn(&txn, a, wall, writes, deletes);
+}
+
+/// Same as `nextDocumentVersion`, reading through an already-open probe/read
+/// transaction instead of opening (and aborting) its own. perf/lwa-write-
+/// overhead: a mutation's own prep phase calls this once per batch alongside
+/// several other read-only checks; sharing one transaction across them avoids
+/// paying a separate overlay pin/unpin (and, before that fix, a reclaim scan)
+/// for each.
+pub fn nextDocumentVersionTxn(txn: anytype, a: Allocator, wall: u64, writes: anytype, deletes: []const []const u8) !?u64 {
     var keys = std.ArrayList([]const u8).empty;
     defer {
         for (keys.items) |key| if (!std.mem.eql(u8, key, document_version_watermark_key)) a.free(key);
@@ -82,11 +97,6 @@ pub fn nextDocumentVersion(store: anytype, a: Allocator, wall: u64, writes: anyt
     for (keys.items) |key| if (unique.items.len == 0 or !std.mem.eql(u8, unique.items[unique.items.len - 1], key)) try unique.append(a, key);
     const values = try a.alloc(?[]const u8, unique.items.len);
     defer a.free(values);
-    var txn = if (comptime @TypeOf(store) == *DocStore) try store.beginProbeTxn() else blk: {
-        var backend = store;
-        break :blk try backend.beginProbe();
-    };
-    defer txn.abort();
     try txn.getManySorted(unique.items, values);
     var previous: u64 = 0;
     for (unique.items, values) |key, value| if (value) |bytes| {

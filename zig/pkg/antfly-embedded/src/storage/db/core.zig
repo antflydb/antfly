@@ -2342,6 +2342,24 @@ pub const DBCore = struct {
         try manager.checkOrdinaryWriteConflicts(keys);
     }
 
+    /// Same as `checkOrdinaryWriteConflicts`, reading through an already-open
+    /// probe/read transaction instead of opening (and aborting) its own --
+    /// see `transactions_mod.TxnManager.checkOrdinaryWriteConflictsWithProbe`.
+    pub fn checkOrdinaryWriteConflictsWithProbe(
+        self: *DBCore,
+        writes: []const types.BatchWrite,
+        deletes: []const []const u8,
+        probe: anytype,
+    ) !void {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        const keys = try self.alloc.alloc([]const u8, writes.len + deletes.len);
+        defer self.alloc.free(keys);
+        for (writes, 0..) |write, i| keys[i] = write.key;
+        for (deletes, 0..) |key, i| keys[writes.len + i] = key;
+        try manager.checkOrdinaryWriteConflictsWithProbe(keys, probe);
+    }
+
     pub fn resolveTransactionIntents(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,

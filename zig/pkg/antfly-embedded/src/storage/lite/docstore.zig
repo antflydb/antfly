@@ -3957,14 +3957,16 @@ pub const Store = struct {
         // §9.6a: mirror image of `pinInitializedReadGeneration`'s own
         // `pin` call -- releases this pin's hold on the shared overlay,
         // then opportunistically reclaims whatever that newly-advanced
-        // floor now permits (passing `0` leaves `durable_checkpoint_sequence`
-        // itself unchanged -- `reclaim`'s own `@max` -- while still
-        // recomputing the floor against the just-updated pin set; see
-        // `reclaim`'s own doc comment for why this is also worth doing
-        // right after `checkpointRedoLog` publishes, not only here).
+        // floor now permits. perf/lwa-write-overhead: `reclaim`'s own
+        // per-root, per-key walk only has anything to do when this exact
+        // release moves the floor (`unpinAndReclaimIfNeeded`'s own doc
+        // comment); unconditionally running it on every release -- the
+        // common case being a short-lived probe pinned at the current,
+        // already-durable sequence, which can never be the thing holding
+        // the floor down -- was a per-abort cost with nothing to show for
+        // it on the single-writer hot path.
         if (generation.file.redo) |*redo| {
-            redo.shared.unpin(io, pin.sequence);
-            redo.shared.reclaim(std.heap.page_allocator, io, 0);
+            redo.shared.unpinAndReclaimIfNeeded(std.heap.page_allocator, io, pin.sequence);
         }
         if (generation.file.inode_lock_ref.load(.acquire)) |entry| {
             inode_lock.unpinReader(entry, io, .{ .data = pin.sequence, .metadata = pin.sequence });

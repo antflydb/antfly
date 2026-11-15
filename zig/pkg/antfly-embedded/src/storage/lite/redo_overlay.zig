@@ -853,6 +853,45 @@ pub const SharedRedoOverlay = struct {
         }
     }
 
+    /// `unpin`, but only runs `reclaim`'s full per-root, per-key walk when
+    /// releasing this exact pin can actually raise `reclaim`'s floor
+    /// (`@min(durable_checkpoint_sequence, minPinLocked() orelse
+    /// durable_checkpoint_sequence)`). perf/lwa-write-overhead: a mutation's
+    /// own prep phase opens and aborts several short-lived probe/read `Txn`s
+    /// (one per helper) before it ever commits, each pinning and unpinning
+    /// the *current*, just-committed sequence -- which, by construction, is
+    /// always >= `durable_checkpoint_sequence` (a checkpoint can only cover
+    /// already-durable history). Releasing a pin at or above the floor
+    /// never frees anything `reclaim` could find, so unconditionally
+    /// re-walking every key in every root on every one of those aborts (the
+    /// prior behavior) was pure overhead on the single-writer hot path --
+    /// confirmed in profiles as `Txn.releaseGenerationReadLock ->
+    /// SharedRedoOverlay.reclaim`. The one case that still needs the walk is
+    /// a genuinely *stale* pin: one whose sequence predates a checkpoint
+    /// that landed while it was still held, and which was the sole pin
+    /// holding the floor below that checkpoint. Both reads of the pin set
+    /// (before removing this entry, and after) happen under one lock
+    /// acquisition here, so nothing else can slip a pin or a checkpoint
+    /// publish in between and invalidate the decision.
+    pub fn unpinAndReclaimIfNeeded(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, sequence: u64) void {
+        self.mutex.lockUncancelable(io);
+        const min_before = self.minPinLocked();
+        var removed = false;
+        for (self.pins.items, 0..) |value, i| {
+            if (value == sequence) {
+                _ = self.pins.swapRemove(i);
+                removed = true;
+                break;
+            }
+        }
+        const needs_reclaim = removed and if (min_before) |before|
+            before < self.durable_checkpoint_sequence and (self.minPinLocked() orelse std.math.maxInt(u64)) > before
+        else
+            false;
+        self.mutex.unlock(io);
+        if (needs_reclaim) self.reclaim(allocator, io, 0);
+    }
+
     /// The oldest live pin's sequence, or null if there are none (nothing
     /// currently restricts reclaim beyond `durable_checkpoint_sequence`
     /// itself).

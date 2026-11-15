@@ -2250,6 +2250,21 @@ pub const TxnManager = struct {
     /// linearizable with concurrent intent admission.
     pub fn checkOrdinaryWriteConflicts(self: *TxnManager, user_keys: []const []const u8) !void {
         if (user_keys.len == 0) return;
+        var probe = try self.store.beginProbe();
+        defer probe.abort();
+        try self.checkOrdinaryWriteConflictsWithProbe(user_keys, &probe);
+    }
+
+    /// Same as `checkOrdinaryWriteConflicts`, reading through an already-open
+    /// probe/read transaction instead of opening (and aborting) its own.
+    /// perf/lwa-write-overhead: lets a mutation's own prep phase share one
+    /// transaction across this and its other read-only checks instead of
+    /// paying a separate overlay pin/unpin for each. `probe` need only
+    /// support `getManySorted`/`get`, matching both `backend_erased.ProbeTxn`
+    /// (this function's own default) and `docstore.DocStore.Txn` (the
+    /// concrete type the DB layer's shared prep-phase probe uses).
+    pub fn checkOrdinaryWriteConflictsWithProbe(self: *TxnManager, user_keys: []const []const u8, probe: anytype) !void {
+        if (user_keys.len == 0) return;
 
         const lock_keys = try self.alloc.alloc([]u8, user_keys.len);
         var initialized: usize = 0;
@@ -2275,8 +2290,6 @@ pub const TxnManager = struct {
         @memset(owners, null);
 
         const have_readers = blk: {
-            var probe = try self.store.beginProbe();
-            defer probe.abort();
             try probe.getManySorted(key_refs, owners);
             for (owners) |maybe_owner| {
                 const owner = maybe_owner orelse continue;
