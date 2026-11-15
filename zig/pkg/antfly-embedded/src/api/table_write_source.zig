@@ -82,6 +82,10 @@ pub const TableWriteSource = struct {
     supports_sql_range_guards: bool = false,
 
     pub const VTable = struct {
+        /// Missing capability is unsupported; a null result means the original
+        /// destination has authoritatively found no admission.
+        resolve_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command, db_mod.types.SyncLevel, db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome = null,
+        release_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command) anyerror!void = null,
         activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,
         txn_status_group_local_with_request: ?*const fn (
             ptr: *anyopaque,
@@ -652,6 +656,16 @@ pub const TableWriteSource = struct {
         return BoundaryAbi.call("activate_range_tracking", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, context });
     }
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn resolveSourceAdmission(self: TableWriteSource, alloc: std.mem.Allocator, original_table_name: []const u8, command: @import("../storage/source_admission.zig").Command, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+        const callback = self.vtable.resolve_source_admission orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("resolve_source_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, original_table_name, command, sync_level, cancellation });
+    }
+
+    pub fn releaseSourceAdmission(self: TableWriteSource, alloc: std.mem.Allocator, original_table_name: []const u8, command: @import("../storage/source_admission.zig").Command) !void {
+        const callback = self.vtable.release_source_admission orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("release_source_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, original_table_name, command });
+    }
 
     pub fn batch(
         self: TableWriteSource,

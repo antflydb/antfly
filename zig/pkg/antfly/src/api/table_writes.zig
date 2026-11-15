@@ -43878,7 +43878,10 @@ fn implementationTests() type {
             altered_request.source_admission = altered_pending;
             try std.testing.expectError(error.SourcePayloadConflict, source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{altered_request}, .write));
             try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try db.getTransactionStatus(command.transactionId()));
-            const resolved = (try source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{request}, .write)).?;
+            // Recover using only the durable command and original coordinator
+            // locator, including after the live table locator has changed.
+            source.table_name = "renamed-docs";
+            const resolved = (try source.source().resolveSourceAdmission(alloc, "docs", command, .write, .{})).?;
             try std.testing.expect(resolved == .committed);
             try std.testing.expect((try db.sourceAdmissionReceipt(command)) != null);
             var final = (try db.lookup(alloc, "counter", .{})).?;
@@ -43886,7 +43889,13 @@ fn implementationTests() type {
             var final_parsed = try std.json.parseFromSlice(std.json.Value, alloc, final.json, .{});
             defer final_parsed.deinit();
             try std.testing.expectEqual(@as(i64, 4), final_parsed.value.object.get("count").?.integer);
-            _ = try source.source().acknowledgeTransactionCommit(alloc, command.transactionId(), 0, "docs");
+            try source.source().releaseSourceAdmission(alloc, "docs", command);
+            try source.source().releaseSourceAdmission(alloc, "docs", command);
+            try std.testing.expect(try db.cleanupTransactionMetadataIfEligible(command.transactionId(), std.math.maxInt(u64), std.math.maxInt(u64)));
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(command.transactionId()));
+            const released = (try source.source().resolveSourceAdmission(alloc, "docs", command, .write, .{})).?;
+            try std.testing.expect(released == .committed);
+            try std.testing.expect(released.committed.coordinator_table_name == null);
         }
 
         test "bound single-group batch reports prepared intent conflicts" {

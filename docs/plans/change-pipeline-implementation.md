@@ -187,6 +187,41 @@ self-authorizing public strings: native and writable-Iceberg adapters must prove
 their engine-specific outcomes before accepting, committing, replanning or
 retiring source work. No source actor/public capability is advertised yet.
 
+## In progress: delivery orchestration and native outcome recovery
+
+- `metadata/source_delivery.zig` now orders capability validation, linearizable
+  source-state reads, durable reservation, destination admission, observed
+  metadata acceptance and destination coordinator release. A failed release
+  blocks the next reservation so its receipt cannot be overwritten while an
+  acknowledgment debt remains. Recovery resolves the original pending manifest
+  without provider rows when destination admission already happened.
+- The actor preserves the original pending timestamp/sequence/plan on retries,
+  checks exact batch/checkpoint/predecessor/payload identity, and never orders
+  opaque checkpoints. Acceptance and authoritative commit remain independent
+  adapter outputs. Unknown destination or metadata outcomes stop progress.
+- Private table-write callbacks resolve a native prepared vote using the durable
+  command and original coordinator locator, without schema validation or
+  transform expansion against newer rows. Immutable table ID and the persisted
+  payload fingerprint are verified before using the locator. Coordinator release
+  verifies a committed source receipt and remains idempotent after metadata GC.
+- The delivery fault test passes with a stateful simulated destination and source
+  control service: lost destination response, recovery without input rows, lost
+  metadata acceptance acknowledgment, release failure, payload mismatch and
+  cyclic checkpoints. This is orchestration qualification, not proof of a
+  production native/Iceberg adapter or an existing CDC client.
+
+`zig build source-admission-test source-control-test -j2` passes, including
+native prepared-vote recovery through callbacks after reopen/rename, explicit
+coordinator metadata collection, receipt-only recovery after collection, and the
+metadata persistence/snapshot/decoder checks. Standalone delivery/control tests
+also pass (8 tests, no leaks). Logs: `zig/source-delivery-test.log` and
+`zig/source-delivery-native-qualification.log`.
+
+Production native capability validation and receipt encoding, real database plus
+metadata actor recovery tests, managed runner wiring, distributed source authority
+and writable-Iceberg adapters remain required. The callbacks and actor do not yet
+advertise a public ingestion/changefeed capability.
+
 ## Remaining implementation phases
 
 1. Finish root history tests, prepared credit accounting and native integration.

@@ -103,6 +103,8 @@ pub const BoundTableWriteSource = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .resolve_source_admission = resolveSourceAdmissionCallback,
+                .release_source_admission = releaseSourceAdmissionCallback,
                 .create_table = createTable,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
@@ -786,6 +788,68 @@ pub const BoundTableWriteSource = struct {
         defer alloc.free(participant);
         try (try self.activeDb()).markTransactionParticipantResolved(txn_id, participant);
         return {};
+    }
+
+    fn resolveSourceAdmissionCallback(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, command: source_admission.Command, sync: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.resolveSourceAdmission(alloc, name, command, sync, cancellation);
+    }
+
+    fn releaseSourceAdmissionCallback(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, command: source_admission.Command) !void {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return self.releaseSourceAdmission(alloc, name, command);
+    }
+
+    /// Resolve only an authenticated durable source reservation. A prepared
+    /// vote already contains the final row effects, so recovery must never
+    /// expand the original transforms against today's documents or schema.
+    /// The original name locates the retained coordinator; table ID authority
+    /// is checked by sourceAdmissionStatus before that locator is used.
+    pub fn resolveSourceAdmission(
+        self: *BoundTableWriteSource,
+        alloc: std.mem.Allocator,
+        original_table_name: []const u8,
+        command: source_admission.Command,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        const db = try self.activeDb();
+        switch (try db.sourceAdmissionStatus(command)) {
+            .absent => return null,
+            .committed => return try sourceCommittedOutcome(db, command.transactionId(), original_table_name, sync_level, true, cancellation),
+            .prepared => {},
+        }
+        var original = self.*;
+        original.table_name = original_table_name;
+        const outcome = try commitBoundTransactionInner(&original, alloc, command.transactionId(), command.accepted_at_ns, &.{.{
+            .table_name = original_table_name,
+            .source_admission = command,
+        }}, sync_level, true, cancellation, true);
+        if (outcome) |value| if (value == .committed) {
+            if (try db.sourceAdmissionReceipt(command) == null) return error.SourceOutcomeUnresolved;
+        };
+        return outcome;
+    }
+
+    /// Release coordinator retention only after the caller has durably recorded
+    /// destination acceptance. The independent source receipt survives release,
+    /// making retries safe even after the native transaction record is gone.
+    pub fn releaseSourceAdmission(
+        self: *BoundTableWriteSource,
+        alloc: std.mem.Allocator,
+        original_table_name: []const u8,
+        command: source_admission.Command,
+    ) !void {
+        const db = try self.activeDb();
+        if (try db.sourceAdmissionReceipt(command) == null) return error.SourceOutcomeUnresolved;
+        const status = db.getTransactionStatus(command.transactionId()) catch |err| switch (err) {
+            error.TxnNotFound => return,
+            else => return err,
+        };
+        if (status != .committed) return error.SourceOutcomeUnresolved;
+        const participant = try distributed_txn.participantIdForGroup(alloc, original_table_name, 0);
+        defer alloc.free(participant);
+        try db.markTransactionParticipantResolved(command.transactionId(), participant);
     }
 
     pub fn commitBoundTransaction(
