@@ -393,6 +393,38 @@ a distributed completion or construct a consistent snapshot. Provisioned/hosted
 root selection, owner RPCs, feed reconciliation and public transports remain
 required before advertising public changefeeds.
 
+## Delivery coordination and exact projection
+
+`metadata/changefeed_delivery.zig` coordinates authorized prepared pages with the
+durable receipt ledger. It rechecks live authorization before source work,
+before issuing a receipt and before returning data; checks expiry with a fresh
+clock; and returns no data on an unknown metadata outcome. A retry reconstructs
+the original issued interval and verifies its public payload, provider proof,
+event count and advances. Changing page limits cannot silently repartition an
+already issued delivery. Full cursor windows reject new work before another
+source read, while retained deliveries remain replayable. Client ACK is durable
+metadata progress; native ACK/collection remains a separate owner operation.
+
+`common/changefeed_projection.zig` evaluates bounded exact predicates on both
+already authorized historical images before projecting fields. It distinguishes
+insert/enter/update/leave/delete, treats missing separately from JSON null,
+preserves arbitrary decimal precision/exponents with the existing exact numeric
+kernel, and masks inaccessible image existence before classifying an operation.
+Rows contain only requested literal top-level fields; an empty field selection
+means all provider-authorized fields. Updates remain version notifications when
+only unselected fields changed. Iterative arena-owned cloning preserves deeply
+nested values without recursive stack growth or float conversion.
+
+Focused tests qualify lost apply replies, rejected proposals, forged ACKs,
+expired/unknown/misbound cursors, full receipt windows, replay payload mismatch,
+policy change/revocation before or after receipt commit, every filtered
+transition, hidden images, decimal precision, and deeply nested values. These
+components are included in `changefeed-control-test` and the unit target. A
+production provider still must authenticate against real current policy,
+produce canonical authorized images, certify distributed completion, and bind
+its prepare/replay implementation to retained root history. Public HTTP/SQL,
+bootstrap, lifecycle categories and pgoutput remain unfinished.
+
 ## Remaining implementation phases
 
 1. Finish root history tests, prepared credit accounting and native integration.
