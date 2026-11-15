@@ -613,6 +613,24 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn nativeHistoryGrant(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantIdentity) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation {
+        return self.historyGrant(alloc, table_name, .{ .version = 1, .authority = .native, .identity = identity });
+    }
+    pub fn orderedHistoryGrant(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, identity: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantIdentity, minimum_applied_index: u64) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation {
+        return self.historyGrant(alloc, table_name, .{ .version = 1, .authority = .raft, .identity = identity, .minimum_applied_index = minimum_applied_index });
+    }
+    fn historyGrant(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_grant_wire.Request) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation {
+        const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_grant_wire;
+        try request.validate();
+        const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(json);
+        if (json.len > wire.max_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_history_grant(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        return (try wire.decodeReply(alloc, response.bytes(), request)).observation;
+    }
+
     pub fn orderedHistoryOutcome(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, lookup: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Lookup) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome {
         const ordered = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered;
         const json = try std.json.Stringify.valueAlloc(alloc, lookup, .{});

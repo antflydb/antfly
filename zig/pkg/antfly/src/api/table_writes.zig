@@ -40395,6 +40395,10 @@ fn implementationTests() type {
             try @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire.test_support.malformedPages();
         }
 
+        test "ordered history consumer grant wire contracts" {
+            try @import("antfly_local_sources").api_local_table_writes.table_write_source.history_grant_wire.test_support.contracts();
+        }
+
         test "ordered history consumer grant observations recover leases without mutation" {
             const a = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});

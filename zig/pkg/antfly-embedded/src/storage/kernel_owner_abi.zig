@@ -26,7 +26,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 92 adds ordered history control and its stable retention failures.
 // Version 93 adds bounded binary retained-history pages at an ordered read cut.
 // Version 94 adds read-only exact retained-history outcome recovery.
-pub const abi_version: u32 = 94;
+// Version 95 adds request-bound read-only retained grant observations.
+pub const abi_version: u32 = 95;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1984,6 +1985,13 @@ pub extern fn antfly_storage_owner_ordered_history_control_json(
 
 /// Read-only exact outcome lookup; request and response are bounded typed JSON.
 pub extern fn antfly_storage_owner_ordered_history_outcome(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Read-only native/ordered lease observation, bound to the exact request.
+pub extern fn antfly_storage_owner_history_grant(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,

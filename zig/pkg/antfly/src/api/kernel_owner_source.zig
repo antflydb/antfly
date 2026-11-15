@@ -1788,12 +1788,20 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
-    const HistoryReadKind = enum { page, outcome };
+    const HistoryReadKind = enum { page, outcome, grant };
     fn HistoryReadInput(comptime kind: HistoryReadKind) type {
-        return if (kind == .page) table_write_source.history_page.Request else table_write_source.history_ordered.Lookup;
+        return switch (kind) {
+            .page => table_write_source.history_page.Request,
+            .outcome => table_write_source.history_ordered.Lookup,
+            .grant => table_write_source.history_consumer.GrantIdentity,
+        };
     }
     fn HistoryReadResult(comptime kind: HistoryReadKind) type {
-        return if (kind == .page) table_write_source.history_page.Page else table_write_source.history_ordered.Outcome;
+        return switch (kind) {
+            .page => table_write_source.history_page.Page,
+            .outcome => table_write_source.history_ordered.Outcome,
+            .grant => table_write_source.history_consumer.GrantObservation,
+        };
     }
 
     /// Private retained-history reads never fall back to stale consistency.
@@ -1804,6 +1812,10 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Exact receipt recovery has the same route and leader fences as pages.
     pub fn orderedHistoryOutcomeRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: table_write_source.history_ordered.Lookup) !table_write_source.history_ordered.Outcome {
         return self.historyReadRouted(alloc, fence, table_name, .outcome, request);
+    }
+
+    pub fn orderedHistoryGrantRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, identity: table_write_source.history_consumer.GrantIdentity) !table_write_source.history_consumer.GrantObservation {
+        return self.historyReadRouted(alloc, fence, table_name, .grant, identity);
     }
 
     fn historyReadRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, comptime kind: HistoryReadKind, request: HistoryReadInput(kind)) !HistoryReadResult(kind) {
@@ -1818,7 +1830,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
         std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
         std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
-        const requested_namespace = if (comptime kind == .page) request.reference.namespace else request.command.namespace();
+        const requested_namespace = switch (kind) {
+            .page => request.reference.namespace,
+            .outcome => request.command.namespace(),
+            .grant => request.namespace,
+        };
+        if (comptime kind == .grant) try request.validate();
         if (!std.mem.eql(u8, &namespace, &requested_namespace)) return error.HistoryResynchronizationRequired;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
         const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
@@ -1835,12 +1852,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         if (lease.entry.identity.table_id != identity.table_id or lease.entry.identity.shard_id != identity.shard_id or lease.entry.identity.range_id != identity.range_id) return error.HistoryResynchronizationRequired;
         try self.validateRoutedRead(alloc, fence, group, table_name);
-        var result = if (comptime kind == .page)
-            try lease.owner().orderedHistoryPage(alloc, table_name, request, proof.applied_index)
-        else blk: {
-            var recovery = request;
-            recovery.minimum_applied_index = proof.applied_index;
-            break :blk try lease.owner().orderedHistoryOutcome(alloc, table_name, recovery);
+        var result = switch (kind) {
+            .page => try lease.owner().orderedHistoryPage(alloc, table_name, request, proof.applied_index),
+            .outcome => blk: {
+                var recovery = request;
+                recovery.minimum_applied_index = proof.applied_index;
+                break :blk try lease.owner().orderedHistoryOutcome(alloc, table_name, recovery);
+            },
+            .grant => try lease.owner().orderedHistoryGrant(alloc, table_name, request, proof.applied_index),
         };
         errdefer if (comptime kind == .page) result.deinit();
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);

@@ -108,10 +108,19 @@ test "ordered history routed pages retain real images and discard failed final f
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
 
     fixture.validations = 0;
+    const grant_identity = history.history_consumer.GrantIdentity.fromGrant(grant);
+    const grant_observation = try owners.orderedHistoryGrantRouted(a, fence, "docs", grant_identity);
+    try std.testing.expectEqualDeep(enrolled.applied.consumer.?, grant_observation.active.consumer);
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+
+    fixture.validations = 0;
     fixture.mode = .leader_loss;
     try std.testing.expectError(error.NotLeader, owners.orderedHistoryPageRouted(a, fence, "docs", request));
     fixture.validations = 0;
     try std.testing.expectError(error.NotLeader, owners.orderedHistoryOutcomeRouted(a, fence, "docs", recovery));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    try std.testing.expectError(error.NotLeader, owners.orderedHistoryGrantRouted(a, fence, "docs", grant_identity));
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
     fixture.validations = 0;
     fixture.mode = .route_change;
@@ -121,7 +130,11 @@ test "ordered history routed pages retain real images and discard failed final f
     fixture.ranges[0].range_id = 7;
     try std.testing.expectError(error.TopologyChanged, owners.orderedHistoryOutcomeRouted(a, fence, "docs", recovery));
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
-    try std.testing.expectEqual(@as(usize, 6), fixture.waits);
+    fixture.validations = 0;
+    fixture.ranges[0].range_id = 7;
+    try std.testing.expectError(error.TopologyChanged, owners.orderedHistoryGrantRouted(a, fence, "docs", grant_identity));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    try std.testing.expectEqual(@as(usize, 9), fixture.waits);
     fixture.mode = .normal;
     fixture.ranges[0].range_id = 7;
     var future = recovery;

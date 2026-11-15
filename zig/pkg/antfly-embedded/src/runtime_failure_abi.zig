@@ -885,6 +885,7 @@ pub const Status = enum(u32) {
     history_too_large = 925,
     history_checkpoint_conflict = 926,
     corrupt_ordered_apply_receipt = 927,
+    history_consumer_conflict = 928,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

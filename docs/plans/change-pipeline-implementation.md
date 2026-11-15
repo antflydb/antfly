@@ -1574,6 +1574,37 @@ change. The compiled-owner C ABI,
 routed observation endpoint, durable root-control recovery and production root
 registration remain required; this DB observer alone does not finish them.
 
+## In progress: compiled grant observation and frozen route binding
+
+Storage-owner ABI 95 adds a read-only native/ordered grant query. Bounded JSON
+requests carry an explicit wire version, authority kind, immutable grant
+identity and required applied cut. Replies bind all those fields with a domain
+separated digest and validate active consumer identity/policy, grant equality,
+retirement-floor inequalities and scalar bounds. No observation is promoted to
+a command receipt. The client copies fixed-size results before freeing the
+compiled-owner response. Old ABI requests fail before touching storage. Selecting native authority cannot
+provision an unused root's durable document namespace: observation fails closed
+until explicit root activation has persisted it.
+
+`ProvisionedKernelOwnerSource.orderedHistoryGrantRouted` shares the existing
+ReadIndex, frozen owner proof, current descriptor identity, final leader and
+final route checks with pages and exact receipt recovery. The caller cannot
+choose a weaker native authority or a zero ordered cut for a Raft root.
+
+Initial compiled tests exposed a missing native status mapping for
+`HistoryConsumerConflict`; it now has an explicit append-only status (928)
+instead of becoming a generic kernel failure. The routed source checks passed
+before that mapping correction. Final qualification covers all observation
+states, close/reopen, request binding, full-width integers, allocation failure,
+malformed replies, old ABI rejection and both final-fence failure paths. The
+physical runner invokes the wire contract assertions explicitly; an imported
+helper namespace alone is not test execution. The status-corrected combined
+gate passes without leaks: six physical/wire checks, two compiled-owner checks,
+and two routed-source checks (plus thirteen discovery/support checks).
+Routed HTTP observation,
+durable pending-control reconciliation and production root registration are
+still required.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

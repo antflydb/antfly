@@ -24,6 +24,7 @@ const db_mod = struct {
 };
 const backend_types = @import("../storage/backend_types.zig");
 pub const history_consumer = @import("../storage/history_consumer.zig");
+pub const history_grant_wire = @import("../storage/history_grant_wire.zig");
 pub const history_ordered = @import("../storage/history_ordered.zig");
 pub const history_page = @import("../storage/history_page.zig");
 pub const history_page_wire = @import("../storage/history_page_wire.zig");
