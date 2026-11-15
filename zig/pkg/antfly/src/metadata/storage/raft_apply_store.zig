@@ -15415,7 +15415,7 @@ pub const RaftApplyStore = struct {
             const bytes = (try stagingGet(txn, try tableKeyForGroup(&key_buffer, group_id, table_id))) orelse return;
             const table = try decodeTableRecord(a, bytes);
             if (state.dropped or table.object_storage_generation != scope.object_generation or
-                !std.mem.eql(u8, &@import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(table), &scope.desired)) return;
+                !std.mem.eql(u8, &(try @import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(a, table)), &scope.desired)) return;
         }
         const next = mutation.apply(a, state) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -41882,7 +41882,7 @@ test "metadata.lake index Raft CAS rejects stale builders and unconditional cata
     defer store.deinit();
     const group_id = 22;
     const table: metadata.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = "{}" };
-    const signature: lake.Signature = .{ .desired = lake.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+    const signature: lake.Signature = .{ .desired = try lake.desiredFingerprint(a, table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
     const first = try (lake.State{}).begin(signature, @splat(5), 100, 20);
     const first_bytes = try lake.encode(a, first);
     defer a.free(first_bytes);
@@ -41966,7 +41966,7 @@ test "metadata.lake reader authority survives DROP and snapshots without changin
     const group_id = 22;
     const table: metadata.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = "{}" };
     try store.applyStandaloneCommand(group_id, .{ .upsert_table = table });
-    const signature: lake.Signature = .{ .desired = lake.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+    const signature: lake.Signature = .{ .desired = try lake.desiredFingerprint(a, table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
     const pending = try (lake.State{}).begin(signature, @splat(5), 100, 20);
     var building = table;
     building.lake_index_catalog_json = try lake.encode(ca, pending);

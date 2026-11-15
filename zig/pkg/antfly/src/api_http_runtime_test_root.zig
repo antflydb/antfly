@@ -142,5 +142,6 @@ test "linear merge discovery" {
 }
 
 test "index alias object runtime discovery" {
+    _ = @import("api/sql_execution.zig");
     _ = @import("api/object_table_runtime.zig");
 }

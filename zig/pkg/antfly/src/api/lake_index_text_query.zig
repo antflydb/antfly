@@ -230,7 +230,7 @@ pub const Scope = struct {
         for (self.entries[0..self.len]) |entry| {
             if (entry.serving_token == null or !std.mem.eql(u8, token, entry.serving_token.?)) continue;
             if (entry.table.table_id != table.table_id or entry.table.object_storage_generation != table.object_storage_generation or entry.table.storage.engine != table.storage.engine or
-                !std.mem.eql(u8, &local.metadata_lake_index_catalog.desiredFingerprint(entry.table), &local.metadata_lake_index_catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
+                !std.mem.eql(u8, &(try local.metadata_lake_index_catalog.desiredFingerprint(self.budget.allocator(), entry.table)), &(try local.metadata_lake_index_catalog.desiredFingerprint(self.budget.allocator(), table)))) return error.CatalogGenerationChanged;
             if (entry.published_only != (if (req.lake_read) |read| read.visibility == .published else false)) return error.CatalogGenerationChanged;
             const expiry = if (entry.native_cut != null) entry.native_expires_ms else if (entry.retained) |cut| cut.expires_ms else entry.cut_expires_ms;
             if (expiry <= @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) return error.CatalogGenerationChanged;
@@ -301,7 +301,7 @@ const Prepared = struct {
             .expires_ms = self.cut_expires_ms,
             .table_id = self.table.table_id,
             .object_generation = self.table.object_storage_generation,
-            .desired = local.metadata_lake_index_catalog.desiredFingerprint(self.table),
+            .desired = try local.metadata_lake_index_catalog.desiredFingerprint(self.arena.allocator(), self.table),
             .publication = self.state.value.published.?,
             .reader_token = self.lease.retainedToken(),
             .pending = self.pending,
@@ -523,7 +523,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     context = source.protectContext(context);
     const ca = a;
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, ca, table.schema_json, table.table_id, table.name);
-    sql_table.external_indexes = .{ .object_generation = table.object_storage_generation, .schema_json = table.schema_json, .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table) };
+    sql_table.external_indexes = .{ .object_generation = table.object_storage_generation, .schema_json = table.schema_json, .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table) };
     server.attachLakeRepairHint(&source);
     var selected = blk: {
         const publication_started = @import("antfly_platform").time.monotonicNs();
@@ -694,7 +694,7 @@ fn refreshOwnedCutExclusive(backing: A, server: *server_api.ApiHttpServer, table
     const native_owner = (try source_owner.activate(a, server, table, request)) orelse return;
     const retained_api = @import("lake_retained_cut.zig");
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
-    if (native_owner.current) |cut| if (now < cut.refresh_after_ms and cut.canIssue(now, retained_api.configuredTtl(server.cfg.node_config)) and std.mem.eql(u8, &cut.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table))) {
+    if (native_owner.current) |cut| if (now < cut.refresh_after_ms and cut.canIssue(now, retained_api.configuredTtl(server.cfg.node_config)) and std.mem.eql(u8, &cut.desired, &(try local.metadata_lake_index_catalog.desiredFingerprint(a, table)))) {
         var store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
         defer store.deinit();
         var artifacts = store.artifactStore();
@@ -717,7 +717,7 @@ fn refreshOwnedCutExclusive(backing: A, server: *server_api.ApiHttpServer, table
     const ttl = retained_api.configuredTtl(server.cfg.node_config);
     const horizon = try source_owner.admission.retention(now, ttl);
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return error.MetadataSourceUnavailable;
-    const cut_descriptor: retained_api.Descriptor = .{ .expires_ms = horizon.expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .publication = prepared.state.value.published.?, .reader_token = prepared.lease.retainedToken(), .pending = prepared.pending, .catalog_metadata = prepared.metadata, .published_only = false };
+    const cut_descriptor: retained_api.Descriptor = .{ .expires_ms = horizon.expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table), .publication = prepared.state.value.published.?, .reader_token = prepared.lease.retainedToken(), .pending = prepared.pending, .catalog_metadata = prepared.metadata, .published_only = false };
     var artifacts = prepared.store.artifactStore();
     const token = retainedCancellation(&prepared.retained_context);
     const ref = try retained_api.savePayloadReference(a, &artifacts, prepared.store.identity, server.embedding_provider_runtime.io, cut_descriptor, token, &server.lake_retained_payloads);
@@ -729,7 +729,7 @@ fn refreshOwnedCutExclusive(backing: A, server: *server_api.ApiHttpServer, table
     }
     const uuid = if (prepared.metadata) |metadata| try local.serverless_external_source_mod.lake_catalog.metadata.str(try local.serverless_external_source_mod.lake_catalog.metadata.get(try local.serverless_external_source_mod.lake_catalog.metadata.parse(a, metadata.metadata_json), "table-uuid")) else prepared.source.inventory.source_id;
     const cut: source_owner.admission.Cut = .{ .desired = cut_descriptor.desired, .store = prepared.store.identity, .generation = cut_descriptor.publication.generation, .reader_token = cut_descriptor.reader_token, .state = .{ .id = ref.id, .bytes = ref.bytes, .generation = ref.generation }, .manifest = manifest, .wal_lsn = prepared.pending.lsn, .base_lsn = prepared.pending.base_lsn, .created_ms = now, .refresh_after_ms = horizon.refresh_after_ms, .expires_ms = horizon.expires_ms, .cursor_ttl_ms = ttl };
-    try authority.apply(table.table_id, .{ .admit_source = .{ .scope = source_owner.scope(table, native_owner), .epoch = native_owner.epoch, .source_uuid = uuid, .cut = cut, .now_ms = now } });
+    try authority.apply(table.table_id, .{ .admit_source = .{ .scope = try source_owner.scope(a, table, native_owner), .epoch = native_owner.epoch, .source_uuid = uuid, .cut = cut, .now_ms = now } });
     // Read once through the normal path to install immutable state/row groups
     // and the sealed manifest in process-accounted residency before serving.
     const warm = (try prepare(a, server, table, .{}, request, &profile, &is_lake, true, null)) orelse return;
@@ -954,7 +954,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
             var artifacts = store.artifactStore();
             if (cut_expires_ms <= @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) return error.DeadlineExceeded;
             _ = server.lake_query_metrics.cursor_publications.fetchAdd(1, .monotonic);
-            break :cut try retained_api.saveCached(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = prepared.pending, .catalog_metadata = prepared.metadata, .published_only = prepared.published_only, .recent = owner.recent_declarations, .recent_cloud = owner.recent_cloud, .recent_runs = owner.recent_runs }, retained_cancellation, &server.lake_retained_payloads);
+            break :cut try retained_api.saveCached(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = prepared.pending, .catalog_metadata = prepared.metadata, .published_only = prepared.published_only, .recent = owner.recent_declarations, .recent_cloud = owner.recent_cloud, .recent_runs = owner.recent_runs }, retained_cancellation, &server.lake_retained_payloads);
         };
     };
     if (prepared.serving_token == null) prepared.serving_token = try prepared.arena.allocator().dupe(u8, serving_token);
@@ -6211,7 +6211,7 @@ test "external lake covering search hydration survives missing Parquet and prese
     var server = server_api.ApiHttpServer.init(a, .{}, .{ .ptr = &status_token, .vtable = &.{ .status = undefined, .get_lake_index_lifecycle = Hooks.read, .mutate_lake_index_lifecycle = Hooks.mutate } }, null, null);
     defer server.deinit();
     var table = try server.sql_schema_cache.resolve(std.testing.io, ca, schema_json, 7, "lake");
-    table.external_indexes = .{ .schema_json = schema_json, .catalog_json = record.lake_index_catalog_json, .indexes_json = record.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(record) };
+    table.external_indexes = .{ .schema_json = schema_json, .catalog_json = record.lake_index_catalog_json, .indexes_json = record.indexes_json, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, record) };
     var owner: Execution = .{ .server = &server, .table = table, .source = &source, .store = &store, .domain = publication.uploadDomainWithNamespace(7, store.identity, catalog.value.published.?.namespace), .declarations = catalog.value.published.?.declarations, .context = .{ .io = std.testing.io }, .request = .{}, .schema_json = schema_json, .arena = ca };
     defer owner.deinit();
     const first = try local.storage_rowsource_identity.allocId(ca, .{ .external = .{ .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .file_id = source.inventory.files[0].file_id, .row_group_ordinal = 0, .row_ordinal = 0 } });
@@ -6778,7 +6778,7 @@ test "external lake recent reconciliation skips directory backed text definition
     var table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "text_only", .schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","base_source":{"kind":"external","table_id":"text_only","format":"parquet","uri":"s3://archive/data","schema_fingerprint":"schema"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":true}}}}
     , .indexes_json = "{\"body\":{\"type\":\"full_text\"}}" };
-    const publication: metadata.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = metadata.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://archive/data", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .directory = .{ .artifact_id = "directory", .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .byte_len = 1, .count = 1 } };
+    const publication: metadata.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = try metadata.desiredFingerprint(a, table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://archive/data", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .directory = .{ .artifact_id = "directory", .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .byte_len = 1, .count = 1 } };
     table.lake_index_catalog_json = try metadata.encode(scratch, .{ .generation = 1, .published = publication });
     // No serving authority is installed. Text-only recent work must be a no-op
     // even when declarations are stored in an immutable directory; dense and
@@ -6888,7 +6888,7 @@ test "external lake owned serving recovery admission skips unrelated tables and 
         \\{"version":1,"storage_mode":"relational","default_type":"row","base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://archive/sealed.parquet-manifest.json","schema_fingerprint":"schema","object_mutability":"immutable"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":true}}}}
     , .indexes_json = "{\"body\":{\"type\":\"full_text\"}}" };
     const schema_json = table.schema_json;
-    const publication: metadata.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = metadata.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://archive/sealed.parquet-manifest.json", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
+    const publication: metadata.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = try metadata.desiredFingerprint(a, table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://archive/sealed.parquet-manifest.json", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
     const catalog_json = try metadata.encode(scratch, .{ .generation = 1, .published = publication });
     table.lake_index_catalog_json = catalog_json;
     var lanes: [4]@import("lake_index_navigation_warming.zig").Cache.Recovery = undefined;

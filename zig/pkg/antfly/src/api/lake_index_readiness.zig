@@ -63,7 +63,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
     const normalized = try request.platformDeadline();
     var context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, sa, table.schema_json, table.table_id, table.name);
-    sql_table.external_indexes = .{ .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table) };
+    sql_table.external_indexes = .{ .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table) };
     const transport = try server.lakeProviderTransport();
     const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = transport.io, .requests = transport.requests, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store };
     try server.prepareLakeCache();

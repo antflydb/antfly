@@ -60,14 +60,21 @@ fn envelopeValue(value: V) bool {
     return false;
 }
 
-pub fn physicalProjection(out: A, bytes: []const u8) ![]u8 {
-    if (!uses(bytes)) return out.dupe(u8, bytes);
+/// Null means the original bytes are already the physical recipe. The fast
+/// path allocates nothing; catalogs containing controls are parsed only once.
+pub fn physicalProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
+    if (std.mem.indexOfScalar(u8, bytes, '\\') == null and std.mem.indexOf(u8, bytes, "_index_alias") == null) return null;
     var arena = std.heap.ArenaAllocator.init(out);
     defer arena.deinit();
     var root = try std.json.parseFromSliceLeaky(V, arena.allocator(), bytes, .{});
-    _ = root.object.orderedRemove(key);
-    _ = root.object.orderedRemove(receipts_key);
-    return std.json.Stringify.valueAlloc(out, root, .{});
+    if (root != .object) return error.InvalidTableIndexMetadata;
+    const removed_aliases = root.object.orderedRemove(key);
+    const removed_receipts = root.object.orderedRemove(receipts_key);
+    if (!removed_aliases and !removed_receipts) return null;
+    return try std.json.Stringify.valueAlloc(out, root, .{});
+}
+pub fn physicalProjection(out: A, bytes: []const u8) ![]u8 {
+    return (try physicalProjectionIfNeeded(out, bytes)) orelse try out.dupe(u8, bytes);
 }
 
 /// Materialize at catalog publication, never on the query hot path.

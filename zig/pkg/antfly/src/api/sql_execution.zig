@@ -209,6 +209,9 @@ pub const Adapter = struct {
     /// statement. Owner verification still fences every scan against the
     /// exact serving generation, including a publication changed mid-read.
     policy_proofs: ?std.AutoHashMapUnmanaged(u64, ?[]u8) = null,
+    /// All graph inputs of one SQL execution reuse the first catalog cut for
+    /// each immutable table ID. Owned separately from transient bind arenas.
+    statement_index_catalogs: ?std.AutoHashMapUnmanaged(u64, []u8) = null,
     graph_parameters: []const std.json.Value = &.{},
     graph_parameter_cells: ?[]const @import("antfly_local_sources").sql_scalar.Datum = null,
     /// Materialize only arguments actually crossing into a graph expression;
@@ -283,6 +286,9 @@ pub const Adapter = struct {
             zig017_return_error = error.InvalidSqlBackendResponse;
             break :zig017_failure error.InvalidSqlBackendResponse;
         };
+        if (self.statement_index_catalogs != null) return error.InvalidSqlBackendResponse;
+        self.statement_index_catalogs = .empty;
+        defer self.releaseIndexCatalogs();
         self.policy_proofs = .empty;
         defer {
             var proofs = &self.policy_proofs.?;
@@ -807,23 +813,43 @@ pub const Adapter = struct {
         return bindings;
     }
 
+    fn releaseIndexCatalogs(self: *Adapter) void {
+        if (self.statement_index_catalogs) |*cuts| {
+            var values = cuts.valueIterator();
+            while (values.next()) |bytes| self.server.alloc.free(bytes.*);
+            cuts.deinit(self.server.alloc);
+            self.statement_index_catalogs = null;
+        }
+    }
+    fn bindIndexCatalog(self: *Adapter, out: std.mem.Allocator, table_id: u64, indexes_json: []const u8) ![]const u8 {
+        if (self.statement_index_catalogs) |*cuts| if (cuts.get(table_id)) |cut| return out.dupe(u8, cut);
+        const projected = if (std.mem.indexOf(u8, indexes_json, "_index_aliases") != null or std.mem.indexOfScalar(u8, indexes_json, '\\') != null)
+            try self.server.index_alias_cache.project(self.server.alloc, out, indexes_json)
+        else
+            try out.dupe(u8, "{}");
+        errdefer out.free(projected);
+        if (self.statement_index_catalogs) |*cuts| {
+            const owned = try self.server.alloc.dupe(u8, projected);
+            errdefer self.server.alloc.free(owned);
+            try cuts.put(self.server.alloc, table_id, owned);
+        }
+        return projected;
+    }
+
     fn bindResolved(self: *Adapter, alloc: std.mem.Allocator, target: system_catalog.Target, resolved: ?system_catalog.ResolvedTable, revision: u64, action: catalog.Action) !catalog.Table {
         const logical = try target.resourceNameAlloc(alloc);
         const table = resolved orelse return error.TableNotFound;
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
-        binding.index_catalog_json = if ((std.mem.indexOf(u8, definition.indexes_json, "_index_aliases") != null or std.mem.indexOfScalar(u8, definition.indexes_json, '\\') != null))
-            try self.server.index_alias_cache.project(self.server.alloc, alloc, definition.indexes_json)
-        else
-            "{}";
+        binding.index_catalog_json = try self.bindIndexCatalog(alloc, table.table_id, definition.indexes_json);
         if (binding.external_base_source != null and action != .read and action != .admin) return error.ExternalLakeReadOnly;
         if (binding.external_base_source != null) binding.external_indexes = .{
             .catalog_json = definition.lake_index_catalog_json,
             .object_generation = definition.object_storage_generation,
             .indexes_json = definition.indexes_json,
             .schema_json = definition.schema_json,
-            .desired = @import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(.{
+            .desired = try @import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(alloc, .{
                 .table_id = table.table_id,
                 .name = table.name,
                 .schema_json = definition.schema_json,
@@ -4970,4 +4996,40 @@ test "lake SQL GRAPH_TABLE shared graph joins reuse typed bindings and bounded s
     try std.testing.expect(!try sameGraphSyntax(cypher.ast.Query, one.query, different.query, &budget));
     budget.remaining = 0;
     try std.testing.expect(!try sameGraphSyntax(cypher.ast.Query, one.query, one.query, &budget));
+}
+
+test "index alias SQL statement retains one table catalog across graph binding arenas" {
+    const a = std.testing.allocator;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    var recipes = std.heap.ArenaAllocator.init(a);
+    defer recipes.deinit();
+    const r = recipes.allocator();
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, r, "{\"complete\":true}", .{});
+    const first = try aliases.put(r, "{\"a\":{\"type\":\"full_text\"},\"b\":{\"type\":\"full_text\"}}", "live", .{ .index = "a", .idempotency_key = "1" }, ready, 1);
+    const second = try aliases.put(r, first, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "2" }, ready, 2);
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = a;
+    server.index_alias_cache = .{};
+    defer server.index_alias_cache.deinit(a);
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{}, .statement_index_catalogs = .empty };
+    defer adapter.releaseIndexCatalogs();
+    {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const cut = try adapter.bindIndexCatalog(scratch.allocator(), 7, first);
+        const expected = try aliases.queryProjection(r, first);
+        try std.testing.expectEqualStrings(expected, cut);
+    }
+    const repeated = try adapter.bindIndexCatalog(a, 7, second);
+    defer a.free(repeated);
+    try std.testing.expectEqualStrings(try aliases.queryProjection(r, first), repeated);
+    const distinct = try adapter.bindIndexCatalog(a, 8, second);
+    defer a.free(distinct);
+    try std.testing.expectEqualStrings(try aliases.queryProjection(r, second), distinct);
+    adapter.releaseIndexCatalogs();
+    adapter.statement_index_catalogs = .empty;
+    const next_statement = try adapter.bindIndexCatalog(a, 7, second);
+    defer a.free(next_statement);
+    try std.testing.expectEqualStrings(distinct, next_statement);
 }

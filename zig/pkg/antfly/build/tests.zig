@@ -448,6 +448,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-index-alias-raft-test", "Verify committed alias rejection and durable store-admission indexes")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_raft_tests, &.{"metadata alias"}).step);
+    const alias_metadata_http_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"index alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-metadata-http-test", "Verify alias preflight conflicts across metadata HTTP routes and forwarding")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_metadata_http_tests, &.{"index alias"}).step);
     const system_catalog_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
