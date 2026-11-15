@@ -81,7 +81,7 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     var incarnation: identity.logical.Digest = undefined;
     hash.final(&incarnation);
     const namespace: identity.logical.Namespace = .{ .incarnation = incarnation, .adapter = .stable_key, .recipe = tuple.fingerprint };
-    const definition = local.metadata_lake_index_catalog.desiredFingerprint(table);
+    const definition = try local.metadata_lake_index_catalog.desiredFingerprint(a, table);
     var metadata = std.heap.ArenaAllocator.init(a);
     defer metadata.deinit();
     const input_recipes = try @import("lake_row_input_recipes.zig").plan(a, metadata.allocator(), table, provider, base);

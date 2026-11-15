@@ -19,9 +19,13 @@ const Allocator = std.mem.Allocator;
 /// Clone and adopt an ordered key, preserving duplicates. Caller owns the
 /// existing list on failure; a newly cloned key is installed without allocation.
 pub fn appendOwnedKey(alloc: Allocator, list: anytype, key: []const u8) !void {
-    try list.ensureUnusedCapacity(alloc, 1);
+    if (comptime @hasField(@TypeOf(list.*), "budget")) if (list.budget) |budget| {
+        var projected = budget.*;
+        try projected.reserve(key.len, 1);
+    };
     const owned = try alloc.dupe(u8, key);
-    list.appendAssumeCapacity(owned);
+    errdefer alloc.free(owned);
+    try list.append(alloc, owned);
 }
 
 pub fn appendUniqueOwnedKey(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), key: []const u8) !void {

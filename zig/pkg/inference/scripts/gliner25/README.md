@@ -197,3 +197,9 @@ probes, including under its declared Transformers version. See
 `investigate_span_extraction.py` for reproduction and retained evidence.
 Discovery and pull-time manifests withhold these extraction capabilities;
 typed decisions and classification remain available.
+
+## GLiNER2.5-Decide loaded API on Metal
+
+See [DECIDE_METAL_BENCHMARK.md](DECIDE_METAL_BENCHMARK.md) for the exact-artifact
+FP32 batch-API performance and memory matrix against Fastino MPS, including both
+default and full-batch Python execution.

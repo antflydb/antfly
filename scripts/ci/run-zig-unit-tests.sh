@@ -123,6 +123,11 @@ unit_log="${RUNNER_TEMP:-/tmp}/antfly-zig-unit.log"
 export ANTFLY_TEST_LOG_DIR="${RUNNER_TEMP:-/tmp}/antfly-zig-test-logs"
 mkdir -p "$ANTFLY_TEST_LOG_DIR"
 
+# Keep Debug safety and test coverage while omitting CI-only DWARF. Native
+# measurements show the public API consumer uses roughly half the compiler
+# memory without symbols. Local make/zig defaults still retain full symbols;
+# reproduce a failing test with -Doptimize=debug -Dstrip=false for a source trace.
+#
 # Reject incomplete or overlapping shard inventories before launching unrelated
 # compilation. Otherwise one cheap audit failure still burns the whole unit
 # watchdog budget while the independent build branches continue.
@@ -130,12 +135,12 @@ mkdir -p "$ANTFLY_TEST_LOG_DIR"
   cd zig
   taskset -c "${1:?CPU affinity is required}" \
     python3 tools/run_bounded_zig_build.py --zig "${ZIG:-zig}" -- build \
-    unit-storage-test-audit --maxrss "${2:?Scheduler memory budget is required}" --summary all
+    unit-storage-test-audit -Doptimize=debug -Dstrip=true --maxrss "${2:?Scheduler memory budget is required}" --summary all
 ) 2>&1 | tee -a "$unit_log"
 
 (
   set +e
-  taskset -c "${1:?CPU affinity is required}" make zig-unit-test ZIG_BUILD_FLAGS="--maxrss ${2:?Scheduler memory budget is required} --summary all" 2>&1 | tee -a "$unit_log"
+  taskset -c "${1:?CPU affinity is required}" make zig-unit-test ZIG_BUILD_FLAGS="-Doptimize=debug -Dstrip=true --maxrss ${2:?Scheduler memory budget is required} --summary all" 2>&1 | tee -a "$unit_log"
   exit "${PIPESTATUS[0]}"
 ) &
 unit_pid="$!"

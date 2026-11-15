@@ -1334,6 +1334,7 @@ pub const RuntimeStats = struct {
     launch_linear_qkv: usize = 0,
     deberta_fused_attention_calls: usize = 0,
     deberta_fused_attention_fallbacks: usize = 0,
+    deberta_stream_f32_attention_calls: usize = 0,
     deberta_stream_f16_attention_calls: usize = 0,
     deberta_stream_f16_attention_fallbacks: usize = 0,
     deberta_stream_f16_staging_calls: usize = 0,
@@ -3974,6 +3975,42 @@ pub const CudaCompute = struct {
         }
     }
 
+    /// GLiDE's four independent DeltaNet projections consume the same input.
+    /// Stage it once without concatenating weights or changing GEMM arithmetic.
+    pub fn glideDeltaProjections(cb: *const ops.ComputeBackend, input_ct: CT, weights: [4]CT, rows: usize, hidden: usize) !?[4]CT {
+        if (cb.kind() != .cuda) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (!self.glide_cuda or self.strict_f32_weights or self.cublaslt == null or
+            rows < 256 or rows > 16384 or (hidden != 1024 and hidden != 2048) or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            platform.env.getenvBool("ANTFLY_GLIDE_CUDA_DISABLE_SHARED_PROJECTIONS")) return null;
+        const input = tensorFromCt(input_ct);
+        try ensureF32(input);
+        try ensureCount(input, rows * hidden);
+        if (input.buffer.ptr == 0 or input.buffer.len < rows * hidden * 4) return error.InvalidShape;
+        const widths = [_]usize{ 6144, 2048, 16, 16 };
+        for (weights, widths) |weight_ct, width| {
+            const weight = tensorFromCt(weight_ct);
+            if (weight.quant_type != null or weight.dtype != .f16) return null;
+            try ensureCount(weight, hidden * width);
+            if (weight.buffer.ptr == 0 or weight.buffer.len < hidden * width * 2) return error.InvalidShape;
+        }
+        var staged = try allocDeviceBuffer(self, rows * hidden * 2);
+        defer releaseDeviceBuffer(self, &staged);
+        var result: [4]CT = undefined;
+        var initialized: usize = 0;
+        errdefer for (result[0..initialized]) |value| cb.free(value);
+        try self.kernels.launchF32ToF16(&self.ctx, staged, input.buffer, rows * hidden);
+        for (weights, widths, &result) |weight, width, *out| {
+            out.* = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) })).?;
+            initialized += 1;
+            try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, tensorFromCt(out.*).buffer, staged, tensorFromCt(weight).buffer, cublasLtWorkspace(self), rows, hidden, width);
+            self.stats.f16_cublaslt_linear_calls += 1;
+        }
+        self.stats.f16_cublaslt_activation_staging_calls += 1;
+        return result;
+    }
+
     pub fn qwen35LinearCore(cb: *const ops.ComputeBackend, state: *@import("lighton_recurrent.zig").State, request: anytype) !?CT {
         if (cb.kind() != .cuda) return null;
         if (state.failed) return error.CudaRecurrentStateInvalid;
@@ -4009,6 +4046,16 @@ pub const CudaCompute = struct {
         if (state.ctx) |ctx| {
             if (ctx != &self.ctx or state.key_heads != kh or state.value_heads != vh) return error.InvalidTensorShape;
         }
+        const glide_chunk = self.glide_cuda and !self.strict_f32_weights and !state.initialized and n >= 256 and kh == 16 and vh == 16 and
+            !platform.env.getenvBool("ANTFLY_GLIDE_CUDA_DISABLE_CHUNK_CORE");
+        const consume_mixed = if (@hasField(@TypeOf(request), "glide_consume_mixed")) request.glide_consume_mixed else false;
+        if (glide_chunk and consume_mixed) {
+            const source = tensorFromCt(request.mixed).buffer;
+            for (inputs[1..] ++ weights) |input| {
+                const other = tensorFromCt(input).buffer;
+                if (source.ptr < other.ptr + other.len and other.ptr < source.ptr + counts[0] * 4) return error.InvalidTensorShape;
+            }
+        }
         if (request.destination) |destination| {
             const tensor = tensorFromCt(destination);
             try ensureF32(tensor);
@@ -4031,10 +4078,13 @@ pub const CudaCompute = struct {
         const conv_shape = [_]i32{ @intCast(n), @intCast(channels) };
         const conv = (try allocUninitF32ShapeOp(self, &conv_shape)).?;
         defer cb.free(conv);
-        const core = (try allocUninitF32ShapeOp(self, &shape)).?;
-        defer cb.free(core);
+        // Chunk preparation consumes the cached gates before the scan writes
+        // raw output. The per-head finishing norm reads all its values before
+        // writing them, so these three stages can share the destination.
+        const core = if (glide_chunk) output else (try allocUninitF32ShapeOp(self, &shape)).?;
+        defer if (core != output) cb.free(core);
         state.failed = true;
-        try self.lighton_recurrent.run(&self.ctx, .{
+        const pointers = [14]driver_mod.CUdeviceptr{
             tensorFromCt(request.mixed).buffer.ptr, state.weights[0].ptr,
             state.history[0].ptr,                   state.history[1].ptr,
             tensorFromCt(conv).buffer.ptr,          tensorFromCt(request.beta).buffer.ptr,
@@ -4042,7 +4092,39 @@ pub const CudaCompute = struct {
             state.weights[2].ptr,                   state.recurrent.ptr,
             tensorFromCt(core).buffer.ptr,          tensorFromCt(request.z).buffer.ptr,
             state.weights[3].ptr,                   tensorFromCt(output).buffer.ptr,
-        }, n, kh, vh, state.initialized, request.eps, self.lighton_cached_recurrent_gates, self.capability_profile == .lightonocr3 and self.lighton_parallel_prefix);
+        };
+        if (glide_chunk) {
+            const layout = try @import("glide_delta.zig").layout(n, vh);
+            // Only GLiDE's private caller grants consumption of this projected
+            // input. Prefix convolution finishes reading it on ctx.stream
+            // before chunk preparation reuses its storage. Other callers keep
+            // the ordinary immutable-input contract and separately owned arena.
+            const reuse_mixed = consume_mixed and layout.total <= counts[0] * 4;
+            var arena = if (reuse_mixed)
+                debertaWorkspaceRegion(tensorFromCt(request.mixed).buffer, 0, layout.total)
+            else
+                try allocDeviceBuffer(self, layout.total);
+            defer if (!reuse_mixed) releaseDeviceBuffer(self, &arena);
+            var regions: [5]buffer_mod.DeviceBuffer = undefined;
+            for (&regions, layout.offsets, layout.sizes) |*region, offset, size| region.* = debertaWorkspaceRegion(arena, offset, size);
+            try self.lighton_recurrent.prepareGlide(&self.ctx, pointers, n, vh);
+            try self.glide_delta.run(&self.ctx, .{
+                .conv = pointers[4],
+                .gates = pointers[13],
+                .w = regions[0].ptr,
+                .attention = regions[1].ptr,
+                .scaled_k = regions[2].ptr,
+                .u = regions[3].ptr,
+                .decay = regions[4].ptr,
+                .state = pointers[9],
+                .out = pointers[10],
+                .tokens = @intCast(n),
+                .heads = @intCast(vh),
+            });
+            try self.lighton_recurrent.finishGlide(&self.ctx, pointers, n, vh, request.eps);
+        } else {
+            try self.lighton_recurrent.run(&self.ctx, pointers, n, kh, vh, state.initialized, request.eps, self.lighton_cached_recurrent_gates, self.capability_profile == .lightonocr3 and (self.lighton_parallel_prefix or self.glide_cuda));
+        }
         std.mem.swap(buffer_mod.DeviceBuffer, &state.history[0], &state.history[1]);
         state.initialized = true;
         state.failed = false;
@@ -4070,9 +4152,13 @@ pub const CudaCompute = struct {
 
     /// Laya parity requires FP32 execution even for reduced-storage source tensors.
     strict_f32_weights: bool = false,
+    glide_cuda: bool = false,
     /// Artifact-qualified specialty span models retain FP32 attention even
     /// when global diagnostic environment switches request reduced precision.
     qualified_span_fp32: bool = false,
+    /// Exact original Decide identity; independent of other GLiNER profiles.
+    qualified_decide_fp32: bool = false,
+    qualified_decide_q8: bool = false,
     laya_optimizations: bool = false,
     gliner_encoder_attention: bool = false,
     gliner_mixed_attention: bool = false,
@@ -4109,6 +4195,10 @@ pub const CudaCompute = struct {
     lighton_precision: @import("lighton_vision_bf16.zig").Precision = .f32,
     lighton_vision_bf16: @import("lighton_vision_bf16.zig").Module = .{},
     lighton_attention_inputs: @import("lighton_attention_inputs.zig").Module = .{},
+    glide_attention: @import("glide_attention.zig").Module = .{},
+    glide_delta: @import("glide_delta.zig").Module = .{},
+    glide_activation: @import("glide_activation.zig").Module = .{},
+    glide_request_shape: ?[3]usize = null,
     florence_bart_ffn_enabled: bool = false,
     florence_bart_ffn_calls: usize = 0,
     florence_fused_append_enabled: bool = false,
@@ -4702,6 +4792,31 @@ pub const CudaCompute = struct {
         self.embedding_gemma2_constants.deinit(self.allocator);
         self.embedding_gemma2_constants = .empty;
         // Live detached borrowers keep their bytes/leases until release.
+    }
+
+    /// GLiDE has no cross-request KV state. Keep warm buffers for the current
+    /// geometry without accumulating the working sets of every past length.
+    /// Only idle owned storage is retired; weights and live tensors stay put.
+    pub fn prepareGlideRequest(self: *CudaCompute, shape: [3]usize) !void {
+        if (!self.glide_cuda or platform.env.getenvBool("ANTFLY_GLIDE_CUDA_RETAIN_SHAPES") or
+            self.resident_training_cache or self.execution_scope != null or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            self.temp_arena_planner.active or self.temp_arena_planner.ready_for_capture or
+            cudaEffectiveTempSlotPeriod(self) != 0) return;
+        if (self.glide_request_shape) |previous| {
+            if (std.mem.eql(usize, &previous, &shape)) return;
+            while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.temp_buffer_mutex.unlock();
+            try synchronizeAndDrainDeferredDeviceFreesUnlocked(self);
+            for (self.temp_buffers.buffers.items) |*buffer| {
+                self.stats.temp_buffer_evictions += 1;
+                self.stats.device_free_calls += 1;
+                buffer.free(&self.ctx);
+            }
+            self.temp_buffers.clearRetainingCapacity();
+            self.stats.temp_buffer_cached_bytes = 0;
+        }
+        self.glide_request_shape = shape;
     }
 
     pub fn evictEmbeddingGemma2Caches(self: *CudaCompute) !void {
@@ -5374,6 +5489,9 @@ pub const CudaCompute = struct {
         self.lighton_activation.deinit(&self.ctx);
         self.lighton_vision_bf16.deinit(&self.ctx);
         self.lighton_attention_inputs.deinit(&self.ctx);
+        self.glide_attention.deinit(&self.ctx);
+        self.glide_delta.deinit(&self.ctx);
+        self.glide_activation.deinit(&self.ctx);
         self.lighton_vision_fused.deinit(&self.ctx);
         self.lighton_head.deinit(&self.ctx);
         self.lighton_vision_up.deinit(&self.ctx);
@@ -6561,7 +6679,8 @@ pub const CudaCompute = struct {
             errdefer device.free(&self.ctx);
             try copyFromHostTracked(self, device, storage.raw_bytes);
             const gliner_f16 = self.gliner_q8_f16_mirrors and canUseF16TensorCoreWeights(self) and
-                glinerQ8ProjectionWeight(self.gliner_encoder_attention, owned_key, loaded);
+                (glinerQ8ProjectionWeight(self.gliner_encoder_attention, owned_key, loaded) or
+                    decideDebertaQ8ProjectionWeight(self.qualified_decide_q8, owned_key, loaded));
             var tc_quant = if (gliner_f16) null else try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, device, storage.raw_bytes);
             errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
             var gliner_mirror = buffer_mod.DeviceBuffer{};
@@ -6795,6 +6914,32 @@ pub const CudaCompute = struct {
             .row_blocks = packed_quant.row_blocks,
             .bytes = packed_quant.bytes.len,
         };
+    }
+
+    /// GLiDE owns one dense device copy and no training/decode mirrors. Consume
+    /// the key on every path, including allocation failures before upload.
+    pub fn insertGlideWeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        errdefer self.allocator.free(owned_key);
+        if (!self.glide_cuda or (tensor.dtype != .f32 and tensor.dtype != .f16 and tensor.dtype != .bf16)) return error.UnsupportedTensorType;
+        const count = try elementCountFromShape(tensor.shape);
+        if (tensor.data.len != try checkedMul(count, tensor.dtype.byteSize())) return error.InvalidShape;
+        const shape = try self.allocator.dupe(i64, tensor.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, tensor.data.len);
+        errdefer device.free(&self.ctx);
+        try copyFromHostTracked(self, device, tensor.data);
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        try self.resident_weights.put(self.allocator, owned_key, .{
+            .buffer = device,
+            .dtype = tensor.dtype,
+            .shape = shape,
+            .elem_count = count,
+            .quant_type = null,
+            .owns_buffer = false,
+            .owns_shape = false,
+            .owned_by_tensor = false,
+        });
+        self.stats.resident_weight_bytes += tensor.data.len;
     }
 
     pub fn insertBf16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
@@ -8505,6 +8650,43 @@ fn glinerQ8EncoderWeight(enabled: bool, name: []const u8, loaded: *const weight_
 
 fn glinerQ8ProjectionWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
     return std.mem.startsWith(u8, name, "model.layers.") and glinerQ8EncoderWeight(enabled, name, loaded);
+}
+
+fn decideDebertaQ8ProjectionWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
+    if (!enabled) return false;
+    const storage = loaded.quantized_storage orelse return false;
+    if (knownQuantTensorType(storage.tensor_type) != .Q8_0 or storage.shape.len != 2) return false;
+    const prefix = "encoder.layer.";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    const suffix_start = std.mem.indexOfScalarPos(u8, name, prefix.len, '.') orelse return false;
+    const layer = std.fmt.parseInt(u32, name[prefix.len..suffix_start], 10) catch return false;
+    if (layer >= 24) return false;
+    const suffix = name[suffix_start..];
+    const shape: []const i64 = if (std.mem.eql(u8, suffix, ".intermediate.dense.weight")) &.{ 4096, 1024 } else if (std.mem.eql(u8, suffix, ".output.dense.weight")) &.{ 1024, 4096 } else if (std.mem.eql(u8, suffix, ".attention.self.query_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.key_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.value_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.pos_query_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.pos_key_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.output.dense.weight")) &.{ 1024, 1024 } else return false;
+    return std.mem.eql(i64, storage.shape, shape);
+}
+
+test "Decide Q8 projection mirrors bind exact encoder roles" {
+    var loaded = weight_source_mod.LoadedWeight{
+        .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false },
+        .quantized = true,
+        .quantized_storage = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &.{}, .shape = &.{ 1024, 1024 }, .allocator = std.testing.allocator },
+    };
+    try std.testing.expect(decideDebertaQ8ProjectionWeight(true, "encoder.layer.23.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(false, "encoder.layer.0.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.24.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "embeddings.word_embeddings.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "classifier.0.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
+    loaded.quantized_storage.?.shape = &.{ 1024, 4096 };
+    try std.testing.expect(decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
+    loaded.quantized_storage.?.tensor_type = .{ .known = .Q4_0 };
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
 }
 
 /// Bounded host staging: the largest 1B projection needs 26.25 MiB of half
@@ -11531,8 +11713,67 @@ fn lightOnFfnBf16Down(self: *CudaCompute, sources: LightOnActivationSources, dow
     return createTensor(self, output, shape, rows * hidden);
 }
 
+fn glideGatedFfnNoBias(self: *CudaCompute, request: *const ops.GatedFfnNoBiasRequest) !?CT {
+    if (!self.glide_cuda or self.strict_f32_weights or self.cublaslt == null or
+        platform.env.getenvBool("ANTFLY_GLIDE_CUDA_DISABLE_TILED_FFN") or
+        request.activation != .silu or request.rows == 0 or request.rows > 40000 or
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+    const rows = request.rows;
+    const hidden = request.hidden_size;
+    const intermediate = request.intermediate_size;
+    if (!((hidden == 1024 and intermediate == 3584) or (hidden == 2048 and intermediate == 6144))) return null;
+    const input = tensorFromCt(request.input);
+    try ensureF32(input);
+    const input_count = try checkedMul(rows, hidden);
+    try ensureCount(input, input_count);
+    if (input.buffer.ptr == 0 or input.buffer.len < input_count * 4) return error.InvalidShape;
+    const gate = tensorFromCt(request.gate_weight);
+    const up = tensorFromCt(request.up_weight);
+    const down = tensorFromCt(request.down_weight);
+    const weight_count = hidden * intermediate;
+    for ([_]*const CudaTensor{ gate, up, down }) |weight| {
+        if (weight.quant_type != null or weight.dtype != .f16) return null;
+        try ensureCount(weight, weight_count);
+        if (weight.buffer.ptr == 0 or weight.buffer.len < weight_count * 2) return error.InvalidShape;
+    }
+    // Scratch is bounded by a row tile, independent of packed batch length.
+    // Gate/up share one input conversion and the F32 activation never escapes.
+    // Larger decoder weights exceed L4's cache; larger row tiles amortize
+    // their reads while keeping the activation workspace explicitly bounded.
+    const configured_tile = platform.env.getenvUsize("ANTFLY_GLIDE_CUDA_FFN_TILE_ROWS") orelse 4096;
+    if (configured_tile == 0 or configured_tile > 4096) return error.InvalidShape;
+    const tile = @min(rows, configured_tile);
+    var staged = try allocDeviceBuffer(self, tile * hidden * 2);
+    defer releaseDeviceBuffer(self, &staged);
+    var gate_values = try allocDeviceBuffer(self, tile * intermediate * 4);
+    defer releaseDeviceBuffer(self, &gate_values);
+    var up_values = try allocDeviceBuffer(self, tile * intermediate * 4);
+    defer releaseDeviceBuffer(self, &up_values);
+    var activated = try allocDeviceBuffer(self, tile * intermediate * 2);
+    defer releaseDeviceBuffer(self, &activated);
+    const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(hidden) })).?;
+    errdefer freeTensor(self, output);
+    const workspace = cublasLtWorkspace(self);
+    var first: usize = 0;
+    while (first < rows) : (first += tile) {
+        const count = @min(tile, rows - first);
+        const source = debertaWorkspaceRegion(input.buffer, first * hidden * 4, count * hidden * 4);
+        const target = debertaWorkspaceRegion(tensorFromCt(output).buffer, first * hidden * 4, count * hidden * 4);
+        try self.kernels.launchF32ToF16(&self.ctx, staged, source, count * hidden);
+        try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, gate_values, staged, gate.buffer, workspace, count, hidden, intermediate);
+        try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, up_values, staged, up.buffer, workspace, count, hidden, intermediate);
+        try self.glide_activation.run(&self.ctx, .{ activated.ptr, gate_values.ptr, up_values.ptr }, @intCast(count * intermediate));
+        try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, target, activated, down.buffer, workspace, count, intermediate, hidden);
+        self.stats.f16_cublaslt_activation_staging_calls += 1;
+        self.stats.f16_cublaslt_linear_calls += 3;
+        self.stats.launch_elementwise += 1;
+    }
+    return output;
+}
+
 fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequest) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.glide_cuda) return glideGatedFfnNoBias(self, request);
     if ((!self.lighton_fused_ffn and !self.lighton_ffn_bf16_inputs) or self.capability_profile != .lightonocr3 or
         self.lazy_host_store != null or // Paired source addresses must remain immutable.
         !lightOnDevice(self).portableKernels() or
@@ -12012,7 +12253,7 @@ fn tryCublasLtF32Linear(
     // Zero-workspace plans exclude the faster strict FP32 SGEMM schedules on
     // GB10. Reuse one bounded buffer, included in specialty request admission.
     // Allocation failure keeps the existing zero-workspace correctness path.
-    const workspace = if (self.qualified_span_fp32)
+    const workspace = if (self.qualified_span_fp32 or self.qualified_decide_fp32)
         self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("../../models/gliner_specialty_qualification.zig").cuda_matmul_workspace_bytes) catch buffer_mod.DeviceBuffer{}
     else
         buffer_mod.DeviceBuffer{};
@@ -13346,7 +13587,9 @@ fn lightOnStatePoolEnabled(self: *const CudaCompute) bool {
 /// ordinary-cache hits, their old and new GPU users share ctx.stream, so FIFO
 /// ordering permits reuse without a host wait or an intervening cuMemFree.
 fn takeLightOnDeferredBufferUnlocked(self: *CudaCompute, len: usize, exact: bool) ?buffer_mod.DeviceBuffer {
-    if (len == 0 or self.deferred_device_frees.items.len == 0 or self.capability_profile != .lightonocr3 or self.lazy_host_store != null or self.resident_training_cache or self.execution_scope != null or
+    if (len == 0 or self.deferred_device_frees.items.len == 0 or
+        (self.capability_profile != .lightonocr3 and !(self.capability_profile == .gliner25_modern_bert and self.glide_cuda)) or
+        self.lazy_host_store != null or self.resident_training_cache or self.execution_scope != null or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
         !cudaDeferredFreeEnabled()) return null;
     const deferred_budget = cudaDeferredFreeBudgetBytes(self);
@@ -18240,18 +18483,20 @@ const CudaDebertaInvalidModeWarning = struct {
     var emitted = std.atomic.Value(bool).init(false);
 };
 
-fn debertaAttentionExecutionMode(qualified_span_fp32: bool, requested: CudaDebertaAttentionMode) CudaDebertaAttentionMode {
-    return if (qualified_span_fp32) .fused_f32 else requested;
+fn debertaAttentionExecutionMode(qualified_span_fp32: bool, qualified_decide_fp32: bool, requested: CudaDebertaAttentionMode) CudaDebertaAttentionMode {
+    return if (qualified_span_fp32 or qualified_decide_fp32) .fused_f32 else requested;
 }
 
-test "specialty FP32 attention policy cannot be overridden by reduced precision diagnostics" {
+test "qualified FP32 attention policy cannot be overridden by reduced precision diagnostics" {
     inline for (std.meta.tags(CudaDebertaAttentionMode)) |mode| {
-        try std.testing.expectEqual(CudaDebertaAttentionMode.fused_f32, debertaAttentionExecutionMode(true, mode));
-        try std.testing.expectEqual(mode, debertaAttentionExecutionMode(false, mode));
+        try std.testing.expectEqual(CudaDebertaAttentionMode.fused_f32, debertaAttentionExecutionMode(true, false, mode));
+        try std.testing.expectEqual(CudaDebertaAttentionMode.fused_f32, debertaAttentionExecutionMode(false, true, mode));
+        try std.testing.expectEqual(mode, debertaAttentionExecutionMode(false, false, mode));
     }
     // The generated-auto path additionally requires .auto; the qualified
     // effective mode is never .auto even if its environment flag is enabled.
-    try std.testing.expect(debertaAttentionExecutionMode(true, .auto) != .auto);
+    try std.testing.expect(debertaAttentionExecutionMode(true, false, .auto) != .auto);
+    try std.testing.expect(debertaAttentionExecutionMode(false, true, .auto) != .auto);
     try std.testing.expect(debertaFusedF32Default(true, 12, 1));
     // General encoders keep main's compiled-artifact policy on every target;
     // specialty's GB10 exception must not depend on a BF16 tensor-core image.
@@ -19147,7 +19392,7 @@ fn simtQMatmulFallbackVariant(variant: kernels_mod.QMatmulVariant) kernels_mod.Q
 // resident tensor used by identity checks, embeddings or task heads.
 fn boundaryMixedWeight(self: *CudaCompute, weight: *const CudaTensor) ?CudaTensor {
     const boundary = self.gliner_boundary_inference and self.gliner_mixed_attention and weight.dtype == .f32;
-    const q8 = self.gliner_q8_f16_mirrors and self.gliner_encoder_attention and isKnownQuant(weight, .Q8_0);
+    const q8 = self.gliner_q8_f16_mirrors and (self.gliner_encoder_attention or self.qualified_decide_q8) and isKnownQuant(weight, .Q8_0);
     if (!boundary and !q8) return null;
     const mirror = self.gliner_boundary_f16_mirrors.get(weight.buffer.ptr) orelse return null;
     var view = weight.*;
@@ -19188,6 +19433,7 @@ test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
     compute.gliner_boundary_inference = false;
     compute.gliner_mixed_attention = false;
     compute.gliner_encoder_attention = true;
+    compute.qualified_decide_q8 = false;
     compute.gliner_q8_f16_mirrors = true;
     compute.gliner_boundary_f16_mirrors = .{};
     defer compute.gliner_boundary_f16_mirrors.deinit(std.testing.allocator);
@@ -19565,7 +19811,7 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     // The encoder composes plain linear + residual layer norm when declined.
     // Its strict FP32 cuBLASLt projection is much faster than the small fused
     // SIMT projection for these wide FFN output matrices, without extra storage.
-    if (self.qualified_span_fp32 and weight_tensor.quant_type == null) return null;
+    if ((self.qualified_span_fp32 or self.qualified_decide_fp32) and weight_tensor.quant_type == null) return null;
     const bias_tensor = tensorFromCt(bias);
     const residual_tensor = tensorFromCt(residual);
     try ensureF32(input_tensor);
@@ -26784,7 +27030,9 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    const attention_mode = debertaAttentionExecutionMode(self.qualified_span_fp32, cudaDebertaAttentionMode());
+    // Both immutable FP32 profiles must bypass automatic half-precision
+    // attention: the 128-token transition can change Decide classifications.
+    const attention_mode = debertaAttentionExecutionMode(self.qualified_span_fp32, self.qualified_decide_fp32 or self.qualified_decide_q8, cudaDebertaAttentionMode());
     if ((attention_mode == .generated_tc or (attention_mode == .auto and cudaDebertaGeneratedTcAutoEnabled())) and seq_len <= 256 and head_dim == 64) {
         const requested_variant = cudaDebertaGeneratedTcVariant();
         const launched_m32 = if (requested_variant != .m16)
@@ -26885,6 +27133,34 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
             }
         }
         self.stats.deberta_stream_f16_attention_fallbacks += 1;
+    }
+    // The L4-qualified original Decide route keeps attention entirely FP32.
+    // Missing symbols in older CUDA images retain the existing fused fallback.
+    if ((self.qualified_decide_fp32 or self.qualified_decide_q8) and self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
+        (attention_mode == .auto or attention_mode == .fused_f32) and head_dim == 64 and seq_len <= 512)
+    {
+        const launched = self.kernels.launchDebertaAttentionStreamF32(
+            &self.ctx,
+            device,
+            q_tensor.buffer,
+            k_tensor.buffer,
+            v_tensor.buffer,
+            q_r_tensor.buffer,
+            k_r_tensor.buffer,
+            mask_device,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable => false,
+            else => return err,
+        };
+        if (launched) {
+            self.stats.deberta_stream_f32_attention_calls += 1;
+            self.stats.launch_attention += 1;
+            return createTensor(self, device, shape, count);
+        }
     }
     if (cudaDebertaFusedAttentionEnabled(self) and seq_len <= 512) {
         const launched = self.kernels.launchDebertaAttentionFusedF32(
@@ -30557,7 +30833,258 @@ fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
     };
 }
 
+/// GLiDE's encoder projects packed rows, then reuses the existing local/global
+/// ModernBERT kernels independently for each row. A pruned query is staged at
+/// its original position, preserving the same local-window semantics.
+fn glideEncoderSegmentAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttention) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!self.glide_cuda or request.head_dim != 64) return null;
+    const r = request.*;
+    if (r.queries == 0 or r.keys == 0 or r.num_heads == 0 or
+        r.ranges.len != try checkedMul(r.queries, 6) or
+        r.query_positions.len != r.queries or r.key_positions.len != r.keys) return error.InvalidShape;
+    const width = try checkedMul(r.num_heads, 64);
+    if (width > std.math.maxInt(i32) or r.queries > std.math.maxInt(i32) or r.keys > std.math.maxInt(i32)) return error.InvalidShape;
+    for ([_]CT{ q, k, v }, [_]usize{ r.queries, r.keys, r.keys }) |input, rows| {
+        const count = try checkedMul(rows, width);
+        try ensureF32(tensorFromCt(input));
+        try ensureCount(tensorFromCt(input), count);
+        if (tensorFromCt(input).buffer.ptr == 0 or tensorFromCt(input).buffer.len < try checkedMul(count, 4)) return error.InvalidShape;
+    }
+    // Validate every row before submitting any work. General tree masks keep
+    // the existing fallback; the encoder's row layout is contiguous.
+    var first: usize = 0;
+    while (first < r.queries) {
+        const ranges = r.ranges[first * 6 ..][0..6];
+        for (0..3) |i| if (ranges[i * 2] > ranges[i * 2 + 1] or ranges[i * 2 + 1] > r.keys) return error.InvalidShape;
+        if (ranges[0] >= ranges[1] or ranges[1] > r.keys) return error.InvalidShape;
+        if (ranges[2] != ranges[3] or ranges[4] != ranges[5]) return null;
+        var end = first + 1;
+        while (end < r.queries and std.mem.eql(u32, ranges, r.ranges[end * 6 ..][0..6])) : (end += 1) {}
+        const length = ranges[1] - ranges[0];
+        if (length > 8192) return null;
+        if (end - first != length and end - first != 1) return null;
+        for (r.key_positions[ranges[0]..ranges[1]], 0..) |position, i| if (position != i) return error.InvalidShape;
+        for (r.query_positions[first..end], 0..) |position, i| {
+            if (position < 0 or position >= length) return error.InvalidShape;
+            if (end - first != 1 and position != i) return error.InvalidShape;
+        }
+        first = end;
+    }
+    const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(r.queries), @intCast(width) })).?;
+    errdefer freeTensor(self, output);
+    first = 0;
+    while (first < r.queries) {
+        const ranges = r.ranges[first * 6 ..][0..6];
+        var end = first + 1;
+        while (end < r.queries and std.mem.eql(u32, ranges, r.ranges[end * 6 ..][0..6])) : (end += 1) {}
+        const length = ranges[1] - ranges[0];
+        const q_view = try sliceRows2DOp(self, q, first, end - first, width);
+        defer freeTensor(self, q_view);
+        const k_view = try sliceRows2DOp(self, k, ranges[0], length, width);
+        defer freeTensor(self, k_view);
+        const v_view = try sliceRows2DOp(self, v, ranges[0], length, width);
+        defer freeTensor(self, v_view);
+        const pruned = end - first != length;
+        const row_query = if (pruned) (try allocUninitF32ShapeOp(self, &.{ @intCast(length), @intCast(width) })).? else q_view;
+        defer if (pruned) freeTensor(self, row_query);
+        const readout: usize = @intCast(r.query_positions[first]);
+        if (pruned) {
+            try self.kernels.launchFillF32(&self.ctx, tensorFromCt(row_query).buffer, length * width, 0);
+            const target = debertaWorkspaceRegion(tensorFromCt(row_query).buffer, readout * width * 4, width * 4);
+            try copyFromDeviceTracked(self, target, tensorFromCt(q_view).buffer, width * 4);
+        }
+        const mask = try self.allocator.alloc(i64, length);
+        defer self.allocator.free(mask);
+        @memset(mask, 1);
+        const result = try encoderLocalAttention(self, row_query, k_view, v_view, mask, 1, length, r.num_heads, 64, @min(r.window, length));
+        defer freeTensor(self, result);
+        const bytes = (end - first) * width * 4;
+        const target = debertaWorkspaceRegion(tensorFromCt(output).buffer, first * width * 4, bytes);
+        const source = debertaWorkspaceRegion(tensorFromCt(result).buffer, if (pruned) readout * width * 4 else 0, bytes);
+        try copyFromDeviceTracked(self, target, source, bytes);
+        first = end;
+    }
+    return output;
+}
+
+const GlideDenseLayout = struct {
+    offsets: [6]usize,
+    sizes: [6]usize,
+    total: usize,
+    tile: usize,
+    padded_keys: usize,
+};
+fn glideDenseLayout(heads: usize, kv_heads: usize, keys: usize, queries: usize, limit: usize) !?GlideDenseLayout {
+    // Aligned K/V leading dimensions admit tensor-core GEMMs even for odd
+    // prompt lengths. Padding never participates in the softmax denominator.
+    const padded_keys = (try std.math.add(usize, keys, 15)) & ~@as(usize, 15);
+    const kv = try checkedMul(try checkedMul(kv_heads, padded_keys), 512);
+    const fixed = try checkedMul(kv, 2);
+    if (fixed >= limit) return null;
+    const per_query = try checkedMul(heads, try std.math.add(usize, 1536, try checkedMul(padded_keys, 6)));
+    // Reserve alignment slop for six independently aligned regions.
+    if (limit - fixed <= 1536) return null;
+    // Compact K/V and smaller long-prompt score tiles reduce cache pressure.
+    // Shorter contexts retain larger GEMMs to amortize launch overhead.
+    const tile_limit: usize = if (keys <= 3072) 256 else 128;
+    const tile = @min(@min(queries, tile_limit), (limit - fixed - 1536) / per_query);
+    if (tile == 0) return null;
+    const q = try checkedMul(try checkedMul(heads, tile), 512);
+    const scores = try checkedMul(try checkedMul(heads, tile), padded_keys);
+    var result = GlideDenseLayout{ .offsets = undefined, .sizes = .{ q, kv, kv, scores * 4, scores * 2, q * 2 }, .total = 0, .tile = tile, .padded_keys = padded_keys };
+    for (&result.offsets, result.sizes) |*offset, size| {
+        result.total = std.mem.alignForward(usize, result.total, 256);
+        offset.* = result.total;
+        result.total = try std.math.add(usize, result.total, size);
+    }
+    return result;
+}
+
+fn glideDenseAttention(self: *CudaCompute, q: CT, k: CT, v: CT, output: CT, request: *const ops.SegmentAttentionGrouped) !bool {
+    if (self.cublaslt == null or self.strict_f32_weights or platform.env.getenvBool("ANTFLY_GLIDE_CUDA_NO_DENSE_ATTENTION")) return false;
+    const a = request.visibility;
+    // The dense tiles cover a single contiguous bidirectional row. General
+    // disjoint visibility stays on the streaming kernel without an N^2 mask.
+    var maximum: usize = 0;
+    var row: usize = 0;
+    while (row < a.queries) {
+        const ranges = a.ranges[row * 6 ..][0..6];
+        if (ranges[0] == ranges[1] or ranges[2] != ranges[3] or ranges[4] != ranges[5]) return false;
+        var end = row + 1;
+        while (end < a.queries and std.mem.eql(u32, ranges, a.ranges[end * 6 ..][0..6])) : (end += 1) {}
+        const layout = (try glideDenseLayout(a.num_heads, request.num_kv_heads, ranges[1] - ranges[0], end - row, request.workspace_limit_bytes)) orelse return false;
+        maximum = @max(maximum, layout.total);
+        row = end;
+    }
+    var arena = try allocDeviceBuffer(self, maximum);
+    defer releaseDeviceBuffer(self, &arena);
+    row = 0;
+    while (row < a.queries) {
+        const ranges = a.ranges[row * 6 ..][0..6];
+        var end = row + 1;
+        while (end < a.queries and std.mem.eql(u32, ranges, a.ranges[end * 6 ..][0..6])) : (end += 1) {}
+        const keys = ranges[1] - ranges[0];
+        const layout = (try glideDenseLayout(a.num_heads, request.num_kv_heads, keys, end - row, request.workspace_limit_bytes)).?;
+        var buffers: [6]buffer_mod.DeviceBuffer = undefined;
+        for (&buffers, layout.offsets, layout.sizes) |*buf, offset, size| buf.* = debertaWorkspaceRegion(arena, offset, size);
+        var p = @import("glide_attention.zig").DenseParams{
+            .q = tensorFromCt(q).buffer.ptr,
+            .k = tensorFromCt(k).buffer.ptr,
+            .v = tensorFromCt(v).buffer.ptr,
+            .out = tensorFromCt(output).buffer.ptr,
+            .qp = buffers[0].ptr,
+            .kp = buffers[1].ptr,
+            .vp = buffers[2].ptr,
+            .scores = buffers[3].ptr,
+            .probabilities = buffers[4].ptr,
+            .op = buffers[5].ptr,
+            .query_start = @intCast(row),
+            .key_start = ranges[0],
+            .queries = 0,
+            .keys = keys,
+            .heads = @intCast(a.num_heads),
+            .kv_heads = @intCast(request.num_kv_heads),
+            .scale = request.score_scale,
+            .padded_keys = @intCast(layout.padded_keys),
+        };
+        try self.glide_attention.dense(&self.ctx, 0, p);
+        var start = row;
+        while (start < end) : (start += layout.tile) {
+            if (request.control) |control| try control.check();
+            const count = @min(layout.tile, end - start);
+            p.query_start = @intCast(start);
+            p.queries = @intCast(count);
+            try self.glide_attention.dense(&self.ctx, 1, p);
+            // Query heads sharing one KV head are adjacent in the packed
+            // layout. Flatten them into GEMM rows so each KV matrix is stored
+            // once; score/output rows retain their original head order.
+            const group_rows = count * (a.num_heads / request.num_kv_heads);
+            const q_bytes = group_rows * 256 * 2;
+            const kv_bytes = layout.padded_keys * 256 * 2;
+            const score_bytes = group_rows * layout.padded_keys * 4;
+            const probability_bytes = score_bytes / 2;
+            const output_bytes = q_bytes * 2;
+            for (0..request.num_kv_heads) |head| {
+                const query = debertaWorkspaceRegion(buffers[0], head * q_bytes, q_bytes);
+                const key = debertaWorkspaceRegion(buffers[1], head * kv_bytes, kv_bytes);
+                const scores = debertaWorkspaceRegion(buffers[3], head * score_bytes, score_bytes);
+                try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, scores, query, key, cublasLtWorkspace(self), group_rows, 256, layout.padded_keys);
+            }
+            try self.glide_attention.dense(&self.ctx, 2, p);
+            for (0..request.num_kv_heads) |head| {
+                const probabilities = debertaWorkspaceRegion(buffers[4], head * probability_bytes, probability_bytes);
+                const value = debertaWorkspaceRegion(buffers[2], head * kv_bytes, kv_bytes);
+                const destination = debertaWorkspaceRegion(buffers[5], head * output_bytes, output_bytes);
+                try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, destination, probabilities, value, cublasLtWorkspace(self), group_rows, layout.padded_keys, 256);
+            }
+            try self.glide_attention.dense(&self.ctx, 3, p);
+        }
+        row = end;
+    }
+    return true;
+}
+
+fn glideSegmentAttentionGrouped(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttentionGrouped) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const a = request.visibility;
+    if (!self.glide_cuda) return null;
+    // This kernel implements global packed ranges, never causal or local masks.
+    if (a.head_dim != 256 or a.window != std.math.maxInt(u32) or request.metadata != null) return null;
+    if (a.queries == 0 or a.keys == 0 or a.num_heads == 0 or request.num_kv_heads == 0 or
+        a.num_heads % request.num_kv_heads != 0 or a.ranges.len != try checkedMul(a.queries, 6) or
+        !std.math.isFinite(request.score_scale)) return error.InvalidShape;
+    const work = try checkedMul(a.queries, a.num_heads);
+    if (work > std.math.maxInt(u32) - 3 or a.keys > std.math.maxInt(u32)) return error.InvalidShape;
+    for (0..a.queries) |row| {
+        var previous: u32 = 0;
+        for (0..3) |segment| {
+            const begin = a.ranges[row * 6 + segment * 2];
+            const end = a.ranges[row * 6 + segment * 2 + 1];
+            if (begin > end or end > a.keys) return error.InvalidShape;
+            if (begin != end) {
+                if (begin < previous) return error.InvalidShape;
+                previous = end;
+            }
+        }
+    }
+    const count = try checkedMul(work, 256);
+    const kv_count = try checkedMul(try checkedMul(a.keys, request.num_kv_heads), 256);
+    if (count > std.math.maxInt(u32) or kv_count > std.math.maxInt(u32) or
+        a.queries > std.math.maxInt(i32) or a.num_heads > std.math.maxInt(i32) / 256) return error.InvalidShape;
+    for ([_]CT{ q, k, v }, [_]usize{ count, kv_count, kv_count }) |input, expected| {
+        try ensureF32(tensorFromCt(input));
+        try ensureCount(tensorFromCt(input), expected);
+        if (tensorFromCt(input).buffer.ptr == 0 or tensorFromCt(input).buffer.len < try checkedMul(expected, 4)) return error.InvalidShape;
+    }
+    if (request.control) |control| try control.check();
+    const shape = [_]i32{ @intCast(a.queries), @intCast(a.num_heads * 256) };
+    const output = (try allocUninitF32ShapeOp(self, &shape)).?;
+    errdefer freeTensor(self, output);
+    if (try glideDenseAttention(self, q, k, v, output, request)) {
+        if (request.control) |control| try control.check();
+        return output;
+    }
+    const ranges = try uploadTempU32(self, a.ranges);
+    try self.glide_attention.run(&self.ctx, .{
+        .q = tensorFromCt(q).buffer.ptr,
+        .k = tensorFromCt(k).buffer.ptr,
+        .v = tensorFromCt(v).buffer.ptr,
+        .out = tensorFromCt(output).buffer.ptr,
+        .ranges = ranges.ptr,
+        .queries = @intCast(a.queries),
+        .heads = @intCast(a.num_heads),
+        .kv_heads = @intCast(request.num_kv_heads),
+        .scale = request.score_scale,
+    }, !self.strict_f32_weights);
+    self.stats.launch_other += 1;
+    if (request.control) |control| try control.check();
+    return output;
+}
+
 const vtable = ops.ComputeBackend.VTable{
+    .segmentAttention = &glideEncoderSegmentAttention,
+    .segmentAttentionGrouped = &glideSegmentAttentionGrouped,
     .backendKind = &backendKind,
     .modelConstant = &modelConstantOp,
     .audioFrontend = &audioFrontendOp,
@@ -37592,4 +38119,494 @@ test "cooperative decode batches keep sampled and greedy Q6 heads on the same qu
     try std.testing.expect(cudaQuantizedDecodeRowsEligible(2, 2));
     try std.testing.expect(!cudaQuantizedDecodeRowsEligible(3, 2));
     try std.testing.expect(!cudaQuantizedDecodeRowsEligible(0, 0));
+}
+
+test "GLiDE CUDA weight upload consumes keys on early allocation failure" {
+    const a = std.testing.allocator;
+    var tensor = try tensor_mod.Tensor.initFloat32(a, "norm.weight", &.{2}, &.{ 1, 1 });
+    defer tensor.deinit();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    var compute: CudaCompute = undefined;
+    compute.allocator = failing.allocator();
+    compute.glide_cuda = true;
+    // Key allocation succeeds; shape allocation fails before any CUDA access.
+    const key = try compute.allocator.dupe(u8, "norm.weight");
+    try std.testing.expectError(error.OutOfMemory, compute.insertGlideWeightFromTensor(key, &tensor));
+    compute.allocator = a;
+    compute.glide_cuda = false;
+    try std.testing.expectError(error.UnsupportedTensorType, compute.insertGlideWeightFromTensor(try a.dupe(u8, "norm.weight"), &tensor));
+}
+
+test "GLiDE CUDA geometry changes retire idle buffers and preserve live tensors" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    try compute.prepareGlideRequest(.{ 1, 17, 17 });
+    var active = try allocDeviceBufferOrdinary(&compute, 128);
+    defer releaseDeviceBuffer(&compute, &active);
+    try compute.kernels.launchFillF32(&compute.ctx, active, 32, 1.25);
+    var idle = try allocDeviceBufferOrdinary(&compute, 4096);
+    releaseDeviceBuffer(&compute, &idle);
+    const frees = compute.stats.device_free_calls;
+    try compute.prepareGlideRequest(.{ 1, 17, 17 });
+    try std.testing.expectEqual(frees, compute.stats.device_free_calls);
+    try std.testing.expectEqual(@as(usize, 1), compute.temp_buffers.buffers.items.len);
+    try compute.prepareGlideRequest(.{ 1, 33, 33 });
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
+    try std.testing.expectEqual(frees + 1, compute.stats.device_free_calls);
+    var values: [32]f32 = undefined;
+    try active.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+    for (values) |value| try std.testing.expectEqual(@as(f32, 1.25), value);
+    // Other model families never adopt GLiDE's geometry policy.
+    compute.glide_cuda = false;
+    try compute.prepareGlideRequest(.{ 2, 64, 128 });
+    try std.testing.expectEqual([3]usize{ 1, 33, 33 }, compute.glide_request_shape.?);
+}
+
+test "GLiDE CUDA shared projection staging matches independent projections" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    const cb = compute.computeBackend();
+    const rows = 257;
+    const widths = [_]usize{ 6144, 2048, 16, 16 };
+    for ([_]usize{ 1024, 2048 }) |hidden| {
+        const data = try a.alloc(f32, rows * hidden);
+        defer a.free(data);
+        for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 997)) * 0.079);
+        const input = try cb.fromFloat32Shape(data, &.{ rows, @intCast(hidden) });
+        defer cb.free(input);
+        var weights: [4]CT = undefined;
+        var loaded: usize = 0;
+        defer for (weights[0..loaded]) |weight| cb.free(weight);
+        for (widths, 0..) |width, index| {
+            const values = try a.alloc(f16, hidden * width);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = @floatCast(@sin(@as(f32, @floatFromInt((i * 7 + index) % 997)) * 0.71) * 0.025);
+            var name_buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "glide-projection-{d}-{d}", .{ hidden, index });
+            const shape = [_]i64{ @intCast(width), @intCast(hidden) };
+            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(values), .dtype = .f16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+            try compute.insertGlideWeightFromTensor(try a.dupe(u8, name), &tensor);
+        }
+        // Resident tensor pointers are stable after model loading finishes;
+        // insertion can grow the map, so acquire them only after all inserts.
+        for (&weights, 0..) |*weight, index| {
+            var name_buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "glide-projection-{d}-{d}", .{ hidden, index });
+            weight.* = try cb.getWeight(name);
+            loaded += 1;
+        }
+        const actual = (try CudaCompute.glideDeltaProjections(&cb, input, weights, rows, hidden)).?;
+        defer for (actual) |value| cb.free(value);
+        for (weights, widths, actual) |weight, width, got| {
+            const expected = try cb.linearNoBias(input, weight, rows, hidden, width);
+            defer cb.free(expected);
+            const want_values = try cb.toFloat32(expected, a);
+            defer a.free(want_values);
+            const got_values = try cb.toFloat32(got, a);
+            defer a.free(got_values);
+            for (want_values, got_values) |want, value| try std.testing.expectApproxEqAbs(want, value, 1e-5);
+        }
+        const launches = compute.ctx.stats.kernel_launches;
+        var bad = tensorFromCt(input).*;
+        bad.buffer.len -= 4;
+        try std.testing.expectError(error.InvalidShape, CudaCompute.glideDeltaProjections(&cb, @ptrCast(&bad), weights, rows, hidden));
+        compute.strict_f32_weights = true;
+        try std.testing.expect((try CudaCompute.glideDeltaProjections(&cb, input, weights, rows, hidden)) == null);
+        compute.strict_f32_weights = false;
+        try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+    }
+}
+
+test "GLiDE CUDA tiled FFN matches separate operations across tile tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    const cb = compute.computeBackend();
+    for ([_]usize{ 1024, 2048 }, [_]usize{ 3584, 6144 }) |hidden, intermediate| {
+        var weights: [3]CT = undefined;
+        var loaded: usize = 0;
+        defer for (weights[0..loaded]) |weight| cb.free(weight);
+        for (&weights, 0..) |*weight, index| {
+            const values = try a.alloc(f16, hidden * intermediate);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = @floatCast(@sin(@as(f32, @floatFromInt(i * 7 % 997 + index * 23)) * 0.71) * 0.025);
+            var name_buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "glide-test-{d}-{d}", .{ hidden, index });
+            const shape = [_]i64{ @intCast(if (index == 2) hidden else intermediate), @intCast(if (index == 2) intermediate else hidden) };
+            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(values), .dtype = .f16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+            try compute.insertGlideWeightFromTensor(try a.dupe(u8, name), &tensor);
+            weight.* = try cb.getWeight(name);
+            loaded += 1;
+        }
+        for ([_]usize{ 1, 33, 1025, 2049, 4097 }) |rows| {
+            const values = try a.alloc(f32, rows * hidden);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 1327)) * 0.079);
+            const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(hidden) });
+            defer cb.free(input);
+            const gate = try cb.linearNoBias(input, weights[0], rows, hidden, intermediate);
+            defer cb.free(gate);
+            const up = try cb.linearNoBias(input, weights[1], rows, hidden, intermediate);
+            defer cb.free(up);
+            const activated = (try cb.siluMultiply(gate, up)).?;
+            defer cb.free(activated);
+            const expected = try cb.linearNoBias(activated, weights[2], rows, intermediate, hidden);
+            defer cb.free(expected);
+            const request = ops.GatedFfnNoBiasRequest{ .input = input, .gate_weight = weights[0], .up_weight = weights[1], .down_weight = weights[2], .rows = rows, .hidden_size = hidden, .intermediate_size = intermediate, .activation = .silu };
+            const actual = (try cb.gatedFfnNoBias(&request)).?;
+            defer cb.free(actual);
+            const want = try cb.toFloat32(expected, a);
+            defer a.free(want);
+            const got = try cb.toFloat32(actual, a);
+            defer a.free(got);
+            for (want, got) |reference, value| try std.testing.expectApproxEqAbs(reference, value, 5e-4);
+            const launches = compute.ctx.stats.kernel_launches;
+            compute.strict_f32_weights = true;
+            try std.testing.expect((try cb.gatedFfnNoBias(&request)) == null);
+            compute.strict_f32_weights = false;
+            var bad = tensorFromCt(input).*;
+            bad.buffer.len = rows * hidden * 4 - 4;
+            var invalid = request;
+            invalid.input = @ptrCast(&bad);
+            try std.testing.expectError(error.InvalidShape, cb.gatedFfnNoBias(&invalid));
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+    }
+}
+
+test "GLiDE CUDA packed encoder preserves local global and pruned row attention" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    compute.gliner_encoder_attention = true;
+    const cb = compute.computeBackend();
+    const keys = 38;
+    const heads = 2;
+    const width = heads * 64;
+    var q: [keys * width]f32 = undefined;
+    var k: [keys * width]f32 = undefined;
+    var v: [keys * width]f32 = undefined;
+    for (&q, &k, &v, 0..) |*query, *key, *value, i| {
+        query.* = @sin(@as(f32, @floatFromInt(i)) * 0.037);
+        key.* = @cos(@as(f32, @floatFromInt(i)) * 0.019);
+        value.* = @sin(@as(f32, @floatFromInt(i)) * 0.021);
+    }
+    var ranges: [keys * 6]u32 = undefined;
+    var positions: [keys]i32 = undefined;
+    for (0..keys) |i| {
+        ranges[i * 6 ..][0..6].* = if (i < 5) .{ 0, 5, 0, 0, 0, 0 } else .{ 5, keys, 0, 0, 0, 0 };
+        positions[i] = @intCast(if (i < 5) i else i - 5);
+    }
+    const kc = try cb.fromFloat32Shape(&k, &.{ keys, width });
+    defer cb.free(kc);
+    const vc = try cb.fromFloat32Shape(&v, &.{ keys, width });
+    defer cb.free(vc);
+    for ([_]bool{ false, true }) |pruned| {
+        const queries: usize = if (pruned) 2 else keys;
+        var compact_q: [2 * width]f32 = undefined;
+        @memcpy(compact_q[0..width], q[2 * width ..][0..width]);
+        @memcpy(compact_q[width..], q[37 * width ..][0..width]);
+        const q_data: []const f32 = if (pruned) &compact_q else &q;
+        const compact_ranges = ranges[2 * 6 ..][0..6].* ++ ranges[37 * 6 ..][0..6].*;
+        const compact_positions = [_]i32{ 2, 32 };
+        const qc = try cb.fromFloat32Shape(q_data, &.{ @intCast(queries), width });
+        defer cb.free(qc);
+        for ([_]u32{ 2, std.math.maxInt(u32) }) |window| {
+            const request = ops.SegmentAttention{
+                .ranges = if (pruned) &compact_ranges else &ranges,
+                .query_positions = if (pruned) &compact_positions else &positions,
+                .key_positions = &positions,
+                .window = window,
+                .queries = queries,
+                .keys = keys,
+                .num_heads = heads,
+                .head_dim = 64,
+            };
+            const expected = try linalg.segmentAttentionHost(a, q_data, &k, &v, request.ranges, request.query_positions, &positions, window, queries, keys, heads, 64);
+            defer a.free(expected);
+            for ([_]bool{ false, true }) |mixed| {
+                compute.gliner_mixed_attention = mixed;
+                const output = (try glideEncoderSegmentAttention(&compute, qc, kc, vc, &request)).?;
+                defer cb.free(output);
+                const actual = try cb.toFloat32(output, a);
+                defer a.free(actual);
+                for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, if (mixed) @as(f32, 2e-3) else 3e-6);
+            }
+            const launches = compute.ctx.stats.kernel_launches;
+            positions[keys - 1] = -1;
+            try std.testing.expectError(error.InvalidShape, glideEncoderSegmentAttention(&compute, qc, kc, vc, &request));
+            positions[keys - 1] = 32;
+            var truncated = tensorFromCt(kc).*;
+            truncated.buffer.len -= 4;
+            try std.testing.expectError(error.InvalidShape, glideEncoderSegmentAttention(&compute, qc, @ptrCast(&truncated), vc, &request));
+            compute.glide_cuda = false;
+            try std.testing.expect((try glideEncoderSegmentAttention(&compute, qc, kc, vc, &request)) == null);
+            compute.glide_cuda = true;
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+    }
+}
+
+test "GLiDE CUDA dense attention workspace remains bounded" {
+    const limit = 256 * 1024 * 1024;
+    for ([_]usize{ 1, 17, 129, 5129, 16384, 40000 }) |n| {
+        const layout = (try glideDenseLayout(8, 2, n, n, limit)).?;
+        try std.testing.expectEqual(@as(usize, 0), layout.padded_keys % 16);
+        try std.testing.expect(layout.padded_keys >= n and layout.padded_keys - n < 16);
+        try std.testing.expect(layout.total <= limit and layout.tile > 0 and layout.tile <= (if (n <= 3072) @as(usize, 256) else 128));
+        try std.testing.expectEqual(2 * layout.padded_keys * 256 * @sizeOf(f16), layout.sizes[1]);
+        try std.testing.expectEqual(layout.sizes[1], layout.sizes[2]);
+        for (layout.offsets, layout.sizes, 0..) |offset, size, i| {
+            try std.testing.expectEqual(@as(usize, 0), offset % 256);
+            try std.testing.expect(offset + size <= layout.total);
+            if (i > 0) try std.testing.expect(offset >= layout.offsets[i - 1] + layout.sizes[i - 1]);
+        }
+    }
+    try std.testing.expect((try glideDenseLayout(8, 8, 40000, 40000, limit)) == null);
+    try std.testing.expect((try glideDenseLayout(8, 2, 33, 17, 1024)) == null);
+}
+
+test "GLiDE CUDA encoder reuses deferred storage without crossing model scope" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    if (!cudaDeferredFreeEnabled() or cudaDeferredFreeConfiguredBytes() == 0) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.capability_profile = .gliner25_modern_bert;
+    compute.runtime_policy.max_temp_buffers = 1;
+    compute.runtime_policy.temp_cache_mb = 1;
+    var idle = try allocDeviceBufferOrdinary(&compute, 64);
+    releaseDeviceBuffer(&compute, &idle);
+    var original = try allocDeviceBufferOrdinary(&compute, 4096);
+    const pointer = original.ptr;
+    try compute.kernels.launchFillF32(&compute.ctx, original, 1024, 1.25);
+    releaseDeviceBuffer(&compute, &original);
+    try std.testing.expectEqual(@as(usize, 1), compute.deferred_device_frees.items.len);
+    try std.testing.expect(takeLightOnDeferredBufferUnlocked(&compute, 4096, true) == null);
+    compute.glide_cuda = true;
+    const allocations = compute.stats.device_alloc_calls;
+    var reused = try allocDeviceBufferOrdinary(&compute, 4096);
+    defer releaseDeviceBuffer(&compute, &reused);
+    try std.testing.expectEqual(pointer, reused.ptr);
+    try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
+    var values: [1024]f32 = undefined;
+    try reused.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+    try compute.ctx.synchronize();
+    for (values) |value| try std.testing.expectEqual(@as(f32, 1.25), value);
+}
+
+test "GLiDE CUDA chunked linear core matches recurrence and resets row history" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    compute.lighton_cached_recurrent_gates = true;
+    const cb = compute.computeBackend();
+    const State = @import("lighton_recurrent.zig").State;
+    var weights: [4]CT = undefined;
+    var loaded: usize = 0;
+    defer for (weights[0..loaded]) |w| cb.free(w);
+    for (&weights, [_]usize{ 6144 * 4, 16, 16, 128 }, 0..) |*w, count, index| {
+        const values = try a.alloc(f32, count);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = switch (index) {
+            0 => @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.25,
+            1 => -1,
+            2 => -2,
+            else => 1,
+        };
+        w.* = try cb.fromFloat32Shape(values, &.{@intCast(count)});
+        loaded += 1;
+    }
+    var chunk_state: State = .{};
+    defer chunk_state.deinit();
+    // Reuse the same state across unequal rows, including the chunk boundary.
+    for ([_]usize{ 256, 257, 513 }) |n| {
+        var inputs: [4]CT = undefined;
+        var filled: usize = 0;
+        defer for (inputs[0..filled]) |input| cb.free(input);
+        for (&inputs, [_]usize{ 6144, 2048, 16, 16 }, 0..) |*input, width, index| {
+            const values = try a.alloc(f32, n * width);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i + index * 17 + n)) * 0.031) * 0.3;
+            input.* = try cb.fromFloat32Shape(values, &.{ @intCast(n), @intCast(width) });
+            filled += 1;
+        }
+        var consume_mixed: bool = false;
+        _ = &consume_mixed;
+        var request = .{ .mixed = inputs[0], .z = inputs[1], .beta = inputs[2], .a = inputs[3], .conv_weight = weights[0], .a_log = weights[1], .dt_bias = weights[2], .norm_weight = weights[3], .seq_len = n, .key_heads = @as(usize, 16), .value_heads = @as(usize, 16), .dim = @as(usize, 128), .value_dim = @as(usize, 128), .conv_kernel = @as(usize, 4), .eps = @as(f32, 1e-6), .destination = @as(?CT, null), .device_state_admitted = false, .glide_consume_mixed = consume_mixed };
+        var exact_state: State = .{};
+        defer exact_state.deinit();
+        compute.strict_f32_weights = true;
+        const exact = (try CudaCompute.qwen35LinearCore(&cb, &exact_state, request)).?;
+        defer cb.free(exact);
+        compute.strict_f32_weights = false;
+        chunk_state.reset();
+        const output = (try CudaCompute.qwen35LinearCore(&cb, &chunk_state, request)).?;
+        defer cb.free(output);
+        try std.testing.expect(compute.glide_delta.module != null);
+        const want = try cb.toFloat32(exact, a);
+        defer a.free(want);
+        const got = try cb.toFloat32(output, a);
+        defer a.free(got);
+        for (want, got) |expected, actual| {
+            try std.testing.expect(std.math.isFinite(actual));
+            try std.testing.expectApproxEqAbs(expected, actual, 2e-3);
+        }
+        request.glide_consume_mixed = true;
+        chunk_state.reset();
+        const aliased_z = try cb.sliceRows2D(a, inputs[0], 0, n, 2048);
+        defer cb.free(aliased_z);
+        var invalid = request;
+        invalid.z = aliased_z;
+        const launches = compute.ctx.stats.kernel_launches;
+        try std.testing.expectError(error.InvalidTensorShape, CudaCompute.qwen35LinearCore(&cb, &chunk_state, invalid));
+        try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        const consumed = (try CudaCompute.qwen35LinearCore(&cb, &chunk_state, request)).?;
+        defer cb.free(consumed);
+        const reused_values = try cb.toFloat32(consumed, a);
+        defer a.free(reused_values);
+        for (got, reused_values) |original, reused| try std.testing.expectEqual(original, reused);
+    }
+}
+
+test "GLiDE CUDA compact attention preserves KV groups and query tile tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    const cb = compute.computeBackend();
+    const queries = 259;
+    const keys = 257;
+    const heads = 8;
+    const dim = 256;
+    const q = try a.alloc(f32, queries * heads * dim);
+    defer a.free(q);
+    for (q, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 1319)) * 0.037) * 0.2;
+    const qc = try cb.fromFloat32Shape(q, &.{ queries, heads * dim });
+    defer cb.free(qc);
+    var ranges: [queries * 6]u32 = @splat(0);
+    for (0..queries) |row| {
+        ranges[row * 6] = if (row < 257) 1 else 3;
+        ranges[row * 6 + 1] = if (row < 257) 256 else 36;
+    }
+    const qp: [queries]i32 = @splat(0);
+    const kp: [keys]i32 = @splat(0);
+    for ([_]usize{ 1, 2, 8 }) |kv_heads| {
+        const k = try a.alloc(f32, keys * kv_heads * dim);
+        defer a.free(k);
+        const v = try a.alloc(f32, k.len);
+        defer a.free(v);
+        for (k, v, 0..) |*key, *value, i| {
+            key.* = @cos(@as(f32, @floatFromInt(i % 1999)) * 0.019) * 0.3;
+            value.* = @sin(@as(f32, @floatFromInt(i % 1733)) * 0.021);
+        }
+        const kc = try cb.fromFloat32Shape(k, &.{ keys, @intCast(kv_heads * dim) });
+        defer cb.free(kc);
+        const vc = try cb.fromFloat32Shape(v, &.{ keys, @intCast(kv_heads * dim) });
+        defer cb.free(vc);
+        const request = ops.SegmentAttentionGrouped{ .visibility = .{
+            .ranges = &ranges,
+            .query_positions = &qp,
+            .key_positions = &kp,
+            .queries = queries,
+            .keys = keys,
+            .num_heads = heads,
+            .head_dim = dim,
+        }, .num_kv_heads = kv_heads, .score_scale = 0.0625 };
+        compute.strict_f32_weights = true;
+        const reference = (try glideSegmentAttentionGrouped(&compute, qc, kc, vc, &request)).?;
+        defer cb.free(reference);
+        compute.strict_f32_weights = false;
+        const output = (try glideSegmentAttentionGrouped(&compute, qc, kc, vc, &request)).?;
+        defer cb.free(output);
+        const expected = try cb.toFloat32(reference, a);
+        defer a.free(expected);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-3);
+    }
+}
+
+test "GLiDE CUDA grouped attention matches dense oracle and rejects invalid work before launch" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    const cb = compute.computeBackend();
+    const queries = 3;
+    const keys = 36;
+    const heads = 8;
+    const kv_heads = 2;
+    const dim = 256;
+    const q = try a.alloc(f32, queries * heads * dim);
+    defer a.free(q);
+    const k = try a.alloc(f32, keys * kv_heads * dim);
+    defer a.free(k);
+    const v = try a.alloc(f32, k.len);
+    defer a.free(v);
+    for (q, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.037);
+    for (k, v, 0..) |*key, *value, i| {
+        key.* = @cos(@as(f32, @floatFromInt(i)) * 0.019);
+        value.* = @sin(@as(f32, @floatFromInt(i)) * 0.021);
+    }
+    const expanded_k = try a.alloc(f32, keys * heads * dim);
+    defer a.free(expanded_k);
+    const expanded_v = try a.alloc(f32, expanded_k.len);
+    defer a.free(expanded_v);
+    for (0..keys) |row| for (0..heads) |h| {
+        const source = (row * kv_heads + h / 4) * dim;
+        const target = (row * heads + h) * dim;
+        @memcpy(expanded_k[target..][0..dim], k[source..][0..dim]);
+        @memcpy(expanded_v[target..][0..dim], v[source..][0..dim]);
+    };
+    var ranges = [_]u32{ 0, 1, 0, 0, 0, 0, 1, 34, 0, 0, 0, 0, 34, 36, 0, 0, 0, 0 };
+    const qp = [_]i32{ 0, 32, 1 };
+    const kp: [keys]i32 = @splat(0);
+    const expected = try linalg.segmentAttentionHost(a, q, expanded_k, expanded_v, &ranges, &qp, &kp, std.math.maxInt(u32), queries, keys, heads, dim);
+    defer a.free(expected);
+    const qc = try cb.fromFloat32Shape(q, &.{ queries, heads * dim });
+    defer cb.free(qc);
+    const kc = try cb.fromFloat32Shape(k, &.{ keys, kv_heads * dim });
+    defer cb.free(kc);
+    const vc = try cb.fromFloat32Shape(v, &.{ keys, kv_heads * dim });
+    defer cb.free(vc);
+    var request = ops.SegmentAttentionGrouped{ .visibility = .{
+        .ranges = &ranges,
+        .query_positions = &qp,
+        .key_positions = &kp,
+        .queries = queries,
+        .keys = keys,
+        .num_heads = heads,
+        .head_dim = dim,
+    }, .num_kv_heads = kv_heads, .score_scale = 0.0625 };
+    for ([_]bool{ true, false }) |exact| {
+        compute.strict_f32_weights = exact;
+        const output = (try glideSegmentAttentionGrouped(&compute, qc, kc, vc, &request)).?;
+        defer cb.free(output);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, if (exact) @as(f32, 3e-6) else 2e-3);
+    }
+    const launches = compute.ctx.stats.kernel_launches;
+    ranges[1] = keys + 1;
+    try std.testing.expectError(error.InvalidShape, glideSegmentAttentionGrouped(&compute, qc, kc, vc, &request));
+    ranges[1] = 1;
+    var truncated = tensorFromCt(kc).*;
+    truncated.buffer.len -= 4;
+    try std.testing.expectError(error.InvalidShape, glideSegmentAttentionGrouped(&compute, qc, @ptrCast(&truncated), vc, &request));
+    request.control = .{ .deadline_ns = 1 };
+    try std.testing.expectError(error.Timeout, glideSegmentAttentionGrouped(&compute, qc, kc, vc, &request));
+    try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
 }

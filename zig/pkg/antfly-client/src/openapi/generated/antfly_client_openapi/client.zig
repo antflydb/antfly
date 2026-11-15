@@ -2624,6 +2624,42 @@ pub const Client = struct {
         return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
     }
 
+    /// Inspect an index alias
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}
+    pub fn getNamespaceTableIndexAlias(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !ApiResponse(types.IndexAlias) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_alias_name = try httpx.PercentEncoding.encode(self.allocator, alias_name);
+        defer self.allocator.free(encoded_alias_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/index-aliases/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_alias_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.IndexAlias).fromResponse(self.allocator, &resp);
+    }
+
+    /// Atomically create or swap an index alias
+    /// PUT /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}
+    pub fn putNamespaceTableIndexAlias(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8, body: types.IndexAliasRequest) !ApiResponse(types.IndexAlias) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_alias_name = try httpx.PercentEncoding.encode(self.allocator, alias_name);
+        defer self.allocator.free(encoded_alias_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/index-aliases/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_alias_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.IndexAlias).fromResponse(self.allocator, &resp);
+    }
+
     /// List indexes for an explicit namespace table
     /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes
     pub fn listNamespaceTableIndexes(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse([]const types.IndexStatus) {
@@ -4481,6 +4517,34 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect an index alias
+    /// GET /db/v1/tables/{tableName}/index-aliases/{aliasName}
+    pub fn getTableIndexAlias(self: *@This(), table_name: []const u8, alias_name: []const u8) !ApiResponse(types.IndexAlias) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_alias_name = try httpx.PercentEncoding.encode(self.allocator, alias_name);
+        defer self.allocator.free(encoded_alias_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/index-aliases/{s}", .{ self.base_url, encoded_table_name, encoded_alias_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.IndexAlias).fromResponse(self.allocator, &resp);
+    }
+
+    /// Atomically create or swap an index alias
+    /// PUT /db/v1/tables/{tableName}/index-aliases/{aliasName}
+    pub fn putTableIndexAlias(self: *@This(), table_name: []const u8, alias_name: []const u8, body: types.IndexAliasRequest) !ApiResponse(types.IndexAlias) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_alias_name = try httpx.PercentEncoding.encode(self.allocator, alias_name);
+        defer self.allocator.free(encoded_alias_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/index-aliases/{s}", .{ self.base_url, encoded_table_name, encoded_alias_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.IndexAlias).fromResponse(self.allocator, &resp);
     }
 
     /// List all indexes for a table

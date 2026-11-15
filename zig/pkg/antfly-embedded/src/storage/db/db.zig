@@ -7777,6 +7777,42 @@ pub const DB = struct {
     /// is committed (pending or needing repair); before it, the batch was not
     /// applied unless the error is an unknown outcome. Keeps `batch`'s
     /// ANTFLY_BENCH_METRICS phase profile.
+    /// Capture normalized source mutations and producer outputs without commit.
+    pub const validatePreparedEnrichments = local_mutation.validatePreparedEnrichments;
+
+    pub fn prepareDirectEnrichments(self: *DB, alloc: Allocator, req: types.BatchRequest) ![]u8 {
+        return self.prepareDirectEnrichmentsWithContext(alloc, req, null);
+    }
+
+    pub fn prepareDirectEnrichmentsWithContext(self: *DB, alloc: Allocator, req: types.BatchRequest, context: ?@import("antfly_inference_execution_context").RequestContext) ![]u8 {
+        if (context) |control| try control.check();
+        if (req.commit_requires != .direct_enrichments or req.prepared_enrichments_json != null) return error.InvalidBatchRequest;
+        try @import("commit_requirements.zig").validateRequestBounds(req);
+        const digest = try execution_resources.PreparedEnrichments.requestDigest(alloc, req);
+        if (req.transaction) |control| if (control == .prepare) {
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            if (try manager.loadPreparedEnrichments(alloc, control.prepare.txn_id)) |bytes| {
+                errdefer alloc.free(bytes);
+                var packet = try std.json.parseFromSlice(execution_resources.PreparedEnrichments, alloc, bytes, .{});
+                defer packet.deinit();
+                if (!std.mem.eql(u8, &packet.value.request_digest, &digest)) return error.VersionConflict;
+                return bytes;
+            }
+        };
+        {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            if (try @import("artifact_publication.zig").authority(&read)) |authority| {
+                const validation = (try @import("artifact_producer_validation.zig").load(&read)) orelse return error.CommitRequirementUnavailable;
+                if (validation.authority_epoch != authority.epoch or !std.mem.eql(u8, &validation.namespace, &authority.namespace)) return error.CommitRequirementUnavailable;
+            } else if (try @import("../source_authority.zig").maintenanceMode(&read) == .ordered and self.core.hasGeneratedEnrichmentTargets()) return error.CommitRequirementUnavailable;
+        }
+        var output = execution_resources.PreparationCapture{ .alloc = alloc, .request_digest = digest };
+        try self.batchInternal(req, null, .{ .preparation_capture = &output, .preparation_context = context, .wait_for_sync_level = false });
+        return output.json orelse error.InvalidBatchRequest;
+    }
+
     pub fn batchTracked(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
         return self.batchTrackedWithMarker(req, primary_committed, null);
     }
@@ -9243,7 +9279,12 @@ pub const DB = struct {
         const graph_cleanup_maintenance = req.graph_endpoint_cleanup or req.activate_range_tracking;
         if (!graph_cleanup_maintenance or req.row_policy_principal_proof.len != 0)
             try self.maybeFinalizePendingRowPolicyPublication();
-        if (req.row_policy_principal_proof.len != 0) {
+        if (opts.row_policy_lease) |lease| {
+            // Internal capture may borrow the already verified transaction
+            // authority. Replicated votes retain their admission-time proof.
+            if (opts.row_policy_principal == null and req.row_policy_principal_proof.len != 0) return error.RowPolicyAuthenticationRequired;
+            try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        } else if (req.row_policy_principal_proof.len != 0) {
             // Followers do not receive the coordinator's receipt probe. A
             // committed serving intent must become active before checking the
             // next signed mutation against its generation. Defer apply while
@@ -26127,7 +26168,45 @@ pub const DB = struct {
         });
     }
 
-    pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+    fn transactionPreparationRequest(req: types.TransactionIntentRequest) types.BatchRequest {
+        return .{
+            .row_policy_principal_proof = req.row_policy_principal_proof,
+            .row_policy_database = req.row_policy_database,
+            .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+            .range_guards = req.range_guards,
+            .document_version_scheme = req.document_version_scheme,
+            .commit_requires = req.commit_requires,
+            .writes = @ptrCast(req.writes),
+            .deletes = req.deletes,
+            .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
+            .predicates = req.predicates,
+            .integrity = req.integrity,
+            .integrity_commands = req.integrity_commands,
+            .schema_version = req.schema_version,
+            .relational_schema_version = req.relational_schema_version,
+            .relational_integrity_generation_set = req.relational_integrity_generation_set,
+            .relational_activation = req.relational_activation,
+            .relational_retirement = req.relational_retirement,
+            .relational_index_maintenance = req.relational_index_maintenance,
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
+            .relational_repair = req.relational_repair,
+            .normalized_graph_rows = req.normalized_graph_rows,
+        };
+    }
+
+    pub fn writeTransaction(self: *DB, txn_id: types.TxnId, incoming_req: types.TransactionIntentRequest) !void {
+        var req = incoming_req;
+        var prepared_json: ?[]u8 = null;
+        defer if (prepared_json) |bytes| self.alloc.free(bytes);
+        if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) {
+            var preparation_req = transactionPreparationRequest(req);
+            preparation_req.transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 0 } };
+            prepared_json = try self.prepareDirectEnrichments(self.alloc, preparation_req);
+            req.prepared_enrichments_json = prepared_json;
+        }
         if (comptime storage_engine.enabled) return storage_engine.call("writeTransaction", .{ self, txn_id, req });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -26227,12 +26306,60 @@ pub const DB = struct {
     fn writeTransactionInternalOnce(
         self: *DB,
         txn_id: types.TxnId,
-        req: types.TransactionIntentRequest,
+        incoming_req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
         preparation_alloc: Allocator,
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !backend_erased_mod.Ticket {
+        var req = incoming_req;
+        var packet = if (req.prepared_enrichments_json) |json|
+            try std.json.parseFromSlice(execution_resources.PreparedEnrichments, preparation_alloc, json, .{ .allocate = .alloc_always })
+        else
+            null;
+        defer if (packet) |*value| value.deinit();
+        if (req.commit_requires == .direct_enrichments and packet == null) return error.InvalidBatchRequest;
+        if (packet) |value| {
+            if (req.commit_requires != .direct_enrichments) return error.InvalidBatchRequest;
+            const digest = try execution_resources.PreparedEnrichments.requestDigest(preparation_alloc, transactionPreparationRequest(req));
+            if (!std.mem.eql(u8, &digest, &value.value.request_digest)) return error.InvalidBatchRequest;
+            {
+                try self.lockApplyForPortableRuntime();
+                defer self.core.unlockApply();
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                if (try manager.loadPreparedEnrichments(preparation_alloc, txn_id)) |previous| {
+                    defer preparation_alloc.free(previous);
+                    if (!std.mem.eql(u8, previous, req.prepared_enrichments_json.?)) return error.VersionConflict;
+                    if (ordered_receipt) |identity| {
+                        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
+                            .already_applied => return backend_erased_mod.Ticket.alreadyDurable(),
+                            .apply => {},
+                        }
+                        var marker_value: [ordered_apply_receipt_value_len]u8 = undefined;
+                        const marker = orderedApplyReceiptWrite(identity, &marker_value);
+                        try self.core.store.putBatch(&.{marker}, &.{});
+                    }
+                    return backend_erased_mod.Ticket.alreadyDurable();
+                }
+            }
+            const writes = try preparation_alloc.alloc(types.TransactionWrite, value.value.writes.len);
+            errdefer preparation_alloc.free(writes);
+            for (writes, value.value.writes) |*out, write| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
+            req.writes = writes;
+            req.deletes = value.value.deletes;
+            req.transforms = &.{};
+            req.graph_writes = value.value.graph_writes;
+            req.graph_deletes = value.value.graph_deletes;
+            // Reuse the capture-only admission pipeline to authenticate the
+            // closed producer set and physical key scopes without inference.
+            var capture: execution_resources.PreparationCapture = .{ .alloc = preparation_alloc };
+            defer if (capture.json) |bytes| preparation_alloc.free(bytes);
+            var capture_req = transactionPreparationRequest(req);
+            capture_req.prepared_enrichments_json = req.prepared_enrichments_json;
+            try self.batchInternal(capture_req, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = row_policy_principal, .row_policy_lease = row_policy_lease });
+        }
+        defer if (packet != null) preparation_alloc.free(req.writes);
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
                 req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or
@@ -26443,6 +26570,11 @@ pub const DB = struct {
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        if (packet) |value| {
+            var plan = try self.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            try self.validatePreparedEnrichments(preparation_alloc, value.value, plan.plan());
+        }
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         if (row_policy_principal) |principal| {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
@@ -26574,6 +26706,28 @@ pub const DB = struct {
         var endpoint_dependencies = std.heap.ArenaAllocator.init(preparation_alloc);
         defer endpoint_dependencies.deinit();
         try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, intents.items, prepared_schema_view, &predicates);
+        if (packet) |value| {
+            var reservation_plan = self.core.relational_indexes.acquire();
+            defer if (reservation_plan) |*plan| plan.deinit();
+            const indexes = if (reservation_plan) |plan| plan.plan.boundIndexes().len else 0;
+            try @import("commit_requirements.zig").validateTransactionReservation(value.value, intents.items, predicates.items, indexes, try self.directRetirementReservation(preparation_alloc, intents.items, indexes));
+        }
+        if (packet) |value| if (value.value.artifact_writes.len != 0 or value.value.artifact_deletes.len != 0) {
+            // The retained-source reservation covers generated effects before
+            // this participant votes yes, including output-only tombstones.
+            const first = for (intents.items) |*intent| {
+                if (!isMetadataKey(intent.key)) break intent;
+            } else return error.InvalidBatchRequest;
+            for (value.value.artifact_writes) |write| {
+                first.retained_artifact_bytes = std.math.add(u64, first.retained_artifact_bytes, 16 + write.key.len + write.value.len) catch return error.TransactionTooLarge;
+                first.retained_artifact_keys = std.math.add(u64, first.retained_artifact_keys, 1) catch return error.TransactionTooLarge;
+            }
+            for (value.value.artifact_deletes) |key| {
+                first.retained_artifact_bytes = std.math.add(u64, first.retained_artifact_bytes, 16 + key.len) catch return error.TransactionTooLarge;
+                first.retained_artifact_keys = std.math.add(u64, first.retained_artifact_keys, 1) catch return error.TransactionTooLarge;
+            }
+        };
+
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
@@ -26586,10 +26740,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .prepared_enrichments_json = req.prepared_enrichments_json, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             return try self.core.writeIntentsExtraBatchStaged(txn_id, intents.items, predicates.items, .{
+                .prepared_enrichments_json = req.prepared_enrichments_json,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
@@ -26709,6 +26864,44 @@ pub const DB = struct {
     /// Compute server-owned conservative bounds before voting prepared; the
     /// persisted replacement-aware ledger also counts artifact keys so commit
     /// cannot exceed the retained frame's independent key-count limit.
+    /// Count borrowed physical keys before a yes vote. The intent owner fence
+    /// then prevents background publishers from growing this footprint.
+    fn directRetirementReservation(self: *DB, alloc: Allocator, intents: []const transactions_mod.WriteIntent, indexes: usize) !@import("commit_requirements.zig").OutputBudget {
+        var budget = @import("commit_requirements.zig").OutputBudget{};
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openPhysicalCursorAdapter();
+        defer cursor.close();
+        for (intents) |intent| {
+            if (isMetadataKey(intent.key)) continue;
+            const document_prefix = try internal_keys.documentExactPrefixAlloc(alloc, intent.key);
+            defer alloc.free(document_prefix);
+            // Updates retire old secondary keys too. Scan only reverse-index
+            // ownership for updates; generated artifact retirement is already
+            // captured in the immutable packet. Deletes retire the whole row.
+            const prefix = if (intent.value != null)
+                try std.mem.concat(alloc, u8, &.{ document_prefix, &.{internal_keys.relational_index_reverse_kind} })
+            else
+                try alloc.dupe(u8, document_prefix);
+            defer alloc.free(prefix);
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |record| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, record.key, prefix)) break;
+                // Includes retirement stamps, revision clocks, provenance and
+                // replay references, including replacement/delete metadata.
+                try budget.reserve(2048 + 12 * record.key.len, 12);
+                // Reverse values carry the old tuple used to reconstruct the
+                // forward tombstone. Its size is independent of the new row.
+                if (internal_keys.isRelationalIndexReverseKey(record.key))
+                    try budget.reserve(2048 + 4 * record.value.len, 8);
+                if (internal_keys.isStoredSourceRowKey(record.key)) {
+                    for (0..indexes) |_| try budget.reserve(1024 + 4 * record.value.len + 8 * record.key.len, 8);
+                }
+            }
+        }
+        return budget;
+    }
+
     fn prepareOnlineVectorIntentBoundsLocked(self: *DB, alloc: Allocator, intents: []transactions_mod.WriteIntent, schema_view: ?schema_registry_mod.SchemaView) !void {
         for (intents) |*intent| {
             intent.retained_artifact_bytes = 0;
@@ -29727,29 +29920,28 @@ pub const DB = struct {
 
     /// Physical graph reads retain the same admission, identity fence, and
     /// scan budget through selection and the owned result.
-    pub fn graphEdgesForInternalReadBoundedAt(
+    pub fn graphEdgesForInternalRead(
         self: *DB,
         alloc: Allocator,
-        index_name: []const u8,
-        key: []const u8,
-        edge_types: []const []const u8,
-        direction: graph_mod.EdgeDirection,
-        identity_read_generation: ?u64,
-        ttl_now_ns: u64,
-        max_edges: usize,
-        max_owned_bytes: usize,
-        max_scanned_rows: usize,
-    ) !graph_mod.GraphIndex.BoundedEdgeResult {
+        request: @import("../../api/graph.zig").GraphEdgesRequest,
+    ) !@import("../../api/graph.zig").GraphEdgesResponse {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
-        _ = try self.currentIdentityReadGenerationForRequest(identity_read_generation);
-        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
-        const result = try entry.index.getEdgesByTypesBoundedWithStatsAt(alloc, key, edge_types, direction, max_edges, max_owned_bytes, max_scanned_rows, if (ttl_now_ns == 0) entry.index.clock.nowRealtimeNs() else ttl_now_ns);
-        errdefer graph_mod.GraphIndex.freeEdges(alloc, result.edges);
+        _ = try self.currentIdentityReadGenerationForRequest(request.identity_read_generation);
+        const entry = self.core.graphIndex(request.index_name) orelse return error.IndexNotFound;
+        // Preserve batched key prefixes and generation-fenced continuation
+        // cursors through the storage owner, just as direct native readers do.
+        var result = try @import("../../api/graph.zig").readGraphEdgesRequest(
+            alloc,
+            &entry.index,
+            request,
+            if (request.ttl_now_ns == 0) entry.index.clock.nowRealtimeNs() else request.ttl_now_ns,
+        );
+        errdefer result.deinit(alloc);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
     }
@@ -35443,7 +35635,9 @@ pub const DB = struct {
         const retired_unit_jobs = try @import("artifact_unit_jobs.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const retired_authored = try @import("artifact_authored_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const swept_authored = try @import("artifact_authored_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
-        const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored;
+        const retired_prepared = try @import("prepared_producer_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const swept_prepared = try @import("prepared_producer_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
+        const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored and retired_prepared and swept_prepared;
         if (publication_mode == .ordered) {
             var prepared = (try @import("artifact_producer_baseline.zig").prepareRaft(scratch, self.core.store)) orelse {
                 var validation = (try @import("artifact_producer_validation.zig").prepareRaft(scratch, self.core.store)) orelse {
@@ -44324,6 +44518,12 @@ pub const DB = struct {
 
     pub fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) !types.SearchRequest {
         if (comptime storage_engine.enabled) return storage_engine.call("searchRequestAtCurrentIdentityGeneration", .{ self, req });
+        // Caller owns apply-shared or a published catalog lease. Validation
+        // and lookup therefore observe the same incarnation as execution.
+        for (req.index_alias_fences) |fence| {
+            const incarnation = self.core.index_manager.coverageGenerationForIndex(fence.name) orelse return error.CatalogGenerationChanged;
+            if (incarnation != fence.incarnation) return error.CatalogGenerationChanged;
+        }
         var snapshot_req = req;
         snapshot_req.identity_read_generation = try self.currentIdentityReadGenerationForRequest(snapshot_req.identity_read_generation);
         try self.validateResolvedDocFilterWireContext(snapshot_req);
@@ -48129,7 +48329,7 @@ pub const DB = struct {
         // composed queries keep their existing synchronization.
         var remaining = req;
         const defaults: types.SearchRequest = .{};
-        inline for (.{ "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation", "document_authority_mode", "document_authority_group" }) |field| {
+        inline for (.{ "index_alias_fences", "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation", "document_authority_mode", "document_authority_group" }) |field| {
             @field(remaining, field) = @field(defaults, field);
         }
         // Empty slices from a decoded wire envelope need not share the
@@ -51234,6 +51434,19 @@ fn remoteRenderConfig(
             config.io = runtime.inferenceIo() orelse runtime.io();
         }
     }
+    if (comptime @hasField(Receiver, "preparation_context")) if (maybe_db) |db| if (db.preparation_context) |context| {
+        config.io = context.io;
+        config.deadline_ns = context.deadline_ns;
+        if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+            config.cancellation = .{ .ptr = &db.preparation_context.?, .is_cancelled_fn = struct {
+                fn check(ptr: *const anyopaque) bool {
+                    const control: *const @import("antfly_inference_execution_context").RequestContext = @ptrCast(@alignCast(ptr));
+                    control.check() catch return true;
+                    return false;
+                }
+            }.check };
+        }
+    };
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
         config.max_media_parts = max_media_parts;
     }
@@ -86036,6 +86249,128 @@ fn jsonTestNumber(value: std.json.Value) f64 {
     };
 }
 
+test "db mixed extraction batches retain document checkpoint ownership in either order" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        const Blocked = enum { none, text, document };
+        blocked: Blocked = .none,
+        documents: std.atomic.Value(usize) = .init(0),
+        batch_calls: std.atomic.Value(usize) = .init(0),
+        batch_items: std.atomic.Value(usize) = .init(0),
+        fn plain(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.TestMissingInvocationContext;
+        }
+        fn output(alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            return std.fmt.allocPrint(alloc, "{{\"source\":{f}}}", .{std.json.fmt(request.source_text, .{})});
+        }
+        fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request, context: asset_producer_mod.InvocationContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.endsWith(u8, request.source_text, ".pdf")) {
+                if (self.blocked == .text) return error.InferenceTransportUnavailable;
+                return error.TestUnexpectedTextSingleton;
+            }
+            if (context.document_checkpoints == null) return error.TestMissingDocumentCheckpoint;
+            if (self.blocked == .document) return error.InferenceTransportUnavailable;
+            _ = self.documents.fetchAdd(1, .monotonic);
+            return output(alloc, request);
+        }
+        fn batch(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer_mod.Request, context: asset_producer_mod.InvocationContext) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (context.document_checkpoints != null) return error.TestUnexpectedTextCheckpoint;
+            if (self.blocked == .text) return error.InferenceTransportUnavailable;
+            _ = self.batch_calls.fetchAdd(1, .monotonic);
+            _ = self.batch_items.fetchAdd(requests.len, .monotonic);
+            const outputs = try alloc.alloc([]u8, requests.len);
+            @memset(outputs, &.{});
+            errdefer {
+                for (outputs) |bytes| alloc.free(bytes);
+                alloc.free(outputs);
+            }
+            for (requests, outputs) |request, *bytes| {
+                if (std.mem.endsWith(u8, request.source_text, ".pdf")) return error.TestDocumentInTextBatch;
+                bytes.* = try output(alloc, request);
+            }
+            return outputs;
+        }
+        fn mode(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !inference_work.BatchMode {
+            return .native;
+        }
+        fn interface(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = plain, .produce_with_context = produce, .produce_batch_with_context = batch, .batch_mode = mode, .foreground_bounded = true, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } };
+        }
+    };
+    // Cover homogeneous cohorts, a document at either end or in the middle,
+    // and interleaved documents. All remaining text shares one physical batch.
+    for ([_]Producer.Blocked{ .none, .text, .document }) |blocked| {
+        for ([_]u8{ 0, 1, 8, 128, 0b10101010, 255 }) |document_mask| {
+            if ((blocked == .text and document_mask == 255) or (blocked == .document and document_mask == 0)) continue;
+            var directory = try TestDirectory.init("mixed-document-checkpoints");
+            defer directory.cleanup();
+            var producer: Producer = .{ .blocked = blocked };
+            errdefer std.debug.print("mixed batch case: blocked={s}, mask={d}, batches={d}, items={d}, documents={d}\n", .{ @tagName(blocked), document_mask, producer.batch_calls.load(.acquire), producer.batch_items.load(.acquire), producer.documents.load(.acquire) });
+            var db = try DB.open(a, directory.path(), .{
+                .start_index_workers = false,
+                .start_optional_runtime_workers = false,
+                .start_independent_maintenance = false,
+                .enrichment = .{ .owner_id = "mixed-producer", .asset_producer = producer.interface(), .inline_retry_max_attempts = 1 },
+            });
+            defer db.close();
+            try db.addEnrichment(.{ .name = "inspection", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}", .execution = .{ .batch_items = 8, .batch_bytes = 1024 * 1024 } });
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var writes: [8]@import("mutation_values.zig").BatchWrite = undefined;
+            var sources: [8][]const u8 = undefined;
+            for (&writes, &sources, 0..) |*write, *source, index| {
+                source.* = if (document_mask & (@as(u8, 1) << @intCast(index)) != 0) try std.fmt.allocPrint(scratch, "https://example.test/input-{d}.pdf", .{index}) else try std.fmt.allocPrint(scratch, "literal text {d}", .{index});
+                write.* = .{ .key = try std.fmt.allocPrint(scratch, "doc:{d}", .{index}), .value = try std.fmt.allocPrint(scratch, "{{\"body\":{f}}}", .{std.json.fmt(source.*, .{})}) };
+            }
+            try db.batch(.{ .writes = &writes, .sync_level = .write });
+            if (blocked != .none) {
+                try std.testing.expectError(error.EnrichmentRetryInProgress, db.runUntilIdleWithoutWaitingForEnrichmentRetries());
+                // A retry in either transport must not suppress the other group's
+                // publication, and recovering it must not regenerate that sibling.
+                for (writes, sources) |write, source| {
+                    const document = std.mem.endsWith(u8, source, ".pdf");
+                    const artifact = try internal_keys.artifactNamedPrefixAlloc(a, write.key, "asset", "inspection");
+                    defer a.free(artifact);
+                    if (document == (blocked == .document)) {
+                        try std.testing.expectError(error.NotFound, db.core.store.get(a, artifact));
+                    } else {
+                        const stored = try db.core.store.get(a, artifact);
+                        defer a.free(stored);
+                        const expected = try Producer.output(a, .{ .producer_type = .extractor, .config_json = "{}", .source_text = source });
+                        defer a.free(expected);
+                        try std.testing.expectEqualStrings(expected, stored);
+                    }
+                }
+                producer.blocked = .none;
+            }
+            try db.runUntilIdle();
+            const documents: usize = @popCount(document_mask);
+            try std.testing.expectEqual(documents, producer.documents.load(.acquire));
+            if (blocked == .text) {
+                // Durable retry budgets can split recovery into smaller native
+                // batches. Every text still succeeds exactly once below.
+                const batches = producer.batch_calls.load(.acquire);
+                try std.testing.expect(batches >= 1 and batches <= 8 - documents);
+            } else {
+                try std.testing.expectEqual(@as(usize, if (documents == 8) 0 else 1), producer.batch_calls.load(.acquire));
+            }
+            try std.testing.expectEqual(8 - documents, producer.batch_items.load(.acquire));
+            for (writes, sources) |write, source| {
+                const artifact = try internal_keys.artifactNamedPrefixAlloc(a, write.key, "asset", "inspection");
+                defer a.free(artifact);
+                const stored = try db.core.store.get(a, artifact);
+                defer a.free(stored);
+                const expected = try Producer.output(a, .{ .producer_type = .extractor, .config_json = "{}", .source_text = source });
+                defer a.free(expected);
+                try std.testing.expectEqualStrings(expected, stored);
+            }
+        }
+    }
+}
+
 test "db asset producer enrichments execute fake providers and skip unchanged state" {
     const alloc = std.testing.allocator;
 
@@ -86369,6 +86704,634 @@ test "db asset producer sync precompute fails closed on permanent item failure" 
             .{ .key = "doc:bad", .value = "{\"body\":\"bad\"}" },
         },
         .sync_level = .enrichments,
+    }));
+
+    try std.testing.expectEqual(@as(usize, 3), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.single_calls);
+
+    const rejected_doc = try db.get(alloc, "doc:bad");
+    defer if (rejected_doc) |value| alloc.free(value);
+    try std.testing.expect(rejected_doc == null);
+
+    const bad_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:bad", "asset", "summary_v1");
+    defer alloc.free(bad_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, bad_key));
+}
+
+test "db commit requirements extraction failure rejects without consumer indexes" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "units",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json =
+        \\{"type":"document_extraction","config":{"checksum_algorithm":"sha256","source":{"checksum_field":"digest"}}}
+        ,
+    });
+    try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{}" }}, .commit_requires = .none });
+    var committed = false;
+    try std.testing.expectError(error.CommitRequirementFailed, db.batchTracked(.{
+        .writes = &.{.{ .key = "rejected", .value =
+        \\{"url":"data:text/plain;base64,YWxwaGEgYmV0YQ==","digest":"0000000000000000000000000000000000000000000000000000000000000000"}
+        }},
+        .deletes = &.{"keep"},
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    }, &committed));
+    try std.testing.expect(!committed);
+    try std.testing.expect((try db.get(a, "rejected")) == null);
+    const kept = (try db.get(a, "keep")) orelse return error.TestExpectedEqual;
+    defer a.free(kept);
+    const manifest = try internal_keys.artifactNamedPrefixAlloc(a, "rejected", "asset", "units");
+    defer a.free(manifest);
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, manifest));
+}
+
+test "db commit requirements extraction leaves artifact source descendants to replay" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "child-replay", .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "units",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "chunks",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "units",
+        .chunk_size = 16,
+        .chunk_overlap = 0,
+    });
+    try db.addIndex(.{ .name = "child_text", .kind = .full_text, .config_json = "{\"chunk_name\":\"chunks\"}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc", .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}" }},
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    });
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(a, "doc", "units", "document:000001");
+    defer a.free(unit_key);
+    const unit = try db.core.store.get(a, unit_key);
+    defer a.free(unit);
+    // The extraction unit is direct; chunking that unit is an excluded stage.
+    const chunk_prefix = try internal_keys.artifactTypePrefixAlloc(a, "doc", "chunk");
+    defer a.free(chunk_prefix);
+    const chunks = try db.core.store.scanPrefix(a, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(a, chunks);
+    try std.testing.expectEqual(@as(usize, 0), chunks.len);
+    const before = try db.stats(a);
+    defer types.freeDBStats(a, before);
+    var saw_pending = false;
+    for (before.indexes) |index| if (std.mem.eql(u8, index.name, "child_text")) {
+        for (index.source_replay) |source| if (std.mem.eql(u8, source.artifact_name, "chunks")) {
+            try std.testing.expect(!source.producer_complete);
+            saw_pending = true;
+        };
+    };
+    try std.testing.expect(saw_pending);
+    // Run the real replay owner after checking the atomic precommit state.
+    try db.enrichment_runtime.?.start();
+    try db.enrichment_runtime.?.waitForApplied(db.core.nextDerivedSequence());
+    const completed = try db.core.store.scanPrefix(a, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(a, completed);
+    try std.testing.expect(completed.len > 0);
+    try db.runUntilIdle();
+    var found = try db.search(a, .{ .index_name = "child_text", .full_text = .{ .match = .{ .field = "text", .text = "alpha" } }, .return_mode = .chunk });
+    defer found.deinit();
+    try std.testing.expect(found.total_hits > 0);
+}
+
+test "db commit requirements child replay survives materialized visibility waits" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .enrichment = .{ .owner_id = "materialized-children", .enable_without_producers = true } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "units",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "chunks",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "units",
+        .chunk_size = 16,
+        .chunk_overlap = 0,
+    });
+    try db.addIndex(.{ .name = "child_text", .kind = .full_text, .config_json = "{\"chunk_name\":\"chunks\"}" });
+    for ([_]types.SyncLevel{ .full_text, .enrichments, .full_index }) |level| {
+        try db.batch(.{
+            .writes = &.{.{ .key = @tagName(level), .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}" }},
+            .sync_level = level,
+            .commit_requires = .direct_enrichments,
+        });
+    }
+    try db.runUntilIdle();
+    var found = try db.search(a, .{ .index_name = "child_text", .full_text = .{ .match = .{ .field = "text", .text = "alpha" } }, .return_mode = .chunk });
+    defer found.deinit();
+    try std.testing.expectEqual(@as(u32, 3), found.total_hits);
+}
+
+test "db commit requirements retain native asset batches across documents" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        single_calls: usize = 0,
+        batch_calls: usize = 0,
+        batch_items: usize = 0,
+        fn one(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_calls += 1;
+            return out.dupe(u8, "single");
+        }
+        fn many(ptr: *anyopaque, out: Allocator, requests: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            self.batch_items += requests.len;
+            const results = try out.alloc([]u8, requests.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (results[0..initialized]) |value| out.free(value);
+                out.free(results);
+            }
+            for (requests, 0..) |request, i| {
+                results[i] = try out.dupe(u8, request.source_text);
+                initialized += 1;
+            }
+            return results;
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .owner_id = "batching", .asset_producer = .{ .ptr = &producer, .vtable = &.{
+            .produce = Producer.one,
+            .produce_batch = Producer.many,
+            .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+        } } },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .execution = .{ .batch_items = 8, .batch_bytes = 8192 },
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "one", .value = "{\"body\":\"one\"}" },
+            .{ .key = "two", .value = "{\"body\":\"two\"}" },
+            .{ .key = "three", .value = "{\"body\":\"three\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    });
+    try std.testing.expectEqual(@as(usize, 1), producer.batch_calls);
+    try std.testing.expectEqual(@as(usize, 3), producer.batch_items);
+    try std.testing.expectEqual(@as(usize, 0), producer.single_calls);
+}
+
+test "db commit requirements output budget stops subsequent producer work atomically" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        calls: usize = 0,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const result = try out.alloc(u8, 5 * 1024 * 1024);
+            @memset(result, 'x');
+            return result;
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .owner_id = "budget", .asset_producer = .{ .ptr = &producer, .vtable = &.{
+            .produce = Producer.produce,
+            .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+        } } },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+    });
+    var committed = false;
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.batchTracked(.{
+        .writes = &.{
+            .{ .key = "one", .value = "{\"body\":\"one\"}" },
+            .{ .key = "two", .value = "{\"body\":\"two\"}" },
+            .{ .key = "three", .value = "{\"body\":\"three\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    }, &committed));
+    try std.testing.expectEqual(@as(usize, 2), producer.calls);
+    try std.testing.expect(!committed);
+    for ([_][]const u8{ "one", "two", "three" }) |key|
+        try std.testing.expect((try db.get(a, key)) == null);
+}
+
+test "db commit requirements prepared command replays binary artifacts without inference" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        forbidden: bool = false,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.forbidden) return error.TestUnexpectedResult;
+            self.calls += 1;
+            return out.dupe(u8, &.{ 0xff, 0, 0xfe });
+        }
+    };
+    for ([_]bool{ false, true }) |ordered_apply| {
+        var directory = try TestDirectory.init("commit-requirements");
+        defer directory.cleanup();
+        var fake = Fake{};
+        var db = try DB.open(a, directory.path(), .{
+            .identity_namespace = if (ordered_apply) .{ .table_id = 1, .shard_id = 2, .range_id = 2 } else .{},
+            .online_source_authority = if (ordered_apply) .raft else null,
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .enrichment = .{ .owner_id = "prepared", .asset_producer = .{ .ptr = &fake, .vtable = &.{
+                .produce = Fake.produce,
+                .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+            } } },
+        });
+        defer db.close();
+        try db.addEnrichment(.{
+            .name = "binary",
+            .kind = .asset,
+            .field = "body",
+            .content_type = "application/octet-stream",
+            .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        });
+        if (ordered_apply) {
+            const publication = @import("artifact_publication.zig");
+            var inventory = try db.artifactInventoryCommand(a);
+            defer inventory.catalogs.deinit(a);
+            inventory.binding.effect_protocol = 15;
+            var namespace: publication.Namespace = undefined;
+            doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            const catalogs = try @import("artifact_inventory.zig").catalogs(&txn);
+            const authority: publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = catalogs.digest() };
+            try @import("artifact_inventory.zig").stageOrdered(a, &txn, inventory, 1);
+            try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+            try @import("artifact_producer_obligations.zig").begin(a, &txn, authority);
+            try @import("artifact_producer_validation.zig").begin(a, &txn, authority);
+            try txn.commit();
+        }
+        var request = types.BatchRequest{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello\"}" }}, .sync_level = .write, .commit_requires = .direct_enrichments };
+        const packet = try db.prepareDirectEnrichments(a, request);
+        defer a.free(packet);
+        try std.testing.expect((try db.get(a, "doc")) == null);
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        fake.forbidden = true;
+        request.prepared_enrichments_json = packet;
+        if (ordered_apply) try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true) else try db.batch(request);
+        const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "binary");
+        defer a.free(key);
+        const artifact = try db.core.store.get(a, key);
+        defer a.free(artifact);
+        try std.testing.expectEqualSlices(u8, &.{ 0xff, 0, 0xfe }, artifact);
+        if (ordered_apply) {
+            // Identical log-entry replay is a no-op; a different entry may not
+            // reuse a stale source fence.
+            try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
+            try std.testing.expectError(error.VersionConflict, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true));
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            const producer = plan.plan().generated_templates[0];
+            const binding = (try @import("artifact_producer_input.zig").authorizeTemplate(a, &read, producer, plan.plan())).?;
+            var closure = (try @import("prepared_producer_acceptance.zig").read(a, &read, db.root_incarnation, "doc", binding.requirement.id, "binary")).?;
+            defer closure.deinit();
+            try closure.requireCurrent(&read, db.root_incarnation);
+            try db.applyOrderedCommittedMutation(.{ .deletes = &.{"doc"}, .commit_requires = .none }, .{ .term = 1, .index = 4 }, true);
+            try std.testing.expect(try @import("prepared_producer_acceptance.zig").collectCurrentPage(a, db.core.store, db.root_incarnation));
+            try std.testing.expectError(error.NotFound, db.core.store.get(a, closure.receipt_key));
+            // A pinned pre-delete reader retains its coherent old evidence.
+            try closure.requireCurrent(&read, db.root_incarnation);
+        } else try std.testing.expectError(error.VersionConflict, db.batch(request));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    }
+}
+
+test "db commit requirements transaction retains prepared effects through restart and abort" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        forbidden: bool = false,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.forbidden) return error.TestUnexpectedResult;
+            self.calls += 1;
+            return out.dupe(u8, "prepared transaction output");
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements-transaction");
+    defer directory.cleanup();
+    var fake = Fake{};
+    const options: OpenOptions = .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "prepared-transaction", .asset_producer = .{ .ptr = &fake, .vtable = &.{ .produce = Fake.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } } } };
+    var committed: types.TxnId = undefined;
+    var aborted: types.TxnId = undefined;
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
+        try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{\"body\":\"original\"}" }}, .commit_requires = .none });
+        committed = try db.beginTransaction(100);
+        aborted = try db.beginTransaction(101);
+        try db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"new\"}" }}, .commit_requires = .direct_enrichments });
+        try db.writeTransaction(aborted, .{ .writes = &.{.{ .key = "rejected", .value = "{\"body\":\"abort me\"}" }}, .deletes = &.{"keep"}, .commit_requires = .direct_enrichments });
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        fake.forbidden = true;
+        try db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"new\"}" }}, .commit_requires = .direct_enrichments });
+        try std.testing.expectError(error.VersionConflict, db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"different\"}" }}, .commit_requires = .direct_enrichments }));
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        try std.testing.expectError(error.VersionConflict, db.writeTransaction(committed, .{ .writes = &.{.{ .key = "bypass", .value = "{}" }}, .commit_requires = .none }));
+        try std.testing.expect((try db.get(a, "accepted")) == null);
+        {
+            const stale_key = try internal_keys.artifactNamedPrefixAlloc(a, "accepted", "asset", "summary");
+            defer a.free(stale_key);
+            var writer = try db.core.store.beginWriteTxn();
+            errdefer writer.abort();
+            try writer.put(stale_key, "late old-source output");
+            try std.testing.expectError(error.IntentConflict, writer.commit());
+            writer.abort();
+        }
+        try std.testing.expect((try db.get(a, "rejected")) == null);
+        const artifact_key = try internal_keys.artifactNamedPrefixAlloc(a, "accepted", "asset", "summary");
+        defer a.free(artifact_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(a, artifact_key));
+        try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "accepted", .value = "{}" }}, .commit_requires = .none }));
+        try db.addEnrichment(.{ .name = "later", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"later-generator\"}}" });
+    }
+    fake.forbidden = true;
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        // The durable vote remains retryable after restart and catalog changes.
+        try db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"new\"}" }}, .commit_requires = .direct_enrichments });
+        try db.commitTransaction(committed, 200);
+        try db.abortTransaction(aborted, 201);
+        // Terminal retries neither publish outputs again nor invoke a model.
+        try db.commitTransaction(committed, 200);
+        try db.abortTransaction(aborted, 201);
+        const accepted = (try db.get(a, "accepted")).?;
+        defer a.free(accepted);
+        const keep = (try db.get(a, "keep")).?;
+        defer a.free(keep);
+        try std.testing.expect((try db.get(a, "rejected")) == null);
+        const key = try internal_keys.artifactNamedPrefixAlloc(a, "accepted", "asset", "summary");
+        defer a.free(key);
+        const artifact = try db.core.store.get(a, key);
+        defer a.free(artifact);
+        try std.testing.expectEqualStrings("prepared transaction output", artifact);
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    }
+}
+
+test "db commit requirements restored effects release every fallible allocation" {
+    const packet: execution_resources.PreparedEnrichments = .{
+        .request_digest = @splat(1),
+        .catalog_digest = @splat(2),
+        .writes = &.{},
+        .deletes = &.{},
+        .guards = &.{},
+        .artifact_writes = &.{.{ .key = "artifact", .value = &.{ 0xff, 0, 0xfe } }},
+        .artifact_deletes = &.{"retired"},
+        .pending = &.{.{ .kind = .asset, .index_name = "index", .artifact_name = "asset", .doc_key = "doc" }},
+        .coverage = &.{.{ .index_name = @constCast("index"), .doc_key = @constCast("doc"), .outcome = .produced }},
+        .producers = &.{.{ .definition = @splat(3), .doc_key = "doc", .revision = @splat(4) }},
+    };
+    const Check = struct {
+        fn run(a: Allocator, value: execution_resources.PreparedEnrichments) !void {
+            var restored = try local_mutation.restorePreparedEnrichments(a, value);
+            defer restored.deinit(a);
+            try std.testing.expectEqualSlices(u8, value.artifact_writes[0].value, restored.artifact_writes[0].value);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{packet});
+}
+
+test "db commit requirements oversized transaction effects reject before voting prepared" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        calls: usize = 0,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const result = try out.alloc(u8, 4 * 1024 * 1024);
+            @memset(result, 'x');
+            return result;
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements-reservation");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "reservation", .asset_producer = .{ .ptr = &producer, .vtable = &.{ .produce = Producer.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } } } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "large", .kind = .asset, .field = "body", .content_type = "application/octet-stream", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"large-generator\"}}" });
+    const txn = try db.beginTransaction(100);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.writeTransaction(txn, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .commit_requires = .direct_enrichments }));
+    try std.testing.expectEqual(@as(usize, 1), producer.calls);
+    try std.testing.expect((try db.get(a, "doc")) == null);
+    // Failure left no durable intent or exclusive source lock behind.
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .none });
+    try db.abortTransaction(txn, 200);
+}
+
+test "db commit requirements missing provider cannot defer required work" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "no-provider" } });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic\"}}",
+    });
+    for ([_]types.SyncLevel{ .propose, .write }) |level| {
+        var committed = false;
+        try std.testing.expectError(error.CommitRequirementUnavailable, db.batchTracked(.{
+            .writes = &.{.{ .key = "rejected", .value = "{\"body\":\"must not be deferred\"}" }},
+            .sync_level = level,
+            .commit_requires = .direct_enrichments,
+        }, &committed));
+        try std.testing.expect(!committed);
+        try std.testing.expect((try db.get(a, "rejected")) == null);
+    }
+}
+
+test "db commit requirements explicit none waits for postcommit enrichment" {
+    const a = std.testing.allocator;
+    const Observer = struct {
+        db: ?*DB = null,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const source = (try self.db.?.get(out, "observed")) orelse return error.SourceMustCommitFirst;
+            defer out.free(source);
+            return out.dupe(u8, "published after source");
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var observer = Observer{};
+    var db = try DB.open(a, directory.path(), .{ .enrichment = .{
+        .owner_id = "commit-requirements",
+        .asset_producer = .{ .ptr = &observer, .vtable = &.{ .produce = Observer.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } },
+    } });
+    defer db.close();
+    observer.db = &db;
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+    });
+    // If full_index still implicitly precomputed, the observer would fail
+    // before the source existed. The explicit prerequisite must win.
+    try db.batch(.{ .writes = &.{.{ .key = "observed", .value = "{\"body\":\"hello\"}" }}, .sync_level = .full_index, .commit_requires = .none });
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "observed", "asset", "summary");
+    defer a.free(key);
+    const artifact = try db.core.store.get(a, key);
+    defer a.free(artifact);
+    try std.testing.expectEqualStrings("published after source", artifact);
+}
+
+test "db commit requirements gate write before source and delete publication" {
+    const alloc = std.testing.allocator;
+
+    const FallbackProducer = struct {
+        batch_calls: usize = 0,
+        single_calls: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+                },
+            };
+        }
+
+        fn produce(ptr: *anyopaque, alloc_inner: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_calls += 1;
+            if (std.mem.eql(u8, request.source_text, "bad")) return error.BadAssetInput;
+            return try std.fmt.allocPrint(alloc_inner, "ok:{s}", .{request.source_text});
+        }
+
+        fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            return error.BatchItemFailed;
+        }
+    };
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var fake = FallbackProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .execution = .{ .batch_items = 2, .batch_bytes = 1024 },
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:good", .value = "{\"body\":\"good\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.single_calls);
+
+    const good_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:good", "asset", "summary_v1");
+    defer alloc.free(good_key);
+    const good_value = try db.core.store.get(alloc, good_key);
+    defer alloc.free(good_value);
+    try std.testing.expectEqualStrings("ok:good", good_value);
+
+    try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{}" }}, .sync_level = .write, .commit_requires = .none });
+    try std.testing.expectError(error.BadAssetInput, db.batch(.{
+        .deletes = &.{"keep"},
+        .writes = &.{
+            .{ .key = "doc:good", .value = "{\"body\":\"bad\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    }));
+
+    try std.testing.expectEqual(@as(usize, 2), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.single_calls);
+
+    const kept = (try db.get(alloc, "keep")) orelse return error.TestExpectedEqual;
+    defer alloc.free(kept);
+    const committed_doc = (try db.get(alloc, "doc:good")) orelse return error.TestExpectedEqual;
+    defer alloc.free(committed_doc);
+    try std.testing.expectEqualStrings("{\"body\":\"good\"}", committed_doc);
+
+    const unchanged_good_value = try db.core.store.get(alloc, good_key);
+    defer alloc.free(unchanged_good_value);
+    try std.testing.expectEqualStrings("ok:good", unchanged_good_value);
+
+    try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{}" }}, .sync_level = .write, .commit_requires = .none });
+    try std.testing.expectError(error.BadAssetInput, db.batch(.{
+        .deletes = &.{"keep"},
+        .writes = &.{
+            .{ .key = "doc:bad", .value = "{\"body\":\"bad\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
     }));
 
     try std.testing.expectEqual(@as(usize, 3), fake.batch_calls);
@@ -94203,6 +95166,22 @@ test "leann synchronous document provenance pins revisions and tolerates inferen
             if (self.flip) self.revision += 1;
             return vector;
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
         fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.revision) };
@@ -94210,7 +95189,7 @@ test "leann synchronous document provenance pins revisions and tolerates inferen
         fn append(_: Allocator, _: *usize, _: []const u8, _: ?[]const u8, _: []const u8, _: []const f32, _: []const []const u8) !void {}
     };
     var fake = Fake{};
-    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .capabilities_fn = Fake.caps };
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .dense_embed_batch_planned_fn = Fake.planned, .capabilities_fn = Fake.caps };
     var directory = try TestDirectory.init("leann-sync-generation");
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .enrichment = .{ .owner_id = "sync", .dense_embedder = provider }, .ttl_cleanup = .{ .enabled = false } });
@@ -100253,6 +101232,12 @@ fn testDenseRevisionReuse(sync_level: types.SyncLevel, with_parts: bool) !void {
             }
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(revision), .batch = .{ .mode = .native, .max_items = 32 } };
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            return batch(raw, result_alloc, name, texts, dims);
+        }
         fn batch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8, _: u32) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const rows = try alloc.alloc([]const f32, texts.len);
@@ -100272,7 +101257,7 @@ fn testDenseRevisionReuse(sync_level: types.SyncLevel, with_parts: bool) !void {
     var probe = Probe{};
     var directory = try TestDirectory.init("model-revision-reuse");
     defer directory.cleanup();
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "revision-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = if (with_parts) Probe.parts else null, .text_parts_equivalent_fn = Probe.equivalent, .dense_embed_batch_fn = Probe.batch, .capabilities_fn = Probe.caps } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "revision-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = if (with_parts) Probe.parts else null, .text_parts_equivalent_fn = Probe.equivalent, .dense_embed_batch_fn = Probe.batch, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps } } });
     defer db.close();
     try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"passage: {{body}}\",\"embedding_name\":\"model\"}}" });
     for (0..3) |version| {
@@ -100313,6 +101298,22 @@ test "db paper evaluation producer upgrades require explicit reprocess and async
             self.calls += 1;
             if (self.fail) return error.PermanentPromptFailure;
             return alloc.dupe(f32, &.{ if (self.revision == 1) 1 else 0, if (self.revision == 2) 1 else 0, if (std.mem.eql(u8, text, "changed")) 2 else 1 });
+        }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
         }
         fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -100383,7 +101384,7 @@ test "db paper evaluation producer upgrades require explicit reprocess and async
     var directory = try TestDirectory.init("paper-evaluation-contracts");
     defer directory.cleanup();
     var probe = Probe{};
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "paper-contract", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "paper-contract", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps } } });
     defer db.close();
     try db.addEnrichment(Probe.config(1));
     try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"vectors\"}],\"publication_policy\":\"atomic\"}" });
@@ -100454,6 +101455,36 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
         fn caps(_: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(1) };
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(@as(u8, 1)))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
+        fn sparsePlanned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, context: ?@import("antfly_inference_execution_context").RequestContext, generation: embedder_mod.SparseEmbedder.Generation) ![]embedder_mod.SparseEmbedding {
+            if (context) |control| try control.check();
+            if (!std.meta.eql(generation.revision, @as(?[32]u8, @as([32]u8, @splat(1))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc(embedder_mod.SparseEmbedding, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |*row| row.deinit(result_alloc);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embedSparse(raw, result_alloc, name, text);
+                initialized += 1;
+            }
+            return rows;
+        }
         fn revision(_: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
             return @as([32]u8, @splat(1));
         }
@@ -100508,7 +101539,7 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
     var directory = try TestDirectory.init("late-A-generation");
     defer directory.cleanup();
     var probe = Probe{ .hold_at = initial_reprocesses + 1, .rollback = rollback, .sparse = sparse, .recreate = recreate };
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-A", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.embedSparse, .cache_revision_fn = Probe.revision } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-A", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.embedSparse, .sparse_embed_batch_planned_fn = Probe.sparsePlanned, .cache_revision_fn = Probe.revision } } });
     defer db.close();
     probe.db = &db;
     if (relational) try db.setSchemaJson(a,
@@ -123578,6 +124609,28 @@ test "db storage kernel graph edges retain typed filters and physical scan budge
     };
     defer request.deinit(alloc);
     const local = @import("../query.zig");
+    {
+        // The storage-owner bridge must preserve complete key prefixes,
+        // including an empty first key; a scalar read silently drops both
+        // the second key and the metadata required by distributed paths.
+        var batched = request;
+        batched.key = @constCast("missing");
+        batched.keys = @constCast(&[_][]const u8{ "missing", "doc:a" });
+        batched.max_edges = 8;
+        batched.max_scanned_rows = 16;
+        batched.allow_partial_keys = true;
+        var result = try local.executeStorageKernelGraphEdges(alloc, &db, batched);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), result.edges.len);
+        try std.testing.expectEqualSlices(u32, &.{ 0, 0, 2 }, result.key_offsets);
+        try std.testing.expectEqual(@as(usize, 2), result.key_scanned_rows.len);
+        const wire = try graph.encodeGraphEdgesResponse(alloc, result);
+        defer alloc.free(wire);
+        var decoded = try graph.parseGraphEdgesResponse(alloc, wire);
+        defer decoded.deinit(alloc);
+        try std.testing.expectEqualSlices(u32, result.key_offsets, decoded.key_offsets);
+        try std.testing.expectEqualSlices(u32, result.key_scanned_rows, decoded.key_scanned_rows);
+    }
     {
         var result = try local.executeStorageKernelGraphEdges(alloc, &db, request);
         defer result.deinit(alloc);
@@ -154674,6 +155727,21 @@ fn testProducerDefinitionPublication(replace_definition: bool) !void {
         fn caps(_: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(1) };
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(1))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
         fn requireFresh(self: *@This(), alloc: Allocator) !void {
             const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "vectors");
             defer alloc.free(key);
@@ -154705,7 +155773,7 @@ fn testProducerDefinitionPublication(replace_definition: bool) !void {
     var directory = try TestDirectory.init("late-definition");
     defer directory.cleanup();
     var probe = Probe{ .replace_definition = replace_definition };
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-definition", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-definition", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps } } });
     defer db.close();
     probe.db = &db;
     try db.addEnrichment(Probe.config(false));
@@ -154791,6 +155859,18 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
             }
             return rows;
         }
+        fn densePlanned(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            return denseBatch(raw, a, name, texts, dims);
+        }
+        fn sparsePlanned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, context: ?@import("antfly_inference_execution_context").RequestContext, generation: embedder_mod.SparseEmbedder.Generation) ![]embedder_mod.SparseEmbedding {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(generation.revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            return sparseBatch(raw, result_alloc, name, texts);
+        }
         fn denseControlled(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: @import("antfly_inference_execution_context").RequestContext) ![]const []const f32 {
             try context.check();
             return denseBatch(raw, a, name, texts, dims);
@@ -154835,17 +155915,22 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
     var directory = try TestDirectory.init("document-generation-preparation");
     defer directory.cleanup();
     const batch_boundary = mode == .between_batches or shape == .extracted;
-    var probe = Probe{ .change_after_checks = if (sparse)
-        (if (batch_boundary) @as(usize, 1) else 2)
-    else switch (shape) {
-        .extracted => 2,
-        .inline_chunks => if (batch_boundary) @as(usize, 2) else 3,
-        .materialized_chunks => if (batch_boundary) @as(usize, 3) else 4,
-    }, .change = mode != .stable };
+    var probe = Probe{
+        .change_after_checks = if (sparse)
+            (if (batch_boundary) @as(usize, 1) else 2)
+        else switch (shape) {
+            // Leased execution no longer performs the legacy post-call alias
+            // observation; the materializer still fences every completed batch.
+            .extracted => 1,
+            .inline_chunks => if (batch_boundary) @as(usize, 1) else 2,
+            .materialized_chunks => if (batch_boundary) @as(usize, 2) else 3,
+        },
+        .change = mode != .stable,
+    };
     var db = try DB.open(alloc, directory.path(), .{
         .start_optional_runtime_workers = false,
         .start_index_workers = false,
-        .enrichment = .{ .owner_id = "document-generation", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.dense, .dense_embed_batch_fn = Probe.denseBatch, .dense_embed_batch_with_context_fn = Probe.denseControlled, .capabilities_fn = Probe.caps, .foreground_bounded = true }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseOne, .sparse_embed_batch_fn = Probe.sparseBatch, .sparse_embed_batch_with_context_fn = Probe.sparseControlled, .cache_revision_fn = Probe.revisionFn, .foreground_bounded = true } },
+        .enrichment = .{ .owner_id = "document-generation", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.dense, .dense_embed_batch_fn = Probe.denseBatch, .dense_embed_batch_planned_fn = Probe.densePlanned, .dense_embed_batch_with_context_fn = Probe.denseControlled, .capabilities_fn = Probe.caps, .foreground_bounded = true }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseOne, .sparse_embed_batch_fn = Probe.sparseBatch, .sparse_embed_batch_planned_fn = Probe.sparsePlanned, .sparse_embed_batch_with_context_fn = Probe.sparseControlled, .cache_revision_fn = Probe.revisionFn, .foreground_bounded = true } },
     });
     defer db.close();
     const chunk_size: u32 = if (mode == .between_batches or mode == .stable) 256 else 4096;
@@ -154902,4 +155987,301 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
         count += 1;
     }
     try std.testing.expect(count > 3);
+}
+
+test "index alias storage fences reject same-name replacement and survive query leases" {
+    const a = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("alias-fence");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{ .primary_backend = .{ .mem = .{} } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 41 });
+    const request: types.SearchRequest = .{ .index_alias_fences = &.{.{ .name = "text", .incarnation = 41 }} };
+    var lease = try db.beginQueryReadLease();
+    _ = try db.searchRequestAtCurrentIdentityGeneration(request);
+    lease.release();
+    _ = try db.deleteIndex("text");
+    // Retirement owns the physical name until asynchronous artifact cleanup
+    // completes; replacement must exercise the post-cleanup incarnation fence.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 42 });
+    lease = try db.beginQueryReadLease();
+    defer lease.release();
+    try std.testing.expectError(error.CatalogGenerationChanged, db.searchRequestAtCurrentIdentityGeneration(request));
+    _ = try db.searchRequestAtCurrentIdentityGeneration(.{ .index_alias_fences = &.{.{ .name = "text", .incarnation = 42 }} });
+}
+
+test "db commit requirements reserves existing artifact retirement before a prepared vote" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-retirement-reservation");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try db.batch(.{ .writes = &.{.{ .key = "large", .value = "{\"body\":\"source\"}" }}, .commit_requires = .none });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const writes = try arena.allocator().alloc(docstore_mod.KVPair, 6000);
+    for (writes, 0..) |*write, ordinal| write.* = .{ .key = try internal_keys.chunkArtifactKeyAlloc(arena.allocator(), "large", "chunks", @intCast(ordinal)), .value = "old output" };
+    try db.core.store.putBatch(writes, &.{});
+    const transaction = try db.beginTransaction(100);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.writeTransaction(transaction, .{ .deletes = &.{"large"}, .commit_requires = .direct_enrichments }));
+    // No yes vote or lock escaped; ordinary writes can still update the source.
+    try db.batch(.{ .writes = &.{.{ .key = "large", .value = "{}" }}, .commit_requires = .none });
+    try db.abortTransaction(transaction, 200);
+}
+
+test "db commit requirements preparation carries transaction policy authority" {
+    const request = DB.transactionPreparationRequest(.{ .commit_requires = .direct_enrichments, .row_policy_principal_proof = "signed", .row_policy_database = "main", .row_policy_admitted_at_seconds = 123 });
+    try std.testing.expectEqualStrings("signed", request.row_policy_principal_proof);
+    try std.testing.expectEqualStrings("main", request.row_policy_database);
+    try std.testing.expectEqual(@as(i64, 123), request.row_policy_admitted_at_seconds);
+}
+
+test "db commit requirements canceled owner preparation dispatches no producers" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-cancel-context");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, db.prepareDirectEnrichmentsWithContext(a, .{ .writes = &.{.{ .key = "source", .value = "{}" }}, .commit_requires = .direct_enrichments }, .{ .io = std.testing.io, .deadline_ns = null, .cancellation = types.CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expect((try db.get(a, "source")) == null);
+}
+
+test "db commit requirements capture borrows an authenticated policy lease without replay-time reauthentication" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-policy-capture");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    db.local_execution.row_policy_gate = row_policy_gate_mod.Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1, .row_policy_phase = .active, .row_policy_generation = 7, .row_policy_catalog_epoch = 9 });
+    const principal: row_policy_authority_mod.Payload = .{ .principal = "alice", .roles = &.{}, .auth_revision = 1, .table_id = 1, .table = "docs", .database = "main", .policy_generation = 7, .catalog_epoch = 9, .access = .write, .expires = 1 };
+    var lease = try db.local_execution.row_policy_gate.enterReplicatedPrincipal(&principal);
+    defer lease.release();
+    var capture: execution_resources.PreparationCapture = .{ .alloc = a };
+    defer if (capture.json) |bytes| a.free(bytes);
+    try db.batchInternal(.{ .commit_requires = .direct_enrichments, .row_policy_principal_proof = "already verified before Raft proposal", .row_policy_database = "main", .row_policy_admitted_at_seconds = 1 }, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = &principal, .row_policy_lease = &lease });
+    try std.testing.expect(capture.json != null);
+    try lease.checkAt(1000);
+}
+
+test "db commit requirements reserves old reverse index tuples on updates" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-update-retirement");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .none });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const tuple = try owned.alloc(u8, 24 * 1024);
+    @memset(tuple, 'x');
+    const writes = try owned.alloc(docstore_mod.KVPair, 100);
+    for (writes, 0..) |*write, ordinal| {
+        var key = std.ArrayList(u8).empty;
+        try relational_index_records.appendReverseKey(owned, &key, .{ .generation = 1, .slot = @intCast(ordinal) }, "doc");
+        var value = std.ArrayList(u8).empty;
+        try relational_index_records.appendReverseValue(owned, &value, key.items, tuple);
+        write.* = .{ .key = key.items, .value = value.items };
+    }
+    try db.core.store.putBatch(writes, &.{});
+    const transaction = try db.beginTransaction(100);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.writeTransaction(transaction, .{ .writes = &.{.{ .key = "doc", .value = "{\"small\":true}" }}, .commit_requires = .direct_enrichments }));
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .none });
+    try db.abortTransaction(transaction, 200);
+}
+
+test "db commit requirements sealed retries reject changed range guards and version semantics" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-sealed-guards");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const transaction = try db.beginTransaction(100);
+    const request: types.TransactionIntentRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .direct_enrichments };
+    try db.writeTransaction(transaction, request);
+    var changed = request;
+    changed.range_guards = &.{.{ .bucket = 1, .generation = 999 }};
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(transaction, changed));
+    changed = request;
+    changed.document_version_scheme = .legacy;
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(transaction, changed));
+    try db.writeTransaction(transaction, request);
+    try db.abortTransaction(transaction, 200);
+}
+
+test "db commit requirements reject row policy before producer dispatch" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-policy-before-model");
+    defer directory.cleanup();
+    var provider = CountingDenseEmbedder{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .enrichment = .{ .owner_id = "policy-test", .dense_embedder = provider.interface() } });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.batch(.{ .writes = &.{.{ .key = "private", .value = "{\"body\":\"protected tenant source\"}" }}, .commit_requires = .none });
+    try db.addEnrichment(.{ .name = "vectors", .kind = .embedding, .field = "body", .expected_dims = 2, .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"dense\",\"dimensions\":2}" });
+    var view = db.core.acquireSchemaView().?;
+    defer view.release();
+    const schema = view.tableSchema().*;
+    const schema_bytes = try schema_mod.serializeSchema(a, schema);
+    defer a.free(schema_bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema_bytes, &digest, .{});
+    const policies = @import("../../system_catalog/policies.zig");
+    const deny: policies.Predicate = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = false } } }}, .root = 0 };
+    const bundle = try std.json.Stringify.valueAlloc(a, policies.InstallSnapshot{ .table_id = 1, .schema_version = 1, .schema_digest = digest, .policy_generation = 7, .catalog_epoch = 9, .phase = .active, .records = &.{.{ .id = 1, .generation = 7, .table_id = 1, .schema_version = 1, .schema_digest = digest, .name = "deny", .commands = .{ .insert = true, .update = true, .delete = true }, .roles = &.{"public"}, .using = deny, .with_check = deny }}, .settings = &.{} }, .{});
+    defer a.free(bundle);
+    db.local_execution.row_policy_bundle = try row_policy_bundle_mod.Installed.init(a, bundle, 1, schema);
+    db.local_execution.row_policy_gate = row_policy_gate_mod.Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1, .row_policy_phase = .active, .row_policy_generation = 7, .row_policy_catalog_epoch = 9 });
+    const principal: row_policy_authority_mod.Payload = .{ .principal = "alice", .roles = &.{}, .auth_revision = 1, .table_id = 1, .table = "docs", .database = "main", .policy_generation = 7, .catalog_epoch = 9, .access = .write, .expires = 1 };
+    var lease = try db.local_execution.row_policy_gate.enterReplicatedPrincipal(&principal);
+    defer lease.release();
+    const requests = [_]types.BatchRequest{
+        .{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"denied insert\"}" }}, .commit_requires = .direct_enrichments },
+        .{ .writes = &.{.{ .key = "private", .value = "{\"body\":\"denied replacement\"}" }}, .commit_requires = .direct_enrichments },
+        .{ .transforms = &.{.{ .key = "private", .operations = &.{.{ .op = .set, .path = "body", .value_json = "\"denied transform\"" }} }}, .commit_requires = .direct_enrichments },
+    };
+    for (requests) |request| {
+        var capture: execution_resources.PreparationCapture = .{ .alloc = a };
+        defer if (capture.json) |bytes| a.free(bytes);
+        try std.testing.expectError(error.RowPolicyDenied, db.batchInternal(request, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = &principal, .row_policy_lease = &lease }));
+        try std.testing.expect(capture.json == null);
+        try std.testing.expectEqual(@as(usize, 0), provider.calls);
+    }
+}
+
+test "db commit requirements source and planning bounds precede allocation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-planning-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const writes = try a.alloc(types.BatchWrite, @import("commit_requirements.zig").max_output_rows + 1);
+    defer a.free(writes);
+    @memset(writes, .{ .key = "a", .value = "{}" });
+    var failed = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.prepareDirectEnrichments(failed.allocator(), .{ .writes = writes, .commit_requires = .direct_enrichments }));
+    try std.testing.expect(!failed.has_induced_failure);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.batch(.{ .writes = writes, .commit_requires = .direct_enrichments }));
+    const operations = try a.alloc(types.TransformOp, @import("commit_requirements.zig").max_output_rows + 1);
+    defer a.free(operations);
+    @memset(operations, .{ .op = .set, .path = "body", .value_json = "1" });
+    const transforms = [_]types.DocumentTransform{.{ .key = "a", .operations = operations, .upsert = true }};
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.prepareDirectEnrichments(failed.allocator(), .{ .transforms = &transforms, .commit_requires = .direct_enrichments }));
+    try std.testing.expect(!failed.has_induced_failure);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.batch(.{ .transforms = &transforms, .commit_requires = .direct_enrichments }));
+    try db.addEnrichment(.{ .name = "asset", .kind = .asset, .field = "body", .content_type = "application/json" });
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var row = try mapper.extractWrite(a, "a", "{\"body\":\"source words\"}");
+    defer row.deinit(a);
+    var budget: @import("commit_requirements.zig").OutputBudget = .{ .rows = @import("commit_requirements.zig").max_output_rows };
+    try std.testing.expectError(error.CommitRequirementTooLarge, plan.plan().planGeneratedEnrichmentsForRowBounded(failed.allocator(), "a", row, &budget, null));
+    try std.testing.expect(!failed.has_induced_failure);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, plan.plan().planGeneratedEnrichmentsForRowBounded(failed.allocator(), "a", row, null, .{ .io = std.testing.io, .deadline_ns = null, .cancellation = types.CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expect(!failed.has_induced_failure);
+}
+
+test "db commit requirements preserve provider batches across bounded planning windows" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        items: usize = 0,
+        max_items: usize = 0,
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedScalarInference;
+        }
+        fn batch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.items += texts.len;
+            self.max_items = @max(self.max_items, texts.len);
+            const result = try alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (result[0..initialized]) |vector| alloc.free(vector);
+                alloc.free(result);
+            }
+            for (result) |*vector| {
+                const values = try alloc.alloc(f32, dims);
+                @memset(values, 1);
+                vector.* = values;
+                initialized += 1;
+            }
+            return result;
+        }
+    };
+    var directory = try TestDirectory.init("direct-planning-windows");
+    defer directory.cleanup();
+    var probe = Probe{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "window-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch } } });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense\"}}" });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const writes = try alloc.alloc(types.BatchWrite, 40);
+    for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(alloc, "doc-{d}", .{i}), .value = try std.fmt.allocPrint(alloc, "{{\"body\":\"unique source {d}\"}}", .{i}) };
+    try db.batch(.{ .writes = writes, .commit_requires = .direct_enrichments });
+    try std.testing.expectEqual(@as(usize, 40), probe.items);
+    try std.testing.expect(probe.calls > 1 and probe.calls < 40);
+    try std.testing.expect(probe.max_items > 1 and probe.max_items <= @import("commit_requirements.zig").max_window_documents);
+    const last = (try db.get(a, "doc-39")) orelse return error.TestUnexpectedResult;
+    defer a.free(last);
+}
+
+test "db commit requirements relational preparation retries a source race" {
+    const Producer = struct {
+        db: ?*DB = null,
+        calls: usize = 0,
+        fn produce(ptr: *anyopaque, a: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) try self.db.?.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"intervening source\"}" }}, .commit_requires = .none, .sync_level = .write });
+            return a.dupe(u8, "prepared result");
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-relational-source-race");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "source-race", .asset_producer = .{ .ptr = &producer, .vtable = &.{ .produce = Producer.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } } } });
+    defer db.close();
+    producer.db = &db;
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"summary\"}}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"requested source\"}" }}, .commit_requires = .direct_enrichments, .sync_level = .write });
+    try std.testing.expectEqual(@as(usize, 2), producer.calls);
+    const source = (try db.get(a, "doc")) orelse return error.TestUnexpectedResult;
+    defer a.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "requested source") != null);
+}
+
+test "db commit requirements coverage candidates share pinned configuration across windows" {
+    const a = std.testing.allocator;
+    const config = try a.alloc(u8, 64 * 1024);
+    defer a.free(config);
+    @memset(config, ' ');
+    var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 128 * 1024);
+    defer quota.deinit();
+    const alloc = quota.allocator();
+    var candidates: std.ArrayListUnmanaged(PrecomputedCoverageCandidate) = .empty;
+    defer {
+        for (candidates.items) |candidate| candidate.deinit(alloc);
+        candidates.deinit(alloc);
+    }
+    var consumers = [_][]u8{@constCast("dense")};
+    for (0..128) |_| try appendPrecomputedCoverageCandidate(alloc, &candidates, .{ .kind = .dense_embedding, .doc_key = "doc", .index_name = "dense", .source_field = "body", .producer_json = config, .source_template = config, .consumer_indexes = &consumers }, true);
+    for (candidates.items) |candidate| {
+        try std.testing.expectEqual(config.ptr, candidate.request.producer_json.ptr);
+        try std.testing.expectEqual(config.ptr, candidate.request.source_template.ptr);
+        try std.testing.expect(candidate.request.consumer_indexes.ptr != consumers[0..].ptr);
+    }
 }

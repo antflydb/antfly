@@ -37,6 +37,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data runtime commit requirements",
         "data runtime ordered artifact upload handoff",
         "data runtime hosted FK retirement",
         "pure topology control bypasses only ordinary dense repair writer preflight",
@@ -131,6 +132,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
         "remote metadata source restore staging authority binds every owner read",
+        "remote table descriptors prefer ordered peers before legacy fallback",
         "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
         "privacy remote mutation forwarding retains response metadata through the status source",
         "privacy remote read bindings pin metadata identity and never fall back to full catalogs",

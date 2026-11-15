@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import tempfile
 import unittest
@@ -80,6 +81,59 @@ class LicenseHeaderTests(unittest.TestCase):
         )
         self.assertNotIn("Elastic", updated)
         self.assertTrue(updated.endswith("//! Module docs\nconst x = 1;\n"))
+
+    def test_preserves_source_comments_adjacent_to_short_spdx_notice(self):
+        for filename, prefix in (
+            ("example.cu", "//"),
+            ("example.py", "#"),
+            ("example.sh", "#"),
+        ):
+            for separator in ("", prefix + "\n"):
+                with self.subTest(filename=filename, separator=separator):
+                    path = Path(filename)
+                    source_tail = (
+                        separator
+                        + prefix
+                        + " Packed attention implementation.\n"
+                        + prefix
+                        + " Keep this documentation.\n\nimplementation\n"
+                    )
+                    source = (
+                        prefix
+                        + " Copyright 2026 Antfly, Inc.\n"
+                        + prefix
+                        + " SPDX-License-Identifier: Apache-2.0\n"
+                        + source_tail
+                    )
+                    updated = policy.apply_header(
+                        source, path, policy.read_header("apache")
+                    )
+                    self.assertTrue(updated.endswith(source_tail))
+                    self.assertEqual(
+                        updated,
+                        policy.apply_header(
+                            updated, path, policy.read_header("apache")
+                        ),
+                    )
+
+    def test_preserves_full_notice_with_compact_comment_prefixes(self):
+        path = Path("example.cu")
+        header = policy.read_header("apache")
+        rendered = policy.render_header(path, header)
+        tail = "// Source documentation.\nstruct Example {};\n"
+        compact = rendered.replace("// ", "//") + tail
+        self.assertEqual(policy.apply_header(compact, path, header), rendered + tail)
+
+    def test_glide_cuda_ptx_source_hashes_match_checked_in_sources(self):
+        root = policy.ROOT / "zig/pkg/inference/src/ops/cuda"
+        for name in ("glide_activation", "glide_attention", "glide_delta"):
+            with self.subTest(kernel=name):
+                source = (root / f"prototypes/{name}.cu").read_bytes()
+                pin = (root / f"{name}.ptx").read_bytes().split(b"\n", 1)[0]
+                self.assertEqual(
+                    pin,
+                    b"// source-sha256: " + hashlib.sha256(source).hexdigest().encode(),
+                )
 
     def test_preserves_usage_comments_adjacent_to_full_notice(self):
         path = Path("example.sh")

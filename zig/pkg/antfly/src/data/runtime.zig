@@ -1444,6 +1444,11 @@ const RaftTableApplyStateMachine = struct {
                     if (err == @field(@import("../api/relational_row_errors.zig").PolicyError, field)) return null;
                 }
             };
+            if (req.prepared_enrichments_json != null) switch (err) {
+                error.CommitRequirementTooLarge => return .transaction_too_large,
+                error.EnrichmentSourceChanged, error.ArtifactCatalogDrift => return .version_conflict,
+                else => {},
+            };
             return fromError(err);
         }
     };
@@ -12709,7 +12714,9 @@ pub const DataServer = struct {
         return proposal;
     }
 
-    fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+    pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
+            return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
         if (req.graph_endpoint_cleanup) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
@@ -13277,10 +13284,13 @@ pub const DataServer = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        req: antfly.db.types.BatchRequest,
+        incoming_req: antfly.db.types.BatchRequest,
         route: DataRaftBatchRoute,
         leader_wait_ns: u64,
     ) !void {
+        var req = incoming_req;
+        var prepared_json: ?[]u8 = null;
+        defer if (prepared_json) |bytes| alloc.free(bytes);
         try @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, req);
         try @import("antfly_local_sources").storage_db_artifact_publication_transport.validateBatchRequest(req);
         // Do not allow a private/direct batch route to bypass the metadata
@@ -13440,6 +13450,28 @@ pub const DataServer = struct {
                 if (self.dataRaftMonotonicNs() >= deadline_ns) {
                     std.log.warn("data raft pre-admission failed group_id={} phase=protocol_preflight err=Timeout", .{group_id});
                     return error.LeaderUnavailable;
+                }
+                // Inference runs only on the preflighted leader, outside the
+                // Raft proposal lock. Receiver-owned source/catalog fences are
+                // rechecked atomically at ordered apply on every replica.
+                if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) {
+                    // Protocol 30 includes revision-v1 document semantics. Bind
+                    // that admitted scheme before sealing the retry digest.
+                    if (batchMutatesDocuments(req)) req.document_version_scheme = .revision_v1;
+                    const activation = protocol_activation_entry.?;
+                    if (activation.protocol_version.load(.acquire) < minimum_protocol_version and
+                        protocol_preflight.activatable_version < minimum_protocol_version and
+                        activation.pending_version.load(.acquire) < minimum_protocol_version) return error.RaftBatchMergeProtocolUnavailable;
+                    if (protocol_activation_lock_owned) {
+                        protocol_activation_entry.?.activation_mutex.unlock();
+                        protocol_activation_lock_owned = false;
+                    }
+                    if (comptime linked_storage) {
+                        prepared_json = try (try self.ensureKernelOwnerSource()).prepareEnrichments(alloc, group_id, table_name, req, deadline_ns, if (route.cancellation) |signal| signal.token() else .none);
+                        req.prepared_enrichments_json = prepared_json;
+                    } else return error.CommitRequirementUnavailable;
+                    try ensureDataRaftBatchRouteActive(route);
+                    if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 }
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 if (req.restore_staging_scope) |scope| {
@@ -27697,12 +27729,24 @@ const RemoteMetadataSource = struct {
         else
             null;
         var last_err: anyerror = error.MissingMetadataApi;
+        // An N-1 admin snapshot has no ordered catalog revision. Try every
+        // revisioned peer before using that adapter: otherwise read affinity
+        // can pin a mixed-version cluster to revision zero and prevent owner
+        // admission after any revisioned descriptor has been observed.
+        var legacy_endpoints: std.ArrayListUnmanaged(usize) = .empty;
+        defer legacy_endpoints.deinit(self.alloc);
+        // Other requests may update shared affinity while this one probes.
+        // Pin this request's order so each endpoint gets exactly one turn.
+        const start_index = self.metadataReadApiIndexForAttemptWithBudget(0, outer_budget) catch |err|
+            return normalizeCatalogRoutingSnapshotError(err);
         for (0..self.base_uris.len) |attempt| {
             ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
-            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const index = (start_index + attempt) % self.base_uris.len;
             const attempt_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| blk: {
                 const now_ns = self.awakeNs();
-                break :blk .{ .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline, self.base_uris.len - attempt), .io = self.io };
+                // Discovered legacy peers still need a turn after the
+                // revisioned probes; the last probe must not spend their budget.
+                break :blk .{ .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline, self.base_uris.len - attempt + legacy_endpoints.items.len), .io = self.io };
             } else null;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
@@ -27712,18 +27756,8 @@ const RemoteMetadataSource = struct {
             else
                 metadata_client.fetchTableRoutingSnapshot(self.base_uris[index], table_name, attempt_budget)) catch |err| {
                 if (err == error.UnsupportedOperation) {
-                    const legacy = self.fetchLegacyTableRoutingSnapshotAtEndpoint(
-                        &metadata_client,
-                        index,
-                        table_name,
-                        attempt_budget,
-                        linearizable,
-                    ) catch |legacy_err| {
-                        last_err = normalizeCatalogRoutingSnapshotError(legacy_err);
-                        continue;
-                    };
-                    self.noteMetadataReadSuccess(index);
-                    return legacy;
+                    try legacy_endpoints.append(self.alloc, index);
+                    continue;
                 }
                 last_err = normalizeCatalogRoutingSnapshotError(err);
                 continue;
@@ -27743,6 +27777,22 @@ const RemoteMetadataSource = struct {
             };
             self.noteMetadataReadSuccess(index);
             return owned;
+        }
+        for (legacy_endpoints.items, 0..) |index, attempt| {
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            const attempt_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline|
+                .{ .deadline_ns = catalogRoutingAttemptDeadline(self.awakeNs(), deadline, legacy_endpoints.items.len - attempt), .io = self.io }
+            else
+                null;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var metadata_client = self.metadataClient(arena.allocator());
+            const legacy = self.fetchLegacyTableRoutingSnapshotAtEndpoint(&metadata_client, index, table_name, attempt_budget, linearizable) catch |err| {
+                last_err = normalizeCatalogRoutingSnapshotError(err);
+                continue;
+            };
+            self.noteMetadataReadSuccess(index);
+            return legacy;
         }
         if (deadline_ns) |deadline| {
             if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
@@ -47364,6 +47414,67 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), stub.calls);
         }
 
+        test "remote table descriptors prefer ordered peers before legacy fallback" {
+            const Stub = struct {
+                modern: bool,
+                slow_modern: bool = false,
+                affinity_target: ?*RemoteMetadataSource = null,
+                clock: *@import("vopr").vopr_io.VoprIo,
+                point_calls: usize = 0,
+                legacy_calls: usize = 0,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const tables = [_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = "{\"model_b\":{}}" }};
+                    const ranges = [_]antfly.metadata.table_manager.RangeRecord{.{ .table_id = 7, .group_id = 7001, .range_id = 71, .start_key = "", .end_key = null }};
+                    if (std.mem.endsWith(u8, request.uri, "table-routing-snapshot")) {
+                        self.point_calls += 1;
+                        if (std.mem.startsWith(u8, request.uri, "http://old.test")) {
+                            if (self.affinity_target) |source| source.noteMetadataReadSuccess(1);
+                            return .{ .status = 404 };
+                        }
+                        if (!self.modern) return .{ .status = 404 };
+                        if (self.slow_modern) {
+                            const allowance_ms = try std.fmt.parseInt(u64, request.header("X-Antfly-Routing-Remaining-Ms").?, 10);
+                            try std.testing.expect(allowance_ms > 0 and allowance_ms < 1000);
+                            self.clock.monotonic_ns += allowance_ms * std.time.ns_per_ms;
+                            return error.Timeout;
+                        }
+                        const snapshot: antfly.metadata_api.CatalogRoutingSnapshot = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 42, .tables = @constCast(&tables), .ranges = @constCast(&ranges) };
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, snapshot, .{}) };
+                    }
+                    if (std.mem.endsWith(u8, request.uri, "/snapshot") or std.mem.endsWith(u8, request.uri, "/linearizable-snapshot")) {
+                        self.legacy_calls += 1;
+                        // Every revisioned candidate must be tried before a
+                        // legacy read can establish successful read affinity.
+                        try std.testing.expectEqual(@as(usize, 2), self.point_calls);
+                        const snapshot: antfly.metadata_api.AdminSnapshot = .{ .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .metrics = .{} }, .tables = @constCast(&tables), .ranges = @constCast(&ranges), .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, snapshot, .{}) };
+                    }
+                    return error.TestUnexpectedResult;
+                }
+            };
+            for ([_]bool{ false, true }) |linearizable| {
+                const Scenario = enum { legacy_only, ordered, timed_out_ordered, affinity_changed };
+                for ([_]Scenario{ .legacy_only, .ordered, .timed_out_ordered, .affinity_changed }) |scenario| {
+                    var clock = try @import("vopr").vopr_io.VoprIo.init(.{});
+                    defer clock.deinit();
+                    const ordered = scenario == .ordered or scenario == .affinity_changed;
+                    var stub: Stub = .{ .modern = scenario != .legacy_only, .slow_modern = scenario == .timed_out_ordered, .clock = &clock };
+                    var source = try RemoteMetadataSource.initWithRequestExecutors(std.testing.allocator, &.{ "http://old.test", "http://new.test" }, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, clock.io());
+                    defer source.deinit();
+                    if (scenario == .affinity_changed) stub.affinity_target = &source;
+                    var captured = try source.remoteTableRoutingSnapshotWithMode("docs", std.time.ns_per_s, linearizable);
+                    defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &captured);
+                    try std.testing.expectEqual(@as(u64, if (ordered) 42 else 0), captured.catalog_revision);
+                    try std.testing.expectEqual(@as(usize, if (ordered) 0 else 1), stub.legacy_calls);
+                    try std.testing.expectEqual(@as(usize, if (ordered) 1 else 0), source.preferred_read_uri_index);
+                    try std.testing.expectEqualStrings("{\"model_b\":{}}", captured.tables[0].indexes_json);
+                    try std.testing.expect(source.awakeNs() < std.time.ns_per_s);
+                    if (scenario == .timed_out_ordered) try std.testing.expect(clock.monotonic_ns > 0);
+                }
+            }
+        }
+
         test "remote metadata source restore staging authority binds every owner read" {
             const alloc = std.testing.allocator;
             const staging = @import("../metadata/restore_staging.zig");
@@ -56337,7 +56448,10 @@ fn implementationTests() type {
                 try std.testing.expectEqualStrings("alice", restored_key.username);
                 try std.testing.expectEqual(@as(usize, 1), restored_key.roles.len);
                 try std.testing.expectEqualStrings("role:tenant-reader", restored_key.roles[0]);
-                try std.testing.expectEqual(@as(usize, 1), restored_key.row_filter.len);
+                try std.testing.expectEqual(@as(usize, 2), restored_key.row_filter.len);
+                const effective = (try antfly.usermgr.combinedRowFilterForTable(alloc, restored_key.row_filter, "docs")).?;
+                defer effective.deinit(alloc);
+                try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant_id\":\"acme\"}},{\"term\":{\"tier\":\"gold\"}}]}", effective.json);
                 try restored_auth.updatePassword("alice", "post-seed-secret");
             }
             // Materialization is a one-shot install. Subsequent auth mutations survive

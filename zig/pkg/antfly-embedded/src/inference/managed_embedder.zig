@@ -650,6 +650,7 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 pub const ManagedEmbeddingEntry = struct {
     alloc: std.mem.Allocator,
     io: ?std.Io = null,
+    discovery_context: ?RequestContext = null,
     bounded_http_request: bool = false,
     deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
@@ -1436,10 +1437,13 @@ pub const ManagedEmbedder = struct {
             .sparse_embed_batch_fn = embedSparseBatch,
             .sparse_embed_with_context_fn = embedSparseWithContext,
             .sparse_embed_batch_with_context_fn = embedSparseBatchWithContext,
+            .resolve_generation_fn = resolveSparseGeneration,
+            .sparse_embed_batch_planned_fn = embedSparseBatchPlanned,
             .deinit_fn = deinitSparseEmbedder,
             .set_cancellation_fn = setEmbedderCancellation,
             .set_progress_fn = setEmbedderProgress,
             .cache_revision_fn = sparseCacheRevision,
+            .cache_revision_with_context_fn = sparseCacheRevisionWithContext,
             .recovery_identity_fn = recoveryIdentity,
             .foreground_bounded = self.sparseForegroundBounded(),
         };
@@ -1737,6 +1741,28 @@ pub const ManagedEmbedder = struct {
             entry.dimensions,
             EmbeddingTaskType.retrieval_document.canonical(),
         });
+    }
+
+    fn sparseCacheRevisionWithContext(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, context: RequestContext) !?[32]u8 {
+        try context.check();
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var entry = configured.requestOverlay(a);
+        defer entry.auth_header_cache.deinit(a);
+        var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
+        applyRequestContext(&entry, context, &cancellation);
+        const control = entry.discovery_context.?;
+        const local = entry.antfly_provider orelse return null;
+        const resolve = local.model_capabilities_with_context orelse {
+            if (local.model_capabilities != null) return error.UncancellableInferenceProvider;
+            return null;
+        };
+        const capabilities = try AntflyProviderBoundary.call("model_capabilities_with_context", local.boundary_dispatch, resolve, .{ local.ptr, a, entry.model, inference_work.Task.embed, control });
+        try control.check();
+        try capabilities.validate();
+        if (capabilities.task != .embed) return error.InvalidInferenceCapabilities;
+        return capabilities.model_revision;
     }
 
     fn sparseCacheRevision(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?[32]u8 {
@@ -2217,14 +2243,23 @@ pub const ManagedEmbedder = struct {
     }
 
     fn densePartLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
-        var lease = try discoveredDensePartLeaseForEntry(entry, alloc);
+        if (entry.sparse) return error.UnsupportedEmbeddingProvider;
+        var lease = try discoveredEmbeddingLeaseForEntry(entry, alloc);
         if (entry.declared_inputs) |inputs| if (lease.capabilities) |*capabilities| applyDeclaredInputs(capabilities, inputs);
         return lease;
     }
 
-    fn discoveredDensePartLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
-        if (entry.sparse) return error.UnsupportedEmbeddingProvider;
+    fn discoveredEmbeddingLeaseForEntry(entry: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) !inference_work.CapabilityLease {
         if (entry.antfly_provider) |local| {
+            if (entry.discovery_context) |context| {
+                try context.check();
+                const resolve = local.model_capabilities_with_context orelse return error.UncancellableInferenceProvider;
+                const result = try AntflyProviderBoundary.call("model_capabilities_with_context", local.boundary_dispatch, resolve, .{ local.ptr, alloc, entry.model, inference_work.Task.embed, context });
+                try context.check();
+                try result.validate();
+                if (result.task != .embed) return error.InvalidInferenceCapabilities;
+                return .{ .capabilities = result };
+            }
             if (local.model_capabilities) |resolve| {
                 const result = try AntflyProviderBoundary.call(
                     "model_capabilities",
@@ -2317,6 +2352,37 @@ pub const ManagedEmbedder = struct {
         const owner_alloc = self.alloc;
         self.deinit();
         owner_alloc.destroy(self);
+    }
+
+    fn resolveSparseGeneration(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, context: ?RequestContext) !db_embedder.SparseEmbedder.Generation {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
+        if (configured.antfly_provider) |local| if (local.model_capabilities == null and local.model_capabilities_with_context == null) return .{};
+        var entry = configured.requestOverlay(a);
+        defer entry.auth_header_cache.deinit(a);
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&entry, value, &cancellation);
+        }
+        const lease = try discoveredEmbeddingLeaseForEntry(&entry, a);
+        return .{ .revision = if (lease.capabilities) |caps| caps.model_revision else null, .lease = lease };
+    }
+
+    fn embedSparseBatchPlanned(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, texts: []const []const u8, context: ?RequestContext, generation: db_embedder.SparseEmbedder.Generation) ![]db_embedder.SparseEmbedding {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
+        const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
+        if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
+        var entry = configured.requestOverlay(a);
+        defer entry.auth_header_cache.deinit(a);
+        var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
+        if (context) |value| {
+            try value.check();
+            applyRequestContext(&entry, value, &cancellation);
+        }
+        entry.planned_embedding_lease = generation.lease;
+        return embedSparseBatchWithEntry(a, &entry, texts);
     }
 
     fn embedSparse(ptr: *anyopaque, alloc: std.mem.Allocator, embedding_name: []const u8, text: []const u8) !db_embedder.SparseEmbedding {
@@ -2417,6 +2483,11 @@ fn applyRequestContext(
         context.deadline_ns;
     entry.cancellation = cancellation.token();
     if (context.progress) |progress| entry.progress = progress;
+    var discovery = context;
+    discovery.deadline_ns = entry.deadline_ns;
+    discovery.cancellation = entry.cancellation;
+    discovery.progress = entry.progress;
+    entry.discovery_context = discovery;
 }
 
 pub const QueryCacheSecurityDomain = enum {
@@ -7158,6 +7229,7 @@ fn embedSparseBatchWithEntry(
                 try checkEntryDispatchDeadline(entry);
                 const context = embeddingRequestContext(entry, .retrieval_document);
                 try context.check();
+                if ((context.model_revision != null or context.model_identity != null) and local.embed_sparse_texts_with_context == null) return error.InvalidEmbeddingIdentity;
                 const embeddings = (if (local.embed_sparse_texts_with_context) |embed_with_context|
                     AntflyProviderBoundary.call("embed_sparse_texts_with_context", local.boundary_dispatch, embed_with_context, .{ local.ptr, alloc, entry.model, texts, context })
                 else
@@ -11935,6 +12007,24 @@ pub fn testSparseCacheRevision() !void {
         fn sparse(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
             return a.alloc(db_embedder.SparseEmbedding, 0);
         }
+        fn controlledSparse(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8, context: EmbeddingRequestContext) ![]db_embedder.SparseEmbedding {
+            try context.check();
+            try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(7))), context.model_revision);
+            try std.testing.expectEqual(@as(usize, 1), texts.len);
+            const calls: *u8 = @ptrCast(@alignCast(ptr));
+            calls.* += 1;
+            const out = try a.alloc(db_embedder.SparseEmbedding, 1);
+            errdefer a.free(out);
+            const indices = try a.dupe(u32, &.{7});
+            errdefer a.free(indices);
+            out[0] = .{ .indices = indices, .values = try a.dupe(f32, &.{7}) };
+            return out;
+        }
+        fn controlledCapabilities(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, task: inference_work.Task, context: RequestContext) !inference_work.InferenceCapabilities {
+            try context.check();
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), context.deadline_ns);
+            return capabilities(ptr, a, name, task);
+        }
         fn capabilities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, task: inference_work.Task) anyerror!inference_work.InferenceCapabilities {
             return .{ .task = task, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .item, .output = .embedding, .model_revision = @as([32]u8, @splat(7)) };
         }
@@ -11969,6 +12059,17 @@ pub fn testSparseCacheRevision() !void {
     try std.testing.expectEqual(@as([32]u8, @splat(7)), revision);
     const dense = managed.denseInterface();
     try std.testing.expect((try dense.cache_revision_fn.?(dense.ptr, std.testing.allocator, "semantic_idx")) == null);
+    const control: RequestContext = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) };
+    managed.entries[0].antfly_provider.?.model_capabilities_with_context = Local.controlledCapabilities;
+    const controlled_sparse = managed.sparseInterface().withRequestContext(control);
+    try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(7))), try controlled_sparse.captureRevision(std.testing.allocator, "semantic_idx"));
+    managed.entries[0].antfly_provider.?.embed_sparse_texts_with_context = Local.controlledSparse;
+    const generation = try controlled_sparse.captureGeneration(std.testing.allocator, "semantic_idx");
+    const vectors = try controlled_sparse.withGeneration(generation).embedSparseBatch(std.testing.allocator, "semantic_idx", &.{ "first", "second" });
+    defer db_embedder.freeSparseEmbeddingBatch(std.testing.allocator, vectors);
+    try std.testing.expectEqual(@as(u8, 2), context);
+    managed.entries[0].antfly_provider.?.model_capabilities_with_context = null;
+    try std.testing.expectError(error.UncancellableInferenceProvider, controlled_sparse.captureRevision(std.testing.allocator, "semantic_idx"));
 }
 
 test "managed embedder endpoint access denial survives HTTP probing and runtime transport" {
@@ -12913,4 +13014,8 @@ test "offline lake build configuration validates algorithms metrics and corpus a
             return error.TestExpectedError;
         } else |_| {}
     }
+}
+
+test "managed embedder commit requirements sparse discovery carries caller context" {
+    try testSparseCacheRevision();
 }

@@ -23,6 +23,7 @@ pub const CatalogStore = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        apply_catalog_update: ?*const fn (*anyopaque, []const u8, u64, catalog_types.CatalogUpdate) anyerror!void = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         ensure_namespace: *const fn (*anyopaque, []const u8, u64, catalog_types.NamespacePolicy) anyerror!bool,
         ensure_table: *const fn (*anyopaque, []const u8, []const u8, u64, catalog_types.NamespacePolicy, []const u8, []const u8, []const u8) anyerror!bool,
@@ -34,6 +35,10 @@ pub const CatalogStore = struct {
         get_policy: *const fn (*anyopaque, []const u8) anyerror!catalog_types.NamespacePolicy,
         set_policy: *const fn (*anyopaque, []const u8, catalog_types.NamespacePolicy) anyerror!catalog_types.NamespacePolicy,
     };
+
+    pub fn applyCatalogUpdate(self: *CatalogStore, namespace: []const u8, epoch: u64, update: catalog_types.CatalogUpdate) !void {
+        return (self.vtable.apply_catalog_update orelse return error.AtomicCatalogAdmissionUnsupported)(self.ptr, namespace, epoch, update);
+    }
 
     pub fn deinit(self: *CatalogStore) void {
         self.vtable.deinit(self.allocator, self.ptr);

@@ -1098,20 +1098,18 @@ test "preprocessing slab growth failure leaves no retired backing allocation" {
     try std.testing.expect(budget.free_head == null);
 }
 
-test "adaptive preprocessing recovers concurrency for a cheap tail" {
-    const ceiling: usize = 8;
-    var workers = reduceAdaptivePreprocessWorkers(ceiling, ceiling);
-    try std.testing.expectEqual(@as(usize, 4), workers);
-    workers = reduceAdaptivePreprocessWorkers(workers, workers);
-    try std.testing.expectEqual(@as(usize, 2), workers);
-
-    // Once an expensive prefix has completed at the reduced width, successful
-    // cheap waves restore parallelism without exceeding the configured limit.
-    workers = recoverAdaptivePreprocessWorkers(workers, ceiling);
-    try std.testing.expectEqual(@as(usize, 4), workers);
-    workers = recoverAdaptivePreprocessWorkers(workers, ceiling);
-    try std.testing.expectEqual(ceiling, workers);
-    try std.testing.expectEqual(ceiling, recoverAdaptivePreprocessWorkers(workers, ceiling));
+test "preprocessing retains proven concurrency and recovers for smaller geometry" {
+    var budget = try SharedPreprocessBudget.initLazy(std.testing.allocator, 64, 1024, null);
+    defer budget.deinit();
+    var workers: usize = 8;
+    budget.attempt_work_bytes = 800;
+    budget.narrowWave(8, &workers);
+    try std.testing.expectEqual(@as(usize, 4), budget.planWorkers(&.{ 100, 100, 100, 100, 100, 100, 100, 100 }, 8));
+    // Finishing any number of those same-size waves does not widen again.
+    budget.beginAttempt();
+    try std.testing.expectEqual(@as(usize, 4), budget.planWorkers(&.{ 100, 100, 100, 100, 100, 100, 100, 100 }, 8));
+    try std.testing.expectEqual(@as(usize, 8), budget.planWorkers(&.{ 25, 25, 25, 25, 25, 25, 25, 25 }, 8));
+    try std.testing.expectEqual(@as(usize, 1), budget.planWorkers(&.{ 800, 100, 100, 100 }, 8));
 }
 
 test "decode png fixture dimensions are stable" {
@@ -1270,16 +1268,17 @@ pub fn preprocessDecodedWithResampleIntoBounded(
 ) !void {
     if (options.max_workers == 0 or options.max_inflight_decoded_bytes == 0 or options.item_errors != null)
         return error.InvalidBatchPreprocessOptions;
-    var budget = try SharedPreprocessBudget.initResizableAdmittedWithBacking(allocator, preprocessSlabBytesForWave(0, 1, options.max_inflight_decoded_bytes), options.max_inflight_decoded_bytes, options.scratch_admission);
+    var budget = try SharedPreprocessBudget.initLazy(allocator, preprocessSlabBytesForWave(0, 1, options.max_inflight_decoded_bytes), options.max_inflight_decoded_bytes, options.scratch_admission);
     defer budget.deinit();
     const scope = antfly_image.work_control.Scope.enter(options.control);
     defer scope.deinit();
     while (true) {
         try options.control.check();
-        budget.limit_exceeded.store(false, .release);
-        preprocessDecodedWithResampleInto(budget.allocator(), img, output, target_size, mean, std_dev, resample) catch |err| {
+        budget.beginAttempt();
+        preprocessDecodedWithResampleInto(budget.allocator(), img, output, target_size, mean, std_dev, resample) catch |allocation_err| {
+            const err = budget.failure(allocation_err);
             std.debug.assert(budget.live_bytes.load(.acquire) == 0);
-            if (err == error.OutOfMemory and budget.limit_exceeded.load(.acquire)) {
+            if (err == error.OutOfMemory and budget.growth_failure == null and budget.limit_exceeded.load(.acquire)) {
                 if (try budget.growAfterExhaustion()) continue;
                 return error.ImagePreprocessDecodedBytesExceeded;
             }
@@ -1807,7 +1806,7 @@ const BatchPreprocessOperation = union(enum) {
 fn preprocessSlabBytesForWave(decoded_bytes: usize, worker_count: usize, max_bytes: usize) usize {
     // RGBA is the format-independent lower bound. Double it for codec working
     // state and add bounded per-worker metadata/entropy scratch. This is only
-    // an eager sizing hint: the allocator grows on a real exhaustion signal,
+    // an advisory sizing hint: the allocator grows on a real exhaustion signal,
     // and max_bytes remains the authoritative physical ceiling.
     const decoded_and_scratch = std.math.mul(usize, decoded_bytes, 2) catch std.math.maxInt(usize);
     const worker_headroom = std.math.mul(usize, worker_count, preprocess_slab_worker_headroom_bytes) catch std.math.maxInt(usize);
@@ -1818,10 +1817,6 @@ fn preprocessSlabBytesForWave(decoded_bytes: usize, worker_count: usize, max_byt
 fn reduceAdaptivePreprocessWorkers(current: usize, failed_wave_len: usize) usize {
     const observed = @min(current, failed_wave_len);
     return if (observed <= 2) 1 else observed / 2;
-}
-
-fn recoverAdaptivePreprocessWorkers(current: usize, configured_limit: usize) usize {
-    return @min(configured_limit, std.math.mul(usize, current, 2) catch configured_limit);
 }
 
 /// A wave-scoped, thread-safe allocator that accounts decoder output and all
@@ -1847,6 +1842,31 @@ const SharedPreprocessBudget = struct {
     peak_live_bytes: std.atomic.Value(usize) = .init(0),
     limit_exceeded: std.atomic.Value(bool) = .init(false),
     scratch_admission: ?ScratchAdmission = null,
+    lazy_growth: bool = false,
+    preferred_bytes: usize = 0,
+    required_bytes: usize = 0,
+    growth_failure: ?anyerror = null,
+    attempt_work_bytes: usize = 0,
+    learned_work_capacity: ?usize = null,
+
+    /// Sizing forecasts are advisory. No slab or admission is needed until a
+    /// codec actually asks for scratch (bilinear/solid-color paths need none).
+    fn initLazy(backing: std.mem.Allocator, preferred_bytes: usize, max_bytes: usize, admission: ?ScratchAdmission) !@This() {
+        if (max_bytes == 0) return error.InvalidBatchPreprocessOptions;
+        return .{
+            .backing = backing,
+            .slab = &.{},
+            .max_bytes = max_bytes,
+            .free_head = null,
+            .scratch_admission = admission,
+            .lazy_growth = true,
+            .preferred_bytes = @min(preferred_bytes, max_bytes),
+        };
+    }
+
+    fn failure(self: *const @This(), err: anyerror) anyerror {
+        return if (err == error.OutOfMemory) self.growth_failure orelse err else err;
+    }
 
     fn init(max_live_bytes: usize) !@This() {
         return initResizableWithBacking(std.heap.page_allocator, max_live_bytes, max_live_bytes);
@@ -1900,20 +1920,111 @@ const SharedPreprocessBudget = struct {
         if (self.scratch_admission) |admission|
             try admission.grow(admission.context, self.slab.len, target);
 
+        try self.replaceSlab(target);
+    }
+
+    fn replaceSlab(self: *@This(), target: usize) !void {
         const retired = self.slab;
         self.slab = retired[0..0];
         self.free_head = null;
-        self.backing.free(retired);
+        if (retired.len > 0) self.backing.free(retired);
         const replacement = try self.backing.alignedAlloc(u8, .of(FreeBlock), target);
         self.slab = replacement;
         self.resetFreeList();
+    }
+
+    /// Admit the preferred capacity if possible, otherwise the actual demand.
+    /// No backing allocation occurs on a rejected attempt. Once allocation is
+    /// attempted, a backing OOM is terminal rather than retried as pressure.
+    fn growForDemand(self: *@This(), minimum: usize, preferred: usize) !void {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        const target = @min(self.max_bytes, @max(minimum, preferred));
+        if (self.scratch_admission) |admission| {
+            admission.grow(admission.context, self.slab.len, target) catch |err| {
+                if (minimum == target) return err;
+                switch (err) {
+                    error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => {},
+                    else => return err,
+                }
+                try admission.grow(admission.context, self.slab.len, minimum);
+                return self.replaceSlab(minimum);
+            };
+        }
+        try self.replaceSlab(target);
     }
 
     fn growAfterExhaustion(self: *@This()) !bool {
         std.debug.assert(self.live_bytes.load(.acquire) == 0);
         if (self.slab.len >= self.max_bytes) return false;
         const doubled = std.math.mul(usize, self.slab.len, 2) catch self.max_bytes;
-        try self.ensureCapacity(@min(self.max_bytes, @max(self.slab.len + 1, doubled)));
+        if (self.lazy_growth) {
+            // Fragmentation may require another retry even if the sum of live
+            // payloads fits; always make progress without exceeding the cap.
+            const minimum = @min(self.max_bytes, @max(self.slab.len + 1, self.required_bytes));
+            try self.growForDemand(minimum, @max(doubled, self.preferred_bytes));
+        } else {
+            try self.ensureCapacity(@min(self.max_bytes, @max(self.slab.len + 1, doubled)));
+        }
+        return true;
+    }
+
+    fn beginAttempt(self: *@This()) void {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        self.required_bytes = 0;
+        self.growth_failure = null;
+        self.limit_exceeded.store(false, .release);
+    }
+
+    /// A request-local ceiling learned from rejected concurrency. Identical
+    /// expensive pages keep the proven width; a cheaper prefix can widen it
+    /// without repeatedly replaying the same known-overbudget wave.
+    fn planWorkers(self: *const @This(), work: []const usize, configured: usize) usize {
+        const ceiling = @min(configured, work.len);
+        const capacity = self.learned_work_capacity orelse return @max(ceiling, 1);
+        var total: usize = 0;
+        var count: usize = 0;
+        for (work[0..ceiling]) |bytes| {
+            const next = std.math.add(usize, total, bytes) catch break;
+            if (count > 0 and next > capacity) break;
+            total = next;
+            count += 1;
+        }
+        return @max(count, 1);
+    }
+
+    fn narrowWave(self: *@This(), wave_len: usize, workers: *usize) void {
+        workers.* = reduceAdaptivePreprocessWorkers(workers.*, wave_len);
+        if (self.attempt_work_bytes == 0) return;
+        const capacity = @max(1, self.attempt_work_bytes / wave_len * workers.*);
+        self.learned_work_capacity = if (self.learned_work_capacity) |old| @min(old, capacity) else capacity;
+    }
+
+    fn admissionRefusal(err: anyerror) bool {
+        return switch (err) {
+            error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => true,
+            else => false,
+        };
+    }
+
+    /// Retry optional concurrency only after every worker has joined. Backing
+    /// OOM is terminal; admission refusal may fit after narrowing the wave.
+    /// Demand from the rejected width is reset by the next beginAttempt().
+    fn recoverWave(self: *@This(), allocation_err: anyerror, wave_len: usize, workers: *usize) !bool {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        const err = self.failure(allocation_err);
+        if (admissionRefusal(err)) {
+            if (wave_len <= 1) return err;
+        } else {
+            if (err != error.OutOfMemory or self.growth_failure != null or !self.limit_exceeded.load(.acquire)) return err;
+            const grown = self.growAfterExhaustion() catch |growth_err| {
+                if (!admissionRefusal(growth_err) or wave_len <= 1) return growth_err;
+                self.narrowWave(wave_len, workers);
+                return true;
+            };
+            if (grown) return true;
+            if (wave_len <= 1) return false;
+        }
+        self.narrowWave(wave_len, workers);
         return true;
     }
 
@@ -1954,45 +2065,68 @@ const SharedPreprocessBudget = struct {
 
         const requested_alignment = alignment.toByteUnits();
         const allocation_alignment = @max(requested_alignment, @alignOf(AllocationHeader));
-        var previous: ?*FreeBlock = null;
-        var current = self.free_head;
-        while (current) |block| {
-            const block_start = @intFromPtr(block);
-            const header_end = std.math.add(usize, block_start, @sizeOf(AllocationHeader)) catch break;
-            const user_start = std.mem.alignForward(usize, header_end, allocation_alignment);
-            const user_end = std.math.add(usize, user_start, len) catch break;
-            var suffix_start = std.mem.alignForward(usize, user_end, @alignOf(FreeBlock));
-            const block_end = std.math.add(usize, block_start, block.len) catch break;
-            if (suffix_start > block_end or user_end > block_end) {
-                previous = block;
-                current = block.next;
+        while (true) {
+            var previous: ?*FreeBlock = null;
+            var current = self.free_head;
+            while (current) |block| {
+                const block_start = @intFromPtr(block);
+                const header_end = std.math.add(usize, block_start, @sizeOf(AllocationHeader)) catch break;
+                const user_start = std.mem.alignForward(usize, header_end, allocation_alignment);
+                const user_end = std.math.add(usize, user_start, len) catch break;
+                var suffix_start = std.mem.alignForward(usize, user_end, @alignOf(FreeBlock));
+                const block_end = std.math.add(usize, block_start, block.len) catch break;
+                if (suffix_start > block_end or user_end > block_end) {
+                    previous = block;
+                    current = block.next;
+                    continue;
+                }
+
+                // Avoid manufacturing a free fragment too small to hold its own
+                // metadata. Such tail padding remains charged to this allocation.
+                if (block_end - suffix_start < @sizeOf(FreeBlock)) suffix_start = block_end;
+                const consumed = suffix_start - block_start;
+                const next = block.next;
+                if (suffix_start < block_end) {
+                    const suffix: *FreeBlock = @ptrFromInt(suffix_start);
+                    suffix.* = .{ .len = block_end - suffix_start, .next = next };
+                    if (previous) |prev| prev.next = suffix else self.free_head = suffix;
+                } else if (previous) |prev| {
+                    prev.next = next;
+                } else {
+                    self.free_head = next;
+                }
+
+                const header: *AllocationHeader = @ptrFromInt(user_start - @sizeOf(AllocationHeader));
+                header.* = .{ .block_start = @ptrFromInt(block_start), .block_len = consumed };
+                const live = self.live_bytes.load(.monotonic) + consumed;
+                self.live_bytes.store(live, .release);
+                self.peak_live_bytes.store(@max(self.peak_live_bytes.load(.monotonic), live), .release);
+                return @ptrFromInt(user_start);
+            }
+            // Include allocator metadata and worst-case alignment, not just the
+            // codec payload. Live storage prevents relocation until wave unwind.
+            const needed = needed: {
+                // Every free block starts aligned to FreeBlock. For ordinary
+                // alignments this is the exact physical footprint, including
+                // tail alignment; higher alignments allow only the remaining
+                // possible prefix padding rather than another full alignment.
+                const prefix = @sizeOf(AllocationHeader) + allocation_alignment - @alignOf(FreeBlock);
+                const end = std.math.add(usize, len, prefix) catch break :needed std.math.maxInt(usize);
+                const padded = std.math.add(usize, end, @alignOf(FreeBlock) - 1) catch break :needed std.math.maxInt(usize);
+                break :needed padded & ~@as(usize, @alignOf(FreeBlock) - 1);
+            };
+            const live = self.live_bytes.load(.acquire);
+            self.required_bytes = @max(self.required_bytes, std.math.add(usize, live, needed) catch std.math.maxInt(usize));
+            if (self.lazy_growth and live == 0 and self.slab.len < self.max_bytes and needed <= self.max_bytes and self.growth_failure == null) {
+                self.growForDemand(@max(self.slab.len + 1, needed), @max(self.preferred_bytes, self.slab.len *| 2)) catch |err| {
+                    self.growth_failure = err;
+                    return null;
+                };
                 continue;
             }
-
-            // Avoid manufacturing a free fragment too small to hold its own
-            // metadata. Such tail padding remains charged to this allocation.
-            if (block_end - suffix_start < @sizeOf(FreeBlock)) suffix_start = block_end;
-            const consumed = suffix_start - block_start;
-            const next = block.next;
-            if (suffix_start < block_end) {
-                const suffix: *FreeBlock = @ptrFromInt(suffix_start);
-                suffix.* = .{ .len = block_end - suffix_start, .next = next };
-                if (previous) |prev| prev.next = suffix else self.free_head = suffix;
-            } else if (previous) |prev| {
-                prev.next = next;
-            } else {
-                self.free_head = next;
-            }
-
-            const header: *AllocationHeader = @ptrFromInt(user_start - @sizeOf(AllocationHeader));
-            header.* = .{ .block_start = @ptrFromInt(block_start), .block_len = consumed };
-            const live = self.live_bytes.load(.monotonic) + consumed;
-            self.live_bytes.store(live, .release);
-            self.peak_live_bytes.store(@max(self.peak_live_bytes.load(.monotonic), live), .release);
-            return @ptrFromInt(user_start);
+            self.limit_exceeded.store(true, .release);
+            return null;
         }
-        self.limit_exceeded.store(true, .release);
-        return null;
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
@@ -2185,7 +2319,7 @@ fn runBorrowedRasterPreprocessBatch(
     ));
     var tasks: [maximum_preprocess_workers]BorrowedRasterPreprocessTask = undefined;
     var jobs: [maximum_preprocess_workers]linalg.pool.Job = undefined;
-    var scratch_budget = try SharedPreprocessBudget.initResizableAdmittedWithBacking(
+    var scratch_budget = try SharedPreprocessBudget.initLazy(
         backing_allocator,
         preprocessSlabBytesForWave(0, worker_limit, options.max_inflight_decoded_bytes),
         options.max_inflight_decoded_bytes,
@@ -2197,8 +2331,13 @@ fn runBorrowedRasterPreprocessBatch(
     var adaptive_worker_limit: usize = worker_limit;
     while (first < rasters.len) {
         try options.control.check();
+        var work: [maximum_preprocess_workers]usize = undefined;
+        const count = @min(worker_limit, rasters.len - first);
+        for (rasters[first..][0..count], work[0..count]) |raster, *bytes| bytes.* = raster.bytes.len;
+        adaptive_worker_limit = scratch_budget.planWorkers(work[0..count], worker_limit);
         const wave_len = @min(adaptive_worker_limit, rasters.len - first);
-        scratch_budget.limit_exceeded.store(false, .release);
+        scratch_budget.beginAttempt();
+        scratch_budget.attempt_work_bytes = preprocessWaveDecodedBytes(work[0..wave_len]);
         for (tasks[0..wave_len], 0..) |*task, offset| {
             const index = first + offset;
             task.* = .{
@@ -2223,19 +2362,11 @@ fn runBorrowedRasterPreprocessBatch(
             }
         }
         std.debug.assert(scratch_budget.live_bytes.load(.acquire) == 0);
-        if (first_error) |err| {
-            if (err == error.OutOfMemory and scratch_budget.limit_exceeded.load(.acquire)) {
-                if (try scratch_budget.growAfterExhaustion()) continue;
-                if (wave_len > 1) {
-                    adaptive_worker_limit = reduceAdaptivePreprocessWorkers(adaptive_worker_limit, wave_len);
-                    continue;
-                }
-                return error.ImagePreprocessDecodedBytesExceeded;
-            }
-            return err;
+        if (first_error) |allocation_err| {
+            if (try scratch_budget.recoverWave(allocation_err, wave_len, &adaptive_worker_limit)) continue;
+            return error.ImagePreprocessDecodedBytesExceeded;
         }
         first += wave_len;
-        adaptive_worker_limit = recoverAdaptivePreprocessWorkers(adaptive_worker_limit, worker_limit);
     }
 }
 
@@ -2291,13 +2422,11 @@ fn runBoundedPreprocessBatch(
 
     var first: usize = 0;
     var adaptive_worker_limit: usize = worker_limit;
-    // Start from the first wave's bounded demand rather than reserving the
-    // entire (normally 128 MiB) request ceiling. The slab grows only between
-    // waves and never beyond the ceiling, then remains reusable for the rest
-    // of this request without per-wave mmap/munmap churn.
+    // Forecast the first wave, but allocate only on actual codec demand.
+    // Retain capacity across waves without per-wave mmap/munmap churn.
     const first_wave_len = planPreprocessWaveLength(decoded_bytes, first, adaptive_worker_limit, options.max_inflight_decoded_bytes);
     const first_wave_bytes = preprocessWaveDecodedBytes(decoded_bytes[first..][0..first_wave_len]);
-    var wave_budget = try SharedPreprocessBudget.initResizableAdmittedWithBacking(
+    var wave_budget = try SharedPreprocessBudget.initLazy(
         std.heap.page_allocator,
         preprocessSlabBytesForWave(first_wave_bytes, first_wave_len, options.max_inflight_decoded_bytes),
         options.max_inflight_decoded_bytes,
@@ -2307,16 +2436,18 @@ fn runBoundedPreprocessBatch(
     const wave_allocator = wave_budget.allocator();
     while (first < image_list.len) {
         try options.control.check();
+        adaptive_worker_limit = wave_budget.planWorkers(decoded_bytes[first..], worker_limit);
         const wave_len = planPreprocessWaveLength(decoded_bytes, first, adaptive_worker_limit, options.max_inflight_decoded_bytes);
         const wave_decoded_bytes = preprocessWaveDecodedBytes(decoded_bytes[first..][0..wave_len]);
         std.debug.assert(wave_len > 0);
         std.debug.assert(wave_budget.live_bytes.load(.acquire) == 0);
-        try wave_budget.ensureCapacity(preprocessSlabBytesForWave(
+        wave_budget.preferred_bytes = preprocessSlabBytesForWave(
             wave_decoded_bytes,
             wave_len,
             options.max_inflight_decoded_bytes,
-        ));
-        wave_budget.limit_exceeded.store(false, .release);
+        );
+        wave_budget.beginAttempt();
+        wave_budget.attempt_work_bytes = wave_decoded_bytes;
 
         for (tasks[0..wave_len], 0..) |*task, offset| {
             const index = first + offset;
@@ -2357,30 +2488,16 @@ fn runBoundedPreprocessBatch(
             }
         }
         std.debug.assert(wave_budget.live_bytes.load(.acquire) == 0);
-        if (first_error) |err| {
-            if (err == error.OutOfMemory and wave_budget.limit_exceeded.load(.acquire)) {
-                // An intentionally small initial reservation is not evidence
-                // that concurrency is unsafe. Grow within the physical cap and
-                // retry this same wave before reducing worker width.
-                if (try wave_budget.growAfterExhaustion()) continue;
-                // A format may need substantially more scratch than its final
-                // RGBA buffer. Retry with less concurrency so a valid image is
-                // not rejected merely because peers occupied the shared cap.
-                if (wave_len > 1) {
-                    adaptive_worker_limit = reduceAdaptivePreprocessWorkers(adaptive_worker_limit, wave_len);
-                    continue;
-                }
-                if (options.item_errors) |errors| {
-                    errors[first] = error.ImagePreprocessDecodedBytesExceeded;
-                    first += 1;
-                    continue;
-                }
-                return error.ImagePreprocessDecodedBytesExceeded;
+        if (first_error) |allocation_err| {
+            if (try wave_budget.recoverWave(allocation_err, wave_len, &adaptive_worker_limit)) continue;
+            if (options.item_errors) |errors| {
+                errors[first] = error.ImagePreprocessDecodedBytesExceeded;
+                first += 1;
+                continue;
             }
-            return err;
+            return error.ImagePreprocessDecodedBytesExceeded;
         }
         first += wave_len;
-        adaptive_worker_limit = recoverAdaptivePreprocessWorkers(adaptive_worker_limit, worker_limit);
     }
 }
 
@@ -2630,7 +2747,7 @@ test "embeddinggemma2 raster rectangular bicubic matches decoded RGB and release
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
-test "Florence bounded decoded RGB resize matches existing resamplers and caps scratch" {
+test "preprocessing bounded decoded RGB resize matches existing resamplers and caps scratch" {
     var rgb = [_]u8{ 255, 12, 31, 45, 90, 180, 10, 200, 255, 0, 89, 2, 33, 60, 99, 4, 5, 6 };
     const decoded = Image{ .data = &rgb, .width = 2, .height = 3, .channels = 3 };
     for ([_]Resample{ .nearest, .bilinear, .pillow_bicubic }) |resample| {
@@ -2644,7 +2761,7 @@ test "Florence bounded decoded RGB resize matches existing resamplers and caps s
     try std.testing.expectError(error.ImagePreprocessDecodedBytesExceeded, preprocessDecodedWithResampleIntoBounded(std.testing.allocator, decoded, &output, 64, .{ 0, 0, 0 }, .{ 1, 1, 1 }, .pillow_bicubic, .{ .max_inflight_decoded_bytes = 256 }));
 }
 
-test "Florence decoded scratch admission denial precedes backing allocation" {
+test "preprocessing decoded scratch admission denial precedes backing allocation" {
     const Deny = struct {
         fn grow(_: *anyopaque, _: usize, _: usize) anyerror!void {
             return error.ResourceTemporarilyUnavailable;
@@ -2652,8 +2769,156 @@ test "Florence decoded scratch admission denial precedes backing allocation" {
     };
     var context: usize = 0;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var rgb = [_]u8{ 1, 2, 3 };
-    var output: [12]f32 = undefined;
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, preprocessDecodedWithResampleIntoBounded(failing.allocator(), .{ .data = &rgb, .width = 1, .height = 1, .channels = 3 }, &output, 2, .{ 0, 0, 0 }, .{ 1, 1, 1 }, .pillow_bicubic, .{ .scratch_admission = .{ .context = &context, .grow = Deny.grow } }));
+    var rgb = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    var output: [27]f32 = undefined;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, preprocessDecodedWithResampleIntoBounded(failing.allocator(), .{ .data = &rgb, .width = 2, .height = 2, .channels = 3 }, &output, 3, .{ 0, 0, 0 }, .{ 1, 1, 1 }, .pillow_bicubic, .{ .scratch_admission = .{ .context = &context, .grow = Deny.grow } }));
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "preprocessing no-scratch resamplers do not allocate or admit a codec slab" {
+    const Deny = struct {
+        fn grow(_: *anyopaque, _: usize, _: usize) anyerror!void {
+            return error.ResourceLimitExceeded;
+        }
+    };
+    var context: usize = 0;
+    const options = BatchPreprocessOptions{
+        .max_inflight_decoded_bytes = 32 * 1024,
+        .scratch_admission = .{ .context = &context, .grow = Deny.grow },
+    };
+    var rgba = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255 };
+    var solid = [_]u8{ 5, 6, 7 };
+    const decoded = Image{ .data = &rgba, .width = 2, .height = 2, .channels = 4 };
+    const raster = antfly_image.BorrowedRasterAttachment{ .bytes = &rgba, .width = 2, .height = 2, .stride_bytes = 8 };
+    for ([_]Resample{ .nearest, .bilinear }) |resample| {
+        var expected: [3 * 5 * 5]f32 = undefined;
+        var actual: [3 * 5 * 5]f32 = undefined;
+        try preprocessDecodedWithResampleInto(std.testing.allocator, decoded, &expected, 5, .{ 0, 0, 0 }, .{ 1, 1, 1 }, resample);
+        try preprocessDecodedWithResampleIntoBounded(std.testing.failing_allocator, decoded, &actual, 5, .{ 0, 0, 0 }, .{ 1, 1, 1 }, resample, options);
+        try std.testing.expectEqualSlices(f32, &expected, &actual);
+        try preprocessBorrowedRasterBatchIntoWithOptions(std.testing.failing_allocator, &actual, &.{raster}, 5, .{ 0, 0, 0 }, .{ 1, 1, 1 }, resample, options);
+        try std.testing.expectEqualSlices(f32, &expected, &actual);
+    }
+    var output: [3 * 5 * 5]f32 = undefined;
+    try preprocessDecodedWithResampleIntoBounded(std.testing.failing_allocator, .{ .data = &solid, .width = 1, .height = 1, .channels = 3 }, &output, 5, .{ 0, 0, 0 }, .{ 1, 1, 1 }, .pillow_bicubic, options);
+}
+
+test "preprocessing lazy slab falls back to actual demand and preserves typed failures" {
+    const Recorder = struct {
+        ceiling: usize = 32 * 1024,
+        admitted: usize = 0,
+        denied: usize = 0,
+        fn grow(ctx: *anyopaque, current: usize, target: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqual(self.admitted, current);
+            if (target > self.ceiling) {
+                self.denied += 1;
+                return error.ResourceLimitExceeded;
+            }
+            self.admitted = target;
+        }
+    };
+    var tight = Recorder{ .ceiling = @sizeOf(SharedPreprocessBudget.AllocationHeader) + 8 };
+    var tiny = try SharedPreprocessBudget.initLazy(std.testing.allocator, 64 * 1024, 128 * 1024, .{ .context = &tight, .grow = Recorder.grow });
+    defer tiny.deinit();
+    const small = try tiny.allocator().alloc(u8, 4);
+    tiny.allocator().free(small);
+    try std.testing.expectEqual(tight.ceiling, tiny.slab.len);
+    var recorder = Recorder{};
+    var budget = try SharedPreprocessBudget.initLazy(std.testing.allocator, 64 * 1024, 128 * 1024, .{ .context = &recorder, .grow = Recorder.grow });
+    defer budget.deinit();
+    try std.testing.expectEqual(@as(usize, 0), recorder.admitted);
+    const a = budget.allocator();
+    const first = try a.alloc(u8, 1024);
+    try std.testing.expect(recorder.denied > 0);
+    try std.testing.expectEqual(budget.slab.len, recorder.admitted);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 4096));
+    a.free(first);
+    try std.testing.expect(try budget.growAfterExhaustion());
+    const second = try a.alloc(u8, 4096);
+    a.free(second);
+    try std.testing.expect(budget.slab.len <= recorder.ceiling);
+    try std.testing.expect(budget.growth_failure == null);
+    recorder.ceiling = budget.slab.len;
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 32 * 1024));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, budget.failure(error.OutOfMemory));
+    try std.testing.expectEqual(recorder.admitted, budget.slab.len);
+}
+
+test "preprocessing bicubic fits admission smaller than the forecast" {
+    const Limit = struct {
+        calls: usize = 0,
+        fn grow(ctx: *anyopaque, _: usize, target: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (target > 32 * 1024) return error.ResourceLimitExceeded;
+        }
+    };
+    var limit = Limit{};
+    var rgb = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const decoded = Image{ .data = &rgb, .width = 2, .height = 2, .channels = 3 };
+    var expected: [3 * 8 * 8]f32 = undefined;
+    var actual: [3 * 8 * 8]f32 = undefined;
+    try preprocessDecodedWithResampleInto(std.testing.allocator, decoded, &expected, 8, .{ 0, 0, 0 }, .{ 1, 1, 1 }, .pillow_bicubic);
+    try preprocessDecodedWithResampleIntoBounded(std.testing.allocator, decoded, &actual, 8, .{ 0, 0, 0 }, .{ 1, 1, 1 }, .pillow_bicubic, .{ .scratch_admission = .{ .context = &limit, .grow = Limit.grow } });
+    try std.testing.expectEqualSlices(f32, &expected, &actual);
+    try std.testing.expect(limit.calls > 1);
+}
+
+test "preprocessing lazy backing OOM stays terminal after earlier slab exhaustion" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var budget = try SharedPreprocessBudget.initLazy(failing.allocator(), 128, 4096, null);
+    defer budget.deinit();
+    const a = budget.allocator();
+    const first = try a.alloc(u8, 32);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 1024));
+    a.free(first);
+    // A subsequent demand can grow only after all live allocations retire.
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 1024));
+    try std.testing.expect(budget.limit_exceeded.load(.acquire));
+    try std.testing.expectEqual(error.OutOfMemory, budget.growth_failure.?);
+    try std.testing.expectEqual(@as(usize, 0), budget.slab.len);
+}
+
+test "preprocessing admission refuses concurrent scratch then retries a smaller wave" {
+    const Limit = struct {
+        ceiling: usize = 8 * 1024,
+        fn grow(ctx: *anyopaque, _: usize, target: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (target > self.ceiling) return error.ResourceLimitExceeded;
+        }
+    };
+    var limit = Limit{};
+    var budget = try SharedPreprocessBudget.initLazy(std.testing.allocator, 64 * 1024, 128 * 1024, .{ .context = &limit, .grow = Limit.grow });
+    defer budget.deinit();
+    const a = budget.allocator();
+    var workers: usize = 2;
+    budget.beginAttempt();
+    const first = try a.alloc(u8, 6000);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 6000));
+    a.free(first);
+    // Growing the simultaneous 12 KiB wave cannot fit. A serial 6 KiB wave can.
+    try std.testing.expect(try budget.recoverWave(error.OutOfMemory, 2, &workers));
+    try std.testing.expectEqual(@as(usize, 1), workers);
+    budget.beginAttempt();
+    try std.testing.expectEqual(@as(usize, 0), budget.required_bytes);
+    const serial = try a.alloc(u8, 6000);
+    a.free(serial);
+    // An allocation-time admission failure is also retried only at lower width.
+    limit.ceiling = budget.slab.len;
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 12000));
+    workers = 2;
+    try std.testing.expect(try budget.recoverWave(error.OutOfMemory, 2, &workers));
+    budget.beginAttempt();
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 12000));
+    try std.testing.expectError(error.ResourceLimitExceeded, budget.recoverWave(error.OutOfMemory, 1, &workers));
+}
+
+test "preprocessing backing OOM cannot trigger concurrency retries" {
+    var budget = try SharedPreprocessBudget.initLazy(std.testing.failing_allocator, 4096, 8192, null);
+    defer budget.deinit();
+    var workers: usize = 8;
+    try std.testing.expectError(error.OutOfMemory, budget.allocator().alloc(u8, 32));
+    try std.testing.expectError(error.OutOfMemory, budget.recoverWave(error.OutOfMemory, 8, &workers));
+    try std.testing.expectEqual(@as(usize, 8), workers);
 }

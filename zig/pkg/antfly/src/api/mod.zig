@@ -302,6 +302,7 @@ test "api module compiles" {
     _ = kernel_bridge;
     _ = http_client;
     _ = httpx_handler;
+    _ = @import("index_aliases.zig");
     _ = store_root_enrollment_http;
     _ = connections;
     _ = ClusterHealth;

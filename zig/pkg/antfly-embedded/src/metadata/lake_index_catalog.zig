@@ -426,7 +426,7 @@ fn part(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
 /// Only target schema/index semantics participate. The transitional read
 /// schema is a serving projection, not a build input: finalizing it must not
 /// invalidate an immutable index built for the same target schema.
-pub fn desiredFingerprint(table: anytype) Digest {
+pub fn desiredFingerprint(a: A, table: anytype) !Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     // v16 fences bounded interval summaries and corrected nullable proofs.
     // Endpoint metadata migrates independently of reusable native payloads.
@@ -436,17 +436,22 @@ pub fn desiredFingerprint(table: anytype) Digest {
     hash.update(&id);
     part(&hash, table.name);
     part(&hash, table.schema_json);
-    part(&hash, table.indexes_json);
+    // The digest participates in replicated admission. Allocation failures
+    // must abort/retry the operation, never select another fingerprint.
+    const aliases = @import("../api/index_aliases.zig");
+    const physical = try aliases.physicalProjectionIfNeeded(a, table.indexes_json);
+    defer if (physical) |bytes| a.free(bytes);
+    part(&hash, physical orelse table.indexes_json);
     return hash.finalResult();
 }
 
 test "external lake desired publication survives target read schema finalization" {
     var table: @import("../common/topology_records.zig").TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = "target", .read_schema_json = "previous", .indexes_json = "indexes" };
-    const expected = desiredFingerprint(table);
+    const expected = try desiredFingerprint(std.testing.allocator, table);
     table.read_schema_json = "";
-    try std.testing.expectEqual(expected, desiredFingerprint(table));
+    try std.testing.expectEqual(expected, try desiredFingerprint(std.testing.allocator, table));
     table.schema_json = "changed target";
-    try std.testing.expect(!std.mem.eql(u8, &expected, &desiredFingerprint(table)));
+    try std.testing.expect(!std.mem.eql(u8, &expected, &(try desiredFingerprint(std.testing.allocator, table))));
 }
 
 test "metadata.lake index leases fence expiry retries and changed sources" {
@@ -493,7 +498,7 @@ pub fn transitionAllowed(a: A, before: anytype, after: anytype) !bool {
     // Dropping every retained root still advances the durable attempt counter.
     if (replacement.generation == previous.generation +| 1 and replacement.generation > previous.generation) {
         if (replacement.pending) |attempt| {
-            return std.mem.eql(u8, &attempt.signature.desired, &desiredFingerprint(after)) and
+            return std.mem.eql(u8, &attempt.signature.desired, &(try desiredFingerprint(a, after))) and
                 replacement.failure == null and try publicationEqual(a, previous.published, replacement.published) and
                 (if (replacement.checkpoint) |saved| std.meta.eql(saved.signature, attempt.signature) and try publicationEqual(a, previous.checkpoint, saved) else true);
         }
@@ -523,7 +528,7 @@ pub fn transitionAllowed(a: A, before: anytype, after: anytype) !bool {
     const publication = replacement.published orelse return false;
     return publication.generation == attempt.generation and std.mem.eql(u8, &publication.token, &attempt.token) and
         publication.reader_protocol == attempt.reader_protocol and try locatorEqual(a, publication.store_locator, attempt.store_locator) and
-        std.meta.eql(publication.signature, attempt.signature) and std.mem.eql(u8, &publication.signature.desired, &desiredFingerprint(after)) and
+        std.meta.eql(publication.signature, attempt.signature) and std.mem.eql(u8, &publication.signature.desired, &(try desiredFingerprint(a, after))) and
         publication.published_at_ms >= attempt.started_at_ms and publication.published_at_ms < attempt.lease_expires_at_ms;
 }
 
@@ -539,7 +544,7 @@ test "metadata.lake opening publication preserves ready roots and fences changed
     const a = std.testing.allocator;
     const Table = @import("../common/topology_records.zig").TableRecord;
     var table: Table = .{ .table_id = 4, .name = "lake", .schema_json = "{}" };
-    const signature: Signature = .{ .desired = desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+    const signature: Signature = .{ .desired = try desiredFingerprint(std.testing.allocator, table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
     const attempt = try (State{}).begin(signature, @splat(5), 100, 20);
     const inventory: artifacts.ArtifactRef = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
     const publication: Publication = .{
@@ -718,7 +723,7 @@ test "metadata.lake opening publication preserves ready roots and fences changed
     invalid_publication.indexes_json = table.indexes_json;
     try std.testing.expect(!try transitionAllowed(a, building, invalid_publication));
     var changed_signature = signature;
-    changed_signature.desired = desiredFingerprint(table);
+    changed_signature.desired = try desiredFingerprint(std.testing.allocator, table);
     const rebuild = try ready.begin(changed_signature, @splat(7), 200, 20);
     const rebuild_bytes = try encode(a, rebuild);
     defer a.free(rebuild_bytes);
@@ -769,4 +774,54 @@ test "metadata.lake index query definitions own publication bytes under allocati
     const table_bytes = try std.json.Stringify.valueAlloc(a, table, .{});
     defer a.free(table_bytes);
     try std.testing.expect(std.mem.indexOf(u8, table_bytes, "lake_index_catalog_json") == null);
+}
+
+test "index alias swaps preserve external lake physical publication fingerprints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const aliases = @import("../api/index_aliases.zig");
+    var table: @import("../common/topology_records.zig").TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = "target", .indexes_json = "{\"a\":{\"type\":\"full_text\"},\"b\":{\"type\":\"full_text\"}}" };
+    const expected = try desiredFingerprint(std.testing.allocator, table);
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"complete\":true}", .{});
+    table.indexes_json = try aliases.put(a, table.indexes_json, "live", .{ .index = "a", .idempotency_key = "1" }, ready, 1);
+    try std.testing.expectEqual(expected, try desiredFingerprint(std.testing.allocator, table));
+    table.indexes_json = try aliases.put(a, table.indexes_json, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "2" }, ready, 2);
+    try std.testing.expectEqual(expected, try desiredFingerprint(std.testing.allocator, table));
+    table.indexes_json = try aliases.queryProjection(a, table.indexes_json);
+    try std.testing.expectEqual(expected, try desiredFingerprint(std.testing.allocator, table));
+}
+
+test "metadata.lake index alias fingerprints propagate allocation failures" {
+    const T = @import("../common/topology_records.zig").TableRecord;
+    const plain: T = .{ .table_id = 4, .name = "lake", .schema_json = "target", .indexes_json = "{\"a\":{\"type\":\"full_text\"}}" };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const expected = try desiredFingerprint(failing.allocator(), plain);
+    var aliased = plain;
+    aliased.indexes_json = "{\"a\":{\"type\":\"full_text\"},\"_index_aliases\":{}}";
+    try std.testing.expectError(error.OutOfMemory, desiredFingerprint(failing.allocator(), aliased));
+    const Check = struct {
+        fn run(a: A, table: T, digest: Digest) !void {
+            try std.testing.expectEqual(digest, try desiredFingerprint(a, table));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ aliased, expected });
+}
+
+test "metadata.lake index alias admission retries allocation failures" {
+    const a = std.testing.allocator;
+    const T = @import("../common/topology_records.zig").TableRecord;
+    const before: T = .{ .table_id = 4, .name = "lake", .schema_json = "target", .indexes_json = "{\"a\":{\"type\":\"full_text\"},\"_index_aliases\":{}}" };
+    const signature: Signature = .{ .desired = try desiredFingerprint(a, before), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+    const pending = try (State{}).begin(signature, @splat(5), 100, 20);
+    const bytes = try encode(a, pending);
+    defer a.free(bytes);
+    var after = before;
+    after.lake_index_catalog_json = bytes;
+    const Check = struct {
+        fn run(allocator: A, old: T, next: T) !void {
+            try std.testing.expect(try transitionAllowed(allocator, old, next));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{ before, after });
 }

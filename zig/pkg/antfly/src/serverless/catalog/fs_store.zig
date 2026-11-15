@@ -21,12 +21,20 @@ const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
 
 const PersistedNamespace = struct {
+    pub fn jsonStringify(self: @This(), stream: anytype) !void {
+        if (self.policy_epoch == 0) try stream.write(.{ .name = self.name, .created_at_ns = self.created_at_ns, .policy = self.policy }) else try stream.write(.{ .name = self.name, .created_at_ns = self.created_at_ns, .policy = self.policy, .policy_epoch = self.policy_epoch });
+    }
+    policy_epoch: u64 = 0,
     name: []const u8,
     created_at_ns: u64,
     policy: catalog_types.NamespacePolicy = .{},
 };
 
 const PersistedTableBinding = struct {
+    pub fn jsonStringify(self: @This(), stream: anytype) !void {
+        if (self.definition_epoch == 0) try stream.write(.{ .table_name = self.table_name, .namespace = self.namespace, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json }) else try stream.write(.{ .table_name = self.table_name, .namespace = self.namespace, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .definition_epoch = self.definition_epoch });
+    }
+    definition_epoch: u64 = 0,
     table_name: []const u8,
     namespace: []const u8,
     schema_json: []const u8 = "",
@@ -35,6 +43,7 @@ const PersistedTableBinding = struct {
 };
 
 const TableBinding = struct {
+    definition_epoch: u64 = 0,
     table_name: []u8,
     namespace: []u8,
     schema_json: []u8,
@@ -100,6 +109,7 @@ pub const FsStore = struct {
                 .name = try self.alloc.dupe(u8, record.name),
                 .created_at_ns = record.created_at_ns,
                 .policy = record.policy,
+                .policy_epoch = record.policy_epoch,
             };
             initialized += 1;
         }
@@ -159,6 +169,7 @@ pub const FsStore = struct {
                     .name = try self.alloc.dupe(u8, record.name),
                     .created_at_ns = record.created_at_ns,
                     .policy = record.policy,
+                    .policy_epoch = record.policy_epoch,
                 };
                 initialized_namespaces += 1;
             }
@@ -185,6 +196,7 @@ pub const FsStore = struct {
                 .schema_json = try self.alloc.dupe(u8, binding.schema_json),
                 .read_schema_json = try self.alloc.dupe(u8, binding.read_schema_json),
                 .indexes_json = try self.alloc.dupe(u8, binding.indexes_json),
+                .definition_epoch = binding.definition_epoch,
             };
             initialized_bindings += 1;
         }
@@ -269,6 +281,27 @@ pub const FsStore = struct {
         return null;
     }
 
+    pub fn applyCatalogUpdate(self: *FsStore, namespace: []const u8, epoch: u64, update: catalog_types.CatalogUpdate) !void {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/.catalog-update.lock", .{self.root_dir});
+        defer self.alloc.free(path);
+        var lock = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
+        defer lock.close(io);
+        try lock.lock(io, .exclusive);
+        defer lock.unlock(io);
+        switch (update) {
+            .policy => |policy| _ = try self.setPolicyAtEpoch(namespace, policy, epoch),
+            .definition => |value| {
+                const resolved = try self.resolveNamespaceAlloc(self.alloc, value.table);
+                defer self.alloc.free(resolved);
+                if (!std.mem.eql(u8, resolved, namespace)) return error.NamespaceNotFound;
+                if (!try self.setTableDefinitionAtEpoch(value.table, value.schema, value.read_schema, value.indexes, epoch)) return error.NamespaceNotFound;
+            },
+        }
+    }
+
     pub fn setTableDefinition(
         self: *FsStore,
         table_name: []const u8,
@@ -276,12 +309,28 @@ pub const FsStore = struct {
         read_schema_json: []const u8,
         indexes_json: []const u8,
     ) !bool {
+        return self.setTableDefinitionAtEpoch(table_name, schema_json, read_schema_json, indexes_json, null);
+    }
+
+    fn setTableDefinitionAtEpoch(
+        self: *FsStore,
+        table_name: []const u8,
+        schema_json: []const u8,
+        read_schema_json: []const u8,
+        indexes_json: []const u8,
+        epoch: ?u64,
+    ) !bool {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
         const bindings = try self.loadTableBindingsAlloc(self.alloc);
         defer freeTableBindings(self.alloc, bindings);
 
+        for (bindings) |binding| if (std.mem.eql(u8, binding.table_name, table_name)) {
+            if (epoch) |value| {
+                if (binding.definition_epoch >= value) return true;
+            } else if (binding.definition_epoch != 0) return error.CatalogFenceRequired;
+        };
         const updated_bindings = try self.alloc.alloc(TableBinding, bindings.len);
         errdefer self.alloc.free(updated_bindings);
         var initialized_bindings: usize = 0;
@@ -296,6 +345,7 @@ pub const FsStore = struct {
                 .schema_json = try self.alloc.dupe(u8, if (is_target) schema_json else binding.schema_json),
                 .read_schema_json = try self.alloc.dupe(u8, if (is_target) read_schema_json else binding.read_schema_json),
                 .indexes_json = try self.alloc.dupe(u8, if (is_target) indexes_json else binding.indexes_json),
+                .definition_epoch = if (is_target) epoch orelse 0 else binding.definition_epoch,
             };
             initialized_bindings += 1;
             if (is_target) found = true;
@@ -336,6 +386,10 @@ pub const FsStore = struct {
     }
 
     pub fn setPolicy(self: *FsStore, namespace: []const u8, policy: catalog_types.NamespacePolicy) !catalog_types.NamespacePolicy {
+        return self.setPolicyAtEpoch(namespace, policy, null);
+    }
+
+    fn setPolicyAtEpoch(self: *FsStore, namespace: []const u8, policy: catalog_types.NamespacePolicy, epoch: ?u64) !catalog_types.NamespacePolicy {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -345,6 +399,10 @@ pub const FsStore = struct {
         var found = false;
         for (records) |*record| {
             if (!std.mem.eql(u8, record.name, namespace)) continue;
+            if (epoch) |value| {
+                if (record.policy_epoch >= value) return record.policy;
+            } else if (record.policy_epoch != 0) return error.CatalogFenceRequired;
+            record.policy_epoch = epoch orelse 0;
             record.policy = policy;
             found = true;
             break;
@@ -377,6 +435,7 @@ pub const FsStore = struct {
                 .name = try alloc.dupe(u8, record.name),
                 .created_at_ns = record.created_at_ns,
                 .policy = record.policy,
+                .policy_epoch = record.policy_epoch,
             };
             initialized += 1;
         }
@@ -395,6 +454,7 @@ pub const FsStore = struct {
                 .name = record.name,
                 .created_at_ns = record.created_at_ns,
                 .policy = record.policy,
+                .policy_epoch = record.policy_epoch,
             };
         }
 
@@ -427,6 +487,7 @@ pub const FsStore = struct {
                 .schema_json = try alloc.dupe(u8, binding.schema_json),
                 .read_schema_json = try alloc.dupe(u8, binding.read_schema_json),
                 .indexes_json = try alloc.dupe(u8, binding.indexes_json),
+                .definition_epoch = binding.definition_epoch,
             };
             initialized += 1;
         }
@@ -447,6 +508,7 @@ pub const FsStore = struct {
                 .schema_json = binding.schema_json,
                 .read_schema_json = binding.read_schema_json,
                 .indexes_json = binding.indexes_json,
+                .definition_epoch = binding.definition_epoch,
             };
         }
 
@@ -456,6 +518,7 @@ pub const FsStore = struct {
     }
 
     const vtable: catalog_store.CatalogStore.VTable = .{
+        .apply_catalog_update = erasedCatalogUpdate,
         .deinit = erasedDeinit,
         .ensure_namespace = erasedEnsureNamespace,
         .ensure_table = erasedEnsureTable,
@@ -468,6 +531,10 @@ pub const FsStore = struct {
         .set_policy = erasedSetPolicy,
     };
 
+    fn erasedCatalogUpdate(ptr: *anyopaque, namespace: []const u8, epoch: u64, update: catalog_types.CatalogUpdate) !void {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return self.applyCatalogUpdate(namespace, epoch, update);
+    }
     fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         self.deinit();

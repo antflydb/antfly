@@ -610,6 +610,7 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
         try service.ensureLinearizableReadWithContext(context);
         if (!try store.resolverProjectionValid(service.alloc, service.metadata_group_id, replacement)) return error.ResolverCurationConflict;
+        try store.validateTableIndexMutation(service.metadata_group_id, expected, replacement);
     }
 
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
@@ -1039,15 +1040,15 @@ fn preflightProjectedPlacementWithContextImpl(service: anytype, request: api_ope
     const tables = try service.listProjectedTables(service.alloc);
     defer service.freeProjectedTables(service.alloc, tables);
     for (tables) |table|
-        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+        required_version = @max(required_version, (try transitionRequiredCoordinatedDecoderVersion(service.alloc, .{ .upsert_table = table })));
     const splits = try service.listProjectedSplitTransitions(service.alloc);
     defer service.freeProjectedSplitTransitions(service.alloc, splits);
     for (splits) |split|
-        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_split_transition = split }));
+        required_version = @max(required_version, (try transitionRequiredCoordinatedDecoderVersion(service.alloc, .{ .upsert_split_transition = split })));
     const merges = try service.listProjectedMergeTransitions(service.alloc);
     defer service.freeProjectedMergeTransitions(service.alloc, merges);
     for (merges) |merge|
-        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_merge_transition = merge }));
+        required_version = @max(required_version, (try transitionRequiredCoordinatedDecoderVersion(service.alloc, .{ .upsert_merge_transition = merge })));
     if (required_version != 0)
         _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
 }
@@ -1058,7 +1059,7 @@ fn preflightTableRecordWithContextImpl(service: anytype, request: api_operation.
         const store = service.projectedStore() orelse return error.MissingMetadataStore;
         if (!try store.resolverProjectionValid(service.alloc, service.metadata_group_id, table)) return error.ResolverCurationConflict;
     }
-    const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table });
+    const required_version = (try transitionRequiredCoordinatedDecoderVersion(service.alloc, .{ .upsert_table = table }));
     if (required_version != 0)
         _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
 }
@@ -1117,7 +1118,22 @@ fn removeReplicaIntentCatalogLocked(
     } });
 }
 
+// These background/admission plans intentionally keep asynchronous proposal
+// semantics. A successful prefix can still commit if a later command fails;
+// only a rejection before that prefix proves the whole request is unapplied.
 fn applyReconciliationPlanMode(service: anytype, plan: *const metadata_reconciler.ReconciliationPlan, comptime catalog_locked: bool) !void {
+    var possible_admission = false;
+    applyReconciliationPlanSequential(service, plan, catalog_locked, &possible_admission) catch |err| {
+        if (!possible_admission) return err;
+        // A failed suffix does not roll back an admitted prefix. Match the
+        // receipt-backed path: all failures after admission have an unknown
+        // request outcome, including validation and cancellation failures.
+        std.log.warn("metadata reconciliation plan outcome became ambiguous after a successful prefix err={s}", .{@errorName(err)});
+        return error.MetadataMutationOutcomeUnknown;
+    };
+}
+
+fn applyReconciliationPlanSequential(service: anytype, plan: *const metadata_reconciler.ReconciliationPlan, comptime catalog_locked: bool, possible_admission: *bool) !void {
     std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
     for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
         if (comptime catalog_locked) {
@@ -1129,12 +1145,28 @@ fn applyReconciliationPlanMode(service: anytype, plan: *const metadata_reconcile
         } else {
             try service.upsertReplicaIntent(intent, precondition.expected_metadata_version, precondition.expected_version_fence, precondition.expected_target_drain_requested);
         }
+        possible_admission.* = true;
     }
-    for (plan.table_upserts) |record| try service.upsertTable(record);
-    for (plan.split_admissions) |admission| try service.admitSplitTransition(admission);
-    for (plan.range_upserts) |record| try service.upsertRange(record);
-    for (plan.split_upserts) |record| try service.upsertSplitTransition(record);
-    for (plan.merge_upserts) |record| try service.upsertMergeTransition(record);
+    for (plan.table_upserts) |record| {
+        try service.upsertTable(record);
+        possible_admission.* = true;
+    }
+    for (plan.split_admissions) |admission| {
+        try service.admitSplitTransition(admission);
+        possible_admission.* = true;
+    }
+    for (plan.range_upserts) |record| {
+        try service.upsertRange(record);
+        possible_admission.* = true;
+    }
+    for (plan.split_upserts) |record| {
+        try service.upsertSplitTransition(record);
+        possible_admission.* = true;
+    }
+    for (plan.merge_upserts) |record| {
+        try service.upsertMergeTransition(record);
+        possible_admission.* = true;
+    }
     for (plan.placement_removals) |record| {
         if (comptime catalog_locked) {
             const preflight = try cachedInitialPlacementProof(service, record.group_id);
@@ -1142,12 +1174,28 @@ fn applyReconciliationPlanMode(service: anytype, plan: *const metadata_reconcile
         } else {
             try service.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
         }
+        possible_admission.* = true;
     }
-    for (plan.table_removals) |table_id| try service.removeTable(table_id);
-    for (plan.range_removals) |group_id| try service.removeRange(group_id);
-    for (plan.split_removals) |transition_id| try service.removeSplitTransition(transition_id);
-    for (plan.merge_removals) |transition_id| try service.removeMergeTransition(transition_id);
-    if (plan.clear_reallocation_request) |expected| try service.clearReallocationRequest(expected);
+    for (plan.table_removals) |table_id| {
+        try service.removeTable(table_id);
+        possible_admission.* = true;
+    }
+    for (plan.range_removals) |group_id| {
+        try service.removeRange(group_id);
+        possible_admission.* = true;
+    }
+    for (plan.split_removals) |transition_id| {
+        try service.removeSplitTransition(transition_id);
+        possible_admission.* = true;
+    }
+    for (plan.merge_removals) |transition_id| {
+        try service.removeMergeTransition(transition_id);
+        possible_admission.* = true;
+    }
+    if (plan.clear_reallocation_request) |expected| {
+        try service.clearReallocationRequest(expected);
+        possible_admission.* = true;
+    }
 }
 
 /// Materialize a multi-command catalog plan before admitting any part of it,
@@ -1402,6 +1450,59 @@ test "metadata service node lifecycle proposal distinguishes rejection from ambi
         .{ .finalize_node_shutdown = .{ .node_id = 9 } },
     );
     try std.testing.expectEqual(@as(usize, 1), committed.wait_calls);
+}
+
+test "metadata reconciliation sequential plans fence rejection proofs after a transition" {
+    const FakeService = struct {
+        fail_at: usize,
+        failure: anyerror,
+        calls: usize = 0,
+        admitted: usize = 0,
+        fn record(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.fail_at) return self.failure;
+            self.admitted += 1;
+        }
+        fn one(self: *@This(), _: anytype) !void {
+            try self.record();
+        }
+        pub const upsertTable = one;
+        pub const admitSplitTransition = one;
+        pub const upsertRange = one;
+        pub const upsertSplitTransition = one;
+        pub const upsertMergeTransition = one;
+        pub const removeTable = one;
+        pub const removeRange = one;
+        pub const removeSplitTransition = one;
+        pub const removeMergeTransition = one;
+        pub const clearReallocationRequest = one;
+        pub fn upsertReplicaIntent(self: *@This(), _: anytype, _: anytype, _: anytype, _: anytype) !void {
+            try self.record();
+        }
+        pub fn removeReplicaIntent(self: *@This(), _: u64, _: u64, _: u64) !void {
+            try self.record();
+        }
+    };
+    const splits = [_]metadata_reconciler.SplitAdmission{.{ .expected_source_epoch = 0, .record = .{ .transition_id = 19, .attempt_epoch = 1, .source_group_id = 71, .destination_group_id = 72 } }};
+    const merges = [_]transition_state.MergeTransitionRecord{.{ .transition_id = 29, .donor_group_id = 71, .receiver_group_id = 72 }};
+    const removals = [_]u64{99};
+    for ([_]bool{ false, true }) |split| {
+        var plan = metadata_reconciler.ReconciliationPlan.empty();
+        if (split) plan.split_admissions = @constCast(&splits) else plan.merge_upserts = @constCast(&merges);
+        // A transition can be admitted before cleanup of an unrelated group.
+        plan.range_removals = @constCast(&removals);
+        for ([_]anyerror{ error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataMutationNotApplied, error.InvalidArguments, error.OutOfMemory, error.Canceled, error.DeadlineExceeded }) |failure| {
+            for (1..3) |fail_at| {
+                var fake: FakeService = .{ .fail_at = fail_at, .failure = failure };
+                try std.testing.expectError(if (fail_at == 1) failure else error.MetadataMutationOutcomeUnknown, applyReconciliationPlanMode(&fake, &plan, false));
+                try std.testing.expectEqual(fail_at, fake.calls);
+                try std.testing.expectEqual(fail_at - 1, fake.admitted);
+            }
+        }
+        var ready: FakeService = .{ .fail_at = 0, .failure = error.NotLeader };
+        try applyReconciliationPlanMode(&ready, &plan, false);
+        try std.testing.expectEqual(@as(usize, 2), ready.admitted);
+    }
 }
 
 test "metadata reconciliation plan uses one terminal receipt for ordered apply" {
@@ -3268,6 +3369,12 @@ fn requirePrivacyStoreAdmission(service: anytype, record: metadata_table_manager
     for (tables) |table| if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) return error.PrivacyProtocolUpgradeRequired;
 }
 
+fn requireIndexAliasStoreAdmission(service: anytype, record: metadata_table_manager.StoreRecord) !void {
+    if (!record.live or !metadata_table_manager.storeServesTableData(record.role) or metadata_table_manager.indexAliasesProtocolSupported(record.reporter_incarnation, record.artifact_sources_protocol_version)) return;
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (try store.hasIndexAliases(service.metadata_group_id)) return error.IndexAliasProtocolUpgradeRequired;
+}
+
 fn validateDenseNativeStoreAdmission(
     stores: []const metadata_table_manager.StoreRecord,
     activated_version: u16,
@@ -3533,17 +3640,21 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// New wire shapes must never be appended merely because the leader can
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
-pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
-    var required = transitionBaseDecoderVersion(command);
+/// Allocation failure aborts admission instead of selecting another floor.
+pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) std.mem.Allocator.Error!u16 {
+    var required = (try transitionBaseDecoderVersion(a, command));
     switch (command) {
-        .upsert_table => |table| required = @max(required, tableDecoderVersion(table)),
-        .compare_and_replace_table => |cas| required = @max(required, @max(tableDecoderVersion(cas.expected), tableDecoderVersion(cas.replacement))),
+        .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
+            if (record.artifact_sources_protocol_version >= 3) required = @max(required, metadata_topology_protocol.index_aliases_version);
+        },
+        .upsert_table => |table| required = @max(required, (try tableDecoderVersion(a, table))),
+        .compare_and_replace_table => |cas| required = @max(required, @max((try tableDecoderVersion(a, cas.expected)), (try tableDecoderVersion(a, cas.replacement)))),
         .apply_table_topology => |mutation| switch (mutation) {
-            .create => |create| required = @max(required, tableDecoderVersion(create.table)),
+            .create => |create| required = @max(required, (try tableDecoderVersion(a, create.table))),
             .drop => {},
         },
         .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| {
-            for (delta.upsert_tables) |table| required = @max(required, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+            for (delta.upsert_tables) |table| required = @max(required, (try transitionRequiredCoordinatedDecoderVersion(a, .{ .upsert_table = table })));
         },
         else => {},
     }
@@ -3552,8 +3663,9 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
 
 // Table features compose: adding a lower-floor feature must never mask a
 // higher decoder requirement, including the prior definition in a CAS.
-fn tableDecoderVersion(table: metadata_table_manager.TableRecord) u16 {
+fn tableDecoderVersion(a: std.mem.Allocator, table: metadata_table_manager.TableRecord) !u16 {
     var required: u16 = 0;
+    if (try metadata_topology_protocol.usesIndexAliases(a, table.indexes_json)) required = @max(required, metadata_topology_protocol.index_aliases_version);
     if (table.storage.engine == .object) required = @max(required, metadata_topology_protocol.object_table_engine_version);
     if (table.lake_index_catalog_json.len != 0) required = @max(required, metadata_topology_protocol.lake_index_catalog_version);
     if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) required = @max(required, metadata_topology_protocol.privacy_version);
@@ -3562,7 +3674,30 @@ fn tableDecoderVersion(table: metadata_table_manager.TableRecord) u16 {
     return required;
 }
 
-fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+test "index alias decoder floor composes with table features and preserves CAS history" {
+    const aliases: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_index_aliases\":{},\"_privacy\":{}}", .storage = .{ .engine = .object }, .lake_index_catalog_json = "{}" };
+    const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
+    const floor = metadata_topology_protocol.index_aliases_version;
+    try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = aliases })));
+    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = aliases } } }, .{});
+    defer std.testing.allocator.free(envelope);
+    try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = envelope })));
+    try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = aliases, .replacement = plain } })));
+    try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(0, 3));
+    try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, 2));
+    try std.testing.expect(metadata_table_manager.indexAliasesProtocolSupported(7, 3));
+    try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, metadata_table_manager.artifact_sources_protocol_version + 1));
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, command: metadata_storage.TransitionCommand, expected: u16) !void {
+            try std.testing.expectEqual(expected, try transitionRequiredCoordinatedDecoderVersion(allocator, command));
+        }
+    };
+    const escaped: metadata_table_manager.TableRecord = .{ .table_id = 2, .name = "plain", .indexes_json = "{\"text\":{\"type\":\"full_text\",\"description\":\"line\\nnext\"}}" };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .upsert_table = escaped }, @as(u16, 0) });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ metadata_storage.TransitionCommand{ .apply_system_catalog = envelope }, floor });
+}
+
+fn transitionBaseDecoderVersion(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) std.mem.Allocator.Error!u16 {
     if (command == .compare_and_set_job_state) return if (std.mem.startsWith(u8, command.compare_and_set_job_state.key, "privacy/")) metadata_topology_protocol.privacy_version else metadata_topology_protocol.job_state_version;
     const namespace_indexes = switch (command) {
         .apply_restore_staging, .apply_system_catalog => |bytes| bytes,
@@ -3574,13 +3709,14 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         },
         else => "",
     };
+    if ((command == .apply_restore_staging or command == .apply_system_catalog) and namespace_indexes.len != 0 and try @import("antfly_local_sources").api_index_metadata.aliases.usesEnvelope(a, namespace_indexes)) return metadata_topology_protocol.index_aliases_version;
     if (metadata_topology_protocol.usesPrivacy(namespace_indexes)) return metadata_topology_protocol.privacy_version;
     if (metadata_topology_protocol.usesResolverRecords(namespace_indexes)) return metadata_topology_protocol.resolver_records_version;
     if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
     switch (command) {
         .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| {
             var required: u16 = 0;
-            for (delta.upsert_tables) |table| required = @max(required, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+            for (delta.upsert_tables) |table| required = @max(required, (try transitionRequiredCoordinatedDecoderVersion(a, .{ .upsert_table = table })));
             if (required >= metadata_topology_protocol.resolver_namespaces_version) return required;
         },
         else => {},
@@ -3588,7 +3724,10 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
     if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
     if (command == .apply_system_catalog) {
         const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind } };
-        var parsed = std.json.parseFromSlice(Header, std.heap.page_allocator, command.apply_system_catalog, .{ .ignore_unknown_fields = true }) catch return metadata_topology_protocol.current_version;
+        var parsed = std.json.parseFromSlice(Header, a, command.apply_system_catalog, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return metadata_topology_protocol.current_version,
+        };
         defer parsed.deinit();
         if (parsed.value.mutation.kind == .graph) return metadata_topology_protocol.graph_definition_version;
     }
@@ -3676,8 +3815,8 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
     return if (requires_v11) metadata_topology_protocol.coordinated_lifecycle_version else 0;
 }
 
-pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.TransitionCommand) bool {
-    return transitionRequiredCoordinatedDecoderVersion(command) != 0;
+pub fn transitionRequiresCoordinatedDecoder(a: std.mem.Allocator, command: metadata_storage.TransitionCommand) !bool {
+    return (try transitionRequiredCoordinatedDecoderVersion(a, command)) != 0;
 }
 
 fn preflightRowPolicyTopologyCommand(service: anytype, command: metadata_storage.TransitionCommand) !void {
@@ -3711,7 +3850,7 @@ fn preflightRowPolicyTopologyCommand(service: anytype, command: metadata_storage
 /// workflow admission; the final proposal path below only consumes a proof.
 pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_storage.TransitionCommand, request: api_operation.RequestContext) !void {
     try request.ensureActive();
-    const required_version = @max(transitionRequiredCoordinatedDecoderVersion(command), if (metadata_storage.raft_apply_store.apply_contract.transitionMutatesRelationSource(command)) try relationSourceDecoderFloor(service) else 0);
+    const required_version = @max((try transitionRequiredCoordinatedDecoderVersion(service.alloc, command)), if (metadata_storage.raft_apply_store.apply_contract.transitionMutatesRelationSource(command)) try relationSourceDecoderFloor(service) else 0);
     if (required_version == 0) return;
     if (comptime !@hasDecl(@TypeOf(service.*), "ensureTableTopologyProtocolReadyWithContext"))
         return error.TableTopologyProtocolUpgradeRequired;
@@ -3785,7 +3924,7 @@ fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metada
     } else false;
     const source_floor = if (has_source) try relationSourceDecoderFloor(service) else 0;
     for (commands) |command| {
-        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(command));
+        required_version = @max(required_version, (try transitionRequiredCoordinatedDecoderVersion(service.alloc, command)));
         if (metadata_storage.raft_apply_store.apply_contract.transitionMutatesRelationSource(command)) required_version = @max(required_version, source_floor);
     }
     if (required_version == 0) return .{ .source_mutation = has_source };
@@ -6129,6 +6268,14 @@ pub const MetadataService = struct {
         _ = try self.raft.stepTransitions();
     }
 
+    pub fn localMetadataLeadershipTerm(self: *MetadataService) ?u64 {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const leadership_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse return null;
+        if (leadership_status.soft.role != .leader or leadership_status.soft.leader_id == null or leadership_status.soft.leader_id.? != leadership_status.id) return null;
+        return leadership_status.hard.current_term;
+    }
+
     fn isLocalMetadataLeader(self: *MetadataService) bool {
         self.lockRuntime();
         defer self.unlockRuntime();
@@ -6932,13 +7079,14 @@ pub const MetadataService = struct {
     }
 
     pub fn upsertStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
-        const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .upsert_store = record });
+        const required_version = (try transitionRequiredCoordinatedDecoderVersion(self.alloc, .{ .upsert_store = record }));
         const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
         const floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(floor, record);
+        try requireIndexAliasStoreAdmission(self, record);
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
@@ -6974,7 +7122,7 @@ pub const MetadataService = struct {
     }
 
     pub fn registerStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
-        const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .register_store = record });
+        const required_version = (try transitionRequiredCoordinatedDecoderVersion(self.alloc, .{ .register_store = record }));
         const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
@@ -6987,6 +7135,7 @@ pub const MetadataService = struct {
             0;
         try validateDenseNativeStoreAdmission(stores, activated_version, record);
         try requirePrivacyStoreAdmission(self, record);
+        try requireIndexAliasStoreAdmission(self, record);
         const topology_floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(topology_floor, record);
         try self.proposeTransitionCommand(.{ .register_store = record });
@@ -8575,17 +8724,20 @@ pub const MetadataService = struct {
 
     fn ensureReconcileLeaseLocked(self: *MetadataService) !bool {
         const now_ms = self.reconcile_lease.nowMs();
-        const is_local_leader = self.isLocalMetadataLeader();
+        const term = self.localMetadataLeadershipTerm();
+        const is_local_leader = term != null;
         const projected = self.getCachedProjectedReconcileLease(now_ms, is_local_leader) catch |err| switch (err) {
             error.MissingMetadataStore => null,
             else => return err,
         };
         const has_lease = self.reconcile_lease.observe(is_local_leader, projected, now_ms);
-        if (self.reconcile_lease.shouldRenew(is_local_leader, projected, now_ms)) {
-            self.upsertReconcileLease(self.reconcile_lease.desiredRecord(now_ms)) catch |err| {
+        if (self.reconcile_lease.shouldProposeRenewal(term, projected, now_ms)) {
+            const desired = self.reconcile_lease.desiredRecord(now_ms);
+            self.upsertReconcileLease(desired) catch |err| {
                 self.reconcile_lease.noteAcquireFailure();
                 return err;
             };
+            self.reconcile_lease.noteRenewalProposed(term.?, desired);
         }
         return has_lease;
     }
@@ -9519,13 +9671,14 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn upsertStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
-        const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .upsert_store = record });
+        const required_version = (try transitionRequiredCoordinatedDecoderVersion(self.alloc, .{ .upsert_store = record }));
         const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
         const floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(floor, record);
+        try requireIndexAliasStoreAdmission(self, record);
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
@@ -9894,7 +10047,7 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn registerStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
-        const required_version = transitionRequiredCoordinatedDecoderVersion(.{ .register_store = record });
+        const required_version = (try transitionRequiredCoordinatedDecoderVersion(self.alloc, .{ .register_store = record }));
         const readiness = if (required_version != 0) try self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version) else null;
         self.lockCatalogMutation();
         defer self.unlockCatalogMutation();
@@ -9907,6 +10060,7 @@ pub const MetadataHttpService = struct {
             0;
         try validateDenseNativeStoreAdmission(stores, activated_version, record);
         try requirePrivacyStoreAdmission(self, record);
+        try requireIndexAliasStoreAdmission(self, record);
         const topology_floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(topology_floor, record);
         try self.proposeTransitionCommand(.{ .register_store = record });
@@ -13449,17 +13603,20 @@ pub const MetadataHttpService = struct {
 
     fn ensureReconcileLeaseLocked(self: *MetadataHttpService) !bool {
         const now_ms = self.reconcile_lease.nowMs();
-        const is_local_leader = self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id);
+        const term = self.localMetadataLeadershipTerm();
+        const is_local_leader = term != null;
         const projected = self.getCachedProjectedReconcileLease(now_ms, is_local_leader) catch |err| switch (err) {
             error.MissingMetadataStore => null,
             else => return err,
         };
         const has_lease = self.reconcile_lease.observe(is_local_leader, projected, now_ms);
-        if (self.reconcile_lease.shouldRenew(is_local_leader, projected, now_ms)) {
-            self.upsertReconcileLease(self.reconcile_lease.desiredRecord(now_ms)) catch |err| {
+        if (self.reconcile_lease.shouldProposeRenewal(term, projected, now_ms)) {
+            const desired = self.reconcile_lease.desiredRecord(now_ms);
+            self.upsertReconcileLease(desired) catch |err| {
                 self.reconcile_lease.noteAcquireFailure();
                 return err;
             };
+            self.reconcile_lease.noteRenewalProposed(term.?, desired);
         }
         return has_lease;
     }
@@ -13620,11 +13777,11 @@ test "metadata service reallocation barrier requires a current protocol from the
 test "metadata table topology protocol fences namespace writers and restored declarations" {
     const version = metadata_topology_protocol.resolver_namespaces_version;
     const table: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "source", .indexes_json = "{\"knowledge\":{\"resolvers\":[]}}" };
-    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = "{\"topology\":{\"create\":{\"table\":{\"indexes_json\":\"{\\\"resolvers\\\":[]}\"}}}}" }));
-    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
-    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } }));
-    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
-    try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"indexes_json\":\"{\\\"_resolver_namespaces\\\":{}}\"}" }));
+    try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = "{\"topology\":{\"create\":{\"table\":{\"indexes_json\":\"{\\\"resolvers\\\":[]}\"}}}}" })));
+    try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = table })));
+    try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = table, .replacement = table } })));
+    try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } })));
+    try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_restore_staging = "{\"indexes_json\":\"{\\\"_resolver_namespaces\\\":{}}\"}" })));
     // The predecessor advertises v35 but cannot parse the provenance fields
     // emitted even by an otherwise empty new curation state. Every table
     // writer, including reserved-only retired/proposal metadata, must fence it.
@@ -13636,14 +13793,14 @@ test "metadata table topology protocol fences namespace writers and restored dec
     }) |indexes| {
         var replacement = table;
         replacement.indexes_json = indexes;
-        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = replacement }));
-        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = replacement } }));
-        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle = .{ .upsert_tables = &.{replacement} } }));
-        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{replacement} } }));
+        try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = replacement })));
+        try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = table, .replacement = replacement } })));
+        try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_extension_lifecycle = .{ .upsert_tables = &.{replacement} } })));
+        try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{replacement} } })));
         const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .indexes_json = indexes }, .{});
         defer std.testing.allocator.free(encoded);
-        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = encoded }));
-        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = encoded }));
+        try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_restore_staging = encoded })));
+        try std.testing.expectEqual(version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_system_catalog = encoded })));
     }
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var predecessor = MetadataStatus{
@@ -13851,10 +14008,10 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, service.propose(&.{command}));
         try std.testing.expectEqual(@as(usize, 1), service.appended);
     }
-    try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .upsert_restore_job = .{ .key = "1", .value = "{}" } }));
+    try std.testing.expect(!(try transitionRequiresCoordinatedDecoder(std.testing.allocator, .{ .upsert_restore_job = .{ .key = "1", .value = "{}" } })));
     const relation_mutation_command: metadata_storage.TransitionCommand = .{ .compare_and_replace_table = .{ .expected = plain, .replacement = plain, .relation_guard = .{ .target = .{ .name = "idx" }, .logical_table = plain.name, .owner = .{ .table_id = plain.table_id, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) } } };
     const relation_version = metadata_topology_protocol.relation_mutation_version;
-    try std.testing.expectEqual(relation_version, transitionRequiredCoordinatedDecoderVersion(relation_mutation_command));
+    try std.testing.expectEqual(relation_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, relation_mutation_command)));
     var relation_service: Fake = .{ .member_versions = &.{ relation_version, relation_version - 1, relation_version } };
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&relation_service, relation_mutation_command, .{}));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{relation_mutation_command}));
@@ -13863,8 +14020,8 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try ensureCoordinatedDecoderWithContext(&relation_service, relation_mutation_command, .{});
     try relation_service.propose(&.{relation_mutation_command});
     try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
-    try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .create_restore_job = .{ .key = "1", .value = "{}" } }));
-    try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{plain} } }));
+    try std.testing.expect(!(try transitionRequiresCoordinatedDecoder(std.testing.allocator, .{ .create_restore_job = .{ .key = "1", .value = "{}" } })));
+    try std.testing.expect(!(try transitionRequiresCoordinatedDecoder(std.testing.allocator, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{plain} } })));
     const root_bound_store: metadata_table_manager.StoreRecord = .{
         .store_id = 17,
         .node_id = 1,
@@ -13872,11 +14029,11 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         .replica_root_incarnation = 0x1234,
     };
     const root_command: metadata_storage.TransitionCommand = .{ .register_store = root_bound_store };
-    try std.testing.expectEqual(metadata_topology_protocol.store_root_uuid_decoder_version, transitionRequiredCoordinatedDecoderVersion(root_command));
+    try std.testing.expectEqual(metadata_topology_protocol.store_root_uuid_decoder_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, root_command)));
     var signing_store = root_bound_store;
     signing_store.replica_root_public_key = @splat(7);
-    try std.testing.expectEqual(metadata_topology_protocol.store_root_signing_decoder_version, transitionRequiredCoordinatedDecoderVersion(.{ .register_store = signing_store }));
-    try std.testing.expectEqual(metadata_topology_protocol.store_root_signing_decoder_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_store = signing_store }));
+    try std.testing.expectEqual(metadata_topology_protocol.store_root_signing_decoder_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .register_store = signing_store })));
+    try std.testing.expectEqual(metadata_topology_protocol.store_root_signing_decoder_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_store = signing_store })));
     const signing_command: metadata_storage.TransitionCommand = .{ .register_store = signing_store };
     var signing_service: Fake = .{ .member_versions = &.{ 18, 17, 18 } }; // One v17 learner still blocks v18 bytes.
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&signing_service, signing_command, .{}));
@@ -13892,7 +14049,7 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try std.testing.expectEqual(@as(usize, 1), signing_service.appended);
     const initial_create_command: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{}" };
     const generation_command: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{}" };
-    try std.testing.expectEqual(metadata_topology_protocol.fk_generation_publication_version, transitionRequiredCoordinatedDecoderVersion(generation_command));
+    try std.testing.expectEqual(metadata_topology_protocol.fk_generation_publication_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, generation_command)));
     var mixed_generation: Fake = .{ .member_versions = &.{ 19, 18, 19 } };
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&mixed_generation, generation_command, .{}));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed_generation.propose(&.{generation_command}));
@@ -13905,19 +14062,19 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try ensureCoordinatedDecoderWithContext(&mixed_generation, generation_command, .{});
     try mixed_generation.propose(&.{generation_command});
     try std.testing.expectEqual(@as(usize, 1), mixed_generation.appended);
-    try std.testing.expectEqual(metadata_topology_protocol.fk_initial_create_version, transitionRequiredCoordinatedDecoderVersion(initial_create_command));
+    try std.testing.expectEqual(metadata_topology_protocol.fk_initial_create_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, initial_create_command)));
     const hidden_remove: metadata_storage.TransitionCommand = .{ .remove_fk_initial_replica_intent = .{
         .proof = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .child_table_id = 71, .range_id = 9 },
         .group_id = 9171,
         .local_node_id = 8,
         .expected_metadata_version = 1,
     } };
-    try std.testing.expectEqual(metadata_topology_protocol.fk_initial_create_version, transitionRequiredCoordinatedDecoderVersion(hidden_remove));
-    try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .remove_replica_intent = .{
+    try std.testing.expectEqual(metadata_topology_protocol.fk_initial_create_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, hidden_remove)));
+    try std.testing.expectEqual(@as(u16, 0), (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .remove_replica_intent = .{
         .group_id = 9171,
         .local_node_id = 8,
         .expected_metadata_version = 1,
-    } }));
+    } })));
     var old_voter: Fake = .{ .member_versions = &.{ 17, 16, 17 } };
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&old_voter, root_command, .{}));
     try std.testing.expectEqual(@as(usize, 0), old_voter.appended);
@@ -15132,10 +15289,9 @@ fn ensureCdcWorkPermit(service: anytype) !void {
         service.reconcile_lease.config.lease_ttl_ms *| std.time.ns_per_ms,
     );
     const deadline_ns = platform_time.monotonicNs() +| renew_timeout_ns;
-    var proposed_expires_at_ms: u64 = 0;
     while (platform_time.monotonicNs() < deadline_ns) {
         if (service.cdc_shutdown.load(.acquire)) return error.CdcWorkShuttingDown;
-        if (!cdcLocalMetadataLeader(service)) return error.CdcWorkLeaseLost;
+        const term = service.localMetadataLeadershipTerm() orelse return error.CdcWorkLeaseLost;
 
         const now_ms = service.reconcile_lease.nowMs();
         const projected = try service.getProjectedReconcileLease();
@@ -15160,12 +15316,12 @@ fn ensureCdcWorkPermit(service: anytype) !void {
         }
 
         const desired = service.reconcile_lease.desiredRecord(now_ms);
-        if (desired.expires_at_ms > proposed_expires_at_ms) {
+        if (service.reconcile_lease.shouldProposeRenewal(term, projected, now_ms)) {
             service.upsertReconcileLease(desired) catch |err| {
                 service.reconcile_lease.noteAcquireFailure();
                 return err;
             };
-            proposed_expires_at_ms = desired.expires_at_ms;
+            service.reconcile_lease.noteRenewalProposed(term, desired);
         }
         try advanceCdcLeaseRaft(service);
         platform_clock.Clock.real().sleepMs(1);
@@ -23636,15 +23792,15 @@ test "metadata.lake index publication requires its own decoder capability" {
     const base: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "lake" };
     var next = base;
     next.lake_index_catalog_json = "{\"version\":1}";
-    try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = base }));
-    try std.testing.expectEqual(metadata_topology_protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = next }));
-    try std.testing.expectEqual(metadata_topology_protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = next, .replacement = base } }));
+    try std.testing.expectEqual(@as(u16, 0), (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = base })));
+    try std.testing.expectEqual(metadata_topology_protocol.lake_index_catalog_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = next })));
+    try std.testing.expectEqual(metadata_topology_protocol.lake_index_catalog_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = next, .replacement = base } })));
 }
 
 test "metadata.lake index object table engine requires its own decoder capability" {
     const table: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "objects", .storage = .{ .engine = .object }, .min_ranges = 0, .desired_replica_count = 0 };
-    try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
-    try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } }));
+    try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = table })));
+    try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } })));
 }
 
 test "metadata runtime status producer completion requires framed transport" {
@@ -23728,12 +23884,12 @@ test "metadata.lake combined table features retain the highest decoder floor" {
     const protocol = metadata_topology_protocol;
     for ([_][]const u8{ "{}", "{\"resolvers\":{}}", "{\"_resolver_record_store\":{}}", "{\"_privacy\":{}}" }) |indexes| {
         var table: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "objects", .storage = .{ .engine = .object }, .min_ranges = 0, .desired_replica_count = 0, .lake_index_catalog_json = "{\"version\":1}", .indexes_json = indexes };
-        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
-        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } }));
-        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .upsert_table = table })));
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } })));
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } })));
         const before = table;
         table.lake_index_catalog_json = "";
-        try std.testing.expectEqual(protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = before, .replacement = table } }));
+        try std.testing.expectEqual(protocol.lake_index_catalog_version, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = before, .replacement = table } })));
     }
 }
 
@@ -23811,4 +23967,37 @@ test "selected owner readiness transition index cancels while observations are l
     try std.testing.expectError(error.Canceled, lockReadinessTransitions(&mutex, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = Cancel.canceled } }));
     try std.testing.expectEqual(@as(usize, 3), cancellation.calls);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, lockReadinessTransitions(&mutex, .{ .deadline_ns = 0 }));
+}
+
+test "index alias legacy store admission uses only the durable presence lookup" {
+    const Store = struct {
+        present: bool = false,
+        reads: usize = 0,
+        pub fn hasIndexAliases(self: *@This(), group: u64) !bool {
+            try std.testing.expectEqual(@as(u64, 21), group);
+            self.reads += 1;
+            return self.present;
+        }
+    };
+    const Service = struct {
+        metadata_group_id: u64 = 21,
+        store: Store = .{},
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+    };
+    var service: Service = .{};
+    var record: metadata_table_manager.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .artifact_sources_protocol_version = 2 };
+    try requireIndexAliasStoreAdmission(&service, record);
+    service.store.present = true;
+    try std.testing.expectError(error.IndexAliasProtocolUpgradeRequired, requireIndexAliasStoreAdmission(&service, record));
+    record.artifact_sources_protocol_version = 3;
+    try requireIndexAliasStoreAdmission(&service, record);
+    record.artifact_sources_protocol_version = 2;
+    record.live = false;
+    try requireIndexAliasStoreAdmission(&service, record);
+    record.live = true;
+    record.role = "metadata";
+    try requireIndexAliasStoreAdmission(&service, record);
+    try std.testing.expectEqual(@as(usize, 2), service.store.reads);
 }

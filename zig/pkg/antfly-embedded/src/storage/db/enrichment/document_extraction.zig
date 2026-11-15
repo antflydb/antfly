@@ -1360,6 +1360,7 @@ pub const NativeTextConfig = struct {
 pub const ChecksumAlgorithm = enum { sha256 };
 
 pub const Config = struct {
+    cancellation: PdfCancellationProbe = .{},
     filename: []const u8 = "",
     content_type: []const u8 = "",
     etag: []const u8 = "",
@@ -2974,6 +2975,7 @@ pub fn extractDownloadedStreaming(
     config: Config,
     sink: UnitSink,
 ) !void {
+    try config.cancellation.check();
     var marking = UnconfiguredGeneratedTextSink{ .alloc = alloc, .config = &config, .inner = sink };
     return extractDownloadedStreamingUnmarked(alloc, downloaded, source_url, config, marking.sink());
 }
@@ -2988,14 +2990,14 @@ fn extractDownloadedStreamingUnmarked(
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
-        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.native_text, config.ocr_mode, config.pdf_decode_limits, sink);
+        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.native_text, config.ocr_mode, config.pdf_decode_limits, config.cancellation, sink);
     }
     if (config.route_preset == .explicit_only) {
         try streamUnsupportedResult(sink, content_type, "no_configured_route_matched");
         return;
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.native_text, config.ocr_mode, config.pdf_decode_limits, sink);
+        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.native_text, config.ocr_mode, config.pdf_decode_limits, config.cancellation, sink);
     }
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitStreaming(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags, sink);
@@ -3036,10 +3038,11 @@ fn extractWithRouteStreaming(
     native_text: NativeTextConfig,
     ocr_mode: OcrMode,
     pdf_decode_limits: pdf.reader.DecodeLimits,
+    cancellation: PdfCancellationProbe,
     sink: UnitSink,
 ) !void {
     switch (route.extractor_type) {
-        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, native_text, ocr_mode, pdf_decode_limits, sink),
+        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, native_text, ocr_mode, pdf_decode_limits, cancellation, sink),
         .html => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags, sink),
         .text => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "document", "text", false, sink),
         .email => return try streamBufferedExtraction(alloc, try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"), sink),
@@ -3378,8 +3381,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
     };
 }
 
-fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, decode_limits: pdf.reader.DecodeLimits, sink: UnitSink) !void {
-    var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
+fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, decode_limits: pdf.reader.DecodeLimits, cancellation: PdfCancellationProbe, sink: UnitSink) !void {
+    var parsed = try pdf.reader.Reader.initWithDecodeLimitsAndCancellation(alloc, bytes, decode_limits, cancellation);
     defer parsed.deinit();
     parsed.setTextExtractionPolicy(native_text.policy);
 

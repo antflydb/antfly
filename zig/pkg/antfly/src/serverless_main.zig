@@ -35,6 +35,7 @@ const CliConfig = struct {
     wal_document_index: ?bool = null,
     wal_packed_pages: ?bool = null,
     wal_deferred_indexes: ?bool = null,
+    wal_catalog_fences: ?bool = null,
     point_read_blocks: ?bool = null,
     wal_gc: ?bool = null,
     progress_uri: ?[]const u8 = null,
@@ -178,6 +179,7 @@ pub fn runFromIterator(
         .wal_document_index = cli.wal_document_index orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_DOCUMENT_INDEX", false),
         .wal_packed_pages = cli.wal_packed_pages orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_PACKED_PAGES", false),
         .wal_deferred_indexes = cli.wal_deferred_indexes orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_DEFERRED_INDEXES", false),
+        .wal_catalog_fences = cli.wal_catalog_fences orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_CATALOG_FENCES", false),
         .point_read_blocks = cli.point_read_blocks orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_POINT_READ_BLOCKS", false),
         .wal_gc = cli.wal_gc orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_WAL_GC", false),
         .s3_options = configured_uris.s3_options,
@@ -382,6 +384,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--native-read-state")) {
             cfg.native_read_state = try parseBoolArg(args.next() orelse return error.InvalidArguments);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--wal-catalog-fences")) {
+            cfg.wal_catalog_fences = try parseBoolArg(args.next() orelse return error.InvalidArguments);
             continue;
         }
         if (std.mem.eql(u8, arg, "--wal-deferred-indexes")) {
@@ -773,6 +779,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --wal-deferred-indexes <bool>
         \\  --wal-packed-pages <bool>
         \\  --point-read-blocks <bool>
+        \\  --wal-catalog-fences <bool>   Select catalog-capable WAL layout on a new prefix
         \\  --wal-document-index <bool>
         \\  --wal-gc <bool> (managed indexed WAL, new prefix only)
         \\  --query-cache-dir <path>
@@ -802,6 +809,7 @@ fn printUsage(argv0: []const u8) void {
         \\environment:
         \\  ANTFLY_SERVERLESS_ARTIFACTS_URI
         \\  ANTFLY_SERVERLESS_MANIFESTS_URI
+        \\  ANTFLY_SERVERLESS_WAL_CATALOG_FENCES
         \\  ANTFLY_SERVERLESS_WAL_URI
         \\  ANTFLY_SERVERLESS_PROGRESS_URI
         \\  ANTFLY_SERVERLESS_CATALOG_URI

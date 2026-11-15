@@ -271,6 +271,25 @@ pub const Module = struct {
         try self.launch(ctx, 3, params.items * params.value_heads, 1, &gate);
     }
 
+    /// GLiDE starts each row from zero state. Prepare the same normalized
+    /// convolution and gate values consumed by the exact recurrent kernel.
+    pub fn prepareGlide(self: *Module, ctx: *context.CudaContext, pointers: [14]driver.CUdeviceptr, seq: usize, heads: usize) !void {
+        var p = pointers;
+        var n: i32 = @intCast(seq);
+        var channels: i32 = @intCast(heads * 384);
+        var valid: i32 = 0;
+        var vh: i32 = @intCast(heads);
+        var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &p[3], &p[4], &n, &channels, &valid, &p[5], &p[6], &p[7], &p[8], &p[13], &vh };
+        try self.launch(ctx, 13, heads * 3, seq, &args);
+    }
+    pub fn finishGlide(self: *Module, ctx: *context.CudaContext, pointers: [14]driver.CUdeviceptr, seq: usize, heads: usize, eps: f32) !void {
+        var p = pointers;
+        var vh: i32 = @intCast(heads);
+        var epsilon = eps;
+        var args = [_]?*anyopaque{ &p[10], &p[11], &p[12], &p[13], &vh, &epsilon };
+        try self.launch(ctx, 3, seq * heads, 1, &args);
+    }
+
     // Pointer order: mixed, conv weight, history, next history, conv, beta, a,
     // a_log, dt_bias, recurrent, core, z, norm weight, output.
     pub fn run(self: *Module, ctx: *context.CudaContext, pointers: [14]driver.CUdeviceptr, seq: usize, key_heads: usize, value_heads: usize, initialized: bool, eps: f32, cached_gates: bool, parallel_prefix: bool) !void {

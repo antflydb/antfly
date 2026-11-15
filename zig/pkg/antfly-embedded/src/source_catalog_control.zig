@@ -890,6 +890,8 @@ pub const storage_db_enrichment_media_output_counts = @import("storage/db/enrich
 pub const storage_db_field_projection_source = @import("storage/db/field_projection_source.zig");
 pub const storage_source_value_identity = @import("storage/source_value_identity.zig");
 
+pub const storage_db_commit_requirements = @import("storage/db/commit_requirements.zig");
+pub const storage_db_prepared_producer_acceptance = @import("storage/db/prepared_producer_acceptance.zig");
 pub const storage_db_mutation_plan = @import("storage/db/mutation_plan.zig");
 
 pub const storage_db_transform_read_plan = @import("storage/db/transform_read_plan.zig");
