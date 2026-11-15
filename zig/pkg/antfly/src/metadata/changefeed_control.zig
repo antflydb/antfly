@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 93;
+pub const protocol_version: u16 = 94;
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
 pub const max_roots = 4096;
@@ -281,6 +281,10 @@ pub const State = struct {
         if (self.slot) |slot| {
             if (self.phase == .enrolling) return error.InvalidChangefeed;
             try slot.validate();
+            if (slot.spool_epoch != 0 and slot.spool_epoch != self.epoch) return error.InvalidChangefeed;
+            if (slot.spool.definition) |identity| if (!equal(identity, definition.identity())) return error.InvalidChangefeed;
+            if ((self.phase == .closing or self.phase == .reset_required or self.phase == .deleted) and slot.spool.next_id != 1 and !slot.spool_retired) return error.InvalidChangefeed;
+            if (self.phase == .deleted and slot.spool.records.len != 0) return error.InvalidChangefeed;
             if (!equal(self.id, pg_slot.feedId(slot.database, slot.name)) or slot.session_expires_at > self.expires_at or !equal(slot.acknowledged_cursor, self.acknowledged_cursor)) return error.InvalidChangefeed;
             try slotDefinition(definition);
             var partial: [max_roots]bool = @splat(false);
@@ -401,7 +405,8 @@ pub const Mutation = union(enum) {
         var next = state;
         switch (self) {
             .slot => |operation| {
-                if (state.phase != .streaming and state.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
+                const cleanup = operation == .reclaim_spool and (state.phase == .closing or state.phase == .reset_required);
+                if (state.phase != .streaming and state.phase != .bootstrap and !cleanup) return error.ChangefeedResynchronizationRequired;
                 try slotDefinition(state.definition.?);
                 switch (operation) {
                     .configure => |configuration| {
@@ -432,6 +437,24 @@ pub const Mutation = union(enum) {
                         for (roots) |root| if (root.delivered.event != 0) return error.ChangefeedConflict;
                         next.slot = try (state.slot orelse return error.ChangefeedConflict).issue(a, issue.session, issue.now, issue.transaction);
                     },
+                    .reserve_spool => |reservation| {
+                        if (state.phase != .streaming or !equal(reservation.spec.feed, state.id) or reservation.spec.epoch != state.epoch or !equal(reservation.spec.definition, state.definition.?.identity())) return error.ChangefeedConflict;
+                        if (reservation.now >= state.expires_at) return error.ChangefeedLeaseExpired;
+                        const roots = try state.rootsAt(a, reservation.spec.after);
+                        defer a.free(roots);
+                        for (roots) |root| if (root.delivered.event != 0) return error.ChangefeedConflict;
+                        next.slot = try (state.slot orelse return error.ChangefeedConflict).reserveSpool(a, reservation.session, reservation.now, reservation.id, reservation.scope, reservation.spec);
+                    },
+                    .publish_spool => |publication| {
+                        if (state.phase != .streaming) return error.ChangefeedConflict;
+                        if (publication.now >= state.expires_at) return error.ChangefeedLeaseExpired;
+                        next.slot = try (state.slot orelse return error.ChangefeedConflict).publishSpool(a, publication.session, publication.now, publication.id, publication.manifest, publication.content);
+                    },
+                    .abandon_spool => |abandonment| {
+                        if (abandonment.now >= state.expires_at) return error.ChangefeedLeaseExpired;
+                        next.slot = try (state.slot orelse return error.ChangefeedConflict).abandonSpool(a, abandonment.session, abandonment.now, abandonment.id);
+                    },
+                    .reclaim_spool => |reclamation| next.slot = try (state.slot orelse return error.ChangefeedConflict).reclaimSpool(a, reclamation.id, reclamation.storage, reclamation.proof),
                     .confirm => |confirmation| {
                         if (state.phase != .streaming) return error.ChangefeedConflict;
                         if (confirmation.now >= state.expires_at) return error.ChangefeedLeaseExpired;
@@ -615,6 +638,7 @@ pub const Mutation = union(enum) {
             .finish_close => {
                 if (state.phase != .closing) return error.ChangefeedConflict;
                 for (state.roots) |root| if (!root.released or (root.snapshot != null and !root.snapshot_released)) return error.ChangefeedConflict;
+                if (state.slot) |slot| if (slot.spool.records.len != 0) return error.ChangefeedConflict;
                 next.phase = .deleted;
             },
             .restart => |restart| {
@@ -630,6 +654,9 @@ pub const Mutation = union(enum) {
                 next = .{ .id = state.id, .epoch = std.math.add(u64, state.epoch, 1) catch return error.ChangefeedConflict, .authority = state.authority, .definition = restart.definition, .phase = .enrolling, .created_at = restart.now, .expires_at = restart.expires_at, .bootstrap_expires_at = restart.bootstrap_expires_at };
             },
         }
+        if (next.slot) |slot| if (next.phase == .closing or next.phase == .reset_required) {
+            next.slot = try slot.retireSpools(a);
+        };
         next.revision = std.math.add(u64, state.revision, 1) catch return error.ChangefeedConflict;
         next.authority_sequence = stamp.sequence;
         try next.validate();
@@ -1239,4 +1266,41 @@ test "changefeed closed state rejects even an already acknowledged native cursor
     const cursor = state.acknowledged_cursor;
     state = try step(a, state, .close);
     try std.testing.expectError(error.ChangefeedResynchronizationRequired, step(a, state, .{ .acknowledge = cursor }));
+}
+
+test "changefeed slot atomically publishes reserved spool and retains cleanup debt across close and reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testSlotState(a);
+    const initial = state.latest_cursor;
+    const session = state.slot.?.session.?;
+    const delivery = testDelivery(state, &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 11 } }});
+    state = try step(a, state, .{ .issue = delivery });
+    var scope: pg_slot.spool_control.Scope = .{ .namespace = @splat(9), .domain = pg_slot.spool_control.Scope.domainFor(state.id, state.epoch), .attempt = @splat(7) };
+    std.mem.writeInt(u64, scope.attempt[0..8], 1, .big);
+    const spec: pg_slot.spool_control.Spec = .{ .feed = state.id, .epoch = state.epoch, .definition = state.definition.?.identity(), .projection = @splat(8), .storage = scope.storageIdentity(), .before = initial, .after = delivery.cursor, .completion = @splat(4), .start_lsn = 1, .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1 };
+    state = try step(a, state, .{ .slot = .{ .reserve_spool = .{ .session = session, .now = 101, .id = 1, .scope = scope, .spec = spec } } });
+    const charge = state.slot.?.spool.charged_bytes;
+    try std.testing.expectEqual(@as(u64, 1), state.slot.?.next_lsn);
+    var parsed = try parse(std.testing.allocator, try encode(a, state));
+    defer parsed.deinit();
+    try std.testing.expectEqual(charge, parsed.value.slot.?.spool.charged_bytes);
+    state = try step(a, parsed.value, .{ .slot = .{ .publish_spool = .{ .session = session, .now = 102, .id = 1, .manifest = @splat(6), .content = @splat(7) } } });
+    try std.testing.expectEqual(@as(u64, 101), state.slot.?.next_lsn);
+    try std.testing.expectEqual(@as(u64, 0), state.acknowledged_delivery);
+    state = try step(a, state, .{ .slot = .{ .confirm = .{ .session = session, .now = 103, .flushed = 101 } } });
+    try std.testing.expectEqual(@as(u64, 1), state.acknowledged_delivery);
+    try std.testing.expectEqual(charge, state.slot.?.spool.charged_bytes);
+    state = try step(a, state, .close);
+    try std.testing.expect(state.slot.?.session == null);
+    state = try step(a, state, .{ .release_root = .{ .namespace = testNamespace(7), .ownership_epoch = 1, .proof = @splat(5) } });
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .finish_close));
+    state = try step(a, state, .{ .slot = .{ .reclaim_spool = .{ .id = 1, .storage = spec.storage, .proof = @splat(5) } } });
+    state = try step(a, state, .finish_close);
+    var closed = try parse(std.testing.allocator, try encode(a, state));
+    defer closed.deinit();
+    try std.testing.expectEqual(.deleted, closed.value.phase);
+    try std.testing.expectEqual(@as(u64, 1), closed.value.slot.?.spool.collected_through);
+    try std.testing.expectEqual(@as(u64, 0), closed.value.slot.?.spool.charged_bytes);
 }

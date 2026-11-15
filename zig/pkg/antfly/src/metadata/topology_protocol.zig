@@ -123,7 +123,8 @@ const std = @import("std");
 /// Version 90 adds source-control reservations and separate accepted/committed frontiers.
 /// Version 92 binds private provider continuations to outbound delivery/ACK cursors.
 /// Version 93 adds fenced logical-slot sessions and atomic LSN/feed confirmation.
-pub const current_version: u16 = 93;
+/// Version 94 retains fenced slot spool reservations and cleanup accounting.
+pub const current_version: u16 = 94;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;

@@ -19,6 +19,7 @@
 //! through consumer retention. Closure evidence alone is not that authority.
 const std = @import("std");
 const spool = @import("pg_spool.zig");
+const control = @import("pg_spool_control.zig");
 const artifacts = @import("../serverless/artifacts/store.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 pub const Adapter = struct {
@@ -32,19 +33,14 @@ pub const Adapter = struct {
         // Verified reads use either the bounded whole-object capability or the
         // store's exact-size metadata check followed by a bounded range read.
         if (std.mem.allEqual(u8, &namespace, 0)) return error.PgSpoolStorageUnsupported;
-        if (access == .write and store.vtable.put_scoped == null) return error.PgSpoolStorageUnsupported;
+        if (access == .write and (store.vtable.put_scoped == null or store.vtable.retire_scoped_uploads == null)) return error.PgSpoolStorageUnsupported;
         if (store.upload_scope) |authority| if (!std.mem.eql(u8, &authority.domain, &scope.domain) or !std.mem.eql(u8, &authority.attempt, &scope.attempt)) return error.InvalidArtifactUploadScope;
         var scoped = store;
         scoped.upload_scope = scope;
         return .{ .store = scoped, .scope = scope, .cancellation = cancellation, .writable = access == .write };
     }
     pub fn storageIdentity(self: *const Adapter) spool.Digest {
-        var sha = std.crypto.hash.sha2.Sha256.init(.{});
-        sha.update("antfly:pg-spool-storage:v1");
-        sha.update(&self.store.namespace_identity.?);
-        sha.update(&self.scope.domain);
-        sha.update(&self.scope.attempt);
-        return sha.finalResult();
+        return (control.Scope{ .namespace = self.store.namespace_identity.?, .domain = self.scope.domain, .attempt = self.scope.attempt }).storageIdentity();
     }
     pub fn requireShared(self: *const Adapter) !void {
         if (!self.store.shared_across_owners) return error.PgSpoolStorageUnsupported;

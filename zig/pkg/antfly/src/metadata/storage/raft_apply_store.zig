@@ -45738,8 +45738,21 @@ test "metadata changefeed control logical slot survives reopen snapshot failover
     var delivery: changefeed_control.Delivery = .{ .sequence = 1, .before = initial.value.latest_cursor, .cursor = @splat(0), .authority = @splat(8), .issued_at = 101, .advances = &.{.{ .namespace = namespace, .position = .{ .sequence = 11 } }} };
     delivery.cursor = delivery.identity(id, 1);
     try h.mutate(.{ .issue = delivery });
-    const transaction: slot.Prepared = .{ .before = delivery.before, .after = delivery.cursor, .content = @splat(3), .completion = @splat(4), .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1 };
-    try h.mutate(.{ .slot = .{ .issue = .{ .session = session, .now = 102, .transaction = transaction } } });
+    var scope: slot.spool_control.Scope = .{ .namespace = @splat(9), .domain = slot.spool_control.Scope.domainFor(id, 1), .attempt = @splat(7) };
+    std.mem.writeInt(u64, scope.attempt[0..8], 1, .big);
+    const spec: slot.spool_control.Spec = .{ .feed = id, .epoch = 1, .definition = definition.identity(), .projection = @splat(8), .storage = scope.storageIdentity(), .before = delivery.before, .after = delivery.cursor, .completion = @splat(4), .start_lsn = 1, .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1 };
+    try h.mutate(.{ .slot = .{ .reserve_spool = .{ .session = session, .now = 102, .id = 1, .scope = scope, .spec = spec } } });
+    // A crash after admission but before any verified manifest publication must
+    // retain the charge and frozen scope without advancing the wire frontier.
+    store.deinit();
+    store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    var reserved = try h.read();
+    defer reserved.deinit();
+    try std.testing.expectEqual(@as(u64, 1), reserved.value.slot.?.next_lsn);
+    try std.testing.expectEqual(.uploading, reserved.value.slot.?.spool.records[0].phase);
+    const charge = reserved.value.slot.?.spool.charged_bytes;
+    try std.testing.expect(charge > 100);
+    try h.mutate(.{ .slot = .{ .publish_spool = .{ .session = session, .now = 102, .id = 1, .manifest = @splat(6), .content = @splat(3) } } });
     store.deinit();
     store = try RaftApplyStore.init(a, .{ .root_dir = path });
     var reopened = try h.read();
@@ -45747,7 +45760,7 @@ test "metadata changefeed control logical slot survives reopen snapshot failover
     try std.testing.expectEqual(@as(u64, 101), reopened.value.slot.?.next_lsn);
     try std.testing.expectEqual(@as(u64, 1), try reopened.value.slot.?.restartAt(100));
     const before_retry = reopened.value.revision;
-    try h.mutate(.{ .slot = .{ .issue = .{ .session = session, .now = 103, .transaction = transaction } } });
+    try h.mutate(.{ .slot = .{ .publish_spool = .{ .session = session, .now = 103, .id = 1, .manifest = @splat(6), .content = @splat(3) } } });
     var retry = try h.read();
     defer retry.deinit();
     try std.testing.expectEqual(before_retry + 1, retry.value.revision);
@@ -45785,4 +45798,16 @@ test "metadata changefeed control logical slot survives reopen snapshot failover
     try std.testing.expectEqual(@as(u64, 10), confirmed.value.roots[0].reclaimed_through);
     try std.testing.expectEqual(@as(usize, 0), confirmed.value.slot.?.entries.len);
     try std.testing.expectEqual(@as(usize, 0), confirmed.value.cursors.len);
+    try std.testing.expectEqual(charge, confirmed.value.slot.?.spool.charged_bytes);
+    try std.testing.expectEqual(.garbage, confirmed.value.slot.?.spool.records[0].phase);
+    const reclamation: changefeed_control.Mutation = .{ .slot = .{ .reclaim_spool = .{ .id = 1, .storage = spec.storage, .proof = @splat(5) } } };
+    try h.mutate(reclamation);
+    target.deinit();
+    target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    try h.mutate(reclamation);
+    var cleaned = try h.read();
+    defer cleaned.deinit();
+    try std.testing.expectEqual(@as(u64, 0), cleaned.value.slot.?.spool.charged_bytes);
+    try std.testing.expectEqual(@as(u64, 2), cleaned.value.slot.?.spool.next_id);
+    try std.testing.expectEqual(@as(u64, 1), cleaned.value.slot.?.spool.collected_through);
 }

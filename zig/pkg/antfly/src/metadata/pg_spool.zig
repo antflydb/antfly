@@ -379,6 +379,12 @@ const MemoryStore = struct {
         return a.dupe(u8, bytes);
     }
 };
+fn expectReservationCovers(store: *MemoryStore, bytes: u64) !void {
+    var actual: u64 = 0;
+    var objects = store.objects.valueIterator();
+    while (objects.next()) |object| actual += object.len;
+    try std.testing.expect(actual <= try @import("pg_spool_control.zig").reservationBytes(bytes));
+}
 const pgoutput = @import("../pgwire/pgoutput.zig");
 fn testPlan(rows: u32, size: u32) Plan {
     const bytes = 47 + @as(u64, rows) * (@as(u64, size) + 13);
@@ -409,6 +415,7 @@ test "pg spool sealed index resumes exact messages and rejects interior cursors 
     defer store.deinit();
     const plan = testPlan(130, 32);
     const sealed = try testBuild(a, &store, plan, 130, 32);
+    try expectReservationCovers(&store, plan.bytes);
     try std.testing.expectEqual(@as(u8, 2), sealed.root.height);
     const reader = try Reader.open(a, &store, sealed.identity, plan.binding);
     store.reads = 0;
@@ -436,6 +443,7 @@ test "pg spool multipart messages authenticate the final partial part before ret
     const size = 3 * part_bytes + 17;
     const plan = testPlan(1, size);
     const sealed = try testBuild(a, &store, plan, 1, size);
+    try expectReservationCovers(&store, plan.bytes);
     const reader = try Reader.open(a, &store, sealed.identity, plan.binding);
     try std.testing.expectError(error.PgSpoolMessageTooLarge, reader.message(a, &store, 21, size));
     const row = (try reader.message(a, &store, 21, size + 13)).?;
@@ -492,6 +500,7 @@ test "pg spool large committed transaction reads within a small independent memo
     const plan = testPlan(4096, 8192);
     try std.testing.expect(plan.bytes > 32 * 1024 * 1024);
     const sealed = try testBuild(bounded, &store, plan, 4096, 8192);
+    try expectReservationCovers(&store, plan.bytes);
     try std.testing.expect(@sizeOf(Builder) < 64 * 1024);
     const reader = try Reader.open(bounded, &store, sealed.identity, plan.binding);
     store.reads = 0;

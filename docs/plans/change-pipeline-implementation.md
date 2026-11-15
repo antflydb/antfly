@@ -706,13 +706,82 @@ the actual filesystem backend and replay exact indexed messages while preserving
 closure evidence. `zig build pg-spool-test -j2` runs the codec and filesystem
 qualification with local caches (`zig/pg-spool-artifact-qualification.log`).
 
-This format and adapter do not yet reserve/persist upload quota, publish spool
-locators through slot metadata, or implement acknowledgement-driven reclamation.
-Closure witnesses alone do not authorize publication or protect a live slot.
-Those operations must share fenced metadata authority, charge unfinished and
-uncollected uploads, and retain cleanup debt until bounded reclamation succeeds.
+The format and adapter alone do not authorize publication or protect a live
+slot. The durable slot admission/cleanup contract below now supplies metadata
+accounting, but the runtime still must drive it around actual storage work.
 Production row serialization, coherent database cuts and client qualification
 also remain required; the native runtime still has no replication factory.
+
+## In progress: slot spool admission and storage retirement
+
+`pg_slot.State.spool` now retains an upload ledger within the same durable slot
+record as its LSN map. Admission freezes the feed incarnation, definition,
+projection, native cursor interval, completion proof, exact wire interval and
+storage scope before the first put. Each upload has a monotonic ID, scoped nonce
+and conservative payload-byte reservation, including message/index/manifest
+objects. The journal and filesystem metadata remain the store's separate bounded
+maintenance responsibility. One attempt may be uploading at a time; the ledger
+has a fixed record bound and a 2 GiB payload quota. Abandoned uploads consume the
+same reservation until collected. The first reservation permanently binds the
+serialization definition/projection, including after the ledger becomes empty.
+
+Private publication records the verified manifest locator and serialization
+identity atomically with its LSN entry. Feedback advances the native cursor only
+at complete transaction boundaries and marks corresponding uploads as garbage;
+it does not release storage capacity. Cleanup uses the recorded original storage
+scope and advances a monotonic prefix floor only after trusted storage confirms
+fenced reclamation. Lost reservation/publication/cleanup replies are replayable;
+stale sessions and changed payloads/scopes fail. Feed reset/close retires all
+uploads, and deletion waits for outstanding spool cleanup as well as native
+root/snapshot cleanup. Protocol 94 gates these coordinated metadata operations.
+
+Artifact stores now expose an optional durable scoped-upload retirement barrier.
+The filesystem implementation holds shared admission through physical writes and
+closure publication, while retirement drains writers under an exclusive barrier
+and durably records a per-domain floor in the authoritative payload namespace.
+The floor and its locks are independent of replaceable inventory directories;
+backups/restores must preserve this authority. The floor survives attempt and
+whole-inventory removal, different inventory handles, and backend reopen. Writes at or below it fail, so a paused old owner
+cannot recreate a reclaimed upload after its quota was returned. A provider
+without this storage guarantee cannot qualify the writable spool adapter.
+
+Runtime integration still must verify the actual sealed manifest and retained
+completion authority before proposing private publication; hashes received from
+public clients cannot provide either authority. It must also drive bounded
+physical cleanup and persist continuations before supplying cleanup evidence.
+These metadata/storage contracts do not yet supply that production worker or
+first-START publication selection before the first visible transaction.
+
+Qualification includes the actual artifact-store path from reserved admission
+through sealed upload, indexed replay after reopen, complete feedback, bounded
+seven-entry cleanup pages and quota release. It checks retirement across handles,
+blocked-writer cancellation, reopen rejection and corrupt-floor failure. The
+metadata recovery case reserves before publication, reopens, publishes atomically,
+installs a snapshot on another owner, fences stale feedback, then reopens after
+lost confirmation and cleanup replies. Relevant logs are
+`zig/pg-spool-storage-fence-qualification.log`, `zig/pg-spool-control-test.log` and
+`zig/pg-spool-filesystem-regression.log` and
+`zig/pg-spool-metadata-recovery-qualification.log`.
+
+The persisted locator remains immutable. Reconstructing missing immutable objects
+in their original unretired scope is compatible with this contract. Replacing a
+published locator with a different storage namespace still needs an explicit
+fenced repair transition that preserves its serialization/LSNs while charging
+both old cleanup debt and the replacement upload. Never silently overwrite the
+original locator or release its charge merely because a new store is configured.
+
+The next runtime worker must recover the original observed reservation after an
+unknown metadata response before attempting another upload. It must verify the
+stored scope, frozen historical schema/projection and completion authority before
+building, and verify the actual seal before private publication. Streaming reads
+must use the published locator and recheck current session ownership around I/O;
+read/send never acknowledges data. Cleanup must select only the first garbage
+record, persist bounded provider continuations, durably retire its upload ID,
+and prove the attempt is physically empty before returning capacity. Enumeration
+success alone is insufficient when a provider reports retained/nonempty scopes.
+A live or new upload must never be covered by a cleanup cutoff. A runtime worker,
+durable cleanup continuation field and integrated fault/restart qualification are
+still required; the current filesystem collector is a qualification fixture.
 
 ## Working constraints
 

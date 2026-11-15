@@ -45,8 +45,10 @@ committed transaction.
 START is rejected when the owner has no stream callback. The native runtime
 adapter does not yet register the replication capability. The private
 `metadata/pg_spool.zig` format and artifact-store adapter support authenticated
-message seeks and immutable rebuilds, but slot publication, quota/reclamation and
-database-cut/publication integration remain required. These private contracts
+message seeks and immutable rebuilds. Slot metadata now retains upload reservations,
+manifest locators, LSN mappings and cleanup debt; the filesystem store durably
+fences retired upload IDs. Production workers still must drive those contracts
+around storage work, database cuts and publication selection. These private contracts
 and wire tests do not establish existing-client compatibility or activate a
 production replication endpoint. Unknown slot administration stays with the
 replication owner rather than becoming SQL transaction completion work.

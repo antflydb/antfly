@@ -22,6 +22,8 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 // Serialize journal initialization and deterministic staging across separate
 // in-process handles as well as external owners. Stripes keep unrelated
 // publications independent; interprocess file locks remain in place.
+var scope_fence_locks: [64]std.Io.RwLock = @splat(.init);
+var scope_fence_waiters: [64]std.atomic.Value(usize) = @splat(.init(0));
 var journal_mutexes: [64]std.Io.Mutex = @splat(.init);
 var content_mutexes: [64]std.Io.Mutex = @splat(.init);
 var publication_locks: [64]std.Io.RwLock = @splat(.init);
@@ -96,6 +98,8 @@ pub const FsStore = struct {
         var io_impl = threadedIo();
         defer io_impl.deinit();
         const io = io_impl.io();
+        var scope_fence = try self.scopeWriteGuard(io, scope, cancellation);
+        defer scope_fence.deinit();
         try self.durable_dirs.ensure(self.alloc, io, path);
         const attempt = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
         defer attempt.close(io);
@@ -144,6 +148,8 @@ pub const FsStore = struct {
 
         var write_io = threadedIo();
         defer write_io.deinit();
+        var scope_fence = if (scope) |value| try self.scopeWriteGuard(write_io.io(), value, cancellation) else null;
+        defer if (scope_fence) |*guard| guard.deinit();
         var publication = if (scope) |value| try self.publicationGuard(write_io.io(), value, .shared, cancellation) else null;
         defer if (publication) |*guard| guard.deinit();
         const content_mutex = &content_mutexes[std.hash.Wyhash.hash(0, artifact_id) % content_mutexes.len];
@@ -458,6 +464,97 @@ pub const FsStore = struct {
         errdefer file.unlock(io);
         try cancellation.check();
         return .{ .io = io, .lock = lock, .file = file, .mode = mode };
+    }
+    fn scopeFenceGuard(self: *FsStore, io: std.Io, domain: [32]u8, mode: std.Io.File.Lock, cancellation: CancellationToken) !PublicationGuard {
+        if (std.mem.allEqual(u8, &domain, 0)) return error.InvalidArtifactUploadScope;
+        if (mode != .shared and mode != .exclusive) return error.InvalidArtifactUploadScope;
+        var hash = std.hash.Wyhash.init(0);
+        hash.update(&domain);
+        const stripe = hash.final() % scope_fence_locks.len;
+        const lock = &scope_fence_locks[stripe];
+        const waiters = &scope_fence_waiters[stripe];
+        if (mode == .exclusive) _ = waiters.fetchAdd(1, .seq_cst);
+        defer if (mode == .exclusive) {
+            _ = waiters.fetchSub(1, .seq_cst);
+        };
+        while (true) {
+            try cancellation.check();
+            if (mode == .shared) {
+                if (waiters.load(.seq_cst) == 0 and lock.tryLockShared(io)) {
+                    if (waiters.load(.seq_cst) == 0) break;
+                    lock.unlockShared(io);
+                }
+            } else if (lock.tryLock(io)) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        errdefer if (mode == .shared) lock.unlockShared(io) else lock.unlock(io);
+        const root = try std.fs.path.join(self.alloc, &.{ self.root_dir, ".upload-fences-v1", "locks" });
+        defer self.alloc.free(root);
+        try self.durable_dirs.ensure(self.alloc, io, root);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/{x:0>2}", .{ root, stripe });
+        defer self.alloc.free(path);
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+        errdefer file.close(io);
+        while (!try file.tryLock(io, mode)) {
+            try cancellation.check();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        errdefer file.unlock(io);
+        try cancellation.check();
+        return .{ .io = io, .lock = lock, .file = file, .mode = mode };
+    }
+    fn scopeFloorPath(self: *FsStore, domain: [32]u8) ![]u8 {
+        return std.fmt.allocPrint(self.alloc, "{s}/.upload-fences-v1/floors/{s}", .{ self.root_dir, std.fmt.bytesToHex(&domain, .lower) });
+    }
+    fn readScopeFloor(self: *FsStore, io: std.Io, domain: [32]u8) !u64 {
+        const path = try self.scopeFloorPath(domain);
+        defer self.alloc.free(path);
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
+        defer file.close(io);
+        var bytes: [76]u8 = undefined;
+        if (try file.length(io) != bytes.len or try file.readPositionalAll(io, &bytes, 0) != bytes.len or !std.mem.eql(u8, bytes[0..4], "ASF1")) return error.ArtifactUploadFenceCorrupt;
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes[0..44], &hash, .{});
+        if (!std.mem.eql(u8, &domain, bytes[4..36]) or !std.mem.eql(u8, &hash, bytes[44..76])) return error.ArtifactUploadFenceCorrupt;
+        const floor = std.mem.readInt(u64, bytes[36..44], .big);
+        if (floor == 0) return error.ArtifactUploadFenceCorrupt;
+        return floor;
+    }
+    /// Hold through publication, including derived closure metadata. A floor
+    /// reader may not release this barrier before its physical write completes.
+    pub fn scopeWriteGuard(self: *FsStore, io: std.Io, scope: artifact_store.UploadScope, cancellation: CancellationToken) !PublicationGuard {
+        try scope.validate();
+        var guard = try self.scopeFenceGuard(io, scope.domain, .shared, cancellation);
+        errdefer guard.deinit();
+        if (scope.fencingToken() <= try self.readScopeFloor(io, scope.domain)) return error.ArtifactUploadAttemptRetired;
+        return guard;
+    }
+    pub fn retireScopedUploads(self: *FsStore, domain: [32]u8, through: u64, cancellation: CancellationToken) !void {
+        if (through == 0) return error.InvalidArtifactUploadScope;
+        var threaded = threadedIo();
+        defer threaded.deinit();
+        const io = threaded.io();
+        var guard = try self.scopeFenceGuard(io, domain, .exclusive, cancellation);
+        defer guard.deinit();
+        if (through <= try self.readScopeFloor(io, domain)) return;
+        const path = try self.scopeFloorPath(domain);
+        defer self.alloc.free(path);
+        try self.durable_dirs.ensure(self.alloc, io, std.fs.path.dirname(path).?);
+        var bytes: [76]u8 = undefined;
+        @memcpy(bytes[0..4], "ASF1");
+        @memcpy(bytes[4..36], &domain);
+        std.mem.writeInt(u64, bytes[36..44], through, .big);
+        std.crypto.hash.sha2.Sha256.hash(bytes[0..44], bytes[44..76], .{});
+        // One deterministic staging path under the cross-process barrier.
+        // A crash leaves at most one staging record per domain.
+        try writeFileAtomicallyAt(path, &bytes, cancellation, "pending-v2");
+    }
+    fn erasedRetireScopedUploads(raw: *anyopaque, domain: [32]u8, through: u64, cancellation: CancellationToken) !void {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return self.retireScopedUploads(domain, through, cancellation);
     }
     // These 64 lock files are permanent. Deleting an attempt must never
     // replace the lock inode while another initializer is waiting on it.
@@ -1103,6 +1200,7 @@ pub const FsStore = struct {
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
         .put_scoped = erasedPutScoped,
+        .retire_scoped_uploads = erasedRetireScopedUploads,
         .visit_scoped_uploads = erasedVisitScopedUploads,
         .cleanup_retired_scoped_temporaries = cleanupRetiredScopedTemporaries,
         .reclaim_retired_scoped_inventory = reclaimRetiredScopedInventory,
