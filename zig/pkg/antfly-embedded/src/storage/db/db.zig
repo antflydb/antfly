@@ -10402,7 +10402,15 @@ pub const DB = struct {
         var apply_locked = true;
         lockApplyShared(self);
         defer if (apply_locked) self.core.unlockApplyShared();
-        if (self.core.index_manager.denseIndex(artifact_name) != null) {
+        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
+        defer alloc.free(manifest_key);
+        var stored_manifest = try self.core.getStoreValue(alloc, manifest_key);
+        const configured_asset = blk: {
+            self.core.index_manager.catalog_mutex.lockShared();
+            defer self.core.index_manager.catalog_mutex.unlockShared();
+            break :blk self.core.index_manager.getEnrichment(.asset, artifact_name) != null;
+        };
+        if (stored_manifest == null and !configured_asset and self.core.index_manager.denseIndex(artifact_name) != null) {
             // Mutation admission precedes apply ownership throughout native
             // publication. Never wait for capture while retaining apply.
             self.core.unlockApplyShared();
@@ -10411,11 +10419,12 @@ pub const DB = struct {
             replay_capture = self.core.snapshot_replay_admission.tryAcquireCapture() orelse return error.StorageReadTemporarilyUnavailable;
             lockApplyShared(self);
             apply_locked = true;
+            // A catalog/asset may have appeared while apply ownership was
+            // released. Preserve precedence at the admitted cut too.
+            stored_manifest = try self.core.getStoreValue(alloc, manifest_key);
         }
 
-        const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
-        defer alloc.free(manifest_key);
-        const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse {
+        const manifest = stored_manifest orelse {
             var captured = (@import("dense_index_inspection.zig").capture(self, alloc, doc_key, artifact_name) catch |err| {
                 if (@import("privacy_read.zig").pending(err) or err == error.IndexRebuilding or err == error.DeadlineExceeded) return error.StorageReadTemporarilyUnavailable;
                 return err;
@@ -10430,6 +10439,8 @@ pub const DB = struct {
             try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             return inspection;
         };
+        if (replay_capture) |*lease| lease.release();
+        if (primary_capture) |*lease| lease.release();
         var manifest_owned = true;
         errdefer if (manifest_owned) alloc.free(manifest);
 
@@ -154956,6 +154967,16 @@ test "db dense index inspection does not expose unprotected or missing artifacts
     try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
     try std.testing.expect((try db.getDocumentArtifactManifest(a, "missing", "dense")) == null);
     try std.testing.expect((try db.getDocumentArtifactManifest(a, "missing", "absent")) == null);
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "dense");
+    defer a.free(asset_key);
+    try db.core.store.putBatch(&.{.{ .key = asset_key, .value = "{\"manifest_version\":2}" }}, &.{});
+    var busy = db.core.snapshot_replay_admission.acquireMutation();
+    defer busy.release();
+    var asset = (try db.getDocumentArtifactManifest(a, "doc", "dense")) orelse return error.TestUnexpectedResult;
+    defer asset.deinit(a);
+    try std.testing.expectEqualStrings("{\"manifest_version\":2}", asset.manifest_json);
+    var primary = db.core.snapshot_admission.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    primary.release();
 }
 
 test "db dense index inspection never certifies a missing protected vector" {

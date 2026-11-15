@@ -50,6 +50,7 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
 }
 
 pub const Error = operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+    ResourceBudgetExceeded,
     RetainedEffectsFull,
     AuthoritativeLookupMissing,
     TopologyChanged,
@@ -1146,6 +1147,7 @@ pub const Operations = struct {
         return (reads.documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, .read_index, .{ .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
+                error.ResourceBudgetExceeded => error.ResourceBudgetExceeded,
                 error.UnknownGroup, error.TableNotFound, error.NotFound => error.NotFound,
                 else => error.Internal,
             };
@@ -2247,6 +2249,7 @@ fn consumerTests() type {
                 Operations.mapCommonReadError(error.CatalogRoutingUnavailable).?,
             );
             const FakeReads = struct {
+                artifact_error: anyerror = error.StorageReadTemporarilyUnavailable,
                 scan_error: anyerror = error.StorageReadTemporarilyUnavailable,
 
                 fn source(self: *@This()) table_reads.TableReadSource {
@@ -2261,6 +2264,7 @@ fn consumerTests() type {
                         .text_stats_group_local = auxiliary,
                         .algebraic_partials_group_local = auxiliary,
                         .document_artifact_manifest_group_local = artifact,
+                        .document_artifact_manifest_group_local_controlled = artifactControlled,
                         .document_artifact_manifests_group_local = artifacts,
                     } };
                 }
@@ -2307,8 +2311,13 @@ fn consumerTests() type {
                     return error.StorageReadTemporarilyUnavailable;
                 }
 
-                fn artifact(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
-                    return error.StorageReadTemporarilyUnavailable;
+                fn artifactControlled(raw: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, key: []const u8, name: []const u8, consistency: raft_mod.ReadConsistency, _: db_mod.types.LookupOptions) !?db_mod.types.DocumentArtifactManifest {
+                    return artifact(raw, allocator, group, table, key, name, consistency);
+                }
+
+                fn artifact(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.artifact_error;
                 }
 
                 fn artifacts(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
@@ -2325,6 +2334,8 @@ fn consumerTests() type {
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.algebraicPartials(alloc, .{}, 7, "docs", "{}"));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "chunks"));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifests(alloc, .{}, 7, "docs", "doc:a"));
+            fake.artifact_error = error.ResourceBudgetExceeded;
+            try std.testing.expectError(error.ResourceBudgetExceeded, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "dense"));
             try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.NotLeader));
             try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.UnknownGroup));
             try std.testing.expectEqual(
