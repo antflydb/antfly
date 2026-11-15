@@ -297,8 +297,10 @@ pub fn configurationEqual(a: A, left: []const u8, right: []const u8) !bool {
     var r = parse(s, right) catch |err| return if (err == error.OutOfMemory) err else false;
     _ = l.value.object.orderedRemove(key);
     _ = l.value.object.orderedRemove(receipts_key);
+    _ = l.value.object.orderedRemove("_index_alias_epoch");
     _ = r.value.object.orderedRemove(key);
     _ = r.value.object.orderedRemove(receipts_key);
+    _ = r.value.object.orderedRemove("_index_alias_epoch");
     return std.mem.eql(u8, try std.json.Stringify.valueAlloc(s, l.value, .{}), try std.json.Stringify.valueAlloc(s, r.value, .{}));
 }
 
@@ -916,4 +918,13 @@ test "index alias lifecycle controls never change physical or query projections"
     try std.testing.expectEqualStrings(old_query, new_query);
     try std.testing.expectEqual(@as(u16, 3), try requiredStoreProtocol(a, legacy));
     try std.testing.expectEqual(@as(u16, 4), try requiredStoreProtocol(a, scoped));
+}
+
+test "index alias physical configuration equality ignores lifecycle epochs" {
+    const a = std.testing.allocator;
+    const physical = "{\"a\":{\"type\":\"full_text\"}}";
+    const aliased = "{\"a\":{\"type\":\"full_text\"},\"_index_aliases\":{\"live\":{\"index\":\"a\"}},\"_index_alias_receipts\":{},\"_index_alias_epoch\":\"fresh\"}";
+    try std.testing.expect(try configurationEqual(a, physical, aliased));
+    try std.testing.expect(try configurationEqual(a, aliased, physical));
+    try std.testing.expect(!try configurationEqual(a, aliased, "{\"b\":{\"type\":\"full_text\"}}"));
 }

@@ -4396,6 +4396,8 @@ fn remotePublicBatchError(alloc: std.mem.Allocator, status: u16, body: []const u
 }
 
 fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "IndexRebuilding")) return error.IndexRebuilding;
+    if (std.mem.eql(u8, body, "IncompletePublishedSnapshot")) return error.IncompletePublishedSnapshot;
     if (std.mem.eql(u8, body, "group leader unavailable")) return error.GroupLeaderUnavailable;
     if (std.mem.eql(u8, body, "ReadIndexTimeout")) return error.ReadIndexTimeout;
     if (std.mem.eql(u8, body, "GenerationTransitionActive")) return error.GenerationTransitionActive;
@@ -4852,14 +4854,16 @@ fn consumerTests() type {
 
         test "api http client preserves storage read contention across group read endpoints" {
             const UnavailableExecutor = struct {
+                body: []const u8 = "storage read temporarily unavailable",
                 fn executor(self: *@This()) http_common.RequestExecutor {
                     return .{ .ptr = self, .vtable = &.{ .execute = execute } };
                 }
 
-                fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
                     return .{
                         .status = 503,
-                        .body = try alloc.dupe(u8, "storage read temporarily unavailable"),
+                        .body = try alloc.dupe(u8, self.body),
                     };
                 }
             };
@@ -4880,6 +4884,12 @@ fn consumerTests() type {
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphEdges(base_uri, 7, "docs", "{}"));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+            for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |failure| {
+                executor.body = @errorName(failure);
+                try std.testing.expectError(failure, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+                try std.testing.expectError(failure, client.fetchGroupQueryPreflight(base_uri, 7, "docs", "{}", 0));
+                try std.testing.expectError(failure, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+            }
         }
 
         test "api http client transfers query response buffers without copying" {

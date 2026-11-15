@@ -536,7 +536,7 @@ pub const CatalogProjectionReader = struct {
         // these fields here caused production data-Raft entries to persist an
         // empty storage-owner configuration while test adapters (which cloned
         // full admin records) continued to pass.
-        tables[0] = try metadata_table_manager.cloneTable(alloc, table);
+        tables[0] = try clonePointRoutingTable(alloc, table);
         errdefer metadata_table_manager.freeTable(alloc, tables[0]);
         if (std.mem.indexOf(u8, table.indexes_json, "\"projection_only\"") != null) {
             const materialize = source.vtable.execution_indexes orelse return error.CatalogRoutingUnavailable;
@@ -743,6 +743,36 @@ fn waitForBuildFlightWithBudget(flight: *CatalogProjectionReader.BuildFlight, bu
         };
     }
     try budget.checkpoint();
+}
+
+// Point routing and physical-owner opens need index definitions and alias
+// pointers, but never readiness evidence, lifecycle epochs or retry receipts.
+// Reuse the projection built at publication so request allocation stays
+// independent of alias receipt history. Legacy rows retain the full fallback.
+fn clonePointRoutingTable(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord) !metadata_table_manager.TableRecord {
+    var point = table;
+    if (point.query_indexes_json.len != 0) {
+        point.indexes_json = point.query_indexes_json;
+        point.query_indexes_json = "";
+    }
+    return metadata_table_manager.cloneTable(alloc, point);
+}
+
+test "index alias catalog point projection omits receipt copies" {
+    const a = std.testing.allocator;
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "schema",
+        .indexes_json = "unparsed receipt history",
+        .query_indexes_json = "{\"a\":{},\"_index_aliases\":{\"live\":{\"index\":\"a\"}}}",
+    };
+    const point = try clonePointRoutingTable(a, table);
+    defer metadata_table_manager.freeTable(a, point);
+    try std.testing.expectEqualStrings(table.query_indexes_json, point.indexes_json);
+    try std.testing.expectEqualStrings("", point.query_indexes_json);
+    try std.testing.expectEqualStrings(table.schema_json, point.schema_json);
+    try std.testing.expectEqualStrings("unparsed receipt history", table.indexes_json);
 }
 
 fn cloneTables(

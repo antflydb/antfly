@@ -1072,7 +1072,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     // One fixed artifact owns the common/provider/CLI-parser domains. Public
     // steps keep their existing runtime selections and environment policies.
-    const common_config_filters = &.{"common.config.test."};
+    const common_config_filters = &.{ "common.config.test.", "serverless http client ingestion rejects private publication kinds" };
     const preload_filters = &.{
         "preload model spec parser categorizes registry variants and backends",
         "inference runtime preload parser preserves registry variants and explicit backends",

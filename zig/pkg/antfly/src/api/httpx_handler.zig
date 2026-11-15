@@ -1365,9 +1365,14 @@ pub const AntflyApiHandler = struct {
         // and staging authority; handlers reject uncertified historical cuts.
         if ((mutation.surface == .cluster_restore or mutation.surface == .restore_job or mutation.surface == .table_restore or mutation.surface == .backup) and
             self.api_server.hotStandbyCoordinatedRestoreAvailable()) return null;
-        if (policy.catalog_create_enabled and policy.remote_apply_mutations_enabled and
-            mutation.surface == .table_catalog and ctx.request.method == .POST)
-            return null;
+        if (std.meta.stringToEnum(http_common.Method, @tagName(ctx.request.method))) |method| {
+            if (hot_standby_mutation_inventory.admitsCatalogMutation(
+                policy.catalog_create_enabled,
+                policy.remote_apply_mutations_enabled,
+                method,
+                mutation,
+            )) return null;
+        }
         if (mutation.disposition != .reject and
             (mutation.disposition != .remote_apply or policy.remote_apply_mutations_enabled))
         {
@@ -2665,6 +2670,8 @@ pub const AntflyApiHandler = struct {
     /// this is only the shared wire projection at the `httpx` boundary.
     fn sharedInternalHttpErrorSpec(err: anyerror) ?InternalHttpErrorSpec {
         return switch (err) {
+            error.IndexRebuilding => .{ .status = 503, .message = "IndexRebuilding" },
+            error.IncompletePublishedSnapshot => .{ .status = 503, .message = "IncompletePublishedSnapshot" },
             error.IndexGenerationMismatch => .{
                 .status = 409,
                 .message = "IndexGenerationMismatch",
@@ -10390,9 +10397,10 @@ pub const AntflyApiHandler = struct {
             return jsonErrorResponse(ctx, switch (err) {
                 error.TableNotFound, error.IndexNotFound, error.IndexAliasNotFound, error.NotFound => 404,
                 error.InvalidIndexAliasRequest => 400,
+                error.HAReadOnlyStandby, error.HAFencedPrimary, error.HAPromotedStandbyRequiresPrimaryOpen => 409,
                 error.IndexAliasPreconditionRequired => 428,
                 error.IndexAliasPreconditionFailed => 412,
-                error.MetadataTopologyCommandTooLarge, error.IndexAliasNameConflict, error.IndexAliasExpectedIndexMismatch, error.IndexAliasIdempotencyConflict, error.IncompatibleIndexAliasTarget, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexAliasTargetNotReady, error.IndexAliasReceiptCapacity, error.TableGenerationChanged, error.TableTransitionActive, error.VectorMigrationActive, error.Conflict => 409,
+                error.MetadataTopologyCommandTooLarge, error.IndexAliasNameConflict, error.IndexAliasExpectedIndexMismatch, error.IndexAliasIdempotencyConflict, error.IncompatibleIndexAliasTarget, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexAliasTargetNotReady, error.IndexAliasReceiptCapacity, error.TableGenerationChanged, error.TableTransitionActive, error.VectorMigrationActive, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings, error.Conflict => 409,
                 error.UnsupportedOperation, error.IndexAliasProtocolUpgradeRequired, error.TableTopologyProtocolUpgradeRequired => 501,
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout, error.MetadataMutationOutcomeUnknown => 503,
                 error.Canceled, error.Cancelled => 499,
@@ -12343,6 +12351,11 @@ const SchemaReconcileWriteSource = struct {
 };
 
 test "typed internal HTTP errors preserve conflict semantics" {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |failure| {
+        const availability = AntflyApiHandler.sharedInternalHttpErrorSpec(failure).?;
+        try std.testing.expectEqual(@as(u16, 503), availability.status);
+        try std.testing.expectEqualStrings(@errorName(failure), availability.message);
+    }
     const transition = AntflyApiHandler.sharedInternalHttpErrorSpec(error.GenerationTransitionActive).?;
     try std.testing.expectEqual(@as(u16, 503), transition.status);
     try std.testing.expectEqualStrings("GenerationTransitionActive", transition.message);

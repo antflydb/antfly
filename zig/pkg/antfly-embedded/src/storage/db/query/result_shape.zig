@@ -1999,6 +1999,12 @@ fn externalizeChunkHitIdentity(alloc: Allocator, hit: *types.ChunkHit) !void {
     var resolved = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, hit.id);
     defer resolved.deinit(alloc);
 
+    // A shard may already have externalized this member before the coordinator
+    // shapes its grouped page. Recover that public identity and validate it
+    // against the retained reference instead of clearing provenance on pass two.
+    if (resolved.artifact_ref == null)
+        resolved.artifact_ref = try artifact_ids.decodeArtifactPublicIdAlloc(alloc, resolved.id);
+
     const id = try alloc.dupe(u8, resolved.id);
     alloc.free(hit.id);
     hit.id = id;
@@ -3542,6 +3548,46 @@ test "externalizeSearchResultArtifactIds externalizes nested unit chunk hits" {
     try std.testing.expectEqual(types.ArtifactKind.chunk, artifact_ref.kind);
     try std.testing.expectEqual(@as(?u32, 0), artifact_ref.chunk_id);
     try std.testing.expectEqualStrings("page:000001", artifact_ref.unit_id.?);
+}
+
+test "externalizeSearchResultArtifactIds preserves public nested identity and revisions across coordinator passes" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            const ref: types.ArtifactRef = .{
+                .document_id = @constCast("doc:a"),
+                .name = @constCast("chunks"),
+                .kind = .chunk,
+                .chunk_id = 3,
+                .unit_id = @constCast("page:1"),
+                .revision = @constCast("payload-cut"),
+                .derivation_revision = @constCast("producer-cut"),
+            };
+            var hit: types.ChunkHit = .{ .id = try artifact_ids.internalKeyForArtifactRefAlloc(a, ref) };
+            defer hit.deinit(a);
+            hit.artifact_ref = try ref.clone(a);
+            for (0..3) |_| {
+                try externalizeChunkHitIdentity(a, &hit);
+                const actual = hit.artifact_ref orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqualStrings("doc:a", actual.document_id);
+                try std.testing.expectEqualStrings("chunks", actual.name);
+                try std.testing.expectEqualStrings("page:1", actual.unit_id.?);
+                try std.testing.expectEqual(@as(?u32, 3), actual.chunk_id);
+                try std.testing.expectEqualStrings("payload-cut", actual.revision.?);
+                try std.testing.expectEqualStrings("producer-cut", actual.derivation_revision.?);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "externalizeSearchResultArtifactIds rejects mismatched public nested provenance" {
+    const a = std.testing.allocator;
+    const ref: types.ArtifactRef = .{ .document_id = @constCast("doc:a"), .name = @constCast("chunks"), .kind = .chunk, .chunk_id = 0 };
+    var hit: types.ChunkHit = .{ .id = try artifact_ids.artifactPublicIdAlloc(a, ref) };
+    defer hit.deinit(a);
+    hit.artifact_ref = try ref.clone(a);
+    hit.artifact_ref.?.chunk_id = 1;
+    try std.testing.expectError(error.InvalidChunkArtifact, externalizeChunkHitIdentity(a, &hit));
 }
 
 test "reshapeChunkBackedResult source grouping folds assets embeddings and mixed members before paging" {

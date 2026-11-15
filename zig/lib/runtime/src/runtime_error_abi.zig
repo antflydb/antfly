@@ -1115,6 +1115,8 @@ pub const Detail = enum(c_int) {
     index_alias_graph_conflict,
     index_alias_precondition_required,
     index_alias_precondition_failed,
+    storage_kernel_owner_stale_descriptor,
+    object_table_definition_conflict,
 };
 
 pub const Status = extern struct {
@@ -1504,6 +1506,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.HASeedSnapshotRuntimeBusy => status(.unavailable, .ha_seed_snapshot_runtime_busy),
         error.HASeedCaptureAlreadyInProgress => status(.unavailable, .ha_seed_capture_already_in_progress),
         error.StorageKernelOwnerUnavailable => status(.unavailable, .storage_kernel_owner_unavailable),
+        error.StorageKernelOwnerStaleDescriptor => status(.retryable, .storage_kernel_owner_stale_descriptor),
+        error.ObjectTableDefinitionConflict => status(.conflict, .object_table_definition_conflict),
         error.TableTopologyProtocolUpgradeRequired => status(.unavailable, .table_topology_protocol_upgrade_required),
         error.DatabaseNotFound => status(.not_found, .database_not_found),
         error.NamespaceNotFound => status(.not_found, .namespace_not_found),
@@ -2766,6 +2770,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .ha_seed_snapshot_runtime_busy => "HASeedSnapshotRuntimeBusy",
         .ha_seed_capture_already_in_progress => "HASeedCaptureAlreadyInProgress",
         .storage_kernel_owner_unavailable => "StorageKernelOwnerUnavailable",
+        .storage_kernel_owner_stale_descriptor => "StorageKernelOwnerStaleDescriptor",
+        .object_table_definition_conflict => "ObjectTableDefinitionConflict",
         .invalid_table_storage_settings => "InvalidTableStorageSettings",
         .vector_store_requires_local_single_shard_table => "VectorStoreRequiresLocalSingleShardTable",
         .vector_store_requires_empty_table => "VectorStoreRequiresEmptyTable",
@@ -3862,4 +3868,9 @@ test "index dependency conflicts preserve identity across owner callbacks" {
         try std.testing.expectEqual(@backingInt(Code.conflict), result.code);
         try std.testing.expectEqual(err, errorFromStatus(result));
     }
+}
+
+test "index alias owner failures retain their runtime identities" {
+    inline for (.{ error.StorageKernelOwnerStaleDescriptor, error.ObjectTableDefinitionConflict }) |failure|
+        try std.testing.expectEqual(failure, errorFromStatus(statusFromError(failure)));
 }

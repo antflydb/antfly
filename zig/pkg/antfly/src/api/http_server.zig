@@ -17045,6 +17045,7 @@ pub const ApiHttpServer = struct {
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
+        if (try self.nativeObjectIndexResource(alloc, table.*, "indexes", request)) |resource| return resource;
         if (table.schema_json.len > 0) {
             var schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
             defer schema.deinit(alloc);
@@ -17114,18 +17115,33 @@ pub const ApiHttpServer = struct {
         return result;
     }
 
+    // Native object indexes are owned by the incarnation-fenced object runtime,
+    // rather than resident Raft shards. Share its observation across list, GET
+    // and alias admission so these contracts cannot disagree about readiness.
+    fn nativeObjectIndexResource(self: *ApiHttpServer, alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, suffix: []const u8, request: api_operation.RequestContext) public_table_http.TableApi.ExecuteGetIndexError!?[]u8 {
+        if (table.storage.engine != .object) return null;
+        var schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
+        defer schema.deinit(alloc);
+        if (schema.external_base_source != null) return null;
+        var response = (self.tryObjectTableRequestWithOptions(table.name, .get, suffix, "", null, request, .{ .incarnation = .{ .table_id = table.table_id, .generation = table.object_storage_generation } }) catch {
+            try ensureTableOperationActive(request);
+            return error.Unavailable;
+        }) orelse return error.Unavailable;
+        defer response.deinit(self.alloc);
+        try ensureTableOperationActive(request);
+        if (response.status == 404) return error.NotFound;
+        if (response.status != 200) return error.Unavailable;
+        return alloc.dupe(u8, response.body) catch return error.InternalFailure;
+    }
+
     pub fn indexAliasTargetResource(self: *ApiHttpServer, alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index: []const u8, request: api_operation.RequestContext) ![]u8 {
         if (table.storage.engine == .object) {
-            var schema = try schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
-            defer schema.deinit(alloc);
-            if (schema.external_base_source == null) {
-                const suffix = try std.fmt.allocPrint(alloc, "indexes/{s}", .{index});
-                defer alloc.free(suffix);
-                var response = (try self.tryObjectTableRequestWithOptions(table.name, .get, suffix, "", null, request, .{ .incarnation = .{ .table_id = table.table_id, .generation = table.object_storage_generation } })) orelse return error.UnsupportedOperation;
-                defer response.deinit(self.alloc);
-                if (response.status != 200) return error.IndexAliasTargetNotReady;
-                return alloc.dupe(u8, response.body);
-            }
+            const suffix = try std.fmt.allocPrint(alloc, "indexes/{s}", .{index});
+            defer alloc.free(suffix);
+            if (self.nativeObjectIndexResource(alloc, table, suffix, request) catch |err| switch (err) {
+                error.NotFound, error.Unavailable => return error.IndexAliasTargetNotReady,
+                else => return err,
+            }) |resource| return resource;
         }
         return getIndexResourceWithExpected(self, alloc, table.name, index, request, table);
     }
@@ -17154,6 +17170,11 @@ pub const ApiHttpServer = struct {
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
         if (expected) |record| if (!metadata_table_manager.tableDefinitionsEqual(record, table.*)) return error.Conflict;
+        if (table.storage.engine == .object) {
+            const suffix = std.fmt.allocPrint(alloc, "indexes/{s}", .{index_name}) catch return error.InternalFailure;
+            defer alloc.free(suffix);
+            if (try self.nativeObjectIndexResource(alloc, table.*, suffix, request)) |resource| return resource;
+        }
         if (table.schema_json.len != 0) {
             var parsed = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
             defer parsed.deinit(alloc);
