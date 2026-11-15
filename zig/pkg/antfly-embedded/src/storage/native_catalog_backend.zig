@@ -457,6 +457,13 @@ pub const Backend = struct {
             self.inner.abort();
         }
 
+        /// Lets `backend_erased.ReadTxn.forkRead` fork graph adjacency reads
+        /// (Cypher edge expansion pins one read per statement and forks it
+        /// per page).
+        pub fn forkBorrowedRead(self: *@This()) !@This() {
+            return .{ .inner = try self.inner.forkRead(), .namespace = self.namespace };
+        }
+
         pub fn commit(self: *@This()) !void {
             try self.inner.commit();
         }
@@ -605,6 +612,24 @@ pub const Backend = struct {
 
         pub fn abort(self: *NamespaceTxn) void {
             self.teardown();
+        }
+
+        /// A read-only fork at the same immutable state. `RcState` is never
+        /// mutated once published, so the fork only retains it; each fork
+        /// keeps its own arena and closes independently of its parent.
+        pub fn forkRead(self: *NamespaceTxn) !NamespaceTxn {
+            if (!self.read_only or self.closed) return error.ReadSnapshotForkUnsupported;
+            const rc = self.rc orelse return error.ReadSnapshotForkUnsupported;
+            lockBackend(self.backend);
+            retainState(rc);
+            self.backend.mutex.unlock();
+            return .{
+                .allocator = self.allocator,
+                .backend = self.backend,
+                .read_only = true,
+                .rc = rc,
+                .pending_arena = std.heap.ArenaAllocator.init(self.allocator),
+            };
         }
 
         /// Marks this (still-open) write transaction's eventual commit as a
@@ -1216,6 +1241,49 @@ test "native catalog backend runtimeStore gives a flat (non-namespaced) erased S
     var read = try runtime.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("1.0", try read.get("edge:a->b"));
+}
+
+test "native catalog backend runtimeStore reads fork at the parent's snapshot and outlive it" {
+    // Cypher edge expansion forks the graph adjacency read it pinned for the
+    // statement; without a fork the erased read reports
+    // ReadSnapshotForkUnsupported.
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "graph:g:forward" });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+
+    {
+        var batch = try runtime.beginBatch();
+        try batch.put("edge:a->b", "1.0");
+        try batch.commit();
+    }
+    var read = try runtime.beginRead();
+    var fork = try read.forkRead();
+    defer fork.abort();
+    read.abort();
+    {
+        var batch = try runtime.beginBatch();
+        try batch.put("edge:a->b", "2.0");
+        try batch.put("edge:b->c", "3.0");
+        try batch.commit();
+    }
+    try std.testing.expectEqualStrings("1.0", try fork.get("edge:a->b"));
+    try std.testing.expectError(error.NotFound, fork.get("edge:b->c"));
+    var nested = try fork.forkRead();
+    defer nested.abort();
+    var cursor = try nested.openCursor();
+    defer cursor.close();
+    const first = (try cursor.first()).?;
+    try std.testing.expectEqualStrings("edge:a->b", first.key);
+    try std.testing.expect((try cursor.next()) == null);
+
+    var write = try backend.boundWrite(.{});
+    defer write.abort();
+    try std.testing.expectError(error.ReadSnapshotForkUnsupported, write.forkBorrowedRead());
 }
 
 test "native catalog backend runtimeStore binds one namespace, isolated from other namespaces" {
