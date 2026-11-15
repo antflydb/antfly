@@ -19,6 +19,84 @@ tags:
     x-displayName: Hot Standby Replication
     description: Runtime-to-runtime hot-standby replication protocol.
 paths:
+  /groups/{group_id}/tables/{table_name}/history/page-v1:
+    post:
+      tags: [retained-history]
+      operationId: readNativeRetainedHistoryPage
+      summary: Read one bounded retained native frame page
+      description: |
+        Trusted node-to-node read, requiring signed service authority even in
+        legacy migration mode and an immutable catalog route fence. The owner
+        obtains ReadIndex and validates the current leader and route before and
+        after reading the native history transaction. This operation neither
+        acknowledges history nor certifies a distributed transaction's outcome.
+        Binary HPG1 binds namespace, consumer/grant, position, timestamp and all
+        page budgets to the response metadata and historical tuple images.
+        The response is at most 96 + request.max_bytes bytes. A page never
+        substitutes current rows for retained before/after images. These private
+        positions are not public changefeed cursors or PostgreSQL LSNs.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryPageRequest'}
+      responses:
+        '200':
+          description: Request-bound HPG1 binary page; returning a page never advances retention.
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '400':
+          description: Invalid request, bounds or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+        '401':
+          description: Missing or invalid service authority.
+        '403':
+          description: The authenticated principal is not an internal service.
+        '409':
+          description: Topology changed or the retained scope requires resynchronization; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '422':
+          description: The next retained event requires a larger explicit page budget.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+        '500':
+          description: Corrupt retained page or an unclassified owner failure; never return partial rows.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPageError'}
   /groups/{group_id}/tables/{table_name}/history/control-v1:
     post:
       tags: [retained-history]
@@ -184,6 +262,14 @@ components:
           schema:
             type: string
   schemas:
+    NativeHistoryPosition:
+      {"type":"object","additionalProperties":false,"required":["sequence","event"],"properties":{"sequence":{"type":"integer","format":"uint64","minimum":0},"event":{"type":"integer","format":"uint32","minimum":0}}}
+    NativeHistoryPageRead:
+      {"type":"object","additionalProperties":false,"required":["reference","after","now_seconds"],"properties":{"reference":{"$ref":"#/components/schemas/NativeHistoryReference"},"after":{"$ref":"#/components/schemas/NativeHistoryPosition"},"now_seconds":{"type":"integer","format":"uint64","minimum":1},"max_events":{"type":"integer","format":"uint32","minimum":1,"maximum":1024,"default":256},"max_bytes":{"type":"integer","format":"uint32","minimum":1,"maximum":268435456,"default":1048576}}}
+    NativeHistoryPageRequest:
+      {"type":"object","additionalProperties":false,"required":["version","request"],"properties":{"version":{"type":"integer","enum":[1]},"request":{"$ref":"#/components/schemas/NativeHistoryPageRead"}},"description":"At most 4096 bytes; version is mandatory; reject unknown and duplicate fields. Reference namespace must equal the catalog fence namespace."}
+    NativeHistoryPageError:
+      {"type":"object","additionalProperties":false,"required":["version","code"],"properties":{"version":{"type":"integer","enum":[1]},"code":{"type":"string","enum":["invalid_request","resynchronization_required","topology_changed","page_budget_exceeded","unsupported","unavailable","corrupt_page","internal_error"]}}}
     NativeHistoryNamespace:
       {
         "type": "array",

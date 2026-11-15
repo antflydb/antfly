@@ -2667,6 +2667,79 @@ pub const ApiHttpClient = struct {
         return self.fetchGroupBatchWithForwarding(base_uri, group_id, table_name, body, timeout_ms, null, null, null);
     }
 
+    pub fn fetchGroupHistoryPage(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        input: @import("history_page_operations.zig").Request,
+        fence: route_metadata_api.CatalogRouteFence,
+        context: @import("antfly_local_sources").api_operation.RequestContext,
+    ) !@import("history_page_operations.zig").pages.Page {
+        const contract = @import("history_page_operations.zig");
+        try context.ensureActive();
+        if (self.internal_service == null) return error.Unauthorized;
+        try fence.validate();
+        if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], fence.route.identity_namespace.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], fence.route.identity_namespace.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], fence.route.identity_namespace.range_id, .big);
+        try input.validate(namespace);
+        const table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, routes.Routes.history_page_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > contract.max_request_bytes) return error.InvalidHistoryPageRequest;
+        const encoded_fence = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
+        defer self.alloc.free(encoded_fence);
+        if (encoded_fence.len > 16384) return error.InvalidCatalogRouteFence;
+        const timeout = @min(try context.remainingTimeoutMs() orelse route_metadata_api.catalog_route_default_deadline_ms, 5000);
+        var buffer: [10]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&buffer, "{d}", .{timeout});
+        var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+        try context.ensureActive();
+        var response = self.executeRequest(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .headers = &.{
+            .{ .name = route_metadata_api.catalog_route_fence_header, .value = encoded_fence },
+            .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = budget },
+        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = contract.wire.prefix_bytes + @as(usize, input.request.max_bytes) }) catch |err| return switch (err) {
+            error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded => err,
+            else => error.ReadUnavailable,
+        };
+        defer response.deinit(self.alloc);
+        try context.ensureActive();
+        if (response.status != 200) {
+            if (response.status == 401) return error.Unauthorized;
+            if (response.status == 403) return error.Forbidden;
+            if (response.body.len > contract.max_request_bytes) return error.InvalidRemoteResponse;
+            var parsed = std.json.parseFromSlice(contract.ErrorResponse, self.alloc, response.body, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch return error.InvalidRemoteResponse;
+            defer parsed.deinit();
+            if (parsed.value.version != 1 or parsed.value.status() != response.status) return error.InvalidRemoteResponse;
+            return switch (parsed.value.code) {
+                .invalid_request => error.InvalidHistoryPageRequest,
+                .resynchronization_required => error.HistoryResynchronizationRequired,
+                .topology_changed => error.TopologyChanged,
+                .page_budget_exceeded => error.HistoryTooLarge,
+                .unsupported => error.ChangefeedCapabilityUnsupported,
+                .unavailable => error.ReadUnavailable,
+                .corrupt_page => error.HistoryCorrupt,
+                .internal_error => error.UnexpectedHttpStatus,
+            };
+        }
+        const ack = response.header(route_metadata_api.catalog_route_fence_ack_header) orelse return error.InvalidRemoteResponse;
+        if (!std.mem.eql(u8, ack, route_metadata_api.catalog_route_fence_ack_value) or response.header(internal_batch_forwarding.outcome_header) != null) return error.InvalidRemoteResponse;
+        const content_type = response.header("Content-Type") orelse response.content_type orelse return error.InvalidRemoteResponse;
+        if (!std.ascii.eqlIgnoreCase(content_type, "application/octet-stream")) return error.InvalidRemoteResponse;
+        var page = try contract.wire.decode(self.alloc, response.body, input.request);
+        errdefer page.deinit();
+        try context.ensureActive();
+        return page;
+    }
+
     /// One authenticated attempt only. Any failure after entering transport is
     /// unconfirmed, including malformed success replies. Recovery retains its
     /// original receipt and is never rewritten into submission.
@@ -6964,4 +7037,91 @@ test "history control client makes one signed bounded attempt and never replays 
     const lost_submit = try client.fetchGroupHistoryControl("http://node:8080", 17, "docs/tenant", input, fence, .{});
     try std.testing.expectEqual(null, lost_submit.receipt);
     try std.testing.expect(!lost_submit.confirmed());
+}
+
+test "history page client validates request binding headers errors and cancellation" {
+    const a = std.testing.allocator;
+    const contract = @import("history_page_operations.zig");
+    const secret = "history-page-client-secret-long-enough";
+    const Fake = struct {
+        const Mode = enum { good, scope, checksum, missing_ack, wrong_type, resync, topology, small, unavailable, bad_error, missing_version, lost, cancelled };
+        mode: Mode = .good,
+        input: contract.Request,
+        calls: usize = 0,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("http://node:8080/internal/v1/groups/17/tables/docs%2Ftenant/history/page-v1", request.uri);
+            try std.testing.expectEqual(@as(?usize, contract.wire.prefix_bytes + self.input.request.max_bytes), request.max_response_bytes);
+            try std.testing.expect(request.timeout_ms.? > 0 and request.timeout_ms.? <= 5000);
+            try std.testing.expect(request.cancellation != null);
+            try std.testing.expectEqualDeep(self.input, try contract.decode(alloc, request.body, self.input.request.reference.namespace));
+            try internal_service_auth.verifyToken(alloc, request.header(internal_service_auth.header_name).?, .{ .secret = secret, .issuer = "page-test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (self.mode == .lost) return error.ConnectionResetByPeer;
+            if (self.mode == .missing_version) return http_route_helpers.textResponseWithHeaders(alloc, 409, "{\"code\":\"resynchronization_required\"}", &.{});
+            const failure: ?contract.ErrorResponse = switch (self.mode) {
+                .resync, .bad_error => .fromError(error.HistoryResynchronizationRequired),
+                .topology => .fromError(error.TopologyChanged),
+                .small => .fromError(error.HistoryTooLarge),
+                .unavailable => .fromError(error.NotLeader),
+                else => null,
+            };
+            if (failure) |value| {
+                const body = try std.json.Stringify.valueAlloc(alloc, value, .{});
+                defer alloc.free(body);
+                return http_route_helpers.textResponseWithHeaders(alloc, if (self.mode == .bad_error) 500 else value.status(), body, &.{});
+            }
+            var page: contract.pages.Page = .{ .arena = .init(alloc), .next = self.input.request.after, .observed_latest = self.input.request.after.sequence, .caught_up = true };
+            defer page.deinit();
+            var binding = self.input.request;
+            if (self.mode == .scope) binding.reference.grant += 1;
+            const body = try contract.wire.encode(alloc, page, binding);
+            defer alloc.free(body);
+            if (self.mode == .checksum) body[body.len - 1] ^= 1;
+            if (self.mode == .cancelled) self.cancelled.store(true, .release);
+            return http_route_helpers.textResponseWithHeaders(alloc, 200, body, if (self.mode == .missing_ack) &.{.{ .name = "Content-Type", .value = "application/octet-stream" }} else &.{
+                .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = "1" },
+                .{ .name = "Content-Type", .value = if (self.mode == .wrong_type) "text/html" else "application/octet-stream" },
+            });
+        }
+    };
+    const fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 17, .big);
+    std.mem.writeInt(u64, namespace[16..24], 19, .big);
+    const input: contract.Request = .{ .version = 1, .request = .{ .reference = .{ .namespace = namespace, .authority = @splat(1), .definition = @splat(2), .consumer = @splat(3), .epoch = 1, .grant = 1 }, .after = .{ .sequence = std.math.maxInt(u64) }, .now_seconds = 100, .max_bytes = 1 } };
+    var fake: Fake = .{ .input = input };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.Unauthorized, client.fetchGroupHistoryPage("http://node:8080", 17, "docs/tenant", input, fence, .{}));
+    _ = client.withInternalServiceAuth(secret, "page-test");
+    try std.testing.expectError(error.InvalidCatalogRouteFence, client.fetchGroupHistoryPage("http://node:8080", 18, "docs/tenant", input, fence, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    for (std.meta.tags(Fake.Mode)) |mode| {
+        fake.mode = mode;
+        fake.cancelled.store(false, .release);
+        const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&fake.cancelled) };
+        const before = fake.calls;
+        const result = client.fetchGroupHistoryPage("http://node:8080", 17, "docs/tenant", input, fence, context);
+        try std.testing.expectEqual(before + 1, fake.calls);
+        if (mode == .good) {
+            var page = try result;
+            defer page.deinit();
+            try std.testing.expect(page.caught_up);
+            try std.testing.expectEqualDeep(input.request.after, page.next);
+        } else {
+            const expected: anyerror = switch (mode) {
+                .scope, .checksum => error.HistoryCorrupt,
+                .missing_ack, .wrong_type, .bad_error, .missing_version => error.InvalidRemoteResponse,
+                .resync => error.HistoryResynchronizationRequired,
+                .topology => error.TopologyChanged,
+                .small => error.HistoryTooLarge,
+                .unavailable, .lost => error.ReadUnavailable,
+                .cancelled => error.Canceled,
+                .good => unreachable,
+            };
+            try std.testing.expectError(expected, result);
+        }
+    }
 }

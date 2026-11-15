@@ -7065,6 +7065,7 @@ pub const DataServer = struct {
         else
             null;
         api_server_cfg.native_history_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = historyControlOperation } else null;
+        api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.restore_owner = .{ .ptr = self, .execute_fn = restoreOwnerControl };
         api_server_cfg.restore_parent_activation = .{ .ptr = self, .execute_fn = restoreParentActivationControl };
@@ -13341,8 +13342,26 @@ pub const DataServer = struct {
         return .{ .ptr = self, .execute_fn = historyControlRoutedOperation };
     }
 
-    fn historyControlRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: @import("../api/history_control_operations.zig").wire.Request, original: antfly.public_api.operation.RequestContext) !@import("../api/history_control_operations.zig").wire.Response {
+    pub fn historyPagePort(self: *DataServer) @import("../api/history_page_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyPageRoutedOperation };
+    }
+
+    const HistoryOperation = enum { control, page };
+    fn historyRequestType(comptime kind: HistoryOperation) type {
+        return if (kind == .control) @import("../api/history_control_operations.zig").wire.Request else @import("../api/history_page_operations.zig").Request;
+    }
+    fn historyResultType(comptime kind: HistoryOperation) type {
+        return if (kind == .control) @import("../api/history_control_operations.zig").wire.Response else @import("../api/history_page_operations.zig").pages.Page;
+    }
+    fn historyControlRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.control), context: antfly.public_api.operation.RequestContext) !historyResultType(.control) {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .control, input, context);
+    }
+    fn historyPageRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.page), context: antfly.public_api.operation.RequestContext) !historyResultType(.page) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .page, input, context);
+    }
+    fn historyRoutedOperation(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: HistoryOperation, input: historyRequestType(kind), original: antfly.public_api.operation.RequestContext) !historyResultType(kind) {
         if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
         try original.ensureActive();
         try original_fence.validate();
@@ -13372,7 +13391,7 @@ pub const DataServer = struct {
             const host = raft.host.http_host.host;
             break :blk .{ .local = host.isLocalLeader(group), .node = host.cfg.local_node_id, .leader = host.leaderId(group), .hosted = host.raftStatus(group) != null };
         };
-        if (observed.local) return historyControlOperation(self, alloc, fence, table, input, context);
+        if (observed.local) return if (kind == .control) historyControlOperation(self, alloc, fence, table, input, context) else historyPageOperation(self, alloc, fence, table, input, context);
         // Only a compact, deadline-aware peer capture may discover a remote
         // endpoint. Never use the generic admin-snapshot routing fallback or
         // rotate through placement candidates when the leader is unknown.
@@ -13386,11 +13405,23 @@ pub const DataServer = struct {
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
         var lane = try self.acquireDataRaftForwardLaneUntil(group, clock.deadline_ns.?, .{ .discovery = .cached, .cancellation = &cancellation });
         defer lane.release();
-        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{});
+        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{ .max_response_bytes = if (kind == .page) @import("../api/history_page_operations.zig").wire.prefix_bytes + @as(usize, input.request.max_bytes) else @import("../api/history_control_operations.zig").wire.max_bytes });
         defer executor.deinit();
         var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
         _ = client.withInternalServiceAuth(self.api_server_cfg.internal_service_secret, self.api_server_cfg.internal_service_issuer);
-        return client.fetchGroupHistoryControl(uri, group, table, input, fence, context);
+        return if (kind == .control) client.fetchGroupHistoryControl(uri, group, table, input, fence, context) else client.fetchGroupHistoryPage(uri, group, table, input, fence, context);
+    }
+
+    fn historyPageOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.page), context: antfly.public_api.operation.RequestContext) !historyResultType(.page) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        const apply = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
+        const owner = apply.kernel_owner_source orelse return error.ChangefeedCapabilityUnsupported;
+        var page = try owner.orderedHistoryPageRouted(alloc, fence, table, input.request);
+        errdefer page.deinit();
+        try context.ensureActive();
+        return page;
     }
 
     fn historyControlOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: @import("../api/history_control_operations.zig").wire.Request, context: antfly.public_api.operation.RequestContext) !@import("../api/history_control_operations.zig").wire.Response {
@@ -43200,6 +43231,23 @@ fn consumerTests() type {
             try std.testing.expect(submitted.entry.index > 1);
             try std.testing.expectEqual(@import("history_control_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             const ref: control.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = 1, .grant = 1, .definition = grant.definition };
+            for ([_][]const u8{ "{\"v\":1}", "{\"v\":2}" }) |value| {
+                var descriptor = try owner.loadDescriptorWithContext(a, 601, "docs", .{});
+                defer descriptor.deinit(a);
+                const encoded = try data_raft_batch.encodeWithStorageOwnerDescriptor(a, "docs", .{ .writes = &.{.{ .key = "one", .value = value }} }, descriptor.view());
+                defer a.free(encoded);
+                var accepted: ?u64 = null;
+                {
+                    try server.lockHistoryRaftOwner(.{ .deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s });
+                    defer server.data_raft_mutex.unlock();
+                    try managed.host.http_host.proposeWithReceipt(601, encoded, &accepted);
+                }
+                const deadline = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+                while (sm.appliedIndex(601) < accepted.?) {
+                    if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+            }
             const ingress = @import("../api/history_control_operations.zig");
             const encoded_fence = try std.json.Stringify.valueAlloc(a, route.fence().?, .{});
             defer a.free(encoded_fence);
@@ -43225,7 +43273,7 @@ fn consumerTests() type {
                         return error.UnexpectedHistoryPeerRefresh;
                     }
                 };
-                var api_server = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = &server, .execute_fn = DataServer.historyControlOperation } }, .{ .ptr = &server, .vtable = &.{ .status = Status.read } }, null, null);
+                var api_server = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = &server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = &server, .read_fn = DataServer.historyPageOperation } }, .{ .ptr = &server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(&api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -43273,6 +43321,32 @@ fn consumerTests() type {
                     break :blk host.raftStatus(601).?.last_index;
                 };
                 try std.testing.expectEqual(before_remote, after_remote);
+                const page_contract = @import("../api/history_page_operations.zig");
+                const page_input: page_contract.Request = .{ .version = 1, .request = .{ .reference = ref, .after = .{}, .now_seconds = 100 } };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                var first_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
+                defer first_page.deinit();
+                try std.testing.expectEqual(@as(usize, 1), first_page.events.len);
+                try std.testing.expectEqualStrings("{\"v\":1}", first_page.events[0].after.?);
+                try std.testing.expectEqual(@as(u64, 2), first_page.observed_latest);
+                try std.testing.expect(!first_page.caught_up);
+                var next_page_input = page_input;
+                next_page_input.request.after = first_page.next;
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                var second_page = try origin.historyPagePort().read(a, route.fence().?, "docs", next_page_input, .{});
+                defer second_page.deinit();
+                try std.testing.expectEqualStrings("{\"v\":1}", second_page.events[0].before.?);
+                try std.testing.expectEqualStrings("{\"v\":2}", second_page.events[0].after.?);
+                try std.testing.expect(second_page.caught_up);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                var replay_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
+                defer replay_page.deinit();
+                try std.testing.expectEqualDeep(first_page.events, replay_page.events);
+                // Reads do not ACK; the original page remains replayable.
+                var small_page_input = page_input;
+                small_page_input.request.max_bytes = 1;
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                try std.testing.expectError(error.HistoryTooLarge, origin.historyPagePort().read(a, route.fence().?, "docs", small_page_input, .{}));
                 var remote_input: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .inspect = ref } };
                 const submit_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});
                 defer a.free(submit_body);

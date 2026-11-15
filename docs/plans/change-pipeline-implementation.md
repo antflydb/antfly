@@ -1506,6 +1506,42 @@ checks pass without leaks. This fixture uses in-memory Raft and on-disk native
 storage; it does not qualify WAL-backed multi-node failover. Distributed
 failover and production feed-root binding remain separate required qualification.
 
+## In progress: specified remote retained-page delivery
+
+The internal OpenAPI contract now specifies service-only
+`POST /groups/{group_id}/tables/{table_name}/history/page-v1`. Full generation
+passed. Requests are capped at 4096 bytes and include an explicit version,
+consumer/grant reference, private position, timestamp and page limits. The HPG1
+response binds those fields to the returned metadata and binary historical
+images. Its bound is exactly the fixed 96-byte prefix plus the requested raw
+page budget; forwarding must not silently retain the executor's 4 MiB default.
+
+Native and linked registrars share prebuffering limits. The handler requires a
+signed service credential even in migration mode and returns owned binary bytes
+with `Cache-Control: no-store`. Typed errors distinguish topology changes,
+resynchronization, a larger required event budget, unsupported owners, temporary
+unavailability and corrupt pages. The client validates error/version/status
+binding, binary content type, catalog acknowledgement, checksum and request
+binding, and withholds pages after cancellation. Reads never imply ACK.
+
+Control and page routing now share the deadline-bound leader/lane selection
+path; HTTP receivers remain local-only. Native pages use the existing frozen
+ReadIndex and final leader/route checks. The real Raft fixture commits two
+versions of one row, then reads both historical images over signed HTTP from a
+caller without a local replica. It replays the first page after reading the
+second and checks the explicit too-small-budget error. Ten HTTP/ingress/client
+checks and all five focused real Raft/native checks passed without leaks.
+Append-only runtime error details preserve invalid page/control requests, invalid
+control responses and exact receipt conflicts across independent archives; the
+existing canonical corrupt-Raft-receipt identity is preserved. All 58 runtime
+error tests pass. The combined gate also passes against this final inventory:
+five real Raft/native checks and ten HTTP/ingress/client checks, without leaks.
+
+These are private raw retained pages, not public authorized delivery, typed
+PostgreSQL production, coherent bootstrap, global completion certification,
+retired-root transfer or WAL-backed multi-node failover qualification. Those
+requirements remain mandatory before the full issues can be completed.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

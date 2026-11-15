@@ -18,7 +18,7 @@
 const std = @import("std");
 const pages = @import("history_page.zig");
 const frame = @import("committed_frame.zig");
-const prefix_bytes = 96;
+pub const prefix_bytes = 96;
 pub const max_bytes = prefix_bytes + frame.max_bytes;
 pub const OrderedRead = struct { request: pages.Request, minimum_applied_index: u64 };
 

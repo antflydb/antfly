@@ -188,6 +188,66 @@ pub const NativeHistoryNamespace = []const i64;
 
 pub const NativeHistoryOutcome = std.json.Value;
 
+pub const NativeHistoryPageError = struct {
+    version: i64,
+    code: []const u8,
+};
+
+pub const NativeHistoryPageRead = struct {
+    reference: NativeHistoryReference,
+    after: NativeHistoryPosition,
+    now_seconds: u64,
+    max_events: ?u32 = null,
+    max_bytes: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reference", "reference", false },
+        .{ "after", "after", false },
+        .{ "now_seconds", "now_seconds", false },
+        .{ "max_events", "max_events", true },
+        .{ "max_bytes", "max_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("reference");
+        try jw.write(self.reference);
+        try jw.objectField("after");
+        try jw.write(self.after);
+        try jw.objectField("now_seconds");
+        try jw.write(self.now_seconds);
+        if (self.max_events) |value| {
+            try jw.objectField("max_events");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// At most 4096 bytes; version is mandatory; reject unknown and duplicate fields. Reference namespace must equal the catalog fence namespace.
+pub const NativeHistoryPageRequest = struct {
+    version: i64,
+    request: NativeHistoryPageRead,
+};
+
+pub const NativeHistoryPosition = struct {
+    sequence: u64,
+    event: u32,
+};
+
 pub const NativeHistoryReceipt = struct {
     term: u64,
     index: u64,

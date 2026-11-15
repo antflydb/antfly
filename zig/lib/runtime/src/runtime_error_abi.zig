@@ -1157,6 +1157,10 @@ pub const Detail = enum(c_int) {
     changefeed_resynchronization_required,
     changefeed_lease_expired,
     changefeed_capability_unsupported,
+    invalid_history_page_request,
+    invalid_history_control_wire,
+    invalid_history_control_response,
+    conflicting_ordered_apply_receipt,
 };
 
 pub const Status = extern struct {
@@ -2193,6 +2197,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.SourceTransactionIdentityConflict => status(.conflict, .source_transaction_identity_conflict),
         error.SourceAlreadyCommitted => status(.conflict, .source_already_committed),
         error.SourceOutcomeUnresolved => status(.retryable, .source_outcome_unresolved),
+        error.InvalidHistoryPageRequest => status(.invalid_argument, .invalid_history_page_request),
+        error.InvalidHistoryControlWire => status(.invalid_argument, .invalid_history_control_wire),
+        error.InvalidHistoryControlResponse => status(.corrupt, .invalid_history_control_response),
+        error.ConflictingOrderedApplyReceipt => status(.conflict, .conflicting_ordered_apply_receipt),
         error.InvalidHistoryAdmission => status(.invalid_argument, .invalid_history_admission),
         error.HistoryCorrupt => status(.corrupt, .history_corrupt),
         error.HistoryResynchronizationRequired => status(.conflict, .history_resynchronization_required),
@@ -3279,6 +3287,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .source_transaction_identity_conflict => "SourceTransactionIdentityConflict",
         .source_already_committed => "SourceAlreadyCommitted",
         .source_outcome_unresolved => "SourceOutcomeUnresolved",
+        .invalid_history_page_request => "InvalidHistoryPageRequest",
+        .invalid_history_control_wire => "InvalidHistoryControlWire",
+        .invalid_history_control_response => "InvalidHistoryControlResponse",
+        .conflicting_ordered_apply_receipt => "ConflictingOrderedApplyReceipt",
         .invalid_history_admission => "InvalidHistoryAdmission",
         .history_corrupt => "HistoryCorrupt",
         .history_resynchronization_required => "HistoryResynchronizationRequired",
@@ -3989,4 +4001,19 @@ test "source admission and history failures retain exact native boundary identit
 
 test "changefeed control failures preserve exact runtime identities" {
     for ([_]anyerror{ error.InvalidChangefeed, error.ChangefeedCorrupt, error.ChangefeedConflict, error.ChangefeedCursorExpired, error.ChangefeedBackpressure, error.ChangefeedResynchronizationRequired, error.ChangefeedLeaseExpired, error.ChangefeedCapabilityUnsupported }) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+}
+
+test "history RPC request and receipt errors retain stable boundary identities" {
+    for ([_]anyerror{ error.InvalidHistoryPageRequest, error.InvalidHistoryControlWire, error.InvalidHistoryControlResponse, error.ConflictingOrderedApplyReceipt }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+        const expected: Code = switch (err) {
+            error.InvalidHistoryPageRequest, error.InvalidHistoryControlWire => .invalid_argument,
+            error.InvalidHistoryControlResponse => .corrupt,
+            error.ConflictingOrderedApplyReceipt => .conflict,
+            else => unreachable,
+        };
+        try std.testing.expectEqual(@backingInt(expected), transported.code);
+    }
 }

@@ -363,6 +363,10 @@ fn requiresInternalServicePrincipal(path: []const u8) bool {
     return in_internal_namespace and !standby_exempt;
 }
 
+test "history page ingress operation contracts" {
+    _ = @import("history_page_operations.zig");
+}
+
 test "history control ingress operation contracts" {
     _ = @import("history_control_operations.zig");
 }
@@ -470,17 +474,19 @@ test "history control ingress mounted route rejects unsigned migration traffic" 
     defer client.deinit();
     const base = try server.baseUrl(a);
     defer a.free(base);
-    const url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/history/control-v1", .{base});
-    defer a.free(url);
-    var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &.{.{ "content-type", "application/json" }}, 20);
-    defer unsigned.deinit();
-    try std.testing.expectEqual(@as(u16, 401), unsigned.status.code);
     const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     defer a.free(token);
-    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token } };
-    var authenticated = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &headers, 20);
-    defer authenticated.deinit();
-    try std.testing.expectEqual(@as(u16, 400), authenticated.status.code);
+    for ([_][]const u8{ "control-v1", "page-v1" }) |leaf| {
+        const url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/history/{s}", .{ base, leaf });
+        defer a.free(url);
+        var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+        defer unsigned.deinit();
+        try std.testing.expectEqual(@as(u16, 401), unsigned.status.code);
+        const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token } };
+        var authenticated = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &headers, 20);
+        defer authenticated.deinit();
+        try std.testing.expectEqual(@as(u16, 400), authenticated.status.code);
+    }
 }
 
 test "internal capabilities advertise only the serving history apply profile" {
@@ -1762,6 +1768,9 @@ pub const AntflyApiHandler = struct {
         if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
             try server.postWithBodyLimit(table_prefix ++ routes.history_control_suffix, @import("history_control_operations.zig").wire.max_bytes, httpx.Handler.bind(self, internalHistoryControl));
         } else try server.post(table_prefix ++ routes.history_control_suffix, httpx.Handler.bind(self, internalHistoryControl));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_page_suffix, @import("history_page_operations.zig").max_request_bytes, httpx.Handler.bind(self, internalHistoryPage));
+        } else try server.post(table_prefix ++ routes.history_page_suffix, httpx.Handler.bind(self, internalHistoryPage));
         try self.registerInternalSqlRoutes(server);
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
@@ -3845,6 +3854,30 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("Retry-After", "1");
         if (batch) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
         return textResponse(ctx, 429, "RetainedEffectsFull");
+    }
+
+    fn internalHistoryPage(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_page_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return historyPageFailure(ctx, error.InvalidHistoryPageRequest);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyPageFailure(ctx, error.InvalidHistoryPageRequest);
+        if (body.len > operations.max_request_bytes) return textResponse(ctx, 413, "history page request exceeds byte limit");
+        const encoded = operations.execute(self.api_server.cfg.native_history_page, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyPageFailure(ctx, err);
+        errdefer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/octet-stream");
+        try ctx.setHeader("Cache-Control", "no-store");
+        _ = ctx.response.bodyOwned(ctx.allocator, encoded);
+        return ctx.response.build();
+    }
+
+    fn historyPageFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const failure = @import("history_page_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
     }
 
     fn internalHistoryControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
