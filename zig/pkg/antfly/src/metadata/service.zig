@@ -3686,6 +3686,7 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         else => {},
     }
     if (command == .apply_source_control) return metadata_topology_protocol.source_control_version;
+    if (command == .apply_changefeed_control) return metadata_topology_protocol.changefeed_control_version;
     if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
     if (command == .apply_system_catalog) {
         const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind } };
@@ -7271,6 +7272,13 @@ pub const MetadataService = struct {
         sync: metadata_table_manager.RestoreProgressSync,
     ) !void {
         try syncRestoreProgressBatch(self, sync);
+    }
+
+    pub fn readChangefeedControl(self: *MetadataService, a: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) ![]u8 {
+        return @import("changefeed_control.zig").readOnService(self, a, id, request);
+    }
+    pub fn mutateChangefeedControl(self: *MetadataService, a: std.mem.Allocator, write: @import("changefeed_control.zig").Write, request: api_operation.RequestContext) !void {
+        return @import("changefeed_control.zig").mutateOnService(self, a, write, request);
     }
 
     pub fn readSourceControl(self: *MetadataService, a: std.mem.Allocator, table_id: u64, source_id: [32]u8, request: api_operation.RequestContext) ![]u8 {
@@ -23937,4 +23945,8 @@ test "selected owner readiness transition index cancels while observations are l
 
 test "source control requires its coordinated decoder floor before metadata proposal" {
     try std.testing.expectEqual(metadata_topology_protocol.source_control_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = "{}" }));
+}
+
+test "changefeed control requires its coordinated decoder floor before metadata proposal" {
+    try std.testing.expectEqual(metadata_topology_protocol.changefeed_control_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_changefeed_control = "{}" }));
 }

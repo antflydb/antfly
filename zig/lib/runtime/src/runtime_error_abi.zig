@@ -1149,6 +1149,14 @@ pub const Detail = enum(c_int) {
     source_pending_work,
     replication_projection_incomplete,
     source_attempt_retired,
+    invalid_changefeed,
+    changefeed_corrupt,
+    changefeed_conflict,
+    changefeed_cursor_expired,
+    changefeed_backpressure,
+    changefeed_resynchronization_required,
+    changefeed_lease_expired,
+    changefeed_capability_unsupported,
 };
 
 pub const Status = extern struct {
@@ -2212,6 +2220,15 @@ pub fn statusFromError(err: anyerror) Status {
         error.SourcePendingWork => status(.conflict, .source_pending_work),
         error.ReplicationProjectionIncomplete => status(.unsupported, .replication_projection_incomplete),
         error.SourceAttemptRetired => status(.conflict, .source_attempt_retired),
+        error.InvalidChangefeed => status(.invalid_argument, .invalid_changefeed),
+        error.ChangefeedCorrupt => status(.corrupt, .changefeed_corrupt),
+        error.ChangefeedConflict => status(.conflict, .changefeed_conflict),
+        error.ChangefeedCursorExpired => status(.conflict, .changefeed_cursor_expired),
+        error.ChangefeedBackpressure => status(.unavailable, .changefeed_backpressure),
+        error.ChangefeedResynchronizationRequired => status(.conflict, .changefeed_resynchronization_required),
+        error.ChangefeedLeaseExpired => status(.conflict, .changefeed_lease_expired),
+        error.ChangefeedCapabilityUnsupported => status(.unsupported, .changefeed_capability_unsupported),
+
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
             // the owning side's name in diagnostics instead of leaving an
@@ -3289,6 +3306,14 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .source_pending_work => "SourcePendingWork",
         .replication_projection_incomplete => "ReplicationProjectionIncomplete",
         .source_attempt_retired => "SourceAttemptRetired",
+        .invalid_changefeed => "InvalidChangefeed",
+        .changefeed_corrupt => "ChangefeedCorrupt",
+        .changefeed_conflict => "ChangefeedConflict",
+        .changefeed_cursor_expired => "ChangefeedCursorExpired",
+        .changefeed_backpressure => "ChangefeedBackpressure",
+        .changefeed_resynchronization_required => "ChangefeedResynchronizationRequired",
+        .changefeed_lease_expired => "ChangefeedLeaseExpired",
+        .changefeed_capability_unsupported => "ChangefeedCapabilityUnsupported",
     };
 }
 
@@ -3960,4 +3985,8 @@ test "source admission and history failures retain exact native boundary identit
     for ([_]anyerror{ error.InvalidSourceAdmission, error.SourceAdmissionCorrupt, error.SourceBindingConflict, error.SourceReceiptExpired, error.SourceCheckpointConflict, error.SourcePayloadConflict, error.SourceTableMismatch, error.SourceTransactionIdentityConflict, error.SourceAlreadyCommitted, error.SourceOutcomeUnresolved, error.InvalidHistoryAdmission, error.HistoryCorrupt, error.HistoryResynchronizationRequired, error.HistoryCheckpointConflict, error.HistoryConsumerConflict, error.HistoryPreparedTransactionsPresent, error.HistoryConsumerLimit, error.HistoryMixedControl, error.HistoryTransactionFailed, error.HistoryTooLarge, error.HistorySchemaTooLarge, error.HistoryFull, error.HistoryMultipleTransactions, error.HistoryAuthorityRequired, error.InvalidCommittedFrame, error.InvalidReplicationCheckpoint, error.InvalidReplicationTransaction, error.IncompleteReplicationTransaction, error.UnsupportedReplicationTruncate, error.UnsupportedReplicationMessage, error.InvalidSourceControl, error.SourceControlCorrupt, error.SourceControlConflict, error.SourceAdmissionBackpressure, error.SourcePendingWork, error.ReplicationProjectionIncomplete, error.SourceAttemptRetired }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
+}
+
+test "changefeed control failures preserve exact runtime identities" {
+    for ([_]anyerror{ error.InvalidChangefeed, error.ChangefeedCorrupt, error.ChangefeedConflict, error.ChangefeedCursorExpired, error.ChangefeedBackpressure, error.ChangefeedResynchronizationRequired, error.ChangefeedLeaseExpired, error.ChangefeedCapabilityUnsupported }) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }

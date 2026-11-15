@@ -307,6 +307,33 @@ runner wiring, distributed source authority and writable-Iceberg adapters remain
 required. The callbacks and actor do not yet
 advertise a public ingestion/changefeed capability.
 
+## Durable outbound control authority
+
+The private `metadata/changefeed_control.zig` contract now persists immutable
+owner/authorization and table-incarnation bindings, root enrollment grants,
+consumer epochs, delivery cursors, ACK positions and cleanup obligations through
+metadata Raft. Transition tag 84 requires coordinated decoder floor 91. A
+checksummed authority counter and feed state are updated atomically and included
+in metadata snapshots. Names and index/schema publication do not change a table
+incarnation binding.
+
+A bounded opaque cursor ledger reconstructs the position of each retained
+cursor. Partial-frame delivery never authorizes whole-frame reclamation. Client
+ACK, native reclamation, snapshot ACK, snapshot-pin release and consumer release
+remain separate persisted steps. Bootstrap and consumer leases produce explicit
+reset-required states; restart requires cleanup and creates a new consumer epoch.
+Private enrollment, cut, page and release proofs still require validation by the
+runtime adapter. Nonzero digests in this metadata contract alone do not certify
+a globally coherent snapshot or authorize data access.
+
+Focused checks cover control transitions, forged and expired cursors, bounded
+unacknowledged delivery, bootstrap deadlines, owner rebinding, corrupt state,
+lost metadata acknowledgments, rejected proposals, interleaved authority-counter
+updates, real metadata-store reopen, snapshot installation and retained cleanup
+debt. Runtime root enrollment/read/bootstrap, live authorization, public HTTP/SQL
+feeds and pgwire are still outstanding; this private control layer advertises no
+public changefeed capability.
+
 ## Remaining implementation phases
 
 1. Finish root history tests, prepared credit accounting and native integration.

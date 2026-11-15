@@ -435,6 +435,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"source control requires its coordinated decoder floor"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const changefeed_control_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/metadata/changefeed_control.zig"), .target = target, .optimize = optimize }),
+    });
+    const run_changefeed_control_tests = b.addRunArtifact(changefeed_control_tests);
+    const changefeed_storage_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "metadata changefeed control", "metadata raft apply store snapshot key registry covers every durable projection class" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_changefeed_storage_tests = b.addRunArtifact(changefeed_storage_tests);
+    const changefeed_service_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"changefeed control requires its coordinated decoder floor"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_changefeed_service_tests = b.addRunArtifact(changefeed_service_tests);
+    const changefeed_control_step = b.step("changefeed-control-test", "Verify durable feed ACK windows, bootstrap lifecycle and metadata recovery");
+    changefeed_control_step.dependOn(&run_changefeed_control_tests.step);
+    changefeed_control_step.dependOn(&run_changefeed_storage_tests.step);
+    changefeed_control_step.dependOn(&run_changefeed_service_tests.step);
     const source_control_step = b.step("source-control-test", "Verify durable source reservations, receipt frontiers and metadata recovery");
     const run_source_control_storage_tests = b.addRunArtifact(source_control_storage_tests);
     const run_source_control_service_tests = b.addRunArtifact(source_control_service_tests);
@@ -3229,6 +3241,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
+    unit_test_step.dependOn(&run_changefeed_control_tests.step);
+    unit_test_step.dependOn(&run_changefeed_storage_tests.step);
+    unit_test_step.dependOn(&run_changefeed_service_tests.step);
     unit_test_step.dependOn(&remote_content_adapter_run.step);
     unit_test_step.dependOn(&b.top_level_steps.get("aws-credentials-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("antfly-google-embedding-catalog-test").?.step);
