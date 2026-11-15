@@ -436,7 +436,7 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
     // Client ownership transfers directly to the session; all subsequent
     // failures close it together with the native weight inventory.
     if (build_options.enable_pjrt and preparation.backend == .pjrt) {
-        impl.backend_data.pjrt.client = @import("../backends/compute_factory.zig").createPjrtClient(allocator);
+        impl.backend_data.pjrt.client = try pjrt_lib.pjrt.Client.initFromEnv(allocator);
     }
     const host_data = switch (preparation.backend) {
         .native => &impl.backend_data.native,
@@ -2818,6 +2818,7 @@ const ArchSession = struct {
     /// Tree-packed Laya trunk keys and values, created on first packed run.
     laya_trunk_cache: ?*@import("../architectures/laya_trunk_cache.zig").Cache = null,
     laya_trunk_cache_lock: std.atomic.Mutex = .unlocked,
+    captured_programs: @import("captured_forward.zig").Cache = .{},
     dense_decoder_definitions: @import("dense_decoder_schedule.zig").DefinitionSlot = .{},
     dense_decoder_initial_definitions: @import("dense_decoder_schedule.zig").DefinitionSlot = .{},
     dense_decoder_definition_retirement_mutex: std.atomic.Mutex = .unlocked,
@@ -7045,6 +7046,8 @@ fn archSessionHandle(impl: *ArchSession) Session {
         .ptr = impl,
         .vtable = &arch_vtable,
         .compute_backend_provider = .{ .ptr = impl, .services = &archComputeServices },
+        .model_program_forward = if (encoder and impl.task == .generic and impl.glide_head == null) .{ .context = impl, .fingerprint = 0, .output_names = &.{"last_hidden_state"}, .validate = archValidateProgramInputs, .run = archProgramForward } else null,
+        .embedding_program_forward = if (impl.arch_config == .embedding_gemma2 and impl.task == .generic) .{ .context = impl, .fingerprint = 1, .output_names = &.{"sentence_embedding"}, .validate = archValidateProgramInputs, .run = archEmbeddingProgramForward } else null,
         .resident_preparation = .{ .ptr = impl, .prepare = prepareArchResident },
         .model_contract = .{
             .task = impl.task,
@@ -7796,6 +7799,124 @@ fn eagerHostRunObserved(raw: *anyopaque, inputs: []const Tensor, allocator: std.
     return archRunImplWithContext(raw, inputs, allocator, control, context, receipt, preentry);
 }
 
+const ProgramTextInputs = struct { text: BertRunInputs, dimensions: ?usize };
+fn programTextInputs(inputs: []const @import("capture.zig").Input) !ProgramTextInputs {
+    var ids: ?Tensor = null;
+    var mask: ?Tensor = null;
+    var types: ?Tensor = null;
+    var dimensions: ?Tensor = null;
+    for (inputs) |input| {
+        const slot = if (std.mem.eql(u8, input.tensor.name, "input_ids")) &ids else if (std.mem.eql(u8, input.tensor.name, "attention_mask")) &mask else if (std.mem.eql(u8, input.tensor.name, "token_type_ids")) &types else if (std.mem.eql(u8, input.tensor.name, "output_dimensions")) &dimensions else return error.UnexpectedModelProgramInput;
+        if (slot.* != null) return error.DuplicateInputs;
+        slot.* = input.tensor;
+    }
+    const values = [_]Tensor{ ids orelse return error.MissingInputs, mask orelse return error.MissingInputs, types orelse undefined };
+    const text = try parseBertRunInputs(values[0..if (types != null) @as(usize, 3) else 2]);
+    const width: ?usize = if (dimensions) |value| dimension: {
+        if (value.dtype != .i64 or value.shape.len != 1 or value.shape[0] != 1 or value.data.len != 8 or !value.isAlignedFor(i64)) return error.InvalidEmbeddingDimensions;
+        break :dimension std.math.cast(usize, value.asInt64()[0]) orelse return error.InvalidEmbeddingDimensions;
+    } else null;
+    return .{ .text = text, .dimensions = width };
+}
+fn archValidateProgramInputs(ptr: *anyopaque, inputs: []const @import("capture.zig").Input) anyerror!void {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    const parsed = try programTextInputs(inputs);
+    const bi = parsed.text;
+    switch (self.arch_config) {
+        .bert => |cfg| {
+            _ = try bert_arch.validateBertForwardInputs(cfg, bi.input_ids, bi.attention_mask, bi.token_type_ids, bi.batch, bi.seq_len);
+        },
+        .nomic_bert => |cfg| {
+            _ = try nomic_bert_arch.validateInputs(cfg, bi.input_ids, bi.attention_mask, bi.token_type_ids, bi.batch, bi.seq_len);
+        },
+        .modern_bert => |cfg| {
+            try modern_bert_arch.validateConfig(cfg);
+            if (bi.seq_len > cfg.max_position_embeddings or bi.token_type_ids != null) return error.InvalidInputShape;
+            for (bi.input_ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidTokenId;
+        },
+        .embedding_gemma2 => |cfg| {
+            _ = try embedding_gemma2_arch.validateTextInputs(cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len);
+            if (bi.token_type_ids != null) return error.UnexpectedModelProgramInput;
+        },
+        else => return error.UnsupportedModelProgram,
+    }
+    for (0..bi.batch) |item| {
+        var active: usize = 0;
+        for (bi.attention_mask[item * bi.seq_len ..][0..bi.seq_len]) |value| {
+            if (value != 0 and value != 1) return error.InvalidAttentionMask;
+            active += @intFromBool(value != 0);
+        }
+        if (self.arch_config == .embedding_gemma2 and active == 0) return error.EmptyEmbeddingInput;
+    }
+    if (parsed.dimensions) |width| if (self.arch_config != .embedding_gemma2 or !embedding_gemma2_arch.validDimension(width)) return error.InvalidEmbeddingDimensions;
+}
+
+fn archProgramForward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const @import("capture.zig").Input) anyerror![]@import("capture.zig").Output {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    const bi = (try programTextInputs(inputs)).text;
+    const hidden = switch (self.arch_config) {
+        .bert => |cfg| try bert_arch.forwardCtWithControl(cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.token_type_ids, bi.batch, bi.seq_len, cb.execution_control),
+        .modern_bert => |cfg| try modern_bert_arch.forwardCT(cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len),
+        .nomic_bert => |cfg| try nomic_bert_arch.forwardCT(cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.token_type_ids, bi.batch, bi.seq_len),
+        .embedding_gemma2 => |cfg| try embedding_gemma2_arch.forwardCT(cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len),
+        else => return error.UnsupportedModelProgram,
+    };
+    defer cb.free(hidden);
+    const width = switch (self.arch_config) {
+        .bert => |cfg| cfg.hidden_size,
+        .modern_bert => |cfg| cfg.hidden_size,
+        .nomic_bert => |cfg| cfg.hidden_size,
+        .embedding_gemma2 => |cfg| cfg.embedding_dim,
+        else => unreachable,
+    };
+    const output = try cb.primReshape(hidden, &.{ @intCast(bi.batch), @intCast(bi.seq_len), @intCast(width) });
+    errdefer cb.free(output);
+    const result = try allocator.alloc(@import("capture.zig").Output, 1);
+    result[0] = .{ .name = "last_hidden_state", .value = output };
+    return result;
+}
+
+fn archEmbeddingProgramForward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const @import("capture.zig").Input) anyerror![]@import("capture.zig").Output {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.arch_config != .embedding_gemma2) return error.UnsupportedModelProgram;
+    const parsed = try programTextInputs(inputs);
+    const bi = parsed.text;
+    const count = parsed.dimensions orelse return error.MissingInputs;
+    const output = try embedding_gemma2_arch.forwardPooledCT(cb, allocator, self.arch_config.embedding_gemma2, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len, count);
+    errdefer cb.free(output);
+    const result = try allocator.alloc(@import("capture.zig").Output, 1);
+    result[0] = .{ .name = "sentence_embedding", .value = output };
+    return result;
+}
+
+fn createProgramFrame(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!ops.ComputeBackend {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    return makeComputeBackend(self, allocator, null);
+}
+fn importProgramInput(_: *anyopaque, cb: *const ops.ComputeBackend, input: *const Tensor, _: std.mem.Allocator) anyerror!ops.CT {
+    if (cb.kind() != .native) return error.UnsupportedProgramTransport;
+    const native: *native_mod.NativeCompute = @ptrCast(@alignCast(cb.ptr));
+    return native.importHostTensor(input);
+}
+fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) ![]Tensor {
+    if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
+    const handle = archSessionHandle(self);
+    const pooled = for (inputs) |input| {
+        if (std.mem.eql(u8, input.name, "output_dimensions")) break true;
+    } else false;
+    const forward = (if (pooled) handle.embedding_program_forward else handle.model_program_forward) orelse return error.UnsupportedModelProgram;
+    const client = if (comptime build_options.enable_pjrt) if (self.backend_data.pjrt.client) |*value| @as(*anyopaque, @ptrCast(value)) else return error.MissingPjrtClient else return error.PjrtNotEnabled;
+    const declared = try allocator.alloc(@import("capture.zig").Input, inputs.len);
+    defer allocator.free(declared);
+    for (inputs, declared) |input, *value| value.* = .{ .tensor = input, .specialize = std.mem.eql(u8, input.name, "attention_mask") or std.mem.eql(u8, input.name, "output_dimensions") };
+    return self.captured_programs.run(self.allocator, .{
+        .context = self,
+        .create = createProgramFrame,
+        .import = importProgramInput,
+        .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = client },
+    }, forward, declared, allocator, control);
+}
+
 fn archRunImpl(
     ptr: *anyopaque,
     inputs: []const Tensor,
@@ -7810,6 +7931,8 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("arch-run: start backend={s}", .{@tagName(self.backend_type)});
+
+    if (self.backend_type == .pjrt and self.arch_config != .gpt) return runCapturedProgram(self, inputs, allocator, control);
 
     // One actual receiving header. Its Context remains local through all
     // callbacks and closes BEFORE backend destruction/host output export.
@@ -9108,10 +9231,14 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
         },
         .embedding_gemma2 => |cfg| blk: {
             if (input_seq > embedding_gemma2_arch.max_tokens) return error.InvalidEmbeddingInputLength;
-            if (self.backend_type == .cuda) output_seq = 1;
+            if (self.backend_type == .cuda or (self.backend_type == .pjrt and inputs.named("output_dimensions") != null)) output_seq = 1;
             // Live activations, expanded GQA, streamed PLE, and host/output
             // copies. Attention scores use fixed tiles, never tokens squared.
             workspace_bytes = try std.math.mul(usize, try std.math.mul(usize, batch, input_seq), 64 * 1024);
+            if (self.backend_type == .pjrt) {
+                const scores = try std.math.mul(usize, try std.math.mul(usize, batch, cfg.num_attention_heads), try std.math.mul(usize, input_seq, input_seq));
+                workspace_bytes = @max(workspace_bytes, try std.math.mul(usize, scores, 2 * @sizeOf(f32)));
+            }
             break :blk cfg.embedding_dim;
         },
         // Both media/text towers already include their architecture head.
@@ -9448,6 +9575,7 @@ fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig")
     if (self.backend_type == .native) self.backend_data.native.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
 
     self.model_lifetime.discardUnpublishedFinalResources();
+    self.captured_programs.deinit(self.allocator);
     if (self.video_coefficients) |*cache| cache.deinit();
     if (self.video_coefficient_permit) |*permit| permit.deinit();
     if (self.video_coefficient_device_permit) |*permit| permit.deinit();
@@ -21299,4 +21427,45 @@ test "GLiNER Decide Metal policy leaves native CUDA and changed artifacts untouc
     try applyGlinerDecideMetalExecutionPolicy(&config, .metal, gliner_decide_qualification.pinned_legacy_q8_identity);
     try std.testing.expect(config.gliner.metal_require_f32_weight_mirrors);
     try std.testing.expect(config.gliner.metal_decide_execution_policy);
+}
+
+test "model program frontend captures the complete official EG2 encoder and pooled projection" {
+    const a = std.testing.allocator;
+    const ml = @import("ml");
+    const tracing = @import("../graph/tracing_compute.zig");
+    var metadata = tracing.TracingCompute.init(a);
+    defer metadata.deinit();
+    const Shapes = struct {
+        fn visit(tc: *tracing.TracingCompute, name: []const u8, dims: []const i64) !void {
+            const owned = try tc.allocator.dupe(u8, name);
+            errdefer tc.allocator.free(owned);
+            try tc.weight_shapes.put(tc.allocator, owned, ml.graph.Shape.init(.f32, dims));
+        }
+        fn resolve(ptr: ?*anyopaque, _: std.mem.Allocator, name: []const u8) anyerror!?ml.graph.Shape {
+            const tc: *tracing.TracingCompute = @ptrCast(@alignCast(ptr.?));
+            return tc.weight_shapes.get(name);
+        }
+    };
+    const cfg = embedding_gemma2_arch.Config{};
+    try embedding_gemma2_arch.visitTextWeights(cfg, &metadata, Shapes.visit);
+    var owner = ArchSession{ .allocator = a, .arch_config = .{ .embedding_gemma2 = cfg }, .backend_type = .pjrt, .backend_data = .{ .pjrt = .{ .native = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } } } };
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 3 }, &.{ 2, 7314, 236786 });
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", &.{ 1, 3 }, &.{ 1, 0, 1 });
+    defer mask.deinit();
+    var dimensions = try Tensor.initInt64(a, "output_dimensions", &.{1}, &.{128});
+    defer dimensions.deinit();
+    const session = archSessionHandle(&owner);
+    for ([_]bool{ false, true }) |pooled| {
+        const declared = [_]@import("capture.zig").Input{ .{ .tensor = ids }, .{ .tensor = mask, .specialize = true }, .{ .tensor = dimensions, .specialize = true } };
+        const forward = if (pooled) session.embedding_program_forward.? else session.model_program_forward.?;
+        var program = try @import("capture.zig").trace(a, forward, declared[0..if (pooled) @as(usize, 3) else 2], .{ .context = &metadata, .resolve = Shapes.resolve });
+        defer program.deinit();
+        try std.testing.expect(program.graph.nodeCount() > cfg.num_hidden_layers);
+        for (program.graph.nodes.items) |node| try std.testing.expect(@import("../graph/partition.zig").supportsPjrt(node.op));
+        const output = program.graph.node(program.graph.outputs.items[0]).output_shape;
+        if (pooled) {
+            try std.testing.expectEqualSlices(i64, &.{ 1, 128 }, output.dims[0..output.rank()]);
+        } else try std.testing.expectEqualSlices(i64, &.{ 1, 3, 768 }, output.dims[0..output.rank()]);
+    }
 }

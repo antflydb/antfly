@@ -832,7 +832,9 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     defer cb.free(pp);
     var po: ?CT = try linear(cb, layer, "ple_block.per_layer_projection.weight", pp, rows, cfg.per_layer_input_dim, h);
     defer if (po) |value| cb.free(value);
-    const scale: f32 = cached: {
+    const graph_scale = if (cb.kind() == .graph) try weight(cb, layer, "layer_scalar") else null;
+    defer if (graph_scale) |scalar| cb.free(scalar);
+    const scale: f32 = if (graph_scale != null) 1 else cached: {
         if (cb.vtable.embeddingModelScalar) |get| if (get(cb.ptr, layer)) |value| break :cached value;
         const scalar = try weight(cb, layer, "layer_scalar");
         defer cb.free(scalar);
@@ -841,7 +843,11 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
         if (value.len != 1 or !std.math.isFinite(value[0])) return error.InvalidEmbeddingGemma2Weight;
         break :cached value[0];
     };
-    const result = try normResidual(cb, layer, "ple_block.post_per_layer_input_norm.weight", &po, ffn, h, cfg.rms_norm_eps, scale);
+    const normalized_result = try normResidual(cb, layer, "ple_block.post_per_layer_input_norm.weight", &po, ffn, h, cfg.rms_norm_eps, scale);
+    const result = if (graph_scale) |scalar| product: {
+        defer cb.free(normalized_result);
+        break :product try cb.multiply(normalized_result, scalar);
+    } else normalized_result;
     errdefer cb.free(result);
     ple_region.deinit();
     if (comptime @import("build_options").enable_metal) {
@@ -899,20 +905,36 @@ fn packedPerLayerInputs(cb: *const ComputeBackend, cfg: Config, embeddings: CT, 
     return result;
 }
 
-pub fn forwardCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
-    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
-    if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
+pub fn validateTextInputs(cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !usize {
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
     if (ids.len != rows or mask.len != rows) return error.InvalidInputShape;
     for (ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidTokenId;
+    return rows;
+}
+
+fn textEmbeddings(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
+    _ = allocator;
+    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm and cb.kind() != .graph) return error.UnsupportedEmbeddingGemma2Backend;
+    if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
+    const rows = try validateTextInputs(cfg, ids, mask, batch, seq);
     const ew = try cb.getWeight("language_model.embed_tokens.weight");
     defer cb.free(ew);
     const raw = try cb.embeddingLookup(ew, ids, rows, cfg.hidden_size);
     defer cb.free(raw);
-    const embeddings = try scaled(cb, raw, @sqrt(@as(f32, @floatFromInt(cfg.hidden_size))));
+    return scaled(cb, raw, @sqrt(@as(f32, @floatFromInt(cfg.hidden_size))));
+}
+
+pub fn forwardCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
+    const embeddings = try textEmbeddings(cb, allocator, cfg, ids, mask, batch, seq);
     defer cb.free(embeddings);
     return forwardEmbeddingsCT(cb, allocator, cfg, embeddings, mask, batch, seq);
+}
+
+pub fn forwardPooledCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
+    const embeddings = try textEmbeddings(cb, allocator, cfg, ids, mask, batch, seq);
+    defer cb.free(embeddings);
+    return forwardPooledEmbeddingsCT(cb, allocator, cfg, embeddings, mask, batch, seq, dimensions);
 }
 
 /// Already scaled hard-token embeddings with unscaled projected media tokens.
@@ -1212,7 +1234,7 @@ pub fn compactVisibility(a: std.mem.Allocator, original: Visibility) !Visibility
 const CompactRun = struct { visibility: Visibility, output: CompactOutput };
 
 fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: ?usize, compact: ?CompactRun) !CT {
-    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
+    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm and cb.kind() != .graph) return error.UnsupportedEmbeddingGemma2Backend;
     if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
@@ -1406,7 +1428,7 @@ fn poolCompactProjectNormalize(cb: *const ComputeBackend, cfg: Config, normalize
 
 /// Mean commutes only with the final linear projection, never with token RMSNorm.
 fn poolProjectNormalize(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, normalized: CT, projection: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
-    if (cb.kind() == .metal) {
+    if (cb.kind() == .metal or cb.kind() == .graph) {
         if (cb.vtable.maskedMeanBatch) |pool| {
             if (try pool(cb.ptr, normalized, mask, batch, seq, cfg.hidden_size, cfg.hidden_size, false)) |pooled| {
                 defer cb.free(pooled);

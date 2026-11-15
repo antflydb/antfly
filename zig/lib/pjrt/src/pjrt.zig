@@ -214,10 +214,20 @@ pub const Buffer = struct {
     }
 
     fn downloadFloat32(self: *const Buffer, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: ?[]const i64) ![]f32 {
+        return self.downloadTyped(f32, .float32, allocator, scratch, expected);
+    }
+
+    /// Exact dense host readback for graph state/control tensors. Physical type
+    /// and shape are checked against the actual provider before allocation.
+    pub fn toTypedWithShapeAndScratch(self: *const Buffer, comptime T: type, kind: c.BufferType, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: []const i64) ![]T {
+        return self.downloadTyped(T, kind, allocator, scratch, expected);
+    }
+
+    fn downloadTyped(self: *const Buffer, comptime T: type, expected_kind: c.BufferType, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: ?[]const i64) ![]T {
         if (!self.api.hasBufferReadback()) return error.UnsupportedPjrtFeature;
         var kind = c.BufferElementTypeArgs{ .struct_size = @sizeOf(c.BufferElementTypeArgs), .extension_start = null, .buffer = self.handle, .buffer_type = .invalid };
         try checkError(self.api, self.api.bufferElementType(&kind));
-        if (kind.buffer_type != .float32) return error.PjrtApiError;
+        if (kind.buffer_type != expected_kind) return error.PjrtApiError;
         var dims = std.mem.zeroes(c.BufferDimensionsArgs);
         dims.struct_size = @sizeOf(@TypeOf(dims));
         dims.buffer = self.handle;
@@ -253,9 +263,9 @@ pub const Buffer = struct {
         }
         if (query.event) |event| try awaitAndDestroyEvent(self.api, event);
         const size = query.dst_size;
-        if (size != try std.math.mul(usize, elements, @sizeOf(f32))) return error.PjrtApiError;
-        const num_floats = size / @sizeOf(f32);
-        const result = try allocator.alloc(f32, num_floats);
+        if (size != try std.math.mul(usize, elements, @sizeOf(T))) return error.PjrtApiError;
+        const num_values = size / @sizeOf(T);
+        const result = try allocator.alloc(T, num_values);
         errdefer allocator.free(result);
 
         var args = c.BufferToHostBufferArgs{
@@ -313,6 +323,11 @@ pub const LoadedExecutable = struct {
     /// Native executable metadata is authoritative; sidecar shapes must match
     /// before any execution or retained-state allocation can occur.
     pub fn validateOutputShapes(self: *const LoadedExecutable, expected: []const []const i64) !void {
+        return self.validateOutputSignature(expected, null);
+    }
+
+    pub fn validateOutputSignature(self: *const LoadedExecutable, expected: []const []const i64, expected_types: ?[]const c.BufferType) !void {
+        if (expected_types) |types| if (types.len != expected.len) return error.OutputCountMismatch;
         if (!self.api.hasOutputShapes()) return error.UnsupportedPjrtFeature;
         var owned = try self.executable();
         defer owned.deinit();
@@ -327,7 +342,8 @@ pub const LoadedExecutable = struct {
         if (types.num_output_types != expected.len or dims.num_outputs != expected.len) return error.OutputCountMismatch;
         var offset: usize = 0;
         for (expected, 0..) |shape, i| {
-            if ((types.output_types orelse return error.PjrtApiError)[i] != .float32) return error.PjrtApiError;
+            const expected_type = if (expected_types) |kinds| kinds[i] else c.BufferType.float32;
+            if ((types.output_types orelse return error.PjrtApiError)[i] != expected_type) return error.PjrtApiError;
             const rank = (dims.dim_sizes orelse return error.PjrtApiError)[i];
             if (rank != shape.len) return error.PjrtApiError;
             const end = try std.math.add(usize, offset, rank);
@@ -731,6 +747,24 @@ pub const Client = struct {
         return self.uploadBuffer(@ptrCast(data.ptr), .int64, dims, self.device);
     }
 
+    /// Contiguous typed input transfer. Integer/boolean/float64 operands must
+    /// never pass through F32 conversion. Completion owns the same upload path
+    /// as the typed convenience APIs.
+    pub fn bufferFromHostBytes(self: *const Client, bytes: []const u8, kind: c.BufferType, dims: []const i64) PjrtError!Buffer {
+        const width: usize = switch (kind) {
+            .pred, .int8, .uint8 => 1,
+            .int16, .uint16, .float16, .bfloat16 => 2,
+            .int32, .uint32, .float32 => 4,
+            .int64, .uint64, .float64, .complex64 => 8,
+            .complex128 => 16,
+            else => return error.UnsupportedPjrtFeature,
+        };
+        var count: usize = 1;
+        for (dims) |dim| count = std.math.mul(usize, count, std.math.cast(usize, dim) orelse return error.PjrtApiError) catch return error.PjrtApiError;
+        if (bytes.len != (std.math.mul(usize, count, width) catch return error.PjrtApiError)) return error.PjrtApiError;
+        return self.uploadBuffer(@ptrCast(bytes.ptr), kind, dims, self.device);
+    }
+
     /// Initialize PJRT client by searching for the plugin in standard locations.
     /// Search order:
     ///   1. ANTFLY_INFERENCE_XLA_PLUGIN, ANTFLY_INFERENCE_PJRT_PLUGIN,
@@ -859,9 +893,9 @@ test "end-to-end: compile and execute HLO add via PJRT CPU plugin" {
     const alloc = std.testing.allocator;
 
     // Load CPU plugin — skip test gracefully if not found
-    var client = Client.initFromEnv(alloc) catch |err| {
-        std.debug.print("Skipping PJRT test (plugin not found: {})\n", .{err});
-        return;
+    var client = Client.initFromEnv(alloc) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
     };
     defer client.deinit();
 

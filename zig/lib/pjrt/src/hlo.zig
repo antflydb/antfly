@@ -125,6 +125,8 @@ pub const Builder = struct {
         literal_f32s: ?[]const f32 = null,
         literal_f32s_owned: bool = false,
         literal_s32s: ?[]const i32 = null,
+        literal_s64s: ?[]const i64 = null,
+        literal_preds: ?[]const u8 = null,
         called_computation_ids: ?[]const Id = null,
         comparison_direction: ?[]const u8 = null,
         // Tuple root support:
@@ -270,6 +272,21 @@ pub const Builder = struct {
             .operand_ids = &.{},
             .literal_s32s = data,
         });
+    }
+
+    pub fn constantS64(self: *Builder, shape: Shape, data: []const i64) !Id {
+        return self.addInst(.{
+            .id = self.nextId(),
+            .opcode = "constant",
+            .name = "constant",
+            .shape = shape,
+            .operand_ids = &.{},
+            .literal_s64s = data,
+        });
+    }
+
+    pub fn constantPred(self: *Builder, shape: Shape, data: []const u8) !Id {
+        return self.addInst(.{ .id = self.nextId(), .opcode = "constant", .name = "constant", .shape = shape, .operand_ids = &.{}, .literal_preds = data });
     }
 
     pub fn constantScalarF32(self: *Builder, value: f32) !Id {
@@ -435,6 +452,13 @@ pub const Builder = struct {
     pub fn divide(self: *Builder, lhs: Id, rhs: Id) !Id {
         return self.binaryOp("divide", lhs, rhs);
     }
+    pub fn logicalAnd(self: *Builder, lhs: Id, rhs: Id) !Id {
+        return self.binaryOp("and", lhs, rhs);
+    }
+    pub fn logicalOr(self: *Builder, lhs: Id, rhs: Id) !Id {
+        return self.binaryOp("or", lhs, rhs);
+    }
+
     pub fn maximum(self: *Builder, lhs: Id, rhs: Id) !Id {
         return self.binaryOp("maximum", lhs, rhs);
     }
@@ -853,6 +877,8 @@ fn buildLiteralProto(
     shape: Shape,
     f32s: ?[]const f32,
     s32s: ?[]const i32,
+    s64s: ?[]const i64,
+    predicates: ?[]const u8,
 ) !xla.LiteralProto {
     var proto: xla.LiteralProto = .{};
     errdefer proto.deinit(alloc);
@@ -860,6 +886,11 @@ fn buildLiteralProto(
     proto.shape = try buildShapeProto(alloc, shape);
     if (f32s) |data| proto.f32s = try alloc.dupe(f32, data);
     if (s32s) |data| proto.s32s = try alloc.dupe(i32, data);
+    if (s64s) |data| proto.s64s = try alloc.dupe(i64, data);
+    if (predicates) |data| {
+        proto.preds = try alloc.alloc(bool, data.len);
+        for (proto.preds, data) |*value, byte| value.* = byte != 0;
+    }
     return proto;
 }
 
@@ -934,8 +965,8 @@ fn buildInstructionProto(alloc: Allocator, inst: Builder.Instruction) !xla.HloIn
     if (inst.slice_dimensions) |slice_dims| {
         proto.slice_dimensions = try alloc.dupe(xla.HloInstructionProto.SliceDimensions, slice_dims);
     }
-    if (inst.literal_f32s != null or inst.literal_s32s != null) {
-        proto.literal = try buildLiteralProto(alloc, inst.shape, inst.literal_f32s, inst.literal_s32s);
+    if (inst.literal_f32s != null or inst.literal_s32s != null or inst.literal_s64s != null or inst.literal_preds != null) {
+        proto.literal = try buildLiteralProto(alloc, inst.shape, inst.literal_f32s, inst.literal_s32s, inst.literal_s64s, inst.literal_preds);
     }
     if (inst.parameter_number) |pn| {
         proto.parameter_number = @intCast(pn);

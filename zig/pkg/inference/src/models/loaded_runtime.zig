@@ -2073,11 +2073,11 @@ pub fn preparePrimary(allocator: std.mem.Allocator, model_dir: []const u8, sourc
     if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
     if (man.hasIncompleteClipclapGgufBundle()) return error.IncompleteClipclapGgufBundle;
     if (man.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
-    var eg2_backends: [3]backends.BackendType = undefined;
+    var eg2_backends: [4]backends.BackendType = undefined;
     if (man.embedding_style == .embedding_gemma2) {
         var count: usize = 0;
         for (sm.preferred_backends) |backend| {
-            if (backend != .native and backend != .metal and backend != .cuda) continue;
+            if (backend != .native and backend != .metal and backend != .cuda and backend != .pjrt) continue;
             var duplicate = false;
             for (eg2_backends[0..count]) |existing| if (existing == backend) {
                 duplicate = true;

@@ -108,13 +108,14 @@ pub const PhysicalLayout = struct {
     output_policy: []PhysicalOutputLayout.Check,
     diagnostics: partition_mod.CapabilityDiagnostics,
     target_kind: BackendKind,
+    host_kind: ?BackendKind = null,
     fallback: bool,
     partition_owned: bool = true,
     buffers_owned: bool = true,
 
     pub fn create(allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend, options: Runtime.InitOptions, retain_output_policy: bool) !PhysicalLayout {
         if (backends.len == 0 or backends.len > 2) return error.InvalidPhysicalBackendCount;
-        const target_kind = backendKindForPartition(backends[0].kind());
+        const target_kind = if (options.compiled) |context| context.requested_backend orelse return error.MissingCompiledBackend else backendKindForPartition(backends[0].kind());
         const use_native_fallback = backends.len == 2;
         if (use_native_fallback and (target_kind == .native or backends[1].kind() != .native)) return error.InvalidPhysicalBackendCount;
         var capabilities_buf: [2]partition_mod.Capability = undefined;
@@ -141,6 +142,10 @@ pub const PhysicalLayout = struct {
             };
             break :blk 1;
         };
+        if (options.compiled) |context| {
+            const definition = compiled_registry.find(target_kind) orelse return error.UnsupportedCompiledGraphBackend;
+            capabilities_buf[0] = definition.capability(context, .single_device);
+        }
         const descriptor_seeds = try partition_mod.allocTensorDescriptorSeeds(allocator, graph);
         defer allocator.free(descriptor_seeds);
         try partition_mod.seedAllUploadableResidency(descriptor_seeds, graph, target_kind, 0);
@@ -164,7 +169,7 @@ pub const PhysicalLayout = struct {
         var buffers = try buffer_plan_mod.build(allocator, graph, &base, .{ .output_layout = .{ .context = &output_layout, .resolve = &PhysicalOutputLayout.resolve } });
         errdefer buffers.deinit();
         try buffers.validate(graph, &base);
-        return .{ .allocator = allocator, .partition = base, .buffers = buffers, .output_policy = checks, .diagnostics = diagnostics, .target_kind = target_kind, .fallback = use_native_fallback };
+        return .{ .allocator = allocator, .partition = base, .buffers = buffers, .output_policy = checks, .diagnostics = diagnostics, .target_kind = target_kind, .host_kind = backendKindForPartition(backends[0].kind()), .fallback = use_native_fallback };
     }
 
     pub fn validateCurrent(self: *const PhysicalLayout, allocator: std.mem.Allocator, graph: *const Graph, backends: []const *const ComputeBackend) !void {
@@ -185,7 +190,7 @@ pub const PhysicalLayout = struct {
             const functions = backend.vtable.kernels orelse return error.PhysicalOutputLayoutChanged;
             if (!functions.accepts(backend.vtable)) return error.PhysicalOutputLayoutChanged;
         };
-        if (backends.len != (if (self.fallback) @as(usize, 2) else 1) or backendKindForPartition(backends[0].kind()) != self.target_kind or (self.fallback and backends[1].kind() != .native)) return error.InvalidPhysicalBackendCount;
+        if (backends.len != (if (self.fallback) @as(usize, 2) else 1) or backendKindForPartition(backends[0].kind()) != (self.host_kind orelse self.target_kind) or (self.fallback and backends[1].kind() != .native)) return error.InvalidPhysicalBackendCount;
         if (graphPartitionReportRequested()) {
             if (graphPartitionReportTargetOverride()) |target| if (target != self.target_kind) try dumpPartitionReportForTarget(allocator, graph, target);
             dumpPartitionReport(graph, &self.partition, self.target_kind, self.fallback, &self.diagnostics);
@@ -301,11 +306,18 @@ pub const Runtime = struct {
     partition_last_use: ?[]u32 = null,
     physical_pool: ?*@import("../execution/physical_buffers.zig").Pool = null,
     runtime_cache_entry: ?cache_mod.CacheEntry = null,
+    compiled_context: ?compiled_backend.AttachContext = null,
     native_partition_executors: std.ArrayListUnmanaged(*native_partition_executor.NativePartitionExecutor) = .empty,
     // DeviceMesh borrows this backend across moves of Runtime itself.
     fallback_native: ?*FallbackNativeBackend = null,
 
     pub const InitOptions = struct {
+        /// Compiled implementation and its actual provider are independent of
+        /// the transport backend owning graph inputs/outputs.
+        compiled: ?compiled_backend.AttachContext = null,
+        compiled_allow_fallback: bool = false,
+        /// Borrow immutable compiled executors. The owner must outlive this frame.
+        compiled_source: ?*const Runtime = null,
         kernel_descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor = null,
         tensor_descs: ?[]const ?@import("backend_contracts.zig").TensorDesc = null,
         analysis: ?interpreter.CachedAnalysis = null,
@@ -322,10 +334,12 @@ pub const Runtime = struct {
     }
 
     pub fn initWithOptions(allocator: std.mem.Allocator, graph: *const Graph, backend: *const ComputeBackend, requested_strategy: Strategy, options: InitOptions) !Runtime {
+        if (options.compiled != null and requested_strategy == .interpreter) return error.CompiledBackendRequiresPlan;
         var runtime = Runtime{
             .allocator = allocator,
             .strategy = requested_strategy,
             .default_backend = backend,
+            .compiled_context = options.compiled,
         };
         errdefer runtime.deinit();
 
@@ -659,8 +673,9 @@ pub const Runtime = struct {
         backend: *const ComputeBackend,
         options: InitOptions,
     ) !void {
-        const target_kind = backendKindForPartition(backend.kind());
-        const use_native_fallback = target_kind != .native and build_options.enable_native;
+        const target_kind = if (options.compiled) |context| context.requested_backend orelse return error.MissingCompiledBackend else backendKindForPartition(backend.kind());
+        if (options.compiled != null and compiled_registry.find(target_kind) == null) return error.UnsupportedCompiledGraphBackend;
+        const use_native_fallback = target_kind != .native and build_options.enable_native and (options.compiled == null or options.compiled_allow_fallback);
 
         if (use_native_fallback) {
             try self.initFallbackNativeBackend();
@@ -707,6 +722,9 @@ pub const Runtime = struct {
         for (base.partitions, 0..) |part, i| {
             assignments[i] = if (use_native_fallback and part.backend == .native) 1 else 0;
         }
+        if (options.compiled != null and !options.compiled_allow_fallback) for (base.partitions) |part| {
+            if (partitionHasCompute(graph, part) and part.backend != target_kind) return error.UnsupportedCompiledGraphRuntime;
+        };
         try self.attachNativePartitionExecutors(graph, &base, assignments);
 
         self.plan = .{
@@ -715,7 +733,10 @@ pub const Runtime = struct {
             .allocator = self.allocator,
         };
         plan_installed = true;
-        try self.attachCompiledPartitionExecutors(graph, backend, target_kind);
+        if (options.compiled_source) |source| {
+            try self.borrowCompiledPartitionExecutors(graph, source);
+        } else try self.attachCompiledPartitionExecutors(graph, backend, target_kind);
+        if (options.compiled != null and !self.allComputePartitionsHaveAttachedExecutors(graph)) return error.UnsupportedCompiledGraphRuntime;
         self.buffer_plan = layout.buffers;
         layout.buffers_owned = false;
         self.physical_pool = try @import("../execution/physical_buffers.zig").Pool.createWithDescriptors(self.allocator, graph, &self.buffer_plan.?, physical_backends[0..device_count], self.plan.?.base.node_operator_plans, options.kernel_descriptors);
@@ -747,6 +768,26 @@ pub const Runtime = struct {
         };
     }
 
+    fn borrowCompiledPartitionExecutors(self: *Runtime, graph: *const Graph, source: *const Runtime) !void {
+        const receiving = self.compiled_context orelse return error.MissingCompiledBackend;
+        const original = source.compiled_context orelse return error.MissingCompiledBackend;
+        if (receiving.requested_backend != .pjrt or original.requested_backend != .pjrt or
+            receiving.pjrt_client != original.pjrt_client or receiving.pjrt_client == null)
+            return error.ForeignCompiledProvider;
+        const owned = source.runtime_cache_entry orelse return error.MissingCompiledProgram;
+        if (owned.graph.nodes.items.ptr != graph.nodes.items.ptr or owned.graph.nodeCount() != graph.nodeCount()) return error.ForeignCompiledProgram;
+        const original_plan = source.plan orelse return error.MissingGraphRuntimePlan;
+        const receiving_plan = if (self.plan) |*plan| plan else return error.MissingGraphRuntimePlan;
+        if (original_plan.base.partitions.len != receiving_plan.base.partitions.len) return error.ForeignCompiledProgram;
+        // Complete validation before installing any borrowed pointer.
+        for (original_plan.base.partitions, receiving_plan.base.partitions) |a, b| {
+            if (a.backend != b.backend or !std.mem.eql(NodeId, a.node_ids, b.node_ids)) return error.ForeignCompiledProgram;
+            if (partitionHasCompute(graph, b) and a.executor == null) return error.MissingCompiledProgram;
+        }
+        receiving_plan.base.owns_executors = false;
+        for (original_plan.base.partitions, receiving_plan.base.partitions) |a, *b| b.executor = a.executor;
+    }
+
     fn attachCompiledPartitionExecutors(
         self: *Runtime,
         graph: *const Graph,
@@ -755,11 +796,13 @@ pub const Runtime = struct {
     ) !void {
         const backend_def = compiled_registry.find(target_kind) orelse return;
         const plan = if (self.plan) |*p| p else return error.MissingGraphRuntimePlan;
-        const context = compiled_backend.AttachContext{
+        var context = self.compiled_context orelse compiled_backend.AttachContext{
             .cb = backend,
             .requested_backend = target_kind,
             .attachment_target = .partitioned,
         };
+        context.cb = backend;
+        if (self.compiled_context != null) context.require_compiled = true;
         if (!backend_def.should_attach(context, .single_device)) return;
         if (!backend_def.has_compilable_partition(graph, plan, context, .single_device)) return;
         self.ensureRuntimeCacheEntry(graph);

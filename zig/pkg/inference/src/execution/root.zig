@@ -17,6 +17,8 @@
 //! retain their specialized schedules behind these common owners.
 pub const LoadedModel = @import("../architectures/model_definition.zig").LoadedModel;
 pub const ModelProgram = @import("program.zig").ModelProgram;
+pub const capture = @import("capture.zig");
+pub const captured_forward = @import("captured_forward.zig");
 pub const Binding = @import("program.zig").Binding;
 pub const Executable = @import("executable.zig").Executable;
 pub const prepare = @import("executable.zig").prepare;
@@ -59,6 +61,9 @@ pub const decoder_stage = @import("decoder_stage.zig");
 pub const speculative_activation = @import("speculative_activation.zig");
 
 test {
+    _ = capture;
+    _ = captured_forward;
+    _ = @import("pjrt_typed_test.zig");
     _ = @import("../backends/compute_factory.zig");
     _ = @import("decoder_forward.zig");
     _ = @import("native_decoder_program.zig");

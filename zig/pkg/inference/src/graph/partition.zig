@@ -1127,6 +1127,12 @@ pub fn supportsPjrt(op: OpCode) bool {
                 attrs.num_heads % num_kv_heads == 0 and
                 attrs.head_dim > 0;
         },
+        .parameter, .constant, .stop_gradient,
+        .add, .sub, .mul, .div, .neg, .exp, .log, .sqrt, .rsqrt, .sin, .cos, .tanh, .erf, .abs,
+        .reshape, .transpose, .broadcast_in_dim, .concat_prim, .dot_general,
+        .less_than, .where_select, .reduce_sum, .reduce_mean, .reduce_max,
+        .fused_segment_attention,
+        .fused_gelu_exact,
         .fused_linear,
         .fused_linear_no_bias,
         .fused_linear_no_bias_pair,

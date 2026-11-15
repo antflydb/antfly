@@ -72,14 +72,18 @@ pub const xla = struct {
     };
 
     pub const LiteralProto = struct {
+        preds: []bool = &.{},
         shape: ShapeProto = .{},
         f32s: []const f32 = &.{},
         s32s: []const i32 = &.{},
+        s64s: []const i64 = &.{},
 
         pub fn deinit(self: *LiteralProto, alloc: Allocator) void {
             self.shape.deinit(alloc);
+            if (self.preds.len > 0) alloc.free(self.preds);
             if (self.f32s.len > 0) alloc.free(self.f32s);
             if (self.s32s.len > 0) alloc.free(self.s32s);
+            if (self.s64s.len > 0) alloc.free(self.s64s);
             self.* = .{};
         }
     };
@@ -251,8 +255,14 @@ fn encodeShapeProto(alloc: Allocator, buf: *wire.Buf, value: xla.ShapeProto) !vo
 }
 
 fn encodeLiteralProto(alloc: Allocator, buf: *wire.Buf, value: xla.LiteralProto) !void {
+    if (value.preds.len != 0) {
+        try wire.writeTag(alloc, buf, 2, .length_delimited);
+        try wire.writeVarint(alloc, buf, value.preds.len);
+        for (value.preds) |predicate| try wire.writeVarint(alloc, buf, @intFromBool(predicate));
+    }
     try encodeMessage(alloc, buf, 1, value.shape, encodeShapeProto);
     if (value.s32s.len > 0) try writePackedInt32s(alloc, buf, 4, value.s32s);
+    if (value.s64s.len > 0) try wire.writePackedInt64s(alloc, buf, 5, value.s64s);
     if (value.f32s.len > 0) try wire.writePackedFloats(alloc, buf, 8, value.f32s);
 }
 

@@ -712,6 +712,9 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
 }
 
 fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllocator, session: Session, tokenizer: Tokenizer, group: Group, input_options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache, native_allocator: ?*@import("../backends/admitted_allocator.zig").AdmittedAllocator) !Result {
+    if (session.backend() == .pjrt) for (group.content) |part| {
+        if (part != .text) return error.UnsupportedCompiledMediaProgram;
+    };
     var native_run: ?@import("../backends/admitted_allocator.zig").AdmittedAllocator.RunScope = null;
     defer if (native_run) |*run| run.deinit();
     var pins = @import("embedding_gemma2_video.zig").CachePins{ .cache = cache };
@@ -872,7 +875,10 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     if (options.video_prepared) |hook| try hook.ready(hook.context);
     const mask = prepared.mask;
     if (prepared.embeddings == null and prepared.tensor == null) {
-        const vector = try preparedText(cb, a, cfg, prepared.ids, mask, options.dimensions);
+        const vector = if (session.backend() == .pjrt)
+            try preparedTextProgram(&permit, a, prepared.ids, mask, options.dimensions, effective)
+        else
+            try preparedText(cb, a, cfg, prepared.ids, mask, options.dimensions);
         errdefer a.free(vector);
         try effective.check();
         return .{ .vector = vector, .input_tokens = count };
@@ -4093,6 +4099,23 @@ test "embeddinggemma2 CUDA groups admit complete manual media layouts and reject
 
 /// Encoder benchmark and serving share this boundary: prepared IDs/mask through
 /// synchronized final vector readback. Loading, tokenization and HTTP stay out.
+fn preparedTextProgram(permit: *RunPermit, allocator: std.mem.Allocator, ids: []const i64, mask: []const i64, dimensions: usize, control: Control) ![]f32 {
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    var input = try Tensor.initInt64(allocator, "input_ids", &.{ 1, @intCast(ids.len) }, ids);
+    defer input.deinit();
+    var visibility = try Tensor.initInt64(allocator, "attention_mask", input.shape, mask);
+    defer visibility.deinit();
+    var width = try Tensor.initInt64(allocator, "output_dimensions", &.{1}, &.{@intCast(dimensions)});
+    defer width.deinit();
+    const outputs = try permit.runWithControl(&.{ input, visibility, width }, allocator, control);
+    defer allocator.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 2 or outputs[0].shape[0] != 1 or outputs[0].shape[1] != dimensions) return error.UnexpectedOutputShape;
+    const vector = outputs[0].asFloat32();
+    for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidEmbeddingOutput;
+    return allocator.dupe(f32, vector);
+}
+
 pub fn preparedText(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: encoder.Config, ids: []const i64, mask: []const i64, dimensions: usize) ![]f32 {
     const vectors = try preparedTexts(cb, a, cfg, ids, mask, 1, ids.len, dimensions);
     defer a.free(vectors);

@@ -1822,7 +1822,6 @@ pub fn prepare(allocator: std.mem.Allocator, model_path: []const u8, loaded_mode
     var direct_quant_enabled = directQuantEnabled();
     const cpu_plan_context = defaultPlanContextForBackend(.cpu);
     if (preparation.backend == .pjrt) switch (loaded_model.architecture) {
-        .embedding_gemma2 => return error.UnsupportedBackend,
         .gliner_boundary => return error.UnsupportedGlinerBoundaryBackend,
         else => {},
     };

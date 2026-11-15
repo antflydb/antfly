@@ -257,7 +257,7 @@ pub fn forwardWithControl(
     return cb.toFloat32(hidden, allocator);
 }
 
-fn validateBertForwardInputs(
+pub fn validateBertForwardInputs(
     config: Config,
     input_ids: []const i64,
     attention_mask: []const i64,

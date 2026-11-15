@@ -117,6 +117,9 @@ pub const Executable = struct {
 };
 
 pub const PrepareOptions = struct {
+    compiled: ?@import("../graph/compiled_backend.zig").AttachContext = null,
+    compiled_allow_fallback: bool = false,
+    compiled_source: ?*const runtime_module.Runtime = null,
     physical_replay: bool = true,
     immutable_input_bindings: ?[]const @import("kernel_route.zig").InputBinding = null,
     input_bindings: ?[]const interpreter.RuntimeInput = null,
@@ -129,7 +132,9 @@ pub fn prepare(allocator: std.mem.Allocator, program: *const ModelProgram, backe
 }
 
 pub fn prepareWithOptions(allocator: std.mem.Allocator, program: *const ModelProgram, backend: *const ops.ComputeBackend, strategy: runtime_module.Strategy, options: PrepareOptions) !Executable {
-    var prepared = try prepareAnalyzedGraph(allocator, &program.graph, program.analysis, backend, strategy, options);
+    var resolved_options = options;
+    if (resolved_options.compiled) |*context| context.mutable_parameters = program.mutable_parameters;
+    var prepared = try prepareAnalyzedGraph(allocator, &program.graph, program.analysis, backend, strategy, resolved_options);
     errdefer prepared.deinit();
     if (comptime !@import("build_options").enable_wasm) {
         if (options.physical_replay) if (prepared.runtime.physical_pool) |pool| try pool.prepareReplay(&program.graph, &prepared.runtime.buffer_plan.?, program.bindings, options.region_costs orelse .{});
@@ -149,6 +154,9 @@ pub fn prepareWithOptions(allocator: std.mem.Allocator, program: *const ModelPro
 /// Borrow canonical IR and its cached analysis from an existing semantic owner.
 /// This adapts traced caches without optimizing again or cloning graph storage.
 pub fn prepareAnalyzedGraph(allocator: std.mem.Allocator, graph: *const @import("ml").graph.Graph, analysis: interpreter.CachedAnalysis, backend: *const ops.ComputeBackend, strategy: runtime_module.Strategy, options: PrepareOptions) !Executable {
+    if (comptime @import("build_options").enable_wasm) {
+        if (options.compiled != null) return error.CompiledBackendUnavailable;
+    }
     const partition = @import("../graph/partition.zig");
     var owned_seeds: ?[]?@import("../graph/backend_contracts.zig").TensorDesc = null;
     defer if (owned_seeds) |seeds| allocator.free(seeds);
@@ -176,7 +184,7 @@ pub fn prepareAnalyzedGraph(allocator: std.mem.Allocator, graph: *const @import(
     var result: Executable = .{ .graph = graph, .analysis = analysis, .runtime = if (comptime @import("build_options").enable_wasm)
         try runtime_module.Runtime.init(allocator, graph, backend, strategy)
     else
-        try runtime_module.Runtime.initWithOptions(allocator, graph, backend, strategy, .{ .tensor_descs = tensor_descs, .analysis = analysis, .region_costs = options.region_costs }) };
+        try runtime_module.Runtime.initWithOptions(allocator, graph, backend, strategy, .{ .tensor_descs = tensor_descs, .analysis = analysis, .region_costs = options.region_costs, .compiled = options.compiled, .compiled_allow_fallback = options.compiled_allow_fallback, .compiled_source = options.compiled_source }) };
     errdefer result.deinit();
     try configureOwnedCoverage(&result, graph, analysis);
     if (comptime !@import("build_options").enable_wasm) if (result.runtime.physical_pool) |pool| try pool.configureRoutes(options.immutable_input_bindings orelse &.{});

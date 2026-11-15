@@ -55,12 +55,10 @@ const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-const plugin_path: [:0]const u8 = "/Users/ajroetker/go/src/github.com/antflydb/antfly/termite/pjrt/darwin-arm64/lib/pjrt_c_api_cpu_v0.83.4_plugin.so";
-
-fn initClient() ?pjrt_lib.pjrt.Client {
-    return pjrt_lib.pjrt.Client.init(plugin_path) catch |err| {
-        std.debug.print("Skipping PJRT test (plugin load failed: {s})\n", .{@errorName(err)});
-        return null;
+fn initClient() !pjrt_lib.pjrt.Client {
+    return pjrt_lib.pjrt.Client.initFromEnv(std.testing.allocator) catch |err| switch (err) {
+        error.PjrtPluginNotFound => error.SkipZigTest,
+        else => return err,
     };
 }
 
@@ -165,7 +163,7 @@ test "pjrt_compiler: linear partition compiles to valid HLO" {
     if (!build_options.enable_pjrt) return;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Build graph: Y = X @ W^T + bias (fused_linear)
@@ -238,7 +236,7 @@ test "pjrt_executor: linear layer end-to-end" {
     if (!build_options.enable_pjrt) return;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Build graph: Y = X @ W^T + bias
@@ -351,7 +349,7 @@ test "pjrt_executor: embedding lookup uses runtime embedding ids" {
     if (!build_options.enable_pjrt) return;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     var g = Graph.init(allocator);
@@ -500,7 +498,7 @@ test "pjrt_model_runtime: decode uses single token id" {
     if (!build_options.enable_pjrt) return;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     var g = Graph.init(allocator);
@@ -587,7 +585,7 @@ test "pjrt_executor: gelu activation end-to-end" {
     if (!build_options.enable_pjrt) return;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Build graph: Y = gelu(X)
@@ -673,7 +671,7 @@ test "pjrt_executor: linear + rms_norm + gelu pipeline" {
     if (!build_options.enable_pjrt) return;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Build graph: gelu(rms_norm(X @ W^T, gamma))
@@ -792,7 +790,7 @@ test "pjrt_mesh: createPjrtMesh from CPU plugin" {
     if (!build_options.enable_pjrt) return;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Use fake backends — we only test mesh structure, not execution.
@@ -835,7 +833,7 @@ test "pjrt_executor: element-wise add end-to-end" {
     if (!build_options.enable_pjrt) return;
     const allocator = std.testing.allocator;
 
-    var client = initClient() orelse return;
+    var client = try initClient();
     defer client.deinit();
 
     // Build graph: Z = X + Y (fused_elem_add)

@@ -650,6 +650,17 @@ pub const RopeAttrs = struct {
 ///   forward: (lo*cos - hi*sin, lo*sin + hi*cos)
 ///   inverse: (lo*cos + hi*sin, hi*cos - lo*sin), the transpose, which is
 ///   the VJP of the forward (and vice versa).
+/// Segmented token-major inference attention. The fourth operand is immutable
+/// i32 visibility metadata: six range endpoints per query, then query and key
+/// positions. Q/K/V remain ordinary dynamic tensors.
+pub const SegmentAttentionAttrs = struct {
+    queries: u32,
+    keys: u32,
+    num_heads: u32,
+    head_dim: u32,
+    window: u32 = 0xffffffff,
+};
+
 pub const RopeTableAttrs = struct {
     head_dim: u32,
     inverse: bool = false,
@@ -902,6 +913,7 @@ pub const OpCode = union(enum) {
     /// Inputs are the precomputed cotangent * probability and probability.
     /// Output is weighted_cotangent - probability * row_sum(weighted_cotangent).
     fused_softmax_backward: SoftmaxAttrs,
+    fused_segment_attention: SegmentAttentionAttrs,
 
     pub fn isFused(self: OpCode) bool {
         return switch (self) {

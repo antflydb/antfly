@@ -2587,29 +2587,29 @@ pub fn executeNode(
 
         .constant => |attrs| {
             if (n.output_shape.rank() > 8) return error.UnsupportedShape;
+            const byte_count = std.math.mul(usize, attrs.data_len, n.output_shape.dtype.byteSize()) catch return error.UnsupportedShape;
+            if (attrs.data_offset > graph.constant_pool.items.len or byte_count > graph.constant_pool.items.len - attrs.data_offset) return error.UnsupportedShape;
+            const elements = n.output_shape.numElements() orelse return error.UnsupportedShape;
+            if (elements != attrs.data_len) return error.UnsupportedShape;
+            if (try cb.fromConstantBytes(graph.constant_pool.items[attrs.data_offset..][0..byte_count], n.output_shape.dtype, n.output_shape.dims[0..n.output_shape.rank()])) |tensor| return tensor;
             if (state.options.strict_integer_constants) switch (n.output_shape.dtype) {
                 .i32 => {
-                    const byte_count = std.math.mul(usize, attrs.data_len, @sizeOf(i32)) catch return error.UnsupportedShape;
-                    if (attrs.data_offset > graph.constant_pool.items.len or byte_count > graph.constant_pool.items.len - attrs.data_offset) return error.UnsupportedShape;
                     const data = graph.constantDataAs(i32, attrs.data_offset, attrs.data_len);
                     if (n.output_shape.rank() > 8) return error.UnsupportedShape;
                     var dimensions: [8]i32 = undefined;
-                    var elements: usize = 1;
+                    var fallback_elements: usize = 1;
                     for (0..n.output_shape.rank()) |axis| {
                         const dimension = n.output_shape.dim(@intCast(axis));
                         if (dimension < 0) return error.UnsupportedShape;
                         dimensions[axis] = std.math.cast(i32, dimension) orelse return error.UnsupportedShape;
-                        elements = std.math.mul(usize, elements, @intCast(dimension)) catch return error.UnsupportedShape;
+                        fallback_elements = std.math.mul(usize, fallback_elements, @intCast(dimension)) catch return error.UnsupportedShape;
                     }
-                    if (elements != data.len) return error.UnsupportedShape;
+                    if (fallback_elements != data.len) return error.UnsupportedShape;
                     return (try cb.fromInt32Shape(data, dimensions[0..n.output_shape.rank()])) orelse return error.UnsupportedIntegerTensor;
                 },
                 .i8, .i16, .i64, .u8, .bool_ => return error.UnsupportedIntegerTensor,
                 else => {},
             };
-            const byte_count = std.math.mul(usize, attrs.data_len, n.output_shape.dtype.byteSize()) catch return error.UnsupportedShape;
-            if (attrs.data_offset > graph.constant_pool.items.len or byte_count > graph.constant_pool.items.len - attrs.data_offset) return error.UnsupportedShape;
-            if (try cb.fromConstantBytes(graph.constant_pool.items[attrs.data_offset..][0..byte_count], n.output_shape.dtype, n.output_shape.dims[0..n.output_shape.rank()])) |tensor| return tensor;
             const constant = try graph.constantDataAsF32(
                 graph.allocator,
                 n.output_shape.dtype,
@@ -3149,6 +3149,16 @@ pub fn executeNode(
                 attrs.padding_w,
                 attrs.groups,
             );
+        },
+
+        .fused_segment_attention => |attrs| {
+            const source = graph.node(ins[3]);
+            if (source.op != .constant or source.output_shape.dtype != .i32) return error.InvalidAttentionMetadata;
+            const metadata = graph.constantDataAs(i32, source.op.constant.data_offset, source.op.constant.data_len);
+            const ranges_len = try std.math.mul(usize, attrs.queries, 6);
+            if (metadata.len != try std.math.add(usize, ranges_len, try std.math.add(usize, attrs.queries, attrs.keys))) return error.InvalidAttentionMetadata;
+            const ranges: []const u32 = @ptrCast(metadata[0..ranges_len]);
+            return cb.segmentAttention(state.allocator orelse graph.allocator, V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), &.{ .ranges = ranges, .query_positions = metadata[ranges_len..][0..attrs.queries], .key_positions = metadata[ranges_len + attrs.queries ..], .window = attrs.window, .queries = attrs.queries, .keys = attrs.keys, .num_heads = attrs.num_heads, .head_dim = attrs.head_dim });
         },
 
         .fused_windowed_self_attention => {

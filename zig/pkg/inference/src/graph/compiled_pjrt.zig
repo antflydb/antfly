@@ -198,6 +198,21 @@ pub fn attachPjrtExecutors(
     pjrt_client: *anyopaque,
     attachment_target: compiled_backend.AttachmentTarget,
 ) !void {
+    return attachPjrtExecutorsWithParameters(allocator, entry, graph, dpp, cb, pjrt_client, attachment_target, null, null, false);
+}
+
+fn attachPjrtExecutorsWithParameters(
+    allocator: std.mem.Allocator,
+    entry: *cache_mod.CacheEntry,
+    graph: *const Graph,
+    dpp: *multi_executor_mod.DevicePartitionPlan,
+    cb: *const ops.ComputeBackend,
+    pjrt_client: *anyopaque,
+    attachment_target: compiled_backend.AttachmentTarget,
+    mutable_parameters: ?[]const bool,
+    parameter_store: ?*anyopaque,
+    required: bool,
+) !void {
     if (!build_options.enable_pjrt) return;
 
     const pjrt_lib = @import("pjrt");
@@ -231,14 +246,17 @@ pub fn attachPjrtExecutors(
         for (dpp.base.partitions, 0..) |part, part_idx| {
             if (!isPartitionPjrtEligible(graph, part)) continue;
 
-            const pjrt_exec = pjrt_executor_mod.createExecutor(
+            const pjrt_exec = pjrt_executor_mod.createExecutorWithOptions(
                 allocator,
                 graph,
                 &dpp.base.partitions[part_idx],
                 cb,
                 cb,
                 client,
+                .{ .mutable_parameters = mutable_parameters },
+                if (parameter_store) |store| @ptrCast(@alignCast(store)) else null,
             ) catch |err| {
+                if (required) return err;
                 std.log.warn("PJRT compilation failed for partition {d}: {s}", .{ part_idx, @errorName(err) });
                 continue;
             };
@@ -293,7 +311,7 @@ pub fn isPartitionPjrtEligible(
 
 fn pjrtSupportsGraphConstantDType(dtype: @import("ml").graph.DType) bool {
     return switch (dtype) {
-        .f32, .i32 => true,
+        .f32, .i32, .i64, .bool_ => true,
         else => false,
     };
 }
@@ -356,7 +374,7 @@ fn attachExecutorsViaDefinition(
         return error.PjrtLoadOnlyArtifactsRequired;
     }
     const client = context.pjrt_client orelse return error.MissingPjrtClient;
-    return attachPjrtExecutors(allocator, entry, graph, dpp, context.cb, client, context.attachment_target);
+    return attachPjrtExecutorsWithParameters(allocator, entry, graph, dpp, context.cb, client, context.attachment_target, context.mutable_parameters, context.pjrt_parameter_store, context.require_compiled);
 }
 
 fn executeModelForwardViaDefinition(

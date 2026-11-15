@@ -41,6 +41,11 @@ pub fn Cache(comptime Key: type, comptime Value: type, comptime keyOf: fn (Value
             std.debug.assert(limit > 0);
             return .{ .limit = limit };
         }
+        /// Publication checks do not record a second request lookup.
+        pub fn peek(self: *const Self, key: Key) ?Value {
+            for (self.entries.items) |value| if (equal(keyOf(value), key)) return value;
+            return null;
+        }
         pub fn get(self: *Self, key: Key) ?Value {
             for (self.entries.items, 0..) |value, i| {
                 if (!equal(keyOf(value), key)) continue;

@@ -1085,7 +1085,17 @@ test "native planned constants honor strict integer policy" {
     var cb = compute.computeBackend();
     var state = interpreter.ExecState{ .attention_layer = 0, .options = .{ .strict_integer_constants = true } };
     var values = [_]?CT{};
-    try std.testing.expectError(error.UnsupportedIntegerTensor, executeNativePlannedNode(allocator, &graph, &cb, &values, wide, null, &state));
+    const wide_tensor = (try executeNativePlannedNode(allocator, &graph, &cb, &values, wide, null, &state)).?;
+    defer cb.free(wide_tensor);
+    const wide_exported = (try cb.exportTensorData(wide_tensor, allocator)).?;
+    defer allocator.free(wide_exported.payload.bytes);
+    try std.testing.expectEqual(.i64, wide_exported.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{9007199254740993}), wide_exported.payload.bytes);
+    var unavailable = cb.vtable.*;
+    unavailable.fromConstantBytes = null;
+    var limited = cb;
+    limited.vtable = &unavailable;
+    try std.testing.expectError(error.UnsupportedIntegerTensor, executeNativePlannedNode(allocator, &graph, &limited, &values, wide, null, &state));
     const tensor = (try executeNativePlannedNode(allocator, &graph, &cb, &values, supported, null, &state)).?;
     defer cb.free(tensor);
     const exported = (try cb.exportTensorData(tensor, allocator)).?;

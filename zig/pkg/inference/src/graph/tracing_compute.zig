@@ -91,6 +91,15 @@ pub const TracingCompute = struct {
 
     runtime_embedding_ids_ptr: ?[*]const i64 = null,
     runtime_embedding_ids_len: usize = 0,
+    runtime_inputs: std.ArrayListUnmanaged(RuntimeInput) = .empty,
+    /// Shared program capture cannot observe provisional host values.
+    require_resident_outputs: bool = false,
+
+    const RuntimeInput = struct {
+        bytes: []const u8,
+        shape: Shape,
+        node: NodeId,
+    };
 
     pub fn init(allocator: std.mem.Allocator) TracingCompute {
         return .{
@@ -129,6 +138,7 @@ pub const TracingCompute = struct {
         var it = self.weight_shapes.iterator();
         while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.weight_shapes.deinit(self.allocator);
+        self.runtime_inputs.deinit(self.allocator);
         self.graph.deinit();
     }
 
@@ -145,6 +155,48 @@ pub const TracingCompute = struct {
     pub fn setRuntimeEmbeddingIds(self: *TracingCompute, ids: []const i64) void {
         self.runtime_embedding_ids_ptr = ids.ptr;
         self.runtime_embedding_ids_len = ids.len;
+    }
+
+    /// Declare a request tensor before invoking an ordinary model forward.
+    /// The source bytes are borrowed only during capture. Repeated executions
+    /// supply the parameter's current value rather than a captured constant.
+    pub fn bindRuntimeInput(self: *TracingCompute, name: []const u8, shape: Shape, bytes: []const u8) !NodeId {
+        const count = shape.numElements() orelse return error.UnsupportedShape;
+        if (bytes.len != try std.math.mul(usize, @intCast(count), shape.dtype.byteSize())) return error.InvalidInputShape;
+        for (self.runtime_inputs.items) |input| {
+            if (std.mem.eql(u8, self.graph.parameterName(self.graph.node(input.node)), name)) return error.DuplicateProgramInput;
+            if (bytes.len != 0 and input.bytes.ptr == bytes.ptr and input.bytes.len == bytes.len and input.shape.dtype == shape.dtype) return error.AmbiguousProgramInput;
+        }
+        try self.runtime_inputs.ensureUnusedCapacity(self.allocator, 1);
+        var builder = Builder.init(&self.graph);
+        const node = try builder.parameter(name, shape);
+        self.runtime_inputs.appendAssumeCapacity(.{ .bytes = bytes, .shape = shape, .node = node });
+        return node;
+    }
+
+    fn runtimeInput(self: *TracingCompute, bytes: []const u8, dtype: DType, shape: Shape) !?NodeId {
+        if (bytes.len == 0) return null;
+        for (self.runtime_inputs.items) |input| {
+            if (input.shape.dtype != dtype or input.bytes.ptr != bytes.ptr or input.bytes.len != bytes.len) continue;
+            if (input.shape.eq(shape)) return input.node;
+            if (input.shape.numElements() != shape.numElements()) return error.InvalidInputShape;
+            var builder = Builder.init(&self.graph);
+            return try builder.reshape(input.node, shape);
+        }
+        return null;
+    }
+
+    pub fn markOutput(self: *TracingCompute, value: CT) !NodeId {
+        var owned = false;
+        for (self.handles.items) |handle| if (@as(CT, @ptrCast(handle)) == value) {
+            owned = true;
+            break;
+        };
+        if (!owned) return error.InvalidProgramBinding;
+        const node = nodeIdFromCT(value);
+        if (node >= self.graph.nodeCount()) return error.InvalidProgramBinding;
+        try self.graph.markOutput(node);
+        return node;
     }
 
     /// Transfer ownership of the traced graph to the caller.
@@ -212,6 +264,7 @@ pub const TracingCompute = struct {
         .disentangledRelativeAttentionBackward = &debertaBackwardOp,
         .windowedSelfAttention = &windowedSelfAttentionOp,
         .channelSelfAttention = &channelSelfAttentionOp,
+        .segmentAttention = &segmentAttentionOp,
         .tokenGridConv2d = &tokenGridConv2dOp,
         .multiply = &multiplyOp,
         .conv1d = &conv1dOp,
@@ -223,6 +276,10 @@ pub const TracingCompute = struct {
         .fromFloat32 = &fromFloat32Op,
         .fromFloat32Shape = &fromFloat32ShapeOp,
         .toFloat32 = &toFloat32Op,
+        .multiplyScalar = &multiplyScalarOp,
+        .maskedMeanBatch = &maskedMeanBatchOp,
+        .tensorShape = &tensorShapeOp,
+        .tensorDType = &tensorDTypeOp,
         .takeRows = &takeRowsOp,
         .zeroTensor = &zeroTensorOp,
         .reshape2d = &reshape2dOp,
@@ -237,6 +294,29 @@ pub const TracingCompute = struct {
         .setMoeExpertScale = &setMoeExpertScaleOp,
         .evalTensor = &evalTensorOp,
         .argmaxLastRow = &argmaxLastRowOp,
+        .negate = &primitiveNegate,
+        .sqrtOp = &primitiveSqrtOp,
+        .rsqrtOp = &primitiveRsqrtOp,
+        .expOp = &primitiveExpOp,
+        .logOp = &primitiveLogOp,
+        .sinOp = &primitiveSinOp,
+        .cosOp = &primitiveCosOp,
+        .tanhOp = &primitiveTanhOp,
+        .erfOp = &primitiveErfOp,
+        .absOp = &primitiveAbsOp,
+        .subtract = &primitiveSubtract,
+        .divide = &primitiveDivide,
+        .reduceSumOp = &primitiveReduceSumOp,
+        .reduceMaxOp = &primitiveReduceMaxOp,
+        .reduceMeanOp = &primitiveReduceMeanOp,
+        .sliceRows2D = &sliceRows2DOp,
+        .fromInt32Shape = &fromInt32ShapeOp,
+        .fromConstantBytes = &fromConstantBytesOp,
+        .lessThan = &primitiveLessThan,
+        .whereSelect = &primitiveWhereSelect,
+        .reshapeOp = &primitiveReshape,
+        .transposeOp = &primitiveTranspose,
+        .broadcastInDimOp = &primitiveBroadcast,
     };
 
     fn fromCtx(ctx: *anyopaque) *TracingCompute {
@@ -258,10 +338,290 @@ pub const TracingCompute = struct {
     fn prefetchWeightHint(_: *anyopaque, _: []const u8, _: u32) void {}
     fn drainPrefetchBudget(_: *anyopaque, _: usize) void {}
 
+    fn primitiveNegate(ctx: *anyopaque, input: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.neg(nodeIdFromCT(input)));
+    }
+
+    fn primitiveSqrtOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.sqrt(nodeIdFromCT(input)));
+    }
+
+    fn primitiveRsqrtOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.rsqrt(nodeIdFromCT(input)));
+    }
+
+    fn primitiveExpOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.expOp(nodeIdFromCT(input)));
+    }
+
+    fn primitiveLogOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.logOp(nodeIdFromCT(input)));
+    }
+
+    fn primitiveSinOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.sinOp(nodeIdFromCT(input)));
+    }
+
+    fn primitiveCosOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.cosOp(nodeIdFromCT(input)));
+    }
+
+    fn primitiveTanhOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.tanhOp(nodeIdFromCT(input)));
+    }
+
+    fn primitiveErfOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.erfOp(nodeIdFromCT(input)));
+    }
+
+    fn primitiveAbsOp(ctx: *anyopaque, input: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.absOp(nodeIdFromCT(input)));
+    }
+
+    fn primitiveSubtract(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.sub(nodeIdFromCT(a), nodeIdFromCT(b)));
+    }
+
+    fn primitiveDivide(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.div(nodeIdFromCT(a), nodeIdFromCT(b)));
+    }
+
+    fn primitiveReduceSumOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
+        const tc = fromCtx(ctx);
+        const shape = try tc.checkedInputShape(input, input_shape);
+        var seen: [8]bool = @splat(false);
+        for (axes) |axis| {
+            if (axis >= shape.rank() or seen[axis]) return error.InvalidInputShape;
+            seen[axis] = true;
+        }
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.reduceSum(nodeIdFromCT(input), axes));
+    }
+
+    fn primitiveReduceMaxOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
+        const tc = fromCtx(ctx);
+        const shape = try tc.checkedInputShape(input, input_shape);
+        var seen: [8]bool = @splat(false);
+        for (axes) |axis| {
+            if (axis >= shape.rank() or seen[axis]) return error.InvalidInputShape;
+            seen[axis] = true;
+        }
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.reduceMax(nodeIdFromCT(input), axes));
+    }
+
+    fn primitiveReduceMeanOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {
+        const tc = fromCtx(ctx);
+        const shape = try tc.checkedInputShape(input, input_shape);
+        var seen: [8]bool = @splat(false);
+        for (axes) |axis| {
+            if (axis >= shape.rank() or seen[axis]) return error.InvalidInputShape;
+            seen[axis] = true;
+        }
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.reduceMean(nodeIdFromCT(input), axes));
+    }
+
+    fn sliceRows2DOp(ctx: *anyopaque, input: CT, start: usize, rows: usize, cols: usize) anyerror!CT {
+        const tc = fromCtx(ctx);
+        const source = nodeIdFromCT(input);
+        const shape = tc.graph.node(source).output_shape;
+        if (shape.rank() != 2) return error.InvalidInputShape;
+        const available = std.math.cast(usize, shape.dim(0)) orelse return error.InvalidInputShape;
+        if (shape.dim(1) != cols or start > available or rows > available - start) return error.InvalidInputShape;
+        var attrs = ml.graph.node.SliceAttrs{};
+        attrs.num_axes = 2;
+        attrs.starts[0] = @intCast(start);
+        attrs.limits[0] = @intCast(start + rows);
+        attrs.limits[1] = @intCast(cols);
+        return tc.makeHandle(try tc.graph.addNode(.{ .op = .{ .slice = attrs }, .output_shape = Shape.init(shape.dtype, &.{ @intCast(rows), @intCast(cols) }), .inputs = .{ source, null_node, null_node, null_node }, .num_inputs = 1 }));
+    }
+
+    fn fromConstantBytesOp(ctx: *anyopaque, data: []const u8, dtype: DType, dims: []const i64) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        if (dims.len > 8) return error.UnsupportedShape;
+        const shape = Shape.init(dtype, dims);
+        const count = shape.numElements() orelse return error.InvalidInputShape;
+        if (data.len != try std.math.mul(usize, @intCast(count), dtype.byteSize())) return error.InvalidInputShape;
+        if (try tc.runtimeInput(data, dtype, shape)) |node| return try tc.makeHandle(node);
+        const loc = try tc.graph.internConstantBytes(data, dtype);
+        return try tc.makeHandle(try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } }, .output_shape = shape }));
+    }
+
+    fn primitiveLessThan(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        const lhs = tc.graph.node(nodeIdFromCT(a)).output_shape;
+        const rhs = tc.graph.node(nodeIdFromCT(b)).output_shape;
+        if (!lhs.eq(rhs)) return error.UnsupportedComparisonBroadcast;
+        return tc.makeHandle(try tc.graph.addNode(.{ .op = .{ .less_than = {} }, .output_shape = Shape.init(.bool_, lhs.dims[0..lhs.rank()]), .inputs = .{ nodeIdFromCT(a), nodeIdFromCT(b), null_node, null_node }, .num_inputs = 2 }));
+    }
+
+    fn primitiveWhereSelect(ctx: *anyopaque, condition: CT, yes: CT, no: CT) anyerror!CT {
+        const tc = fromCtx(ctx);
+        const shape = tc.graph.node(nodeIdFromCT(yes)).output_shape;
+        const no_shape = tc.graph.node(nodeIdFromCT(no)).output_shape;
+        const predicate = tc.graph.node(nodeIdFromCT(condition)).output_shape;
+        if (!shape.eq(no_shape) or !std.mem.eql(i64, shape.dims[0..shape.rank()], predicate.dims[0..predicate.rank()])) return error.UnsupportedSelectionBroadcast;
+        return tc.makeHandle(try tc.graph.addNode(.{ .op = .{ .where_select = {} }, .output_shape = shape, .inputs = .{ nodeIdFromCT(condition), nodeIdFromCT(yes), nodeIdFromCT(no), null_node }, .num_inputs = 3 }));
+    }
+
+    fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, dims: []const i32) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        if (dims.len > 8) return error.UnsupportedShape;
+        var shape_dims: [8]i64 = undefined;
+        for (dims, 0..) |dim, axis| shape_dims[axis] = dim;
+        const shape = Shape.init(.i32, shape_dims[0..dims.len]);
+        const count = shape.numElements() orelse return error.InvalidInputShape;
+        if (std.math.cast(usize, count) != data.len) return error.InvalidInputShape;
+        if (try tc.runtimeInput(std.mem.sliceAsBytes(data), .i32, shape)) |node| return try tc.makeHandle(node);
+        const loc = try tc.graph.internConstantBytes(std.mem.sliceAsBytes(data), .i32);
+        return try tc.makeHandle(try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } }, .output_shape = shape }));
+    }
+
+    fn checkedInputShape(tc: *TracingCompute, input: CT, dims: []const i64) !Shape {
+        const shape = tc.graph.node(nodeIdFromCT(input)).output_shape;
+        if (!std.mem.eql(i64, shape.dims[0..shape.rank()], dims)) return error.InvalidInputShape;
+        return shape;
+    }
+
+    fn primitiveReshape(ctx: *anyopaque, input: CT, dims: []const i64) anyerror!CT {
+        const tc = fromCtx(ctx);
+        if (dims.len > 8) return error.UnsupportedShape;
+        const original = tc.graph.node(nodeIdFromCT(input)).output_shape;
+        const shape = Shape.init(original.dtype, dims);
+        const count = shape.numElements() orelse return error.UnsupportedShape;
+        if (count != (original.numElements() orelse return error.UnsupportedShape)) return error.InvalidInputShape;
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.reshape(nodeIdFromCT(input), shape));
+    }
+
+    fn primitiveTranspose(ctx: *anyopaque, input: CT, perm: []const u8, dims: []const i64) anyerror!CT {
+        const tc = fromCtx(ctx);
+        const shape = try tc.checkedInputShape(input, dims);
+        if (perm.len != shape.rank()) return error.InvalidInputShape;
+        var seen: [8]bool = @splat(false);
+        for (perm) |axis| {
+            if (axis >= shape.rank() or seen[axis]) return error.InvalidInputShape;
+            seen[axis] = true;
+        }
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandle(try builder.transpose(nodeIdFromCT(input), perm));
+    }
+
+    fn primitiveBroadcast(ctx: *anyopaque, input: CT, target: []const i64, axes: []const u8, dims: []const i64) anyerror!CT {
+        const tc = fromCtx(ctx);
+        const original = try tc.checkedInputShape(input, dims);
+        if (target.len > 8 or axes.len != original.rank()) return error.InvalidInputShape;
+        const shape = Shape.init(original.dtype, target);
+        _ = shape.numElements() orelse return error.UnsupportedShape;
+        var seen: [8]bool = @splat(false);
+        for (axes, 0..) |axis, i| {
+            if (axis >= target.len or seen[axis]) return error.InvalidInputShape;
+            if (dims[i] != 1 and dims[i] != target[axis]) return error.InvalidInputShape;
+            seen[axis] = true;
+        }
+        return tc.makeHandle(try tc.broadcastNode(nodeIdFromCT(input), axes, shape));
+    }
+
+    fn broadcastNode(tc: *TracingCompute, value: NodeId, axes: []const u8, shape: Shape) !NodeId {
+        var attrs = ml.graph.node.BroadcastAttrs{ .target_shape = shape, .num_axes = @intCast(axes.len) };
+        @memcpy(attrs.broadcast_axes[0..axes.len], axes);
+        return tc.graph.addNode(.{ .op = .{ .broadcast_in_dim = attrs }, .output_shape = shape, .inputs = .{ value, null_node, null_node, null_node }, .num_inputs = 1 });
+    }
+
+    fn maskedMeanBatchOp(ctx: *anyopaque, input: CT, mask: ?[]const i64, batch: usize, sequence: usize, width: usize, dimensions: usize, normalize: bool) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        if (batch == 0 or sequence == 0 or width == 0 or dimensions == 0 or dimensions > width) return error.InvalidInputShape;
+        const rows = try std.math.mul(usize, batch, sequence);
+        if (mask) |values| if (values.len != rows) return error.InvalidInputShape;
+        const flags = try tc.allocator.alloc(f32, rows);
+        defer tc.allocator.free(flags);
+        const counts = try tc.allocator.alloc(f32, batch);
+        defer tc.allocator.free(counts);
+        @memset(counts, 0);
+        for (flags, 0..) |*flag, row| {
+            const active = if (mask) |values| values[row] else 1;
+            if (active != 0 and active != 1) return error.InvalidAttentionMask;
+            flag.* = @floatFromInt(active);
+            counts[row / sequence] += flag.*;
+        }
+        for (counts) |count| if (count == 0) return error.EmptyEmbeddingInput;
+        var builder = Builder.init(&tc.graph);
+        const shape3 = Shape.init(.f32, &.{ @intCast(batch), @intCast(sequence), @intCast(width) });
+        const shaped = try builder.reshape(nodeIdFromCT(input), shape3);
+        const flags_loc = try tc.graph.internConstant(flags);
+        const flags_shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(sequence) });
+        const flags_node = try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = flags_loc.offset, .data_len = flags_loc.len } }, .output_shape = flags_shape });
+        const zero = try builder.scalarConst(.f32, 0);
+        const comparison = try tc.graph.addNode(.{ .op = .{ .less_than = {} }, .output_shape = Shape.init(.bool_, flags_shape.dims[0..flags_shape.rank()]), .inputs = .{ try tc.broadcastNode(zero, &.{}, flags_shape), flags_node, null_node, null_node }, .num_inputs = 2 });
+        const selected = try tc.graph.addNode(.{ .op = .{ .where_select = {} }, .output_shape = shape3, .inputs = .{ try tc.broadcastNode(comparison, &.{ 0, 1 }, Shape.init(.bool_, shape3.dims[0..shape3.rank()])), shaped, try tc.broadcastNode(zero, &.{}, shape3), null_node }, .num_inputs = 3 });
+        const sums = try builder.reshape(try builder.reduceSum(selected, &.{1}), Shape.init(.f32, &.{ @intCast(batch), @intCast(width) }));
+        const counts_loc = try tc.graph.internConstant(counts);
+        const count_node = try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = counts_loc.offset, .data_len = counts_loc.len } }, .output_shape = Shape.init(.f32, &.{@intCast(batch)}) });
+        const mean_shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(width) });
+        var result = try builder.div(sums, try tc.broadcastNode(count_node, &.{0}, mean_shape));
+        if (dimensions != width) result = try builder.sliceLastDim(result, 0, @intCast(dimensions));
+        if (normalize) {
+            const shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(dimensions) });
+            const absolute = try builder.absOp(result);
+            const maximum = try builder.reshape(try builder.reduceMax(absolute, &.{1}), Shape.init(.f32, &.{@intCast(batch)}));
+            result = try builder.div(result, try tc.broadcastNode(maximum, &.{0}, shape));
+            const norms = try builder.reshape(try builder.sqrt(try builder.reduceSum(try builder.mul(result, result), &.{1})), Shape.init(.f32, &.{@intCast(batch)}));
+            result = try builder.div(result, try tc.broadcastNode(norms, &.{0}, shape));
+        }
+        return try tc.makeHandle(result);
+    }
+
+    fn tensorShapeOp(ctx: *anyopaque, value: CT, allocator: std.mem.Allocator) anyerror![]i64 {
+        const shape = fromCtx(ctx).graph.node(nodeIdFromCT(value)).output_shape;
+        return allocator.dupe(i64, shape.dims[0..shape.rank()]);
+    }
+
+    fn tensorDTypeOp(ctx: *anyopaque, value: CT) anyerror!@import("../backends/tensor.zig").DType {
+        const dtype = fromCtx(ctx).graph.node(nodeIdFromCT(value)).output_shape.dtype;
+        return switch (dtype) {
+            inline else => |tag| @field(@import("../backends/tensor.zig").DType, @tagName(tag)),
+        };
+    }
+
+    fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        const scalar = try builder.scalarConst(.f32, scale);
+        return try tc.makeHandle(try builder.mul(nodeIdFromCT(input), scalar));
+    }
+
     // ── Weight / parameter ops ────────────────────────────────────────
 
     fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
         const tc = fromCtx(ctx);
+        for (tc.runtime_inputs.items) |input| {
+            if (std.mem.eql(u8, tc.graph.parameterName(tc.graph.node(input.node)), name)) return error.ProgramBindingNameCollision;
+        }
         if (tc.weight_shapes.get(name) == null) {
             if (tc.weight_shape_resolver) |resolver| {
                 if (try resolver.resolve(resolver.context, tc.allocator, name)) |shape| {
@@ -281,20 +641,17 @@ pub const TracingCompute = struct {
         const tc = fromCtx(ctx);
         const w_id = nodeIdFromCT(weight);
         if (ids.len < total) return error.UnsupportedShape;
-        const idx_id = if (tc.isRuntimeEmbeddingIds(ids[0..total])) blk: {
-            const idx_shape = Shape.init(.i64, &.{@intCast(total)});
+        const idx_shape = Shape.init(.i64, &.{@intCast(total)});
+        const idx_id = if (try tc.runtimeInput(std.mem.sliceAsBytes(ids[0..total]), .i64, idx_shape)) |node| node else if (tc.isRuntimeEmbeddingIds(ids[0..total])) blk: {
             break :blk try tc.graph.addNode(.{
                 .op = .{ .fused_from_float32 = {} },
                 .output_shape = idx_shape,
             });
         } else blk: {
-            const idx_data = try tc.allocator.alloc(f32, total);
-            defer tc.allocator.free(idx_data);
-            for (idx_data, ids[0..total]) |*dst, id| dst.* = @floatFromInt(id);
-            const loc = try tc.graph.internConstant(idx_data);
+            const loc = try tc.graph.internConstantBytes(std.mem.sliceAsBytes(ids[0..total]), .i64);
             break :blk try tc.graph.addNode(.{
                 .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } },
-                .output_shape = Shape.init(.f32, &.{@intCast(total)}),
+                .output_shape = idx_shape,
             });
         };
         var b = Builder.init(tc.getGraphMut());
@@ -824,9 +1181,10 @@ pub const TracingCompute = struct {
         return tc.makeHandle(id);
     }
 
-    fn ropePerItemOp(ctx: *anyopaque, input: CT, _: usize, _: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, _: []const usize, _: []const usize, consecutive_pairs: bool) anyerror!CT {
-        // Record as a basic rope node — per-item details are runtime state
+    fn ropePerItemOp(ctx: *anyopaque, input: CT, batch: usize, sequence: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, lengths: []const usize, offsets: []const usize, consecutive_pairs: bool) anyerror!CT {
         const tc = fromCtx(ctx);
+        if (tc.runtime_inputs.items.len != 0) return tc.declaredRopePerItem(input, batch, sequence, head_dim, rope_dim, theta, freq_scale, lengths, offsets, consecutive_pairs);
+        // Legacy decoder placeholders resolve positions from execution context.
         const in_id = nodeIdFromCT(input);
         const out_shape = tc.graph.node(in_id).output_shape;
         const id = try tc.graph.addNode(.{
@@ -845,6 +1203,57 @@ pub const TracingCompute = struct {
             .num_inputs = 1,
         });
         return tc.makeHandle(id);
+    }
+
+    fn declaredRopePerItem(tc: *TracingCompute, input: CT, batch: usize, sequence: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, lengths: []const usize, offsets: []const usize, consecutive_pairs: bool) !CT {
+        if (batch == 0 or sequence == 0 or head_dim == 0 or lengths.len != batch or offsets.len != batch) return error.InvalidRoPEInput;
+        const original = tc.graph.node(nodeIdFromCT(input)).output_shape;
+        const elements = original.numElements() orelse return error.InvalidRoPEInput;
+        const rows = try std.math.mul(usize, batch, sequence);
+        if (@as(usize, @intCast(elements)) % rows != 0) return error.InvalidRoPEInput;
+        const width = @as(usize, @intCast(elements)) / rows;
+        if (width % head_dim != 0) return error.InvalidRoPEInput;
+        var builder = Builder.init(&tc.graph);
+        const flat = try builder.reshape(nodeIdFromCT(input), Shape.init(original.dtype, &.{ @intCast(rows), @intCast(width) }));
+        var result: ?NodeId = null;
+        for (lengths, offsets, 0..) |length, offset, item| {
+            if (length > sequence) return error.InvalidRoPEInput;
+            for ([_]bool{ true, false }) |active| {
+                const count = if (active) length else sequence - length;
+                if (count == 0) continue;
+                const start = item * sequence + (if (active) @as(usize, 0) else length);
+                var attrs = ml.graph.node.SliceAttrs{};
+                attrs.num_axes = 2;
+                attrs.starts[0] = @intCast(start);
+                attrs.limits[0] = @intCast(start + count);
+                attrs.limits[1] = @intCast(width);
+                const shape = Shape.init(original.dtype, &.{ @intCast(count), @intCast(width) });
+                const slice = try tc.graph.addNode(.{ .op = .{ .slice = attrs }, .output_shape = shape, .inputs = .{ flat, null_node, null_node, null_node }, .num_inputs = 1 });
+                const part = if (active) try tc.graph.addNode(.{ .op = .{ .fused_rope = .{ .seq_len = @intCast(count), .head_dim = @intCast(head_dim), .rope_dim = @intCast(rope_dim), .theta = theta, .freq_scale = freq_scale, .position_offset = std.math.cast(u32, offset) orelse return error.InvalidRoPEInput, .consecutive_pairs = consecutive_pairs } }, .output_shape = shape, .inputs = .{ slice, null_node, null_node, null_node }, .num_inputs = 1 }) else slice;
+                result = if (result) |previous| try builder.concat(previous, part, 0) else part;
+            }
+        }
+        return tc.makeHandle(try builder.reshape(result orelse return error.InvalidRoPEInput, original));
+    }
+
+    fn segmentAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttention) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        if (request.ranges.len != try std.math.mul(usize, request.queries, 6) or request.query_positions.len != request.queries or request.key_positions.len != request.keys or request.num_heads == 0 or request.head_dim == 0) return error.InvalidAttentionShape;
+        const metadata_len = try std.math.add(usize, request.ranges.len, try std.math.add(usize, request.queries, request.keys));
+        const metadata = try tc.allocator.alloc(i32, metadata_len);
+        defer tc.allocator.free(metadata);
+        for (request.ranges, metadata[0..request.ranges.len]) |range, *dest| dest.* = std.math.cast(i32, range) orelse return error.InvalidAttentionShape;
+        @memcpy(metadata[request.ranges.len..][0..request.queries], request.query_positions);
+        @memcpy(metadata[request.ranges.len + request.queries ..], request.key_positions);
+        const loc = try tc.graph.internConstantBytes(std.mem.sliceAsBytes(metadata), .i32);
+        const visibility = try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } }, .output_shape = Shape.init(.i32, &.{@intCast(metadata_len)}) });
+        const node = try tc.graph.addNode(.{
+            .op = .{ .fused_segment_attention = .{ .queries = @intCast(request.queries), .keys = @intCast(request.keys), .num_heads = @intCast(request.num_heads), .head_dim = @intCast(request.head_dim), .window = request.window } },
+            .output_shape = Shape.init(.f32, &.{ @intCast(request.queries), @intCast(try std.math.mul(usize, request.num_heads, request.head_dim)) }),
+            .inputs = .{ nodeIdFromCT(q), nodeIdFromCT(k), nodeIdFromCT(v), visibility },
+            .num_inputs = 4,
+        });
+        return try tc.makeHandle(node);
     }
 
     // ── Convolution ───────────────────────────────────────────────────
@@ -1152,6 +1561,8 @@ pub const TracingCompute = struct {
 
     fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
         const tc = fromCtx(ctx);
+        const shape = Shape.init(.f32, &.{@intCast(data.len)});
+        if (try tc.runtimeInput(std.mem.sliceAsBytes(data), .f32, shape)) |node| return tc.makeHandle(node);
         const loc = try tc.graph.internConstant(data);
         const id = try tc.graph.addNode(.{
             .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } },
@@ -1162,7 +1573,7 @@ pub const TracingCompute = struct {
 
     fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT {
         const tc = fromCtx(ctx);
-        const loc = try tc.graph.internConstant(data);
+        if (shape.len > 8) return error.UnsupportedShape;
         var dims: [8]i64 = @splat(0);
         for (shape, 0..) |d, i| {
             dims[i] = @intCast(d);
@@ -1172,6 +1583,8 @@ pub const TracingCompute = struct {
             .dims = dims,
             .rank_ = @intCast(shape.len),
         };
+        if (try tc.runtimeInput(std.mem.sliceAsBytes(data), .f32, s)) |node| return tc.makeHandle(node);
+        const loc = try tc.graph.internConstant(data);
         const id = try tc.graph.addNode(.{
             .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } },
             .output_shape = s,
@@ -1181,6 +1594,7 @@ pub const TracingCompute = struct {
 
     fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
         const tc = fromCtx(ctx);
+        if (tc.require_resident_outputs) return error.HostReadbackDuringCapture;
         const node_id = nodeIdFromCT(tensor);
         // Mark as graph output
         try tc.graph.markOutput(node_id);

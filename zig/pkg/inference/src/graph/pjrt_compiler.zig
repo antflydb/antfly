@@ -87,6 +87,9 @@ pub const CompileOptions = struct {
     /// current f32 values as HLO constants. This is host-assisted and mainly
     /// useful for validation or plugins that cannot compile huge constant HLO.
     parameter_inputs: bool = false,
+    /// Request/state parameters remain dynamic; immutable model weights can
+    /// still be embedded once in the compiled executable.
+    mutable_parameters: ?[]const bool = null,
     /// Offline whole-model phase artifacts need semantic KV cache values to
     /// cross the ModelRuntime prefill/decode boundary. Inline partitions keep
     /// the old node-oriented ABI.
@@ -138,6 +141,12 @@ pub fn compilePartitionWithOptions(
     defer {
         for (weight_bufs.items) |buf| allocator.free(buf);
         weight_bufs.deinit(allocator);
+    }
+
+    var integer_constants: std.ArrayListUnmanaged([]i32) = .empty;
+    defer {
+        for (integer_constants.items) |data| allocator.free(data);
+        integer_constants.deinit(allocator);
     }
 
     // ── 0. Build add-reducer sub-computation for reductions ─────
@@ -256,10 +265,15 @@ pub fn compilePartitionWithOptions(
         const nid: usize = @intCast(node_id);
         const n = graph.node(node_id);
         const ins = n.getInputs();
+        if (try emitPrimitiveNode(allocator, &b, n, node_map, nid, &reducer_comp, &max_reducer_comp, &needs_reducer, &needs_max_reducer)) continue;
 
         switch (n.op) {
             .parameter => {
-                if (options.parameter_inputs) {
+                const mutable = if (options.mutable_parameters) |flags| blk: {
+                    if (flags.len != graph.nodeCount()) return error.InvalidMutableParameterTable;
+                    break :blk flags[node_id];
+                } else false;
+                if (options.parameter_inputs or mutable) {
                     const shape = graphShapeToHlo(n);
                     const name_buf = try std.fmt.allocPrint(allocator, "input_{d}", .{next_param});
                     defer allocator.free(name_buf);
@@ -309,11 +323,10 @@ pub fn compilePartitionWithOptions(
                 }
             },
 
-            .convert_dtype => |attrs| {
-                node_map[nid] = try b.convertType(
-                    try getHloId(node_map, ins[0]),
-                    graphDTypeToHlo(attrs.target),
-                );
+            .fused_segment_attention => |attrs| {
+                node_map[nid] = try emitSegmentAttention(allocator, &b, &integer_constants, n, try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1]), try getHloId(node_map, ins[2]), try getHloId(node_map, ins[3]), attrs, &reducer_comp, &max_reducer_comp);
+                needs_reducer = true;
+                needs_max_reducer = true;
             },
 
             .fused_linear => {
@@ -355,6 +368,13 @@ pub fn compilePartitionWithOptions(
                 const beta = try getHloId(node_map, ins[2]);
                 node_map[nid] = try emitLayerNorm(&b, x, gamma, beta, attrs.eps, &reducer_comp);
                 needs_reducer = true;
+            },
+
+            .fused_gelu_exact => {
+                const x = try getHloId(node_map, ins[0]);
+                const half_x = try b.multiply(x, try b.constantScalarF32(0.5));
+                const scaled = try b.multiply(x, try b.constantScalarF32(0.7071067811865476));
+                node_map[nid] = try b.add(half_x, try b.multiply(half_x, try b.erf(scaled)));
             },
 
             .fused_gelu => {
@@ -410,27 +430,6 @@ pub fn compilePartitionWithOptions(
                 const ids_ct = try getHloId(node_map, ins[1]);
                 const result_shape = graphShapeToHlo(n);
                 node_map[nid] = try b.gather(table, ids_ct, result_shape);
-            },
-
-            .slice => |attrs| {
-                if (attrs.runtime_starts or attrs.runtime_limits) return error.UnsupportedShape;
-                const rank: usize = attrs.num_axes;
-                if (rank == 0 or rank > 8) return error.UnsupportedShape;
-                var starts: [8]i64 = undefined;
-                var limits: [8]i64 = undefined;
-                var strides: [8]i64 = undefined;
-                for (0..rank) |axis| {
-                    starts[axis] = attrs.starts[axis];
-                    limits[axis] = attrs.limits[axis];
-                    strides[axis] = attrs.strides[axis];
-                }
-                node_map[nid] = try b.slice(
-                    try getHloId(node_map, ins[0]),
-                    starts[0..rank],
-                    limits[0..rank],
-                    strides[0..rank],
-                    graphShapeToHlo(n),
-                );
             },
 
             .fused_rope => |attrs| {
@@ -828,15 +827,10 @@ fn emitStaticRope(
     );
     try owned_constants.append(allocator, sin_mask);
 
-    const perm = try buildRopePermutationMatrix(allocator, hidden, head_dim, rope_dim, attrs.consecutive_pairs);
-    try owned_constants.append(allocator, perm);
-
     const cos_id = try b.constantF32(hlo.Shape.init(.f32, &.{ @intCast(rows), @intCast(hidden) }), cos_mask);
     const sin_id = try b.constantF32(hlo.Shape.init(.f32, &.{ @intCast(rows), @intCast(hidden) }), sin_mask);
-    const perm_id = try b.constantF32(hlo.Shape.init(.f32, &.{ @intCast(hidden), @intCast(hidden) }), perm);
-
+    const rotated = try emitRopePermutation(b, x, rows, hidden, head_dim, rope_dim, attrs.consecutive_pairs);
     const x_scaled = try b.multiply(x, cos_id);
-    const rotated = try b.matmul(x, perm_id);
     const rotated_scaled = try b.multiply(rotated, sin_id);
     return b.add(x_scaled, rotated_scaled);
 }
@@ -884,6 +878,46 @@ fn buildRopeScaleMask(
     return data;
 }
 
+/// Pair-local coordinate rotation. No dense permutation operand or matmul.
+fn emitRopePermutation(b: *hlo.Builder, x: hlo.Id, rows: usize, hidden: usize, head_dim: usize, rope_dim: usize, consecutive: bool) !hlo.Id {
+    const r: i64 = @intCast(rows);
+    const heads: i64 = @intCast(hidden / head_dim);
+    const d: i64 = @intCast(head_dim);
+    const rotary: i64 = @intCast(rope_dim);
+    const shape = hlo.Shape.init(.f32, &.{ r, heads, d });
+    const source = try b.reshape(x, shape);
+    const half = @divExact(rotary, 2);
+    var rotated: hlo.Id = undefined;
+    if (consecutive) {
+        const lane_shape = hlo.Shape.init(.f32, &.{ r, heads, half });
+        const even = try b.slice(source, &.{ 0, 0, 0 }, &.{ r, heads, rotary }, &.{ 1, 1, 2 }, lane_shape);
+        const odd = try b.slice(source, &.{ 0, 0, 1 }, &.{ r, heads, rotary }, &.{ 1, 1, 2 }, lane_shape);
+        const pair_shape = hlo.Shape.init(.f32, &.{ r, heads, half, 1 });
+        const pairs = try b.concatenate(&.{ try b.reshape(try b.negate(odd), pair_shape), try b.reshape(even, pair_shape) }, 3, hlo.Shape.init(.f32, &.{ r, heads, half, 2 }));
+        rotated = try b.reshape(pairs, hlo.Shape.init(.f32, &.{ r, heads, rotary }));
+    } else {
+        // Partial half-split RoPE pairs across head_dim/2, not rope_dim/2.
+        const head_half = @divExact(d, 2);
+        const lane_shape = hlo.Shape.init(.f32, &.{ r, heads, half });
+        var first = try b.slice(source, &.{ 0, 0, 0 }, &.{ r, heads, half }, &.{ 1, 1, 1 }, lane_shape);
+        const second = try b.slice(source, &.{ 0, 0, head_half }, &.{ r, heads, head_half + half }, &.{ 1, 1, 1 }, lane_shape);
+        var negative = try b.negate(second);
+        if (half != head_half) {
+            const gap = try b.broadcast(try b.constantScalarF32(0), &.{}, hlo.Shape.init(.f32, &.{ r, heads, head_half - half }));
+            const half_shape = hlo.Shape.init(.f32, &.{ r, heads, head_half });
+            first = try b.concatenate(&.{ first, gap }, 2, half_shape);
+            negative = try b.concatenate(&.{ negative, gap }, 2, half_shape);
+        }
+        rotated = try b.concatenate(&.{ negative, first }, 2, shape);
+    }
+    if (consecutive and rotary != d) {
+        const tail_shape = hlo.Shape.init(.f32, &.{ r, heads, d - rotary });
+        const tail = try b.broadcast(try b.constantScalarF32(0), &.{}, tail_shape);
+        rotated = try b.concatenate(&.{ rotated, tail }, 2, shape);
+    }
+    return b.reshape(rotated, hlo.Shape.init(.f32, &.{ r, @intCast(hidden) }));
+}
+
 fn buildRopePermutationMatrix(
     allocator: Allocator,
     hidden: usize,
@@ -913,6 +947,261 @@ const StaticGqaAttentionResult = struct {
     present_k: ?hlo.Id = null,
     present_v: ?hlo.Id = null,
 };
+
+/// One portable primitive lowering for inference and gradient programs.
+fn emitPrimitiveNode(
+    allocator: Allocator,
+    b: *hlo.Builder,
+    n: *const Node,
+    node_map: []?hlo.Id,
+    nid: usize,
+    reducer_comp: *const hlo.Computation,
+    max_reducer_comp: *const hlo.Computation,
+    needs_add_reducer: *bool,
+    needs_max_reducer: *bool,
+) !bool {
+    const ins = n.getInputs();
+    switch (n.op) {
+        .stop_gradient => node_map[nid] = try getHloId(node_map, ins[0]),
+        // Unary elementwise ops
+        .neg => node_map[nid] = try b.negate(try getHloId(node_map, ins[0])),
+        .sqrt => node_map[nid] = try b.sqrt(try getHloId(node_map, ins[0])),
+        .rsqrt => node_map[nid] = try b.rsqrt(try getHloId(node_map, ins[0])),
+        .exp => node_map[nid] = try b.exponential(try getHloId(node_map, ins[0])),
+        .log => node_map[nid] = try b.log(try getHloId(node_map, ins[0])),
+        .sin => node_map[nid] = try b.sine(try getHloId(node_map, ins[0])),
+        .cos => node_map[nid] = try b.cosine(try getHloId(node_map, ins[0])),
+        .tanh => node_map[nid] = try b.tanh(try getHloId(node_map, ins[0])),
+        .erf => node_map[nid] = try b.erf(try getHloId(node_map, ins[0])),
+        .abs => node_map[nid] = try b.abs(try getHloId(node_map, ins[0])),
+
+        // Binary elementwise ops
+        .add => node_map[nid] = try b.add(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
+        .mul => node_map[nid] = try b.multiply(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
+        .sub => node_map[nid] = try b.subtract(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
+        .div => node_map[nid] = try b.divide(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
+        .less_than => node_map[nid] = try b.lessThan(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
+
+        // Select (where)
+        .where_select => node_map[nid] = try b.select(
+            try getHloId(node_map, ins[0]),
+            try getHloId(node_map, ins[1]),
+            try getHloId(node_map, ins[2]),
+        ),
+
+        .reduce_sum, .reduce_mean, .reduce_max => |attrs| {
+            const source = try getHloId(node_map, ins[0]);
+            const source_shape = b.getInst(source).shape;
+            if (source_shape.element_type != .f32) return error.UnsupportedPrimitiveType;
+            var axes: [8]i64 = undefined;
+            var reduced: [8]i64 = undefined;
+            var rank: usize = 0;
+            var elements: usize = 1;
+            for (attrs.axes[0..attrs.num_axes], 0..) |axis, index| {
+                if (axis >= source_shape.dimensions.len) return error.UnsupportedShape;
+                axes[index] = axis;
+                elements = try std.math.mul(usize, elements, std.math.cast(usize, source_shape.dimensions[axis]) orelse return error.UnsupportedShape);
+            }
+            for (source_shape.dimensions, 0..) |dimension, axis| {
+                if (std.mem.indexOfScalar(u8, attrs.axes[0..attrs.num_axes], @intCast(axis)) != null) continue;
+                reduced[rank] = dimension;
+                rank += 1;
+            }
+            const maximum = n.op == .reduce_max;
+            if (maximum) needs_max_reducer.* = true else needs_add_reducer.* = true;
+            const initial = try b.constantScalarF32(if (maximum) -std.math.inf(f32) else 0);
+            var value = try b.reduce(source, initial, axes[0..attrs.num_axes], hlo.Shape.init(.f32, reduced[0..rank]), if (maximum) max_reducer_comp.id else reducer_comp.id);
+            if (n.op == .reduce_mean) {
+                if (elements == 0) return error.UnsupportedShape;
+                value = try b.divide(value, try b.constantScalarF32(@floatFromInt(elements)));
+            }
+            node_map[nid] = try b.reshape(value, graphShapeToHlo(n));
+        },
+
+        // Shape ops
+        .reshape => |attrs| {
+            if (attrs.runtime_shape or !hloShapeIsConcretePositive(attrs.new_shape)) return error.UnsupportedShape;
+            node_map[nid] = try b.reshape(
+                try getHloId(node_map, ins[0]),
+                hlo.Shape.init(graphDTypeToHlo(attrs.new_shape.dtype), attrs.new_shape.dims[0..attrs.new_shape.rank()]),
+            );
+        },
+
+        .transpose => |attrs| {
+            const src = try getHloId(node_map, ins[0]);
+            const src_shape = b.getInst(src).shape;
+            var perm = try allocator.alloc(i64, attrs.num_axes);
+            defer allocator.free(perm);
+            var result_dims = try allocator.alloc(i64, attrs.num_axes);
+            defer allocator.free(result_dims);
+            for (attrs.perm[0..attrs.num_axes], 0..) |p, j| {
+                perm[j] = @intCast(p);
+                result_dims[j] = src_shape.dimensions[@intCast(p)];
+            }
+            node_map[nid] = try b.transpose(
+                src,
+                perm,
+                hlo.Shape.init(src_shape.element_type, result_dims),
+            );
+        },
+
+        .broadcast_in_dim => |attrs| {
+            const src = try getHloId(node_map, ins[0]);
+            var bcast_dims = try allocator.alloc(i64, attrs.num_axes);
+            defer allocator.free(bcast_dims);
+            for (attrs.broadcast_axes[0..attrs.num_axes], 0..) |ax, j| bcast_dims[j] = @intCast(ax);
+            const target_shape = hlo.Shape.init(
+                graphDTypeToHlo(attrs.target_shape.dtype),
+                attrs.target_shape.dims[0..attrs.target_shape.rank()],
+            );
+            node_map[nid] = try b.broadcast(src, bcast_dims, target_shape);
+        },
+
+        // Contraction
+        .dot_general => |attrs| {
+            const lhs = try getHloId(node_map, ins[0]);
+            const rhs = try getHloId(node_map, ins[1]);
+            var lhs_cont = try allocator.alloc(i64, attrs.num_contracting);
+            defer allocator.free(lhs_cont);
+            var rhs_cont = try allocator.alloc(i64, attrs.num_contracting);
+            defer allocator.free(rhs_cont);
+            var lhs_batch = try allocator.alloc(i64, attrs.num_batch);
+            defer allocator.free(lhs_batch);
+            var rhs_batch = try allocator.alloc(i64, attrs.num_batch);
+            defer allocator.free(rhs_batch);
+            for (attrs.lhs_contracting[0..attrs.num_contracting], 0..) |d, j| lhs_cont[j] = @intCast(d);
+            for (attrs.rhs_contracting[0..attrs.num_contracting], 0..) |d, j| rhs_cont[j] = @intCast(d);
+            for (attrs.lhs_batch[0..attrs.num_batch], 0..) |d, j| lhs_batch[j] = @intCast(d);
+            for (attrs.rhs_batch[0..attrs.num_batch], 0..) |d, j| rhs_batch[j] = @intCast(d);
+            const result_shape = graphShapeToHlo(n);
+            node_map[nid] = try b.dot(lhs, rhs, result_shape, .{
+                .lhs_contracting_dimensions = lhs_cont,
+                .rhs_contracting_dimensions = rhs_cont,
+                .lhs_batch_dimensions = lhs_batch,
+                .rhs_batch_dimensions = rhs_batch,
+            });
+        },
+
+        // Type conversion
+        .convert_dtype => |attrs| {
+            node_map[nid] = try b.convertType(
+                try getHloId(node_map, ins[0]),
+                graphDTypeToHlo(attrs.target),
+            );
+        },
+
+        .slice => |attrs| {
+            if (attrs.runtime_starts or attrs.runtime_limits) return error.UnsupportedShape;
+            const rank: usize = attrs.num_axes;
+            if (rank == 0 or rank > 8) return error.UnsupportedShape;
+            var starts: [8]i64 = undefined;
+            var limits: [8]i64 = undefined;
+            var strides: [8]i64 = undefined;
+            for (0..rank) |axis| {
+                starts[axis] = attrs.starts[axis];
+                limits[axis] = attrs.limits[axis];
+                strides[axis] = attrs.strides[axis];
+            }
+            node_map[nid] = try b.slice(
+                try getHloId(node_map, ins[0]),
+                starts[0..rank],
+                limits[0..rank],
+                strides[0..rank],
+                graphShapeToHlo(n),
+            );
+        },
+
+        .concat_prim => |attrs| {
+            const x = try getHloId(node_map, ins[0]);
+            const y = try getHloId(node_map, ins[1]);
+            node_map[nid] = try b.concatenate(&.{ x, y }, @intCast(attrs.axis), graphShapeToHlo(n));
+        },
+
+        else => return false,
+    }
+    return true;
+}
+
+fn segmentMetadataLane(b: *hlo.Builder, metadata: hlo.Id, start: usize, limit: usize, stride: usize, count: usize, axis: i64, rows: i64, columns: i64) !hlo.Id {
+    const lane = try b.slice(metadata, &.{@intCast(start)}, &.{@intCast(limit)}, &.{@intCast(stride)}, hlo.Shape.init(.s32, &.{@intCast(count)}));
+    return b.broadcast(lane, &.{axis}, hlo.Shape.init(.s32, &.{ rows, columns }));
+}
+
+fn emitSegmentAttention(
+    allocator: Allocator,
+    b: *hlo.Builder,
+    integer_constants: *std.ArrayListUnmanaged([]i32),
+    node: *const Node,
+    q: hlo.Id,
+    k: hlo.Id,
+    v: hlo.Id,
+    metadata: hlo.Id,
+    attrs: ml.graph.node.SegmentAttentionAttrs,
+    add_reducer: *const hlo.Computation,
+    max_reducer: *const hlo.Computation,
+) !hlo.Id {
+    const zero = try b.constantScalarF32(0);
+    if (attrs.queries == 0 or attrs.keys == 0) return b.broadcast(zero, &.{}, graphShapeToHlo(node));
+    if (attrs.num_heads == 0 or attrs.head_dim == 0) return error.UnsupportedShape;
+    const rows: i64 = attrs.queries;
+    const columns: i64 = attrs.keys;
+    const heads: i64 = attrs.num_heads;
+    const dim: i64 = attrs.head_dim;
+    const ranges_end = try std.math.mul(usize, attrs.queries, 6);
+    const metadata_count = try std.math.add(usize, ranges_end, try std.math.add(usize, attrs.queries, attrs.keys));
+    const metadata_shape = b.getInst(metadata).shape;
+    if (metadata_shape.element_type != .s32 or metadata_shape.dimensions.len != 1 or metadata_shape.dimensions[0] != metadata_count) return error.InvalidAttentionMetadata;
+    const indices = try allocator.alloc(i32, @as(usize, attrs.keys) + 1);
+    integer_constants.append(allocator, indices) catch |err| {
+        allocator.free(indices);
+        return err;
+    };
+    for (indices[0..attrs.keys], 0..) |*value, index| value.* = std.math.cast(i32, index) orelse return error.UnsupportedShape;
+    indices[attrs.keys] = @bitCast(attrs.window);
+    const index = try b.constantS32(hlo.Shape.init(.s32, &.{columns}), indices[0..attrs.keys]);
+    const keys = try b.broadcast(index, &.{1}, hlo.Shape.init(.s32, &.{ rows, columns }));
+    var visible: ?hlo.Id = null;
+    for (0..3) |range| {
+        const start = try segmentMetadataLane(b, metadata, range * 2, ranges_end, 6, attrs.queries, 0, rows, columns);
+        const stop = try segmentMetadataLane(b, metadata, range * 2 + 1, ranges_end, 6, attrs.queries, 0, rows, columns);
+        const allowed = try b.logicalAnd(try b.compare(keys, start, "GE"), try b.compare(keys, stop, "LT"));
+        visible = if (visible) |previous| try b.logicalOr(previous, allowed) else allowed;
+    }
+    if (attrs.window != std.math.maxInt(u32)) {
+        const qp = try segmentMetadataLane(b, metadata, ranges_end, ranges_end + attrs.queries, 1, attrs.queries, 0, rows, columns);
+        const kp = try segmentMetadataLane(b, metadata, ranges_end + attrs.queries, metadata_count, 1, attrs.keys, 1, rows, columns);
+        // Widen before subtracting: signed positions may span the entire i32 domain.
+        const distance = try b.abs(try b.subtract(try b.convertType(qp, .s64), try b.convertType(kp, .s64)));
+        const window = try b.constantS32(hlo.Shape.scalar(.s32), indices[attrs.keys..]);
+        var wide_window = try b.convertType(window, .s64);
+        if (attrs.window > std.math.maxInt(i32)) wide_window = try b.add(wide_window, try b.convertType(try b.constantScalarF32(4294967296), .s64));
+        const window_grid = try b.broadcast(wide_window, &.{}, hlo.Shape.init(.s64, &.{ rows, columns }));
+        visible = try b.logicalAnd(visible.?, try b.compare(distance, window_grid, "LE"));
+    }
+    const query = try reshapeAttentionInputToHeads(b, q, rows, heads, dim);
+    const key = try reshapeAttentionInputToHeads(b, k, columns, heads, dim);
+    const value = try reshapeAttentionInputToHeads(b, v, columns, heads, dim);
+    const key_t = try b.transpose(key, &.{ 0, 2, 1 }, hlo.Shape.init(.f32, &.{ heads, dim, columns }));
+    const score_shape = hlo.Shape.init(.f32, &.{ heads, rows, columns });
+    var scores = try b.dot(query, key_t, score_shape, .{ .lhs_contracting_dimensions = &.{2}, .rhs_contracting_dimensions = &.{1}, .lhs_batch_dimensions = &.{0}, .rhs_batch_dimensions = &.{0} });
+    scores = try b.multiply(scores, try b.constantScalarF32(1 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim)))));
+    const mask = try b.broadcast(visible.?, &.{ 1, 2 }, hlo.Shape.init(.pred, &.{ heads, rows, columns }));
+    const negative_infinity = try b.constantScalarF32(-std.math.inf(f32));
+    scores = try b.select(mask, scores, try b.broadcast(negative_infinity, &.{}, score_shape));
+    const row_shape = hlo.Shape.init(.f32, &.{ heads, rows });
+    const maximum = try b.reduce(scores, negative_infinity, &.{2}, row_shape, max_reducer.id);
+    const safe_maximum = try b.maximum(maximum, try b.constantScalarF32(-std.math.floatMax(f32)));
+    const exp = try b.exponential(try b.subtract(scores, try b.broadcast(safe_maximum, &.{ 0, 1 }, score_shape)));
+    const sums = try b.reduce(exp, zero, &.{2}, row_shape, add_reducer.id);
+    const one = try b.constantScalarF32(1);
+    const probabilities = try b.divide(exp, try b.broadcast(try b.maximum(sums, one), &.{ 0, 1 }, score_shape));
+    const output_shape = hlo.Shape.init(.f32, &.{ heads, rows, dim });
+    var attended = try b.dot(probabilities, value, output_shape, .{ .lhs_contracting_dimensions = &.{2}, .rhs_contracting_dimensions = &.{1}, .lhs_batch_dimensions = &.{0}, .rhs_batch_dimensions = &.{0} });
+    const active = try b.compare(sums, try b.broadcast(zero, &.{}, row_shape), "NE");
+    attended = try b.select(try b.broadcast(active, &.{ 0, 1 }, hlo.Shape.init(.pred, &.{ heads, rows, dim })), attended, try b.broadcast(zero, &.{}, output_shape));
+    const transposed = try b.transpose(attended, &.{ 1, 0, 2 }, hlo.Shape.init(.f32, &.{ rows, heads, dim }));
+    return b.reshape(transposed, graphShapeToHlo(node));
+}
 
 fn emitStaticGqaAttention(
     allocator: Allocator,
@@ -1116,6 +1405,8 @@ fn emitGraphConstant(b: *hlo.Builder, graph: *const Graph, n: *const Node) !hlo.
     return switch (n.output_shape.dtype) {
         .f32 => b.constantF32(shape, graph.constantData(attrs.data_offset, attrs.data_len)),
         .i32 => b.constantS32(shape, graph.constantDataAs(i32, attrs.data_offset, attrs.data_len)),
+        .i64 => b.constantS64(shape, graph.constantDataAs(i64, attrs.data_offset, attrs.data_len)),
+        .bool_ => b.constantPred(shape, graph.constantDataAs(u8, attrs.data_offset, attrs.data_len)),
         else => error.UnsupportedTensorType,
     };
 }
@@ -1300,7 +1591,6 @@ pub fn compileGradientGraph(
         const node_id: NodeId = @intCast(i);
         const n = graph.node(node_id);
         const nid: usize = @intCast(node_id);
-        const ins = n.getInputs();
 
         // Runtime input: emit as HLO parameter.
         if (input_set.get(node_id)) |param_idx| {
@@ -1311,6 +1601,7 @@ pub fn compileGradientGraph(
             continue;
         }
 
+        if (try emitPrimitiveNode(allocator, &b, n, node_map, nid, &reducer_comp, &max_reducer_comp, &needs_add_reducer, &needs_max_reducer)) continue;
         switch (n.op) {
             .parameter => {
                 return error.MissingRuntimeInputParameter;
@@ -1318,164 +1609,6 @@ pub fn compileGradientGraph(
 
             .constant => {
                 node_map[nid] = try emitGraphConstant(&b, graph, n);
-            },
-
-            // Unary elementwise ops
-            .neg => node_map[nid] = try b.negate(try getHloId(node_map, ins[0])),
-            .sqrt => node_map[nid] = try b.sqrt(try getHloId(node_map, ins[0])),
-            .rsqrt => node_map[nid] = try b.rsqrt(try getHloId(node_map, ins[0])),
-            .exp => node_map[nid] = try b.exponential(try getHloId(node_map, ins[0])),
-            .log => node_map[nid] = try b.log(try getHloId(node_map, ins[0])),
-            .sin => node_map[nid] = try b.sine(try getHloId(node_map, ins[0])),
-            .cos => node_map[nid] = try b.cosine(try getHloId(node_map, ins[0])),
-            .tanh => node_map[nid] = try b.tanh(try getHloId(node_map, ins[0])),
-            .erf => node_map[nid] = try b.erf(try getHloId(node_map, ins[0])),
-            .abs => node_map[nid] = try b.abs(try getHloId(node_map, ins[0])),
-
-            // Binary elementwise ops
-            .add => node_map[nid] = try b.add(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
-            .mul => node_map[nid] = try b.multiply(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
-            .sub => node_map[nid] = try b.subtract(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
-            .div => node_map[nid] = try b.divide(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
-            .less_than => node_map[nid] = try b.lessThan(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
-
-            // Select (where)
-            .where_select => node_map[nid] = try b.select(
-                try getHloId(node_map, ins[0]),
-                try getHloId(node_map, ins[1]),
-                try getHloId(node_map, ins[2]),
-            ),
-
-            // Reductions
-            .reduce_sum => |attrs| {
-                needs_add_reducer = true;
-                const x_hlo = try getHloId(node_map, ins[0]);
-                const input_shape = b.getInst(x_hlo).shape;
-                const result_shape = gradReducedShape(input_shape, attrs.axes[0..attrs.num_axes]);
-                const zero = try b.constantScalarF32(0.0);
-                var reduce_dims = try allocator.alloc(i64, attrs.num_axes);
-                defer allocator.free(reduce_dims);
-                for (attrs.axes[0..attrs.num_axes], 0..) |ax, j| reduce_dims[j] = @intCast(ax);
-                node_map[nid] = try b.reduce(
-                    x_hlo,
-                    zero,
-                    reduce_dims,
-                    result_shape,
-                    reducer_comp.id,
-                );
-            },
-
-            .reduce_mean => |attrs| {
-                needs_add_reducer = true;
-                const x_hlo = try getHloId(node_map, ins[0]);
-                const input_shape = b.getInst(x_hlo).shape;
-                const result_shape = gradReducedShape(input_shape, attrs.axes[0..attrs.num_axes]);
-                const zero = try b.constantScalarF32(0.0);
-                var reduce_dims = try allocator.alloc(i64, attrs.num_axes);
-                defer allocator.free(reduce_dims);
-                var n_elems: i64 = 1;
-                for (attrs.axes[0..attrs.num_axes], 0..) |ax, j| {
-                    reduce_dims[j] = @intCast(ax);
-                    n_elems *= input_shape.dimensions[@intCast(ax)];
-                }
-                const sum_id = try b.reduce(x_hlo, zero, reduce_dims, result_shape, reducer_comp.id);
-                const n_f = try b.constantScalarF32(@floatFromInt(n_elems));
-                node_map[nid] = try b.divide(sum_id, n_f);
-            },
-
-            .reduce_max => |attrs| {
-                needs_max_reducer = true;
-                const x_hlo = try getHloId(node_map, ins[0]);
-                const input_shape = b.getInst(x_hlo).shape;
-                const result_shape = gradReducedShape(input_shape, attrs.axes[0..attrs.num_axes]);
-                const neg_inf = try b.constantScalarF32(-std.math.inf(f32));
-                var reduce_dims = try allocator.alloc(i64, attrs.num_axes);
-                defer allocator.free(reduce_dims);
-                for (attrs.axes[0..attrs.num_axes], 0..) |ax, j| reduce_dims[j] = @intCast(ax);
-                node_map[nid] = try b.reduce(x_hlo, neg_inf, reduce_dims, result_shape, max_reducer_comp.id);
-            },
-
-            // Shape ops
-            .reshape => |attrs| {
-                if (attrs.runtime_shape or !hloShapeIsConcretePositive(attrs.new_shape)) return error.UnsupportedShape;
-                node_map[nid] = try b.reshape(
-                    try getHloId(node_map, ins[0]),
-                    hlo.Shape.init(graphDTypeToHlo(attrs.new_shape.dtype), attrs.new_shape.dims[0..attrs.new_shape.rank()]),
-                );
-            },
-
-            .transpose => |attrs| {
-                const src = try getHloId(node_map, ins[0]);
-                const src_shape = b.getInst(src).shape;
-                var perm = try allocator.alloc(i64, attrs.num_axes);
-                defer allocator.free(perm);
-                var result_dims = try allocator.alloc(i64, attrs.num_axes);
-                defer allocator.free(result_dims);
-                for (attrs.perm[0..attrs.num_axes], 0..) |p, j| {
-                    perm[j] = @intCast(p);
-                    result_dims[j] = src_shape.dimensions[@intCast(p)];
-                }
-                node_map[nid] = try b.transpose(
-                    src,
-                    perm,
-                    hlo.Shape.init(src_shape.element_type, result_dims),
-                );
-            },
-
-            .broadcast_in_dim => |attrs| {
-                const src = try getHloId(node_map, ins[0]);
-                var bcast_dims = try allocator.alloc(i64, attrs.num_axes);
-                defer allocator.free(bcast_dims);
-                for (attrs.broadcast_axes[0..attrs.num_axes], 0..) |ax, j| bcast_dims[j] = @intCast(ax);
-                const target_shape = hlo.Shape.init(
-                    graphDTypeToHlo(attrs.target_shape.dtype),
-                    attrs.target_shape.dims[0..attrs.target_shape.rank()],
-                );
-                node_map[nid] = try b.broadcast(src, bcast_dims, target_shape);
-            },
-
-            // Contraction
-            .dot_general => |attrs| {
-                const lhs = try getHloId(node_map, ins[0]);
-                const rhs = try getHloId(node_map, ins[1]);
-                var lhs_cont = try allocator.alloc(i64, attrs.num_contracting);
-                defer allocator.free(lhs_cont);
-                var rhs_cont = try allocator.alloc(i64, attrs.num_contracting);
-                defer allocator.free(rhs_cont);
-                var lhs_batch = try allocator.alloc(i64, attrs.num_batch);
-                defer allocator.free(lhs_batch);
-                var rhs_batch = try allocator.alloc(i64, attrs.num_batch);
-                defer allocator.free(rhs_batch);
-                for (attrs.lhs_contracting[0..attrs.num_contracting], 0..) |d, j| lhs_cont[j] = @intCast(d);
-                for (attrs.rhs_contracting[0..attrs.num_contracting], 0..) |d, j| rhs_cont[j] = @intCast(d);
-                for (attrs.lhs_batch[0..attrs.num_batch], 0..) |d, j| lhs_batch[j] = @intCast(d);
-                for (attrs.rhs_batch[0..attrs.num_batch], 0..) |d, j| rhs_batch[j] = @intCast(d);
-                const result_shape = graphShapeToHlo(n);
-                node_map[nid] = try b.dot(lhs, rhs, result_shape, .{
-                    .lhs_contracting_dimensions = lhs_cont,
-                    .rhs_contracting_dimensions = rhs_cont,
-                    .lhs_batch_dimensions = lhs_batch,
-                    .rhs_batch_dimensions = rhs_batch,
-                });
-            },
-
-            // Type conversion
-            .convert_dtype => |attrs| {
-                node_map[nid] = try b.convertType(
-                    try getHloId(node_map, ins[0]),
-                    graphDTypeToHlo(attrs.target),
-                );
-            },
-
-            .slice => |attrs| {
-                _ = attrs;
-                return error.UnsupportedPrimitiveOp;
-            },
-
-            .concat_prim => |attrs| {
-                const x = try getHloId(node_map, ins[0]);
-                const y = try getHloId(node_map, ins[1]);
-                node_map[nid] = try b.concatenate(&.{ x, y }, @intCast(attrs.axis), graphShapeToHlo(n));
             },
 
             // Ops not supported in the gradient path
@@ -1542,19 +1675,6 @@ pub fn compileGradientGraph(
 }
 
 /// Shape after reducing along the given axes (removed dimensions are dropped).
-fn gradReducedShape(shape: hlo.Shape, axes: []const u8) hlo.Shape {
-    var keep: [8]i64 = undefined;
-    var ki: usize = 0;
-    outer: for (shape.dimensions, 0..) |dim, i| {
-        for (axes) |ax| {
-            if (ax == i) continue :outer;
-        }
-        keep[ki] = dim;
-        ki += 1;
-    }
-    return hlo.Shape.init(shape.element_type, keep[0..ki]);
-}
-
 // ── Tests ───────────────────────────────────────────────────────────
 
 const Shape = ml.graph.Shape;
