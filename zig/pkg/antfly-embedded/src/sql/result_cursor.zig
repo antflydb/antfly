@@ -1030,8 +1030,11 @@ test "SQL bounded native delivery sorted cursor output admission" {
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
     };
+    // Never depend on a favorable arena remap or backing address to retain
+    // enough headroom for one payload while collecting a wider key window.
+    var stable: @import("antfly_platform").allocator.StableTestAllocator = .{ .backing = a };
     for ([_]usize{ 4000, 6000, 8000, 12000, 16000 }) |available| for ([_]usize{ 1, 64 }) |maximum| for ([_]bool{ false, true }) |via_cursor| {
-        var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 2 * 1024 * 1024 };
+        var budget: @import("memory_budget.zig") = .{ .backing = stable.allocator(), .limit = 2 * 1024 * 1024 };
         defer std.debug.assert(budget.live == 0);
         var token: u8 = 0;
         var manager: spill.Manager = .{ .alloc = budget.allocator(), .io = std.testing.io, .context = &token, .checkpoint = Hook.check, .compression = .none, .async_writes = false, .buffer_bytes = 128 };

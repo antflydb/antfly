@@ -67,7 +67,20 @@ pub fn recognized(a: A, body: []const u8) ?Failure {
     inline for (terminal ++ transient) |err| if (std.mem.eql(u8, parsed.value.@"error", @errorName(err))) return fromError(err);
     return null;
 }
+/// A cold-start refusal precedes model execution and must retain its capacity
+/// identity. Neither an arbitrary retryable flag nor an authentication failure
+/// can claim this exemption from a document's execution-attempt budget.
+pub fn capacityRefusal(a: A, status: u16, body: []const u8) bool {
+    if (status != 503 or body.len > 4096) return false;
+    var parsed = std.json.parseFromSlice(struct { @"error": []const u8 = "", retryable: bool = false }, a, body, .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .@"error" }) catch return false;
+    defer parsed.deinit();
+    return parsed.value.retryable and
+        (std.mem.eql(u8, parsed.value.@"error", "INFERENCE_STARTING") or
+            std.mem.eql(u8, parsed.value.@"error", "MODEL_RESOURCE_BUSY"));
+}
+
 pub fn fromResponse(a: A, status: u16, body: []const u8) Failure {
+    if (capacityRefusal(a, status, body)) return fromError(error.InferenceCapacityUnavailable);
     if (recognized(a, body)) |failure| return failure;
     return switch (status) {
         408, 425, 429 => .{ .retryable = true, .code = "InferenceUpstreamTemporarilyUnavailable" },
@@ -94,4 +107,22 @@ test "document failure classification preserves native error identity across HTT
     try std.testing.expect(recognized(a, "{\"error\":\"unrecognized user-controlled error\"}") == null);
     try std.testing.expect(recognized(a, "{\"error\":\"Timeout\",\"error\":\"DocumentBudgetExhausted\"}") == null);
     try std.testing.expect(recognized(a, &@as([4097]u8, @splat(' '))) == null);
+}
+
+test "cold start and resource refusal require bounded explicit protocol evidence" {
+    const a = std.testing.allocator;
+    const starting = "{\"error\":\"INFERENCE_STARTING\",\"retryable\":true,\"phase\":\"starting_gpu\",\"retry_after_ms\":30000}";
+    try std.testing.expect(capacityRefusal(a, 503, starting));
+    try std.testing.expect(capacityRefusal(a, 503, "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true}"));
+    try std.testing.expectEqual(fromError(error.InferenceCapacityUnavailable), fromResponse(a, 503, starting));
+    for ([_]u16{ 200, 400, 401, 403, 429, 500 }) |status| try std.testing.expect(!capacityRefusal(a, status, starting));
+    for ([_][]const u8{
+        "{}",
+        "{\"error\":\"INFERENCE_STARTING\"}",
+        "{\"error\":\"INFERENCE_STARTING\",\"retryable\":false}",
+        "{\"error\":\"UNKNOWN\",\"retryable\":true}",
+        "{\"error\":\"INFERENCE_STARTING\",\"retryable\":true,\"retryable\":false}",
+        "{\"error\":\"INFERENCE_STARTING\",\"retryable\":\"true\"}",
+    }) |body| try std.testing.expect(!capacityRefusal(a, 503, body));
+    try std.testing.expect(!capacityRefusal(a, 503, &@as([4097]u8, @splat(' '))));
 }

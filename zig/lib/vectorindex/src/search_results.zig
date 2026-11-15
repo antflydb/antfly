@@ -90,6 +90,11 @@ fn approxResultWorseThan(_: void, a: ApproxSearchResult, b: ApproxSearchResult) 
     return std.math.order(b.distance, a.distance);
 }
 
+fn candidateWorseThan(authoritative: bool, a: ApproxSearchResult, b: ApproxSearchResult) std.math.Order {
+    if (!authoritative) return approxResultWorseThan({}, a, b);
+    return resultWorseThan({}, .{ .vector_id = a.vector_id, .distance = a.distance }, .{ .vector_id = b.vector_id, .distance = b.distance });
+}
+
 pub const SearchResults = struct {
     alloc: Allocator,
     items: std.PriorityQueue(SearchResult, void, resultWorseThan),
@@ -235,18 +240,27 @@ pub const SearchResults = struct {
 
 pub const ApproxSearchResults = struct {
     alloc: Allocator,
-    items: std.PriorityQueue(ApproxSearchResult, void, approxResultWorseThan),
+    items: std.PriorityQueue(ApproxSearchResult, bool, candidateWorseThan),
     k: usize,
     max_items: usize,
 
     pub fn init(alloc: Allocator, k: usize) ApproxSearchResults {
-        return .{ .alloc = alloc, .items = .initContext({}), .k = k, .max_items = k };
+        return .{ .alloc = alloc, .items = .initContext(false), .k = k, .max_items = k };
     }
 
     pub fn initCapacity(alloc: Allocator, k: usize, max_items: usize, capacity: usize) !ApproxSearchResults {
         var out = ApproxSearchResults.init(alloc, k);
         out.max_items = max_items;
         try out.items.ensureTotalCapacity(alloc, capacity);
+        return out;
+    }
+
+    /// Complete-snapshot search must use the public exact ordering even when
+    /// source cache/WAL hits are admitted before deferred vector completions.
+    /// Ordinary ANN retains its established distance-only heap policy.
+    pub fn initExactCapacity(alloc: Allocator, k: usize, capacity: usize) !ApproxSearchResults {
+        var out = try initCapacity(alloc, k, k, capacity);
+        out.items.context = true;
         return out;
     }
 
@@ -264,7 +278,7 @@ pub const ApproxSearchResults = struct {
             self.items.push(self.alloc, candidate) catch return;
         } else {
             const worst = self.items.peek() orelse return;
-            if (candidate.distance < worst.distance) {
+            if (candidateWorseThan(self.items.context, candidate, worst) == .gt) {
                 _ = self.items.pop();
                 self.items.push(self.alloc, candidate) catch return;
             }
@@ -732,4 +746,22 @@ test "exact result admission and sorting agree on equal distances" {
     results.sort();
     try std.testing.expectEqual(@as(u64, 1), results.getHits()[0].vector_id);
     try std.testing.expectEqual(@as(u64, 2), results.getHits()[1].vector_id);
+}
+
+test "authoritative candidate heap preserves public tie order across admission order" {
+    var results = try ApproxSearchResults.initExactCapacity(std.testing.allocator, 2, 2);
+    defer results.deinit();
+    results.addResult(100, 1, 0);
+    results.addResult(200, 1, 0);
+    // Already-exact rows can arrive before smaller-ID deferred completions.
+    results.addResult(20, 0, 0);
+    results.addResult(30, 0, 0);
+    try std.testing.expectEqual(@as(u64, 30), results.items.peek().?.vector_id);
+    results.addResult(10, 0, 0);
+    try std.testing.expectEqual(@as(u64, 20), results.items.peek().?.vector_id);
+    var final = try results.toFinalResults();
+    defer final.deinit();
+    final.sort();
+    try std.testing.expectEqual(@as(u64, 10), final.getHits()[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 20), final.getHits()[1].vector_id);
 }

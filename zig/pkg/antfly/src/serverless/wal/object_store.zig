@@ -40,12 +40,18 @@ pub const ObjectStore = struct {
         managed_indexed = 3,
         indexed_relative = 4,
         managed_indexed_relative = 5,
+        catalog_indexed = 6,
+        managed_catalog_indexed = 7,
+
+        fn catalog(self: Layout) bool {
+            return self == .catalog_indexed or self == .managed_catalog_indexed;
+        }
 
         fn managed(self: Layout) bool {
-            return self == .managed_indexed or self == .managed_indexed_relative;
+            return self == .managed_indexed or self == .managed_indexed_relative or self == .managed_catalog_indexed;
         }
         fn relative(self: Layout) bool {
-            return self == .indexed_relative or self == .managed_indexed_relative;
+            return self == .indexed_relative or self == .managed_indexed_relative or self.catalog();
         }
     };
 
@@ -168,6 +174,8 @@ pub const ObjectStore = struct {
         if (std.mem.eql(u8, result.body, "antfly-wal:indexed-managed:1")) return .managed_indexed;
         if (std.mem.eql(u8, result.body, "antfly-wal:indexed:2")) return .indexed_relative;
         if (std.mem.eql(u8, result.body, "antfly-wal:indexed-managed:2")) return .managed_indexed_relative;
+        if (std.mem.eql(u8, result.body, "antfly-wal:indexed:3")) return .catalog_indexed;
+        if (std.mem.eql(u8, result.body, "antfly-wal:indexed-managed:3")) return .managed_catalog_indexed;
         return error.UnsupportedWalLayout;
     }
     fn ensureLayout(self: *ObjectStore, wanted: Layout, create: bool) !void {
@@ -190,6 +198,8 @@ pub const ObjectStore = struct {
             .managed_indexed => "antfly-wal:indexed-managed:1",
             .indexed_relative => "antfly-wal:indexed:2",
             .managed_indexed_relative => "antfly-wal:indexed-managed:2",
+            .catalog_indexed => "antfly-wal:indexed:3",
+            .managed_catalog_indexed => "antfly-wal:indexed-managed:3",
         };
         var published = self.client.compareAndPut(self.bucket, key, value, null, .{ .cancellation = self.cancellation }) catch |err| {
             // The immutable selection may have committed before an ACK was
@@ -210,17 +220,25 @@ pub const ObjectStore = struct {
 
     /// Explicit format selection. Existing legacy WALs must be migrated into a
     /// new prefix; activation may never silently hide acknowledged records.
-    pub fn enableIndexed(self: *ObjectStore, options: struct { read_state: bool = false, document_index: bool = false, packed_pages: bool = false, deferred_indexes: bool = false, inline_tail: bool = true, managed_collection: bool = false, initialize: bool = true }) !void {
+    pub fn enableIndexed(self: *ObjectStore, options: struct { catalog_fences: bool = false, read_state: bool = false, document_index: bool = false, packed_pages: bool = false, deferred_indexes: bool = false, inline_tail: bool = true, managed_collection: bool = false, initialize: bool = true }) !void {
         if (self.indexed != null) return error.WalAlreadyConfigured;
         const selected = try self.readLayout();
         if (selected == .legacy) return error.LegacyWalMigrationRequired;
+        // Never upgrade a live namespace implicitly. Old readers and metadata
+        // writers must be removed before an operator selects the new prefix.
+        if (selected) |layout| {
+            if (options.catalog_fences and !layout.catalog()) return error.CatalogWalMigrationRequired;
+            if (layout.catalog() and !options.catalog_fences) return error.CatalogWalActivationRequired;
+        }
         if (options.managed_collection and (selected == .indexed or selected == .indexed_relative)) return error.ManagedWalMigrationRequired;
         // Version one at an empty prefix deliberately retains its historical
         // leading-slash keys on S3/GCS. It cannot be reinterpreted as relative
         // paths, nor can the filesystem validator safely alias those names.
         if (self.fs_client != null and self.prefix.len == 0 and (selected == .indexed or selected == .managed_indexed)) return error.LegacyIndexedRootMigrationRequired;
         const managed = options.managed_collection or (selected != null and selected.?.managed());
-        const wanted: Layout = selected orelse if (self.prefix.len == 0)
+        const wanted: Layout = selected orelse if (options.catalog_fences)
+            (if (managed) .managed_catalog_indexed else .catalog_indexed)
+        else if (self.prefix.len == 0)
             (if (managed) .managed_indexed_relative else .indexed_relative)
         else
             (if (managed) .managed_indexed else .indexed);
@@ -272,6 +290,7 @@ pub const ObjectStore = struct {
         indexed.deferred_indexes_enabled = options.deferred_indexes;
         indexed.inline_tail_enabled = options.inline_tail;
         indexed.managed_reads = wanted.managed();
+        indexed.catalog_fences_enabled = wanted.catalog();
         indexed.cancellation = self.cancellation;
         self.indexed = indexed;
     }
@@ -279,7 +298,9 @@ pub const ObjectStore = struct {
     /// Existing selections are cached; only a pristine namespace needs a CAS.
     pub fn initializeIndexed(self: *ObjectStore) !void {
         const indexed = self.indexed orelse return error.WalNotConfigured;
-        const wanted: Layout = if (self.prefix.len == 0)
+        const wanted: Layout = if (indexed.catalog_fences_enabled)
+            (if (indexed.managed_reads) .managed_catalog_indexed else .catalog_indexed)
+        else if (self.prefix.len == 0)
             (if (indexed.managed_reads) .managed_indexed_relative else .indexed_relative)
         else
             (if (indexed.managed_reads) .managed_indexed else .indexed);
@@ -305,7 +326,7 @@ pub const ObjectStore = struct {
         return .{
             .allocator = self.alloc,
             .ptr = self,
-            .vtable = if (self.indexed != null) &indexed_vtable else &vtable,
+            .vtable = if (self.indexed) |indexed| (if (indexed.catalog_fences_enabled) &catalog_vtable else &indexed_vtable) else &vtable,
         };
     }
 
@@ -557,8 +578,33 @@ pub const ObjectStore = struct {
         value.read_range_alloc = erasedRange;
         value.append_batch = erasedUnkeyedBatch;
         value.append_batch_idempotent = erasedBatch;
+        value.append_batch_idempotent_if_latest = erasedConditionalBatch;
         break :blk value;
     };
+    const catalog_vtable: wal_store.WalStore.VTable = blk: {
+        var value = indexed_vtable;
+        value.catalog_fence = erasedCatalogFence;
+        value.begin_catalog_update = erasedBeginCatalog;
+        value.complete_catalog_update = erasedCompleteCatalog;
+        value.append_prepared = erasedPrepared;
+        break :blk value;
+    };
+    fn erasedCatalogFence(ptr: *anyopaque, a: std.mem.Allocator, ns: []const u8) !wal_types.CatalogTransition {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.catalogFence(a, ns);
+    }
+    fn erasedBeginCatalog(ptr: *anyopaque, ns: []const u8, payload: []const u8, epoch: u64) !u64 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.beginCatalogUpdate(ns, payload, epoch);
+    }
+    fn erasedCompleteCatalog(ptr: *anyopaque, ns: []const u8, epoch: u64) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.completeCatalogUpdate(ns, epoch);
+    }
+    fn erasedPrepared(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, fence: wal_types.CatalogFence) !wal_types.BatchResult {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.appendPrepared(ns, timestamp, payloads, id, fence);
+    }
     fn erasedMaterialize(ptr: *anyopaque, ns: []const u8, cancellation: ?objectstore.CancellationToken) !bool {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return self.indexed.?.materializePendingWithCancellation(ns, cancellation);
@@ -578,6 +624,10 @@ pub const ObjectStore = struct {
     fn erasedUnkeyedBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8) !wal_types.BatchResult {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return self.indexed.?.appendBatch(ns, timestamp, payloads);
+    }
+    fn erasedConditionalBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, expected: u64) !wal_types.BatchResult {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.appendBatchIdempotentIfLatest(ns, timestamp, payloads, id, expected);
     }
     fn erasedBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8) !wal_types.BatchResult {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
@@ -1075,4 +1125,40 @@ test "serverless object WAL whole-log reads honor their result allocator" {
     try std.testing.expectError(error.OutOfMemory, borrowed.readFromAlloc("docs", 1));
     try std.testing.expectError(error.OutOfMemory, store.tryReadLog(small.allocator(), "events/docs/wal.log"));
     try std.testing.expectEqual(@as(usize, 0), small.live_bytes);
+}
+
+test "commit requirements catalog layout requires explicit new prefix activation" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    {
+        var legacy = try ObjectStore.initWithClient(a, client, "db", "old");
+        defer legacy.deinit();
+        try legacy.enableIndexed(.{});
+        try std.testing.expect(!legacy.walStore().supportsCatalogFences());
+    }
+    {
+        var migration = try ObjectStore.initWithClient(a, client, "db", "old");
+        defer migration.deinit();
+        try std.testing.expectError(error.CatalogWalMigrationRequired, migration.enableIndexed(.{ .catalog_fences = true }));
+    }
+    {
+        var activated = try ObjectStore.initWithClient(a, client, "db", "new");
+        defer activated.deinit();
+        try activated.enableIndexed(.{ .catalog_fences = true, .initialize = false });
+        try activated.initializeIndexed();
+        try std.testing.expect(activated.walStore().supportsCatalogFences());
+        var marker = try client.getObject("db", "new/.antfly/WAL_FORMAT", .{});
+        defer marker.deinit(a);
+        try std.testing.expectEqualStrings("antfly-wal:indexed:3", marker.body);
+    }
+    {
+        var unactivated = try ObjectStore.initWithClient(a, client, "db", "new");
+        defer unactivated.deinit();
+        try std.testing.expectError(error.CatalogWalActivationRequired, unactivated.enableIndexed(.{}));
+        try unactivated.enableIndexed(.{ .catalog_fences = true });
+        try std.testing.expect(unactivated.walStore().supportsCatalogFences());
+    }
 }

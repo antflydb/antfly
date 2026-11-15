@@ -235,14 +235,19 @@ pub const Worker = struct {
     }
 
     pub fn executeGraphGetEdgesBatch(self: Worker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: GraphEdgesRequest, consistency: raft_mod.ReadConsistency) !GraphEdgesResponse {
+        if (req.physical_scan_observation) |observed| observed.* = 0;
         try self.ensureActive();
         const func = self.vtable.execute_graph_get_edges_batch orelse return error.GraphEdgesBatchUnsupported;
         if (self.work_cost_port) |port| try port.charge(group_id, .get_edges, 1);
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
+        // Uninstrumented workers remain safe: never infer zero from an error
+        // after dispatch. Native readers/remote decoders publish exact work.
+        if (req.physical_scan_observation) |observed| observed.* = null;
         var result = try func(self.ptr, alloc, group_id, table_name, controlled, consistency);
         errdefer result.deinit(alloc);
+        if (req.physical_scan_observation) |observed| observed.* = result.scanned_rows;
         try self.ensureActive();
         return result;
     }
@@ -1999,6 +2004,7 @@ const QueryState = struct {
     hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
     metric_status: std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus) = .empty,
     path_states: std.ArrayListUnmanaged(PathState) = .empty,
+    path_memory: ?graph_work_budget.RetainedAllocator = null,
     seen: graph_node_identity.Map(void) = .{},
     // Path-producing traversal visits (root, table, key), so one root never
     // suppresses another root's evidence. PathState IDs are request local.
@@ -2184,6 +2190,24 @@ const QueryState = struct {
         return self.putSeenInMap(alloc, &self.seen, ref);
     }
 
+    fn appendPath(self: *QueryState, a: std.mem.Allocator, item: *PathState) !void {
+        if (self.path_memory == null) self.path_memory = .{ .backing = graph_memory_budget.reclaimingAllocator(a), .budget = self.work_budget };
+        self.path_states.ensureUnusedCapacity(self.path_memory.?.allocator(), 1) catch |err|
+            return if (err == error.OutOfMemory and self.path_memory.?.denied) error.GraphWorkBudgetExceeded else err;
+        // The container owns all inline slots, including spare capacity and
+        // replacement peaks. Entries retain only their independently owned data.
+        std.debug.assert(item.retained_lease.bytes >= @sizeOf(PathState));
+        try item.retained_lease.resize(item.retained_lease.bytes - @sizeOf(PathState));
+        self.path_states.appendAssumeCapacity(item.*);
+    }
+    fn deinitPaths(self: *QueryState, a: std.mem.Allocator) void {
+        for (self.path_states.items) |*item| item.deinit(a);
+        self.path_states.deinit(if (self.path_memory) |*memory| memory.allocator() else a);
+        if (self.path_memory) |memory| std.debug.assert(memory.live_bytes == 0);
+        self.path_memory = null;
+        self.path_states = .empty;
+    }
+
     fn seenAllocator(self: *QueryState, alloc: std.mem.Allocator) std.mem.Allocator {
         if (self.seen_memory == null) self.seen_memory = .{ .backing = alloc, .budget = self.work_budget };
         return self.seen_memory.?.allocator();
@@ -2229,15 +2253,13 @@ const QueryState = struct {
         self.hits.deinit(alloc);
         for (self.metric_status.items) |*status| status.deinit(alloc);
         self.metric_status.deinit(alloc);
-        for (self.path_states.items) |*path_state| path_state.deinit(alloc);
-        self.path_states.deinit(alloc);
+        self.deinitPaths(alloc);
         self.deinitSeen(alloc);
         self.* = undefined;
     }
 
     fn deinitTransient(self: *QueryState, alloc: std.mem.Allocator) void {
-        for (self.path_states.items) |*path_state| path_state.deinit(alloc);
-        self.path_states.deinit(alloc);
+        self.deinitPaths(alloc);
         self.deinitSeen(alloc);
         self.path_states = .empty;
         self.seen = .{};
@@ -2827,6 +2849,60 @@ const FrontierState = struct {
     }
 };
 
+/// FIFO for unit-cost searches, heap for weighted Pareto labels. Both own
+/// their pending states; settled parents live separately in QueryState.
+const PathFrontier = struct {
+    fifo: bool,
+    memory: graph_work_budget.RetainedAllocator,
+    queue: std.ArrayListUnmanaged(FrontierState) = .empty,
+    head: usize = 0,
+    heap: std.PriorityQueue(FrontierState, void, frontierStateOrder) = .initContext({}),
+
+    fn count(self: *const @This()) usize {
+        return if (self.fifo) self.queue.items.len - self.head else self.heap.items.len;
+    }
+    fn peek(self: *const @This()) ?FrontierState {
+        return if (self.fifo) (if (self.head < self.queue.items.len) self.queue.items[self.head] else null) else self.heap.peek();
+    }
+    fn pop(self: *@This()) ?FrontierState {
+        if (!self.fifo) return self.heap.pop();
+        const next = self.peek() orelse return null;
+        self.head += 1;
+        return next;
+    }
+    fn push(self: *@This(), item: *FrontierState) !void {
+        const budget = self.memory.budget.?;
+        try budget.checkIntermediateStates(self.count() + 1, budget.max_intermediate_states);
+        const a = self.memory.allocator();
+        if (self.fifo) {
+            if (self.head >= 64 and self.head >= self.queue.items.len / 2) {
+                const pending = self.queue.items[self.head..];
+                std.mem.copyForwards(FrontierState, self.queue.items[0..pending.len], pending);
+                self.queue.items.len = pending.len;
+                self.head = 0;
+            }
+            self.queue.ensureUnusedCapacity(a, 1) catch |err| return self.failure(err);
+        } else self.heap.ensureUnusedCapacity(a, 1) catch |err| return self.failure(err);
+        // The container now owns the slot allocation, including spare capacity
+        // and growth peaks. Transfer the entry's inline reservation only after
+        // capacity succeeds so the caller retains complete ownership on error.
+        std.debug.assert(item.retained_lease.bytes >= @sizeOf(FrontierState));
+        try item.retained_lease.resize(item.retained_lease.bytes - @sizeOf(FrontierState));
+        if (self.fifo) self.queue.appendAssumeCapacity(item.*) else self.heap.push(a, item.*) catch unreachable;
+    }
+    fn failure(self: *@This(), err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and self.memory.denied) error.GraphWorkBudgetExceeded else err;
+    }
+    fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        for (self.queue.items[self.head..]) |*item| item.deinit(a);
+        for (self.heap.items) |*item| item.deinit(a);
+        const tracked = self.memory.allocator();
+        self.queue.deinit(tracked);
+        self.heap.deinit(tracked);
+        std.debug.assert(self.memory.live_bytes == 0);
+    }
+};
+
 const PathCostLabels = struct {
     const Label = struct {
         depth: u32,
@@ -2836,76 +2912,44 @@ const PathCostLabels = struct {
     values: graph_node_identity.Map(std.ArrayListUnmanaged(Label)) = .{},
     max_depth: u32,
     work_budget: ?*graph_pattern_mod.WorkBudget = null,
-    retained_state_bytes: usize = 0,
+    memory: ?graph_work_budget.RetainedAllocator = null,
 
     fn init(max_depth: u32, work_budget: ?*graph_pattern_mod.WorkBudget) PathCostLabels {
         return .{ .max_depth = max_depth, .work_budget = work_budget };
     }
-
+    fn allocator(self: *@This(), a: std.mem.Allocator) std.mem.Allocator {
+        if (self.memory == null) self.memory = .{ .backing = graph_memory_budget.reclaimingAllocator(a), .budget = self.work_budget };
+        return self.memory.?.allocator();
+    }
+    fn failure(self: *@This(), err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and self.memory.?.denied) error.GraphWorkBudgetExceeded else err;
+    }
     pub fn deinit(self: *PathCostLabels, alloc: std.mem.Allocator) void {
+        const a = self.allocator(alloc);
         var it = self.values.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(alloc);
-        self.values.deinit(alloc);
-        if (self.work_budget) |budget| budget.releaseStateBytes(self.retained_state_bytes);
+        while (it.next()) |entry| entry.value_ptr.deinit(a);
+        self.values.deinit(a);
+        std.debug.assert(self.memory.?.live_bytes == 0);
         self.* = undefined;
     }
-
-    fn recordIfPareto(
-        self: *PathCostLabels,
-        alloc: std.mem.Allocator,
-        ref: graph_node_identity.Ref,
-        depth: u32,
-        cost: f64,
-    ) !bool {
+    fn recordIfPareto(self: *PathCostLabels, alloc: std.mem.Allocator, ref: graph_node_identity.Ref, depth: u32, cost: f64) !bool {
         if (depth > self.max_depth) return false;
+        const a = self.allocator(alloc);
         if (self.values.getPtr(ref)) |labels| {
-            for (labels.items) |label| {
-                if (label.depth <= depth and label.cost <= cost) return false;
-            }
-
-            // Keep only the Pareto frontier. This is normally one label per
-            // node and avoids allocating max_depth slots for every identity.
+            for (labels.items) |label| if (label.depth <= depth and label.cost <= cost) return false;
             var index: usize = 0;
             while (index < labels.items.len) {
                 const label = labels.items[index];
-                if (depth <= label.depth and cost <= label.cost) {
-                    _ = labels.swapRemove(index);
-                } else {
-                    index += 1;
-                }
+                if (depth <= label.depth and cost <= label.cost) _ = labels.swapRemove(index) else index += 1;
             }
-            const added_bytes: usize = if (labels.capacity == labels.items.len) @sizeOf(Label) else 0;
-            if (self.work_budget) |budget| try budget.retainStateBytes(added_bytes);
-            errdefer if (self.work_budget) |budget| budget.releaseStateBytes(added_bytes);
-            if (added_bytes > 0) try labels.ensureTotalCapacityPrecise(alloc, labels.items.len + 1);
-            labels.appendAssumeCapacity(.{ .depth = depth, .cost = cost });
-            self.retained_state_bytes += added_bytes;
+            labels.append(a, .{ .depth = depth, .cost = cost }) catch |err| return self.failure(err);
             return true;
         }
-
-        var added_bytes = std.math.add(usize, @sizeOf(graph_node_identity.Key), ref.key.len) catch
-            return if (self.work_budget) |budget|
-                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
-            else
-                error.OutOfMemory;
-        if (ref.table) |table| added_bytes = std.math.add(usize, added_bytes, table.len) catch
-            return if (self.work_budget) |budget|
-                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
-            else
-                error.OutOfMemory;
-        added_bytes = std.math.add(usize, added_bytes, 3 * @sizeOf(usize) + @sizeOf(Label)) catch
-            return if (self.work_budget) |budget|
-                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
-            else
-                error.OutOfMemory;
-        if (self.work_budget) |budget| try budget.retainStateBytes(added_bytes);
-        errdefer if (self.work_budget) |budget| budget.releaseStateBytes(added_bytes);
         var labels = std.ArrayListUnmanaged(Label).empty;
-        errdefer labels.deinit(alloc);
-        try labels.ensureTotalCapacityPrecise(alloc, 1);
+        errdefer labels.deinit(a);
+        labels.ensureTotalCapacityPrecise(a, 1) catch |err| return self.failure(err);
         labels.appendAssumeCapacity(.{ .depth = depth, .cost = cost });
-        _ = try self.values.putIfAbsent(alloc, ref, labels);
-        self.retained_state_bytes += added_bytes;
+        _ = self.values.putIfAbsent(a, ref, labels) catch |err| return self.failure(err);
         return true;
     }
 
@@ -3064,19 +3108,21 @@ fn executeSingleCrossRange(
 // Optional bounded prefetch for traversals that must visit the full candidate
 // frontier. Early-stop queries retain demand-driven single-key reads.
 // Each async request owns a private bounded allocator. Only the coordinator
-// reserves/refunds the shared budget; response arenas stay alive in the cache.
+// reserves/refunds the shared budget and adopts result ownership after joining.
 const CanonicalBatchSlot = struct {
     owner: std.mem.Allocator,
     budget: *graph_pattern_mod.WorkBudget,
+    backing: std.mem.Allocator,
     group_id: u64,
     request: GraphEdgesRequest,
     local_budget: graph_work_budget.WorkBudget = undefined,
     tracked: graph_work_budget.RetainedAllocator = undefined,
-    arena: ?std.heap.ArenaAllocator = null,
+    reserved: bool = false,
     held: graph_work_budget.RetainedLease = .{},
     physical_allowance: usize = 0,
     physical_settled: bool = false,
     started: bool = false,
+    observed_scans: ?usize = null,
     result: ?GraphEdgesResponse = null,
     err: ?anyerror = null,
 
@@ -3085,8 +3131,8 @@ const CanonicalBatchSlot = struct {
         try self.budget.consumePhysicalEdges(scans);
         self.physical_allowance = scans;
         self.local_budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = bytes });
-        self.tracked = .{ .backing = std.heap.page_allocator, .budget = &self.local_budget };
-        self.arena = std.heap.ArenaAllocator.init(self.tracked.allocator());
+        self.tracked = .{ .backing = self.backing, .budget = &self.local_budget };
+        self.reserved = true;
     }
     fn settle(self: *@This(), scans: usize) void {
         std.debug.assert(!self.physical_settled and scans <= self.physical_allowance);
@@ -3097,16 +3143,16 @@ const CanonicalBatchSlot = struct {
         self.started = true;
         var request = self.request;
         request.scratch_allocator = self.tracked.allocator();
-        self.result = worker.executeGraphGetEdgesBatch(self.arena.?.allocator(), self.group_id, table_name, request, consistency) catch |err| {
+        request.physical_scan_observation = &self.observed_scans;
+        self.result = worker.executeGraphGetEdgesBatch(self.tracked.allocator(), self.group_id, table_name, request, consistency) catch |err| {
             self.err = if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
             return;
         };
     }
     fn deinit(self: *@This()) void {
         if (!self.started and !self.physical_settled) self.settle(0);
-        if (self.arena) |*arena| {
-            if (self.result) |*result| result.deinit(arena.allocator());
-            arena.deinit();
+        if (self.reserved) {
+            if (self.result) |*result| result.deinit(self.tracked.allocator());
             std.debug.assert(self.tracked.live_bytes == 0);
         }
         self.held.deinit();
@@ -3116,66 +3162,326 @@ const CanonicalBatchSlot = struct {
 };
 
 const CanonicalEdgeBatch = struct {
-    const Table = struct { logical: []const u8, physical: []const u8 = "", groups_loaded: bool = false, key_bytes: usize = 0, keys: std.ArrayListUnmanaged([]const u8) = .empty, seen: std.StringHashMapUnmanaged(void) = .empty, groups: []u64 = &.{} };
-    const Shard = struct { table: usize, group: u64, result: GraphEdgesResponse, key_base: usize = 0, memory: ?*CanonicalBatchSlot = null };
+    const GroupKeys = struct { keys: []const []const u8, ids: []u32 };
+    const ShardChain = struct { first: usize, last: usize };
+    const LookupWork = if (@import("builtin").is_test) struct { lookups: usize = 0, shard_visits: usize = 0 } else struct {};
+    const Table = struct {
+        logical: []const u8,
+        physical: []const u8 = "",
+        groups_loaded: bool = false,
+        key_bytes: usize = 0,
+        keys: std.ArrayListUnmanaged([]const u8) = .empty,
+        seen: std.StringHashMapUnmanaged(void) = .empty,
+        groups: []u64 = &.{},
+        group_shards: std.AutoHashMapUnmanaged(u64, ShardChain) = .empty,
+        incoming_resolved: bool = false,
+        incoming_complete: u64 = 0,
+        incoming: std.AutoHashMapUnmanaged(u64, GroupKeys) = .empty,
+        fn readKeys(self: *const @This(), group: u64) []const []const u8 {
+            return if (self.incoming_resolved) self.incoming.get(group).?.keys else self.keys.items;
+        }
+        fn keyIds(self: *const @This(), group: u64) []const u32 {
+            return if (self.incoming_resolved) self.incoming.get(group).?.ids else &.{};
+        }
+        fn produces(self: *const @This(), group: u64) bool {
+            return !self.incoming_resolved or self.incoming.contains(group);
+        }
+    };
+    const Shard = struct {
+        table: usize,
+        group: u64,
+        result: GraphEdgesResponse,
+        key_base: usize = 0,
+        key_ids: []const u32 = &.{},
+        pinned: bool = false,
+        retired: bool = false,
+        consumed_keys: u64 = 0,
+        next: ?usize = null,
+        fn keyIndex(self: @This(), index: usize) usize {
+            return if (self.key_ids.len != 0) self.key_ids[index] else self.key_base + index;
+        }
+    };
     tracked: graph_work_budget.RetainedAllocator,
+    // Shortest paths prefetch only a bounded same-depth window. Limit
+    // speculative physical work across all producing groups, not per group.
+    path_prefetch: bool = false,
+    path_routes: ?*PathEdgeRoutes = null,
+    prefetch_scans: usize = 0,
+    owns_reclaimer: bool = false,
+    retired_pages: usize = 0,
+    unobserved_prefetch_failure: bool = false,
     tables: std.ArrayListUnmanaged(Table) = .empty,
+    table_ids: std.StringHashMapUnmanaged(usize) = .empty,
     shards: std.ArrayListUnmanaged(Shard) = .empty,
+    lookup_work: LookupWork = .{},
     unsupported: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    fn addTable(self: *@This(), logical: []const u8) !*Table {
+        if (self.table(logical)) |entry| return entry;
+        const a = self.tracked.allocator();
+        try self.tables.ensureUnusedCapacity(a, 1);
+        try self.table_ids.putNoClobber(a, logical, self.tables.items.len);
+        self.tables.appendAssumeCapacity(.{ .logical = logical });
+        return &self.tables.items[self.tables.items.len - 1];
+    }
+    fn reserveShards(self: *@This(), table_id: usize, count: usize) !void {
+        const a = self.tracked.allocator();
+        try self.shards.ensureUnusedCapacity(a, count);
+        try self.tables.items[table_id].group_shards.ensureUnusedCapacity(a, @intCast(count));
+    }
+    fn appendShardAssumeCapacity(self: *@This(), shard: Shard) void {
+        std.debug.assert(shard.next == null);
+        const id = self.shards.items.len;
+        const group = self.tables.items[shard.table].group_shards.getOrPutAssumeCapacity(shard.group);
+        if (group.found_existing) {
+            self.shards.items[group.value_ptr.last].next = id;
+            group.value_ptr.last = id;
+        } else group.value_ptr.* = .{ .first = id, .last = id };
+        self.shards.appendAssumeCapacity(shard);
+    }
+    fn appendShard(self: *@This(), shard: Shard) !void {
+        try self.reserveShards(shard.table, 1);
+        self.appendShardAssumeCapacity(shard);
+    }
+    fn firstShard(self: *@This(), logical: []const u8, group: u64) ?usize {
+        if (comptime @import("builtin").is_test) self.lookup_work.lookups += 1;
+        const entry = self.table(logical) orelse return null;
+        return (entry.group_shards.get(group) orelse return null).first;
+    }
+    fn indexedShard(self: *@This(), id: usize) *Shard {
+        if (comptime @import("builtin").is_test) self.lookup_work.shard_visits += 1;
+        return &self.shards.items[id];
+    }
+
+    fn enableReclamation(self: *@This()) void {
+        const budget = self.tracked.budget orelse return;
+        if (budget.state_reclaimer != null) return;
+        budget.state_reclaimer = .{ .ctx = self, .reclaim = reclaim };
+        self.owns_reclaimer = true;
+    }
+    fn reclaim(ptr: *anyopaque, needed: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const budget = self.tracked.budget.?;
+        const a = self.tracked.allocator();
+        for (self.shards.items) |*shard| {
+            const available = @min(budget.max_retained_state_bytes -| budget.retained_state_bytes, graph_memory_budget.reusableHeadroom(self.tracked.backing) orelse std.math.maxInt(usize));
+            if (needed <= available) break;
+            if (shard.retired or shard.pinned) continue;
+            shard.result.deinit(a);
+            shard.retired = true;
+            self.retired_pages += 1;
+        }
+    }
+    fn yieldForRead(self: *@This(), preferred: usize) void {
+        // Explicitly surrender this cache as well if another optional owner
+        // already occupies the request's single reclaimer hook.
+        reclaim(self, preferred);
+        _ = self.tracked.budget.?.prepareStateHeadroom(preferred);
+    }
+    /// Move a key's payloads into the stream's allocator without copying them.
+    /// Only the descriptor prefix may need a new allocation. Pin the source
+    /// during that allocation so reentrant reclamation cannot invalidate it.
+    fn takePage(self: *@This(), logical: []const u8, group: u64, key: []const u8, target: *graph_work_budget.RetainedAllocator) !?GraphEdgesResponse {
+        var shard_cursor = self.firstShard(logical, group);
+        while (shard_cursor) |id| {
+            const shard = self.indexedShard(id);
+            shard_cursor = shard.next;
+            if (shard.retired) continue;
+            const source = self.tables.items[shard.table];
+            var complete_scans: u32 = 0;
+            for (shard.result.key_scanned_rows, 0..) |scans, i| {
+                complete_scans += scans;
+                if (shard.consumed_keys & (@as(u64, 1) << @intCast(i)) != 0 or !std.mem.eql(u8, source.keys.items[shard.keyIndex(i)], key)) continue;
+                const first = shard.result.key_offsets[i];
+                const last = shard.result.key_offsets[i + 1];
+                shard.pinned = true;
+                defer shard.pinned = false;
+                const input = shard.result.edges[first..last];
+                const whole = first == 0 and last == shard.result.edges.len and shard.result.partial_key == null;
+                const prior_exhaustion = target.budget.?.last_exhaustion;
+                const descriptor_bytes = input.len * @sizeOf(graph_mod.Edge);
+                self.yieldForRead(descriptor_bytes);
+                const output = if (whole) input else target.allocator().dupe(graph_mod.Edge, input) catch |err| {
+                    const parent_room = graph_memory_budget.reusableHeadroom(target.backing) orelse std.math.maxInt(usize);
+                    if (err == error.OutOfMemory and (target.denied or parent_room < descriptor_bytes)) {
+                        shard.pinned = false;
+                        self.yieldForRead(target.budget.?.max_retained_state_bytes);
+                        target.denied = false;
+                        target.budget.?.last_exhaustion = prior_exhaustion;
+                        return null;
+                    }
+                    return err;
+                };
+                var bytes: usize = if (whole) output.len * @sizeOf(graph_mod.Edge) else 0;
+                for (input) |edge| bytes += graphEdgeOwnedBytes(edge) - @sizeOf(graph_mod.Edge);
+                self.tracked.transferTo(target, bytes);
+                shard.consumed_keys |= @as(u64, 1) << @intCast(i);
+                if (whole) {
+                    shard.result.edges = &.{};
+                    // Other complete keys have no payloads, but their scan/EOF
+                    // proofs still prevent re-reading TTL-hidden adjacency.
+                    @memset(shard.result.key_offsets, 0);
+                } else for (input) |*edge| edge.* = .{ .source = "", .target = "", .edge_type = "", .weight = 0, .created_at = 0, .updated_at = 0, .metadata = "" };
+                const all = if (shard.result.key_scanned_rows.len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(shard.result.key_scanned_rows.len)) - 1;
+                if (shard.consumed_keys == all and shard.result.partial_key == null) {
+                    shard.result.deinit(self.tracked.allocator());
+                    shard.retired = true;
+                }
+                return .{ .edges = output, .scanned_rows = scans, .physical_rows_precharged = true };
+            }
+            if (shard.result.partial_key) |i| {
+                if (!std.mem.eql(u8, source.keys.items[shard.keyIndex(i)], key)) continue;
+                const output = shard.result.partial_edges;
+                const cursor = shard.result.resume_cursor.?;
+                var bytes: usize = output.len * @sizeOf(graph_mod.Edge);
+                for (output) |edge| bytes += graphEdgeOwnedBytes(edge) - @sizeOf(graph_mod.Edge);
+                inline for (.{ cursor.edge_type, cursor.adjacent_key, cursor.edge_id, cursor.owner_document }) |field| bytes += field.len;
+                if (cursor.physical_resume_key) |raw| bytes += raw.len;
+                self.tracked.transferTo(target, bytes);
+                shard.result.partial_edges = &.{};
+                shard.result.resume_cursor = null;
+                shard.result.partial_key = null;
+                return .{ .edges = output, .resume_cursor = cursor, .scanned_rows = shard.result.scanned_rows - complete_scans, .physical_rows_precharged = true };
+            }
+        }
+        return null;
+    }
 
     fn clear(self: *@This()) void {
         const a = self.tracked.allocator();
         for (self.shards.items) |*shard| {
-            if (shard.memory) |memory| {
-                shard.result.deinit(memory.arena.?.allocator());
-                memory.deinit();
-            } else shard.result.deinit(a);
+            if (!shard.retired) shard.result.deinit(a);
         }
         self.shards.clearRetainingCapacity();
         for (self.tables.items) |*entry| {
+            var incoming = entry.incoming.valueIterator();
+            while (incoming.next()) |read| {
+                a.free(read.keys);
+                a.free(read.ids);
+            }
+            entry.incoming.deinit(a);
+            entry.group_shards.deinit(a);
             entry.keys.deinit(a);
             entry.seen.deinit(a);
             a.free(entry.groups);
         }
         self.tables.clearRetainingCapacity();
+        self.table_ids.clearRetainingCapacity();
     }
     fn deinit(self: *@This()) void {
+        if (self.owns_reclaimer) {
+            std.debug.assert(self.tracked.budget.?.state_reclaimer.?.ctx == @as(*anyopaque, @ptrCast(self)));
+            self.tracked.budget.?.state_reclaimer = null;
+        }
         self.clear();
-        const a = self.tracked.allocator();
-        self.tables.deinit(a);
-        self.shards.deinit(a);
-        self.unsupported.deinit(a);
+        self.releaseContainers();
+        self.unsupported.deinit(self.tracked.allocator());
         std.debug.assert(self.tracked.live_bytes == 0);
     }
+    fn releaseContainers(self: *@This()) void {
+        const a = self.tracked.allocator();
+        std.debug.assert(self.tables.items.len == 0 and self.shards.items.len == 0);
+        self.tables.deinit(a);
+        self.tables = .empty;
+        self.table_ids.deinit(a);
+        self.table_ids = .empty;
+        self.shards.deinit(a);
+        self.shards = .empty;
+    }
     fn table(self: *@This(), logical: []const u8) ?*Table {
-        for (self.tables.items) |*entry| if (std.mem.eql(u8, logical, entry.logical)) return entry;
-        return null;
+        return &self.tables.items[self.table_ids.get(logical) orelse return null];
     }
     fn hasKey(self: *@This(), logical: []const u8, key: []const u8) bool {
         for (self.shards.items) |*shard| {
+            if (shard.retired) continue;
             const source = self.tables.items[shard.table];
             if (!std.mem.eql(u8, source.logical, logical)) continue;
-            if (shard.result.partial_key) |index| if (std.mem.eql(u8, source.keys.items[shard.key_base + index], key)) return true;
-            for (shard.result.key_scanned_rows, 0..) |scans, i| if (scans != std.math.maxInt(u32) and std.mem.eql(u8, source.keys.items[shard.key_base + i], key)) return true;
+            if (shard.result.partial_key) |index| if (std.mem.eql(u8, source.keys.items[shard.keyIndex(index)], key)) return true;
+            for (shard.result.key_scanned_rows, 0..) |scans, i| if (scans != std.math.maxInt(u32) and shard.consumed_keys & (@as(u64, 1) << @intCast(i)) == 0 and std.mem.eql(u8, source.keys.items[shard.keyIndex(i)], key)) return true;
+        }
+        return false;
+    }
+    fn incomingRoute(self: *@This(), logical: []const u8, group: u64, key: []const u8) ?bool {
+        const entry = self.table(logical) orelse return null;
+        if (!entry.incoming_resolved) return null;
+        const id = for (entry.keys.items, 0..) |candidate, i| {
+            if (std.mem.eql(u8, candidate, key)) break i;
+        } else return null;
+        if (entry.incoming_complete & (@as(u64, 1) << @intCast(id)) == 0) return null;
+        const read = entry.incoming.get(group) orelse return false;
+        for (read.keys) |candidate| if (std.mem.eql(u8, candidate, key)) return true;
+        return false;
+    }
+    fn prepareIncoming(self: *@This(), reader: DistributedEdgeReader, entry: *Table, state: *GraphAdmissionTableState) !void {
+        const a = self.tracked.allocator();
+        std.debug.assert(entry.keys.items.len <= 64);
+        // Projection is speculative; unresolved keys must retain their normal
+        // demand probe/learning path rather than spend its full scan budget.
+        var projection = (try reader.worker.resolveIncomingSourceGroups(a, state.table_name, .{
+            .index_name = reader.index_name,
+            .index_identity = state.graph_index_identity,
+            .keys = entry.keys.items,
+            .topology_epoch = state.topology_epoch,
+            .identity_read_generation = state.identity_read_generation,
+            .identity_read_generations = state.identity_read_generations,
+        }, reader.consistency)) orelse {
+            entry.incoming_resolved = true;
+            return;
+        };
+        defer projection.deinit(a);
+        try validateIncomingProjection(projection, entry.keys.items.len, entry.groups);
+        var positive = GraphExpandBatches.empty;
+        defer freeFrontierBatches(a, &positive);
+        for (projection.entries, 0..) |route, id| {
+            if (!route.complete and !projection.complete) continue;
+            entry.incoming_complete |= @as(u64, 1) << @intCast(id);
+            for (route.source_group_ids) |group| try appendFrontierBatch(a, &positive, state, group, @intCast(id));
+        }
+        var it = positive.iterator();
+        while (it.next()) |batch| {
+            const owned_ids = try a.dupe(u32, batch.value_ptr.frontier_ids.items);
+            errdefer a.free(owned_ids);
+            const keys = try a.alloc([]const u8, owned_ids.len);
+            errdefer a.free(keys);
+            for (keys, owned_ids) |*key, id| key.* = entry.keys.items[id];
+            try entry.incoming.putNoClobber(a, batch.key_ptr.group_id, .{ .keys = keys, .ids = owned_ids });
+        }
+        entry.incoming_resolved = true;
+    }
+
+    fn hasPage(self: *@This(), logical: []const u8, group: u64, key: []const u8) bool {
+        var cursor = self.firstShard(logical, group);
+        while (cursor) |id| {
+            const shard = self.indexedShard(id);
+            cursor = shard.next;
+            if (shard.retired) continue;
+            const source = self.tables.items[shard.table];
+            for (shard.result.key_scanned_rows, 0..) |_, i| if (shard.consumed_keys & (@as(u64, 1) << @intCast(i)) == 0 and std.mem.eql(u8, source.keys.items[shard.keyIndex(i)], key)) return true;
+            if (shard.result.partial_key) |i| if (std.mem.eql(u8, source.keys.items[shard.keyIndex(i)], key)) return true;
         }
         return false;
     }
     fn take(self: *@This(), alloc: std.mem.Allocator, reader: DistributedEdgeReader, logical: []const u8, group: u64, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, max_edges: usize, max_bytes: usize) !?GraphEdgesResponse {
-        for (self.shards.items) |*shard| {
+        var cursor = self.firstShard(logical, group);
+        while (cursor) |id| {
+            const shard = self.indexedShard(id);
+            cursor = shard.next;
+            if (shard.retired) continue;
             const source = self.tables.items[shard.table];
-            if (shard.group != group or !std.mem.eql(u8, source.logical, logical)) continue;
             for (shard.result.key_scanned_rows, 0..) |*scans, i| {
-                if (!std.mem.eql(u8, source.keys.items[shard.key_base + i], key)) continue;
+                if (shard.consumed_keys & (@as(u64, 1) << @intCast(i)) != 0 or !std.mem.eql(u8, source.keys.items[shard.keyIndex(i)], key)) continue;
                 const counted = if (scans.* == std.math.maxInt(u32)) 0 else scans.*;
                 scans.* = std.math.maxInt(u32);
                 return .{ .edges = shard.result.edges[shard.result.key_offsets[i]..shard.result.key_offsets[i + 1]], .scanned_rows = counted, .borrowed_edges = true, .physical_rows_precharged = true };
             }
         }
-        for (self.shards.items, 0..) |shard, index| {
-            if (shard.group != group) continue;
+        cursor = self.firstShard(logical, group);
+        while (cursor) |index| {
+            const shard = self.indexedShard(index);
+            cursor = shard.next;
+            if (shard.retired) continue;
             const source = self.tables.items[shard.table];
-            if (!std.mem.eql(u8, source.logical, logical)) continue;
-            if (shard.result.partial_key) |partial| if (std.mem.eql(u8, source.keys.items[shard.key_base + partial], key))
+            if (shard.result.partial_key) |partial| if (std.mem.eql(u8, source.keys.items[shard.keyIndex(partial)], key))
                 return self.finishPartial(alloc, reader, index, key, edge_types, direction, max_edges, max_bytes) catch |err| return if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
         }
         return null;
@@ -3186,7 +3492,7 @@ const CanonicalEdgeBatch = struct {
         const budget = reader.physical_work_budget orelse return error.InvalidGraphEdgesResponse;
         const table_index = self.shards.items[first].table;
         const group_id = self.shards.items[first].group;
-        const key_index = self.shards.items[first].key_base + self.shards.items[first].result.partial_key.?;
+        const key_index = self.shards.items[first].keyIndex(self.shards.items[first].result.partial_key.?);
         const logical = self.tables.items[table_index].logical;
         const state = try reader.admission.ensureTable(logical);
         try reader.admission.preparedEdges();
@@ -3206,7 +3512,7 @@ const CanonicalEdgeBatch = struct {
             if (bytes > max_bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
             if (budget.remaining_physical_edges == 0) return budget.exhaust(.explored_edges, budget.max_edges);
             const a = self.tracked.allocator();
-            try self.shards.ensureUnusedCapacity(a, 1);
+            try self.reserveShards(table_index, 1);
             var cursor_bytes: usize = 0;
             inline for (.{ cursor.edge_type, cursor.adjacent_key, cursor.edge_id, cursor.owner_document }) |value| cursor_bytes = try std.math.add(usize, cursor_bytes, value.len);
             if (cursor.physical_resume_key) |value| cursor_bytes = try std.math.add(usize, cursor_bytes, value.len);
@@ -3250,23 +3556,51 @@ const CanonicalEdgeBatch = struct {
             const fragment = if (response.partial_key != null) response.partial_edges else response.edges;
             for (fragment) |edge| bytes = try std.math.add(usize, bytes, graphEdgeOwnedBytes(edge));
             try edges.appendSlice(alloc, fragment);
-            self.shards.appendAssumeCapacity(.{ .table = table_index, .group = group_id, .key_base = key_index, .result = response });
+            self.appendShardAssumeCapacity(.{ .table = table_index, .group = group_id, .key_base = key_index, .result = response });
             if (response.resume_cursor) |next| cursor = next else break;
         }
         // Fragments are retired only by clear. Mark their payloads consumed so
         // no later demand read can return an incomplete or duplicate prefix.
-        for (self.shards.items) |*shard| if (shard.table == table_index and shard.group == group_id) {
-            if (shard.result.partial_key) |partial| if (shard.key_base + partial == key_index) {
+        var fragment = self.firstShard(logical, group_id);
+        while (fragment) |id| {
+            const shard = self.indexedShard(id);
+            fragment = shard.next;
+            if (shard.retired) continue;
+            if (shard.result.partial_key) |partial| if (shard.keyIndex(partial) == key_index) {
                 shard.result.partial_key = null;
             };
             if (shard.key_base == key_index and shard.result.key_scanned_rows.len == 1) shard.result.key_scanned_rows[0] = std.math.maxInt(u32);
-        };
+        }
         return .{ .edges = try edges.toOwnedSlice(alloc), .scanned_rows = @intCast(scans), .borrowed_edges = true, .owns_descriptors = true, .physical_rows_precharged = true };
     }
     fn prepare(self: *@This(), reader: DistributedEdgeReader, frontier: []const FrontierState, max_depth: u32, params: graph_query_mod.QueryParams) !void {
         self.clear();
-        if (reader.worker.vtable.execute_graph_get_edges_batch == null or params.direction == .in) return;
-        self.prepareOwned(reader, frontier, max_depth, params) catch |err| return if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
+        self.unobserved_prefetch_failure = false;
+        if (reader.worker.vtable.execute_graph_get_edges_batch == null or (params.direction == .in and !self.path_prefetch)) return;
+        if (self.path_prefetch and params.direction == .in and reader.worker.vtable.resolve_incoming_source_groups == null) return;
+        // Speculation must be refundable through the complete allocator chain.
+        // Monotonic and opaque admission owners retain the demand-only path.
+        if (self.path_prefetch and graph_memory_budget.reusableHeadroom(self.tracked.backing) == null) return;
+        if (self.path_prefetch) {
+            self.prefetch_scans = @min(@as(usize, 16384), reader.physical_work_budget.?.remaining_physical_edges / 4);
+            if (self.prefetch_scans < 256) return;
+        }
+        const budget = reader.physical_work_budget;
+        const prior = if (budget) |work| work.last_exhaustion else null;
+        self.prepareOwned(reader, frontier, max_depth, params) catch |err| {
+            const memory_denied = (err == error.OutOfMemory and self.tracked.denied) or
+                (err == error.GraphWorkBudgetExceeded and budget != null and budget.?.last_exhaustion != null and budget.?.last_exhaustion.?.dimension == .retained_state_bytes);
+            if (self.path_prefetch and memory_denied and !self.unobserved_prefetch_failure) {
+                self.clear();
+                // A refused speculation has no remaining page/routing proofs
+                // to preserve. Return index and slot capacity to demand reads.
+                self.releaseContainers();
+                self.tracked.denied = false;
+                budget.?.last_exhaustion = prior;
+                return;
+            }
+            return if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
+        };
     }
     fn validatePrefix(result: GraphEdgesResponse, key_count: usize, scan_cap: usize) !void {
         if (result.key_offsets.len != result.key_scanned_rows.len + 1 or result.key_scanned_rows.len > key_count or result.key_offsets[0] != 0 or result.key_offsets[result.key_offsets.len - 1] != result.edges.len or result.scanned_rows > scan_cap) return error.InvalidGraphEdgesResponse;
@@ -3281,13 +3615,14 @@ const CanonicalEdgeBatch = struct {
         if (scans > result.scanned_rows) return error.InvalidGraphEdgesResponse;
     }
     fn parallelPrefix(self: *@This(), reader: DistributedEdgeReader, entry: *Table, table_index: usize, state: *GraphAdmissionTableState, prepared: anytype, params: graph_query_mod.QueryParams, io: std.Io, width: usize) !usize {
+        var workers = @import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator{ .backing = self.tracked.backing };
         const a = self.tracked.allocator();
         const budget = reader.physical_work_budget.?;
         const overhead = (entry.key_bytes + entry.keys.items[0].len) * 6 + 64 * 1024;
         var cursor: usize = 0;
         while (cursor < entry.groups.len) {
             const wave_bound = @min(width, entry.groups.len - cursor);
-            const available = budget.max_retained_state_bytes -| budget.retained_state_bytes;
+            const available = @min(budget.max_retained_state_bytes -| budget.retained_state_bytes, graph_memory_budget.reusableHeadroom(self.tracked.backing) orelse std.math.maxInt(usize));
             if (available < wave_bound * (@sizeOf(CanonicalBatchSlot) + overhead + 128 * 1024) or budget.remaining_physical_edges < wave_bound * 8192) return cursor;
             var slots: [4]?*CanonicalBatchSlot = @splat(null);
             defer for (slots) |slot| if (slot) |memory| memory.deinit();
@@ -3295,14 +3630,16 @@ const CanonicalEdgeBatch = struct {
             var end = cursor;
             while (end < entry.groups.len and count < width) : (end += 1) {
                 const group_id = entry.groups[end];
+                if (!entry.produces(group_id)) continue;
                 if (self.unsupported.contains(group_id)) continue;
+                if (self.path_routes) |routes| if (routes.mode(state.table_name, group_id) == .scalar) continue;
                 const generation = try state.generationForGroup(group_id);
                 const memory = try a.create(CanonicalBatchSlot);
                 slots[count] = memory;
-                memory.* = .{ .owner = a, .budget = budget, .group_id = group_id, .request = .{
+                memory.* = .{ .owner = a, .budget = budget, .backing = workers.allocator(), .group_id = group_id, .request = .{
                     .index_name = @constCast(reader.index_name),
-                    .key = @constCast(entry.keys.items[0]),
-                    .keys = entry.keys.items,
+                    .key = @constCast(entry.readKeys(group_id)[0]),
+                    .keys = @constCast(entry.readKeys(group_id)),
                     .edge_types = @constCast(params.edge_types),
                     .direction = params.direction,
                     .tensor_access_path = prepared.path,
@@ -3317,18 +3654,20 @@ const CanonicalEdgeBatch = struct {
                 cursor = end;
                 continue;
             }
-            try self.shards.ensureUnusedCapacity(a, count);
-            const room = budget.max_retained_state_bytes -| budget.retained_state_bytes;
+            try self.reserveShards(table_index, count);
+            const room = @min(budget.max_retained_state_bytes -| budget.retained_state_bytes, graph_memory_budget.reusableHeadroom(self.tracked.backing) orelse std.math.maxInt(usize));
             const per_memory = room / count;
             // Small or nearly exhausted budgets keep demand-driven serial
             // reads. A scan allowance includes one native overflow probe.
             if (per_memory < overhead + 128 * 1024 or budget.remaining_physical_edges < count * 8192) return cursor;
-            const per_scans = @min(budget.remaining_physical_edges / count, graph_pattern_mod.default_max_explored_edges + 1);
+            const per_scans = @min(if (self.path_prefetch) self.prefetch_scans / count else budget.remaining_physical_edges / count, graph_pattern_mod.default_max_explored_edges + 1);
+            if (per_scans < 2) return cursor;
             for (slots[0..count]) |slot| {
                 const memory = slot.?;
                 memory.request.allow_partial_keys = true;
-                memory.request.max_edges = 4096;
-                memory.request.max_owned_bytes = @intCast(@min(@as(usize, 1024 * 1024), (per_memory - overhead) / 32));
+                const initial_head = self.path_prefetch and memory.request.keys.len == 1;
+                memory.request.max_edges = if (initial_head) 64 else 4096;
+                memory.request.max_owned_bytes = @intCast(@min(@as(usize, if (initial_head) 256 * 1024 else 1024 * 1024), (per_memory - overhead) / 32));
                 memory.request.max_scanned_rows = @intCast(per_scans - 1);
                 try reader.worker.ensureActive();
                 // Keep logical work charging in deterministic dispatch order.
@@ -3341,15 +3680,22 @@ const CanonicalEdgeBatch = struct {
             for (slots[0..count]) |slot| group.async(io, CanonicalBatchSlot.run, .{ slot.?, worker, entry.physical, reader.consistency });
             try group.await(io);
             // Refund unused reservations before installing responses. Actual
-            // response arena capacity remains charged until cache retirement.
+            // response storage remains charged until ownership moves or it is evicted.
             for (slots[0..count]) |slot| {
                 const memory = slot.?;
                 try memory.held.resize(memory.tracked.live_bytes);
                 if (memory.result) |result| {
-                    try validatePrefix(result, entry.keys.items.len, memory.physical_allowance);
+                    try validatePrefix(result, memory.request.keys.len, memory.physical_allowance);
                     memory.settle(result.scanned_rows);
+                    if (self.path_prefetch) self.prefetch_scans -= result.scanned_rows;
                 } else if (memory.err) |err| {
-                    if (err == error.GraphEdgesBatchUnsupported) memory.settle(0);
+                    if (err == error.GraphEdgesBatchUnsupported) {
+                        memory.settle(0);
+                    } else if (memory.observed_scans) |scans| {
+                        if (scans > memory.physical_allowance) return error.InvalidGraphEdgesResponse;
+                        memory.settle(scans);
+                        if (self.path_prefetch) self.prefetch_scans -= scans;
+                    } else self.unobserved_prefetch_failure = true;
                 }
             }
             for (slots[0..count], 0..) |slot, si| {
@@ -3363,8 +3709,18 @@ const CanonicalEdgeBatch = struct {
                     return err;
                 }
                 const result = memory.result.?;
-                self.shards.appendAssumeCapacity(.{ .table = table_index, .group = memory.group_id, .result = result, .memory = memory });
+                const live = memory.tracked.live_bytes;
+                std.debug.assert(memory.held.bytes == live);
+                // All result allocations share the cache's backing allocator.
+                // Preserve the parent's existing reservation while transferring
+                // deallocation ownership from the worker-local wrapper.
+                memory.held.consume();
+                memory.local_budget.releaseStateBytes(live);
+                memory.tracked.detach();
+                self.tracked.live_bytes += live;
+                self.appendShardAssumeCapacity(.{ .table = table_index, .group = memory.group_id, .result = result, .key_ids = entry.keyIds(memory.group_id) });
                 memory.result = null;
+                memory.deinit();
                 slots[si] = null;
             }
             cursor = end;
@@ -3374,7 +3730,7 @@ const CanonicalEdgeBatch = struct {
     fn prepareOwned(self: *@This(), reader: DistributedEdgeReader, frontier: []const FrontierState, max_depth: u32, params: graph_query_mod.QueryParams) !void {
         const a = self.tracked.allocator();
         const budget = reader.physical_work_budget orelse return;
-        if (budget.max_retained_state_bytes -| budget.retained_state_bytes < 2 * 1024 * 1024) return;
+        if (@min(budget.max_retained_state_bytes -| budget.retained_state_bytes, graph_memory_budget.reusableHeadroom(self.tracked.backing) orelse std.math.maxInt(usize)) < 2 * 1024 * 1024) return;
         for (frontier, 0..) |item, i| {
             if (reader.root_groups) |groups| if (groups.representative(reader.frontier_base + i) != reader.frontier_base + i) continue;
             if (max_depth != 0 and item.depth >= max_depth) continue;
@@ -3383,8 +3739,7 @@ const CanonicalEdgeBatch = struct {
             const count: usize = if (std.mem.eql(u8, tagged, reader.source_table)) 1 else 2;
             for (names[0..count]) |name| {
                 if (reader.reuse_cache) |cache| if (cache.get(name, null, item) != null) continue;
-                if (self.table(name) == null) try self.tables.append(a, .{ .logical = name });
-                const entry = self.table(name).?;
+                const entry = try self.addTable(name);
                 if (item.key.len > 64 * 1024 - entry.key_bytes) continue;
                 const key_entry = try entry.seen.getOrPut(a, item.key);
                 if (key_entry.found_existing) continue;
@@ -3396,27 +3751,43 @@ const CanonicalEdgeBatch = struct {
         try reader.admission.preparedEdges();
         const prepared = &reader.admission.prepared_edges.?;
         for (self.tables.items, 0..) |*entry, ti| {
-            if (entry.keys.items.len < 2) continue;
+            if (entry.keys.items.len == 0) continue;
+            if (entry.keys.items.len < 2 and (!self.path_prefetch or params.direction == .in or reader.worker.fanoutIo() == null)) continue;
             const state = try reader.admission.ensureTable(entry.logical);
             entry.physical = state.table_name;
             if (!state.allowed or !(try reader.admission.graphIndexAvailable(state, reader.index_name))) continue;
-            entry.groups = try table_catalog.resolveGroupsForSpanPinnedUntil(a, reader.catalog, entry.physical, "", "", state.topology_epoch, reader.worker.routingDeadline(reader.catalog));
+            entry.groups = if (self.path_routes) |routes|
+                try a.dupe(u64, try routes.get(reader, state))
+            else
+                try table_catalog.resolveGroupsForSpanPinnedUntil(a, reader.catalog, entry.physical, "", "", state.topology_epoch, reader.worker.routingDeadline(reader.catalog));
             entry.groups_loaded = true;
+            if (self.path_prefetch and params.direction == .in) try self.prepareIncoming(reader, entry, state);
+            if (entry.keys.items.len < 2 and entry.groups.len < 2) continue;
             const plan = planGraphFanout(reader.worker.fanoutIo() != null, reader.worker.fanoutWidthCap(), entry.groups.len);
             const dispatched = if (plan.parallel) try self.parallelPrefix(reader, entry, ti, state, prepared, params, reader.worker.fanoutIo().?, plan.width) else 0;
             for (entry.groups[dispatched..]) |group| {
+                if (!entry.produces(group)) continue;
+                if (self.path_prefetch and self.prefetch_scans < 2) return;
                 if (self.unsupported.contains(group)) continue;
+                if (self.path_routes) |routes| if (routes.mode(state.table_name, group) == .scalar) continue;
                 if (budget.remaining_physical_edges == 0) return;
-                const room = budget.max_retained_state_bytes -| budget.retained_state_bytes;
+                const room = @min(budget.max_retained_state_bytes -| budget.retained_state_bytes, graph_memory_budget.reusableHeadroom(self.tracked.backing) orelse std.math.maxInt(usize));
                 // Reserve headroom for JSON escaping, request metadata and
                 // duplicate transport buffers before bounding response payloads.
                 const overhead = (entry.key_bytes + entry.keys.items[0].len) * 6 + 64 * 1024;
                 if (room < overhead + 128 * 1024) return;
-                try self.shards.ensureUnusedCapacity(a, 1);
+                try self.reserveShards(ti, 1);
+                var observed_scans: ?usize = null;
                 const request = GraphEdgesRequest{
                     .index_name = @constCast(reader.index_name),
-                    .key = @constCast(entry.keys.items[0]),
-                    .keys = entry.keys.items,
+                    .key = @constCast(entry.readKeys(group)[0]),
+                    .keys = @constCast(entry.readKeys(group)),
+                    .physical_scan_observation = &observed_scans,
+                    // Preserve an incomplete key's physical cursor just as in
+                    // parallel prefetch for path streams. Complete-key
+                    // traversal readers retain their existing EOF policy.
+                    // Discarding a path prefix forces a charged rescan.
+                    .allow_partial_keys = self.path_prefetch,
                     .edge_types = @constCast(params.edge_types),
                     .direction = params.direction,
                     .tensor_access_path = prepared.path,
@@ -3424,21 +3795,27 @@ const CanonicalEdgeBatch = struct {
                     .topology_epoch = state.topology_epoch,
                     .identity_read_generation = try state.generationForGroup(group),
                     .ttl_now_ns = reader.ttl_now_ns,
-                    .max_edges = 4096,
-                    .max_owned_bytes = @intCast(@min(@as(usize, 1024 * 1024), (room - overhead) / 16)),
-                    .max_scanned_rows = @intCast(@min(budget.remaining_physical_edges, graph_pattern_mod.default_max_explored_edges)),
+                    .max_edges = if (self.path_prefetch and entry.keys.items.len == 1) 64 else 4096,
+                    .max_owned_bytes = @intCast(@min(@as(usize, if (self.path_prefetch and entry.keys.items.len == 1) 256 * 1024 else 1024 * 1024), (room - overhead) / 16)),
+                    .max_scanned_rows = @intCast(@min(if (self.path_prefetch) self.prefetch_scans - 1 else budget.remaining_physical_edges, graph_pattern_mod.default_max_explored_edges)),
                 };
                 var result = reader.worker.executeGraphGetEdgesBatch(a, group, entry.physical, request, reader.consistency) catch |err| {
                     if (err == error.GraphEdgesBatchUnsupported) {
                         try self.unsupported.put(a, group, {});
                         continue;
                     }
+                    if (observed_scans) |scans| {
+                        if (scans > @as(usize, request.max_scanned_rows) + 1) return error.InvalidGraphEdgesResponse;
+                        try budget.consumePhysicalEdges(scans);
+                        if (self.path_prefetch) self.prefetch_scans -= scans;
+                    } else self.unobserved_prefetch_failure = true;
                     return err;
                 };
                 errdefer result.deinit(a);
-                try validatePrefix(result, entry.keys.items.len, budget.remaining_physical_edges);
+                try validatePrefix(result, entry.readKeys(group).len, @min(budget.remaining_physical_edges, @as(usize, request.max_scanned_rows) + 1));
                 try budget.consumePhysicalEdges(result.scanned_rows);
-                self.shards.appendAssumeCapacity(.{ .table = ti, .group = group, .result = result });
+                if (self.path_prefetch) self.prefetch_scans -= result.scanned_rows;
+                self.appendShardAssumeCapacity(.{ .table = ti, .group = group, .result = result, .key_ids = entry.keyIds(group) });
             }
         }
     }
@@ -3463,6 +3840,9 @@ const SelectedGraphEdges = struct {
 };
 
 const DistributedEdgeReader = struct {
+    // Min-hop coordinators charge nodes on first discovery, after admission
+    // and visited checks, rather than once per materialized relationship.
+    count_expansion_nodes: bool = true,
     catalog: table_catalog.CatalogSource,
     worker: Worker,
     source_table: []const u8,
@@ -3921,7 +4301,9 @@ const DistributedEdgeReader = struct {
         max_owned_bytes: usize,
         max_scanned_rows: usize,
     ) !GraphEdgesResponse {
-        if (self.prefetched) |batch| if (try batch.take(a, self, table_name, group_id, key, edge_types, direction, max_edges, max_owned_bytes)) |response| return response;
+        if (self.prefetched) |batch| if (!batch.path_prefetch) {
+            if (try batch.take(a, self, table_name, group_id, key, edge_types, direction, max_edges, max_owned_bytes)) |response| return response;
+        };
         if (max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
         if (max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         if (max_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
@@ -3957,6 +4339,415 @@ const DistributedEdgeReader = struct {
 
     pub fn freeEdges(_: @This(), a: std.mem.Allocator, edges: []graph_mod.Edge) void {
         graph_mod.GraphIndex.freeEdges(a, edges);
+    }
+};
+
+/// A query's routing fence is immutable. Cache each table's producing groups
+/// once instead of allocating and resolving the same span for every BFS node.
+const PathEdgeRoutes = struct {
+    const Mode = enum { paged, scalar };
+    const Table = struct { groups: []u64, modes: std.AutoHashMapUnmanaged(u64, Mode) = .empty };
+    memory: graph_work_budget.RetainedAllocator,
+    tables: std.StringHashMapUnmanaged(Table) = .empty,
+    fn mode(self: *@This(), table: []const u8, group: u64) Mode {
+        const entry = self.tables.getPtr(table) orelse return .paged;
+        return entry.modes.get(group) orelse .paged;
+    }
+    fn setMode(self: *@This(), table: []const u8, group: u64, value: Mode) !void {
+        self.tables.getPtr(table).?.modes.put(self.memory.allocator(), group, value) catch |err|
+            return if (err == error.OutOfMemory and self.memory.denied) error.GraphWorkBudgetExceeded else err;
+    }
+    fn get(self: *@This(), reader: DistributedEdgeReader, state: *GraphAdmissionTableState) ![]const u64 {
+        if (self.tables.get(state.table_name)) |entry| return entry.groups;
+        const a = self.memory.allocator();
+        const groups = table_catalog.resolveGroupsForSpanPinnedUntil(a, reader.catalog, state.table_name, "", "", state.topology_epoch, reader.worker.routingDeadline(reader.catalog)) catch |err|
+            return if (err == error.OutOfMemory and self.memory.denied) error.GraphWorkBudgetExceeded else err;
+        errdefer a.free(groups);
+        self.tables.put(a, state.table_name, .{ .groups = groups }) catch |err| return if (err == error.OutOfMemory and self.memory.denied) error.GraphWorkBudgetExceeded else err;
+        return groups;
+    }
+    fn deinit(self: *@This()) void {
+        const a = self.memory.allocator();
+        var it = self.tables.valueIterator();
+        while (it.next()) |entry| {
+            a.free(entry.groups);
+            entry.modes.deinit(a);
+        }
+        self.tables.deinit(a);
+        std.debug.assert(self.memory.live_bytes == 0);
+    }
+};
+
+/// Demand-driven, generation-fenced adjacency merge. A shard owns at most one
+/// bounded page. The heap holds one borrowed head per shard; contributors are
+/// selected globally before predicates or admission can observe an edge.
+const PathEdgeStream = struct {
+    const Shard = struct {
+        group: u64,
+        response: ?GraphEdgesResponse = null,
+        position: usize = 0,
+        complete: bool = false,
+        pending: bool = true,
+        legacy: bool = false,
+        last: ?graph_mod.Edge = null,
+        page_edges: usize = 64,
+        page_bytes: usize = 256 * 1024,
+    };
+    const Head = struct { shard: usize, edge: graph_mod.Edge };
+    const Order = struct {
+        key: []const u8,
+        kinds: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        fn rank(self: @This(), edge: graph_mod.Edge) usize {
+            return blk: {
+                for (self.kinds, 0..) |kind, i| if (std.mem.eql(u8, kind, edge.edge_type)) break :blk i;
+                break :blk 0;
+            };
+        }
+        fn phase(self: @This(), edge: graph_mod.Edge) u8 {
+            return if (self.direction == .both and !std.mem.eql(u8, self.key, edge.source)) 1 else 0;
+        }
+        fn compare(self: @This(), a: graph_mod.Edge, b: graph_mod.Edge) std.math.Order {
+            const kind_order = std.math.order(self.rank(a), self.rank(b));
+            if (kind_order != .eq) return kind_order;
+            const phase_order = std.math.order(self.phase(a), self.phase(b));
+            if (phase_order != .eq) return phase_order;
+            const incoming = self.direction == .in or self.phase(a) == 1;
+            const left = [_][]const u8{ a.edge_type, if (incoming) a.source else a.target, a.edge_id, a.owner_document };
+            const right = [_][]const u8{ b.edge_type, if (incoming) b.source else b.target, b.edge_id, b.owner_document };
+            for (left, right) |x, y| {
+                const order = std.mem.order(u8, x, y);
+                if (order != .eq) return order;
+            }
+            return .eq;
+        }
+        fn less(self: @This(), a: Head, b: Head) std.math.Order {
+            const order = self.compare(a.edge, b.edge);
+            return if (order == .eq) std.math.order(a.shard, b.shard) else order;
+        }
+    };
+    const Page = struct {
+        edges: []graph_mod.Edge,
+        lease: graph_work_budget.RetainedLease,
+        fn deinit(self: *@This(), a: std.mem.Allocator) void {
+            a.free(self.edges);
+            self.lease.deinit();
+        }
+    };
+
+    memory: graph_work_budget.RetainedAllocator,
+    reader: DistributedEdgeReader,
+    routes: *PathEdgeRoutes,
+    table: []const u8,
+    key: []const u8,
+    kinds: []const []const u8,
+    direction: graph_mod.EdgeDirection,
+    shards: std.ArrayListUnmanaged(Shard) = .empty,
+    pending: std.ArrayListUnmanaged(usize) = .empty,
+    heap: std.PriorityQueue(Head, Order, Order.less),
+
+    fn init(a: std.mem.Allocator, reader: DistributedEdgeReader, routes: *PathEdgeRoutes, table: []const u8, key: []const u8, params: graph_query_mod.QueryParams) !@This() {
+        var self = @This(){ .memory = .{ .backing = graph_memory_budget.reclaimingAllocator(a), .budget = reader.physical_work_budget }, .reader = reader, .routes = routes, .table = table, .key = key, .kinds = params.edge_types, .direction = params.direction, .heap = .initContext(.{ .key = key, .kinds = params.edge_types, .direction = params.direction }) };
+        errdefer self.deinit();
+        const state = try reader.admission.ensureTable(table);
+        if (!state.allowed or !(try reader.admission.graphIndexAvailable(state, reader.index_name))) return self;
+        const tracked = self.memory.allocator();
+        const all_groups = try routes.get(reader, state);
+        // Reuse the physical, generation-fenced probe path on directory
+        // misses. Only physical adjacency (including expired rows) may certify
+        // a reusable negative; TTL-filtered edge pages cannot do that.
+        {
+            var incoming = GraphExpandBatches.empty;
+            defer freeFrontierBatches(tracked, &incoming);
+            const resolved_incoming = params.direction == .in and if (reader.prefetched) |cache| cache.incomingRoute(table, 0, key) != null else false;
+            var cached_all = false;
+            if (params.direction == .in and !resolved_incoming) {
+                cached_all = reader.prefetched != null;
+                if (reader.prefetched) |cache| for (all_groups) |group| {
+                    if (!cache.hasPage(table, group, key)) {
+                        cached_all = false;
+                        break;
+                    }
+                };
+            }
+            const probe_incoming = params.direction == .in and !cached_all and !resolved_incoming and
+                (reader.worker.vtable.resolve_incoming_source_groups != null or reader.worker.recordsIncomingSourceGroups());
+            if (probe_incoming) appendIncomingProbeBatches(
+                tracked,
+                reader.worker,
+                &incoming,
+                state,
+                all_groups,
+                &.{0},
+                &.{key},
+                reader.index_name,
+                reader.consistency,
+                .{ .ttl_now_ns = reader.ttl_now_ns, .work_budget = reader.physical_work_budget },
+            ) catch |err| return self.failure(err);
+            const owner = if (params.direction != .in and all_groups.len > 1)
+                table_catalog.resolveGroupForKeyPinnedUntil(tracked, reader.catalog, state.table_name, key, state.topology_epoch, reader.worker.routingDeadline(reader.catalog)) catch |err| return self.failure(err)
+            else
+                null;
+            if (owner) |id| {
+                if (std.mem.indexOfScalar(u64, all_groups, id) != null) self.shards.append(tracked, .{ .group = id, .legacy = key.len > 64 * 1024 }) catch |err| return self.failure(err);
+            }
+            for (all_groups) |group| {
+                if (owner != null and group == owner.?) continue;
+                if (params.direction == .in) {
+                    if (reader.prefetched) |cache| if (cache.incomingRoute(table, group, key)) |produces| {
+                        if (!produces) continue;
+                    };
+                }
+                if (probe_incoming and !incoming.contains(.{ .table_name = state.table_name, .group_id = group })) continue;
+                self.shards.append(tracked, .{ .group = group, .legacy = key.len > 64 * 1024 }) catch |err| return self.failure(err);
+            }
+        }
+        const initial_edges = @max(1, @min(@as(usize, 64), 4096 / @max(1, self.shards.items.len)));
+        for (self.shards.items, 0..) |*shard, index| {
+            shard.page_edges = initial_edges;
+            shard.legacy = shard.legacy or routes.mode(state.table_name, shard.group) == .scalar;
+            if (reader.prefetched) |cache| if (cache.unsupported.contains(shard.group)) {
+                shard.legacy = true;
+                routes.setMode(state.table_name, shard.group, .scalar) catch |err| return self.failure(err);
+            };
+            self.pending.append(tracked, index) catch |err| return self.failure(err);
+        }
+        return self;
+    }
+    fn deinit(self: *@This()) void {
+        const a = self.memory.allocator();
+        for (self.shards.items) |*shard| {
+            if (shard.response) |*response| response.deinit(a);
+            if (shard.last) |edge| graph_mod.GraphIndex.freeEdge(a, edge);
+        }
+        self.shards.deinit(a);
+        self.pending.deinit(a);
+        self.heap.deinit(a);
+        std.debug.assert(self.memory.live_bytes == 0);
+    }
+    fn items(shard: *const Shard) []const graph_mod.Edge {
+        const response = shard.response orelse return &.{};
+        return if (response.partial_key != null) response.partial_edges else response.edges;
+    }
+    fn failure(self: *@This(), err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and self.memory.denied) error.GraphWorkBudgetExceeded else err;
+    }
+    fn sameCursor(left: graph_mod.EdgeScanCursor, right: graph_mod.EdgeScanCursor) bool {
+        if (left.direction != right.direction or left.type_index != right.type_index or left.at_phase_start != right.at_phase_start) return false;
+        inline for (.{ "edge_type", "adjacent_key", "edge_id", "owner_document" }) |field| if (!std.mem.eql(u8, @field(left, field), @field(right, field))) return false;
+        if ((left.physical_resume_key == null) != (right.physical_resume_key == null)) return false;
+        return if (left.physical_resume_key) |key| std.mem.eql(u8, key, right.physical_resume_key.?) else true;
+    }
+    fn fetch(self: *@This(), index: usize) !void {
+        const a = self.memory.allocator();
+        const budget = self.reader.physical_work_budget.?;
+        const shard = &self.shards.items[index];
+        const first_read = shard.response == null;
+        if (first_read and self.reader.prefetched != null) {
+            if (try self.reader.prefetched.?.takePage(self.table, shard.group, self.key, &self.memory)) |response| {
+                const edges = response.edges;
+                if (response.resume_cursor != null and response.scanned_rows == 0 and edges.len == 0) {
+                    var invalid = response;
+                    invalid.deinit(a);
+                    return error.InvalidGraphEdgesResponse;
+                }
+                if (edges.len > 1) for (edges[1..], 0..) |edge, i| if (self.heap.context.compare(edges[i], edge) != .lt) {
+                    var invalid = response;
+                    invalid.deinit(a);
+                    return error.InvalidGraphEdgesResponse;
+                };
+                shard.complete = response.resume_cursor == null;
+                shard.position = 0;
+                shard.response = response;
+                return;
+            }
+        }
+        var cursor: ?graph_mod.EdgeScanCursor = null;
+        defer if (cursor) |*value| value.deinit(a);
+        if (shard.response) |*old| {
+            const previous = items(shard);
+            if (previous.len > 0) {
+                var identity = previous[previous.len - 1];
+                identity.metadata = "";
+                identity.winner_key_hex = "";
+                const owned = try cloneOwnedGraphEdge(a, identity);
+                if (shard.last) |edge| graph_mod.GraphIndex.freeEdge(a, edge);
+                shard.last = owned;
+            }
+            if (old.resume_cursor) |value| {
+                cursor = try value.clone(a);
+                // Preserve cheap early-target reads, then amortize RPC and
+                // snapshot overhead for hubs. Bound the aggregate shard window.
+                const edge_ceiling = @max(shard.page_edges, @min(@as(usize, 4096), 16384 / @max(1, self.shards.items.len)));
+                shard.page_edges = @min(edge_ceiling, shard.page_edges * 4);
+                shard.page_bytes = @min(@as(usize, 4 * 1024 * 1024), shard.page_bytes * 4);
+            }
+            old.deinit(a);
+            shard.response = null;
+        }
+        const state = try self.reader.admission.ensureTable(self.table);
+        try self.reader.admission.preparedEdges();
+        const prepared = self.reader.admission.prepared_edges.?;
+        var overhead: usize = 512 +| (self.key.len *| 12) +| (self.reader.index_name.len *| 12);
+        for (self.kinds) |kind| overhead +|= kind.len *| 6;
+        if (cursor) |value| {
+            inline for (.{ value.edge_type, value.adjacent_key, value.edge_id, value.owner_document }) |field| overhead +|= field.len *| 6;
+            if (value.physical_resume_key) |field| overhead +|= field.len *| 6;
+        }
+        const Attempt = enum { page, single, complete };
+        var attempt: Attempt = if (shard.legacy) .complete else .page;
+        while (true) {
+            if (self.reader.prefetched) |cache| cache.yieldForRead(if (attempt == .page) overhead +| (shard.page_bytes *| 16) else budget.max_retained_state_bytes);
+            const room = try budget.ensureStateHeadroom(overhead +| 16);
+            // Retain the encoded body, final edges, and parser workspace at
+            // once. Keep ordinary pages conservative; a single-edge retry can
+            // spend the larger safe allowance without gathering a broad page.
+            const complete_bytes = @min(graph_pattern_mod.default_max_explored_edge_bytes, (room - overhead) / 8);
+            const bytes = if (attempt == .page) @min(shard.page_bytes, (room - overhead) / 16) else complete_bytes;
+            const edge_allowance = @max(1, @min(budget.remaining_edges, graph_pattern_mod.default_max_explored_edges));
+            const scan_allowance = @max(1, @min(budget.remaining_physical_edges, graph_pattern_mod.default_max_explored_edges));
+            const keys = [_][]const u8{self.key};
+            const request = GraphEdgesRequest{
+                .index_name = @constCast(self.reader.index_name),
+                .key = @constCast(self.key),
+                .keys = @constCast(&keys),
+                .resume_cursor = cursor,
+                .allow_partial_keys = true,
+                .edge_types = @constCast(self.kinds),
+                .direction = self.direction,
+                .tensor_access_path = prepared.path,
+                .tensor_program = prepared.program,
+                .topology_epoch = state.topology_epoch,
+                .identity_read_generation = try state.generationForGroup(shard.group),
+                .ttl_now_ns = self.reader.ttl_now_ns,
+                .max_edges = @intCast(switch (attempt) {
+                    .page => @min(shard.page_edges, edge_allowance),
+                    .single => 1,
+                    .complete => @min(edge_allowance, scan_allowance),
+                }),
+                .max_owned_bytes = @intCast(bytes),
+                .max_scanned_rows = @intCast(scan_allowance),
+                .scratch_allocator = a,
+            };
+            var response = if (!shard.legacy) self.reader.worker.executeGraphGetEdgesBatch(a, shard.group, state.table_name, request, self.reader.consistency) catch |err| blk: {
+                if (err != error.GraphEdgesBatchUnsupported) return err;
+                // A scalar read cannot resume a cursor. Ownership/version
+                // changes must restart the fenced query, never replay a key
+                // into an already-advanced merge.
+                if (cursor != null) return error.TopologyChanged;
+                shard.legacy = true;
+                try self.routes.setMode(state.table_name, shard.group, .scalar);
+                break :blk try self.reader.getEdgesFromGroup(a, self.table, state, shard.group, self.key, self.kinds, self.direction, edge_allowance, complete_bytes, scan_allowance);
+            } else try self.reader.getEdgesFromGroup(a, self.table, state, shard.group, self.key, self.kinds, self.direction, edge_allowance, complete_bytes, scan_allowance);
+            var response_owned = true;
+            errdefer if (response_owned) response.deinit(a);
+            if (!response.physical_rows_precharged) try budget.consumePhysicalEdges(response.scanned_rows);
+            // Native complete-key readers and continuation EOF checks may
+            // charge one overflow probe. The request-wide budget above still
+            // bounds actual work; the per-RPC ceiling includes that probe.
+            if (!shard.legacy and !response.physical_rows_precharged) try CanonicalEdgeBatch.validatePrefix(response, 1, @as(usize, request.max_scanned_rows) + 1);
+            if (!shard.legacy and !response.physical_rows_precharged and response.key_scanned_rows.len == 0 and response.partial_key == null) {
+                const edge_window_hit = response.scanned_rows > request.max_edges;
+                response.deinit(a);
+                response_owned = false;
+                if (budget.remaining_physical_edges == 0) return budget.exhaust(.explored_edges, budget.max_edges);
+                switch (attempt) {
+                    // A count miss can require a complete-key read on an
+                    // unfenced index. This choice never escapes the key.
+                    .page => attempt = if (edge_window_hit) .complete else .single,
+                    .single => attempt = .complete,
+                    .complete => return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes),
+                }
+                continue;
+            }
+            const edges = if (response.partial_key != null) response.partial_edges else response.edges;
+            if (response.resume_cursor) |next| {
+                if (response.scanned_rows == 0 and edges.len == 0) return error.InvalidGraphEdgesResponse;
+                if (cursor) |prior| if (sameCursor(prior, next)) return error.InvalidGraphEdgesResponse;
+            }
+            if (edges.len > 0) if (shard.last) |last| if (self.heap.context.compare(last, edges[0]) != .lt) return error.InvalidGraphEdgesResponse;
+            if (edges.len > 1) for (edges[1..], 0..) |edge, i| if (self.heap.context.compare(edges[i], edge) != .lt) return error.InvalidGraphEdgesResponse;
+            shard.complete = response.resume_cursor == null;
+            shard.position = 0;
+            shard.response = response;
+            return;
+        }
+    }
+    fn refill(self: *@This()) !void {
+        while (self.pending.items.len > 0) {
+            const index = self.pending.items[self.pending.items.len - 1];
+            self.pending.items.len -= 1;
+            const shard = &self.shards.items[index];
+            shard.pending = false;
+            while (shard.position >= items(shard).len and !shard.complete) try self.fetch(index);
+            if (shard.position < items(shard).len) try self.heap.push(self.memory.allocator(), .{ .shard = index, .edge = items(shard)[shard.position] });
+        }
+    }
+    fn advance(self: *@This(), index: usize) void {
+        const shard = &self.shards.items[index];
+        shard.position += 1;
+        if (!shard.pending) {
+            shard.pending = true;
+            self.pending.appendAssumeCapacity(index);
+        }
+    }
+    fn better(candidate: graph_mod.Edge, current: graph_mod.Edge) !bool {
+        if (candidate.winner_key_hex.len > 0 and candidate.winner_rank == current.winner_rank and std.mem.eql(u8, candidate.winner_key_hex, current.winner_key_hex) and
+            (candidate.weight != current.weight or candidate.created_at != current.created_at or candidate.updated_at != current.updated_at or !std.mem.eql(u8, candidate.metadata, current.metadata))) return error.GraphContributorConflict;
+        return candidate.winner_rank < current.winner_rank or (candidate.winner_rank == current.winner_rank and candidate.winner_key_hex.len > 0 and (current.winner_key_hex.len == 0 or std.mem.order(u8, candidate.winner_key_hex, current.winner_key_hex) == .lt));
+    }
+    fn nextPage(self: *@This(), a: std.mem.Allocator) !?Page {
+        const budget = self.reader.physical_work_budget.?;
+        var out = std.ArrayListUnmanaged(graph_mod.Edge).empty;
+        errdefer {
+            out.deinit(a);
+        }
+        // Reserve both descriptor buffers before the final slice shrink can
+        // replace the fixed page allocation. Payloads are leased separately.
+        var lease = try graph_work_budget.RetainedLease.init(budget, 128 * @sizeOf(graph_mod.Edge) + 64);
+        errdefer lease.deinit();
+        try self.refill();
+        if (self.heap.peek() == null) {
+            lease.deinit();
+            return null;
+        }
+        try out.ensureTotalCapacityPrecise(a, 64);
+        // Never fetch a new shard page speculatively after producing output.
+        // A target in this prefix must reach admission before any next read.
+        while (out.items.len < 64) {
+            if (out.items.len > 0) {
+                var refill_needed = false;
+                for (self.pending.items) |index| if (self.shards.items[index].position >= items(&self.shards.items[index]).len and !self.shards.items[index].complete) {
+                    refill_needed = true;
+                    break;
+                };
+                if (refill_needed) break;
+            }
+            try self.refill();
+            const head = self.heap.pop() orelse break;
+            var winner = head.edge;
+            var winner_group = self.shards.items[head.shard].group;
+            self.advance(head.shard);
+            while (self.heap.peek()) |duplicate| {
+                if (self.heap.context.compare(winner, duplicate.edge) != .eq) break;
+                _ = self.heap.pop();
+                if (try better(duplicate.edge, winner)) {
+                    winner = duplicate.edge;
+                    winner_group = self.shards.items[duplicate.shard].group;
+                }
+                self.advance(duplicate.shard);
+            }
+            // Payloads remain pinned in shard pages until the consumer has
+            // admitted this prefix. Clone only the eventual predecessor edges.
+            winner.origin_group_id = winner_group;
+            out.appendAssumeCapacity(winner);
+        }
+        if (out.items.len == 0) {
+            out.deinit(a);
+            lease.deinit();
+            return null;
+        }
+        return .{ .edges = try out.toOwnedSlice(a), .lease = lease };
     }
 };
 
@@ -4070,7 +4861,7 @@ fn canonicalGraphStepInMemory(
     work_budget: *graph_pattern_mod.WorkBudget,
     memory: *CanonicalStepMemory,
 ) !CanonicalGraphStep {
-    var selection = try reader.getEdgeSelection(
+    const selection = try reader.getEdgeSelection(
         alloc,
         expansion_table,
         key,
@@ -4081,10 +4872,31 @@ fn canonicalGraphStepInMemory(
         true,
         reader.prefetched != null,
     );
+    return canonicalGraphSelectionInMemory(alloc, reader, expansion_table, current_table, key, params, work_budget, memory, selection);
+}
+
+fn canonicalGraphPageStepAlloc(alloc: std.mem.Allocator, reader: DistributedEdgeReader, expansion_table: []const u8, current_table: []const u8, key: []const u8, params: graph_query_mod.QueryParams, work_budget: *graph_pattern_mod.WorkBudget, page: *PathEdgeStream.Page) !CanonicalGraphStep {
+    const memory = try reader.admission.acquireStepMemory(alloc, work_budget);
+    const ownership = alloc.alloc(bool, page.edges.len) catch |err| {
+        memory.release();
+        return err;
+    };
+    @memset(ownership, false);
+    const selection = SelectedGraphEdges{ .edges = page.edges, .owned = ownership };
+    page.edges = &.{};
+    return canonicalGraphSelectionInMemory(alloc, reader, expansion_table, current_table, key, params, work_budget, memory, selection) catch |err| {
+        const denied = memory.tracked.denied;
+        memory.release();
+        return if (err == error.OutOfMemory and denied) error.GraphWorkBudgetExceeded else err;
+    };
+}
+
+fn canonicalGraphSelectionInMemory(alloc: std.mem.Allocator, reader: DistributedEdgeReader, expansion_table: []const u8, current_table: []const u8, key: []const u8, params: graph_query_mod.QueryParams, work_budget: *graph_pattern_mod.WorkBudget, memory: *CanonicalStepMemory, input: SelectedGraphEdges) !CanonicalGraphStep {
+    var selection = input;
     errdefer selection.deinit(alloc);
     const edges = selection.edges;
 
-    const limit = @min(edges.len, @min(work_budget.remaining_nodes, work_budget.remaining_edges));
+    const limit = @min(edges.len, if (reader.count_expansion_nodes) @min(work_budget.remaining_nodes, work_budget.remaining_edges) else work_budget.remaining_edges);
     const scratch_alloc = memory.tracked.allocator();
     var table_scratch = graph_traversal_mod.MetadataScratch.init(scratch_alloc, null);
     errdefer table_scratch.deinit();
@@ -4105,7 +4917,7 @@ fn canonicalGraphStepInMemory(
         const endpoint = @import("antfly_local_sources").graph_metadata_tables.adjacentInTables(edge, key, current_table_name, evaluated.source_table orelse expansion_table_name, evaluated.target_table orelse expansion_table_name, params.direction);
         if (!endpoint.connected) continue;
         if (memory.descriptors.items.len == limit) {
-            if (work_budget.remaining_nodes <= work_budget.remaining_edges)
+            if (reader.count_expansion_nodes and work_budget.remaining_nodes <= work_budget.remaining_edges)
                 return work_budget.exhaust(.explored_nodes, work_budget.max_nodes);
             return work_budget.exhaust(.explored_edges, work_budget.max_edges);
         }
@@ -4129,7 +4941,7 @@ fn canonicalGraphStepInMemory(
     }
     for (memory.nodes.items, 0..) |*node, i| node.path_edges = memory.paths.items[i .. i + 1];
     try work_budget.consumeEdgeBytes(edge_bytes);
-    try work_budget.consumeNodes(node_count);
+    if (reader.count_expansion_nodes) try work_budget.consumeNodes(node_count);
     try work_budget.consumeEdges(node_count);
     return .{ .edges = edges, .edge_ownership = selection.owned, .memory = memory, .nodes = memory.nodes.items, .path_edges = memory.paths.items, .group_ids = memory.groups.items, .node_count = node_count, .array_lease = .{}, .table_scratch = table_scratch };
 }
@@ -4621,6 +5433,7 @@ fn executeDistributedPattern(
             .include_paths = graph_query.query.params.include_paths,
             .node_admission = admission.iface(),
             .work_budget = request_work_budget,
+            .max_intermediate_states = request_work_budget.max_intermediate_states,
         },
     );
     defer graph_pattern_mod.freeMatches(alloc, raw_matches);
@@ -4800,6 +5613,7 @@ fn executeDistributedConjunctivePattern(
             .materialized => .required,
         },
         .work_budget = request_work_budget,
+        .max_intermediate_states = request_work_budget.max_intermediate_states,
     };
 
     const requested_specs = try alloc.alloc(graph_pattern_mod.CountAggregateSpec, graph_query.query.aggregates.len);
@@ -5436,7 +6250,7 @@ fn mergeTraversalNode(
     if (max_depth == 0 or merged.depth < max_depth) {
         try next_frontier.ensureUnusedCapacity(alloc, 1);
         next_frontier.appendAssumeCapacity(try frontierFromState(alloc, state, merged, path_id));
-        try budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
+        try budget.checkIntermediateStates(next_frontier.items.len, budget.max_intermediate_states);
     }
     if (return_node) {
         try state.nodes.append(alloc, merged);
@@ -5512,7 +6326,7 @@ fn executeDistributedTraverse(
     defer freeFrontier(alloc, frontier);
     frontier = try retainAdmittedFrontier(alloc, admission, frontier);
     try request_work_budget.consumeNodes(frontier.len);
-    try request_work_budget.checkIntermediateStates(frontier.len, graph_pattern_mod.default_max_intermediate_states);
+    try request_work_budget.checkIntermediateStates(frontier.len, request_work_budget.max_intermediate_states);
 
     for (frontier) |item| {
         _ = try state.putTraversalSeenIfAbsent(
@@ -5524,7 +6338,7 @@ fn executeDistributedTraverse(
 
     var metric_batch = CanonicalMetricBatch{ .alloc = alloc, .worker = worker, .admission = admission, .state = &state, .index_name = graph_query.query.index_name, .reads = metric_reads, .consistency = consistency, .work_budget = request_work_budget, .status_seen = &metric_status_seen_groups, .row_limit = @min(@as(usize, 256), collection_limit) };
     defer metric_batch.deinit();
-    var edge_batch = CanonicalEdgeBatch{ .tracked = .{ .backing = alloc, .budget = request_work_budget } };
+    var edge_batch = CanonicalEdgeBatch{ .tracked = .{ .backing = graph_memory_budget.reclaimingAllocator(alloc), .budget = request_work_budget } };
     defer edge_batch.deinit();
     var read_cache = TraversalReadCache{};
     defer read_cache.deinit();
@@ -5710,6 +6524,7 @@ fn executeDistributedTraverse(
                     if (entry.value_ptr.frontier_ids.items.len == 0) continue;
                     const batch_table = entry.key_ptr.table_name;
                     var step_req = try makeGraphExpandRequestWithAlgebraicMode(alloc, graph_query, frontier, entry.value_ptr.frontier_ids.items, exclude_nodes, @constCast((&[_][]u8{})[0..]), include_paths, algebraic_semiring_selected);
+                    step_req.work_limits = req.graph_execution_limits;
                     step_req.ttl_now_ns = req.graph_ttl_now_ns;
                     step_req.allow_legacy_wire_fallback = try catalogGraphIndexAllowsLegacyWire(alloc, catalog, batch_table, graph_query.query.index_name);
                     step_req.topology_epoch = entry.value_ptr.topology_epoch;
@@ -5777,6 +6592,7 @@ fn executeDistributedTraverse(
                     include_paths,
                     algebraic_semiring_selected,
                     req.graph_ttl_now_ns,
+                    req.graph_execution_limits,
                     @intCast(@min(request_work_budget.remaining_physical_edges, graph_pattern_mod.default_max_explored_edges)),
                     allow_legacy_wire_fallback,
                     consistency,
@@ -5826,6 +6642,7 @@ fn executeDistributedTraverse(
                 if (entry.value_ptr.frontier_ids.items.len == 0) continue;
                 const batch_table = entry.key_ptr.table_name;
                 var step_req = try makeGraphExpandRequestWithAlgebraicMode(alloc, graph_query, frontier, entry.value_ptr.frontier_ids.items, exclude_nodes, @constCast((&[_][]u8{})[0..]), include_paths, algebraic_semiring_selected);
+                step_req.work_limits = req.graph_execution_limits;
                 step_req.ttl_now_ns = req.graph_ttl_now_ns;
                 step_req.allow_legacy_wire_fallback = !canonical_batch and try catalogGraphIndexAllowsLegacyWire(alloc, catalog, batch_table, graph_query.query.index_name);
                 step_req.topology_epoch = entry.value_ptr.topology_epoch;
@@ -6704,11 +7521,9 @@ fn findDistributedShortestPath(
     );
     defer target_set.deinit(alloc);
 
-    var frontier = std.PriorityQueue(FrontierState, void, frontierStateOrder).initContext({});
-    defer {
-        for (frontier.items) |*item| item.deinit(alloc);
-        frontier.deinit(alloc);
-    }
+    const min_hops = graph_query.query.params.weight_mode == .min_hops;
+    var frontier = PathFrontier{ .fifo = min_hops, .memory = .{ .backing = alloc, .budget = request_work_budget } };
+    defer frontier.deinit(alloc);
     const roots = try resolveStartFrontier(alloc, &state, table_name, req, base_result, prior_results, graph_query.query.start_nodes, true);
     defer freeFrontier(alloc, roots);
     if (start_table_override) |table| {
@@ -6726,6 +7541,7 @@ fn findDistributedShortestPath(
         if (excluded_nodes) |set| {
             if (set.contains(.{ .table = item.table orelse table_name, .key = item.key })) continue;
         }
+        if (!try best_cost.recordIfPareto(alloc, .{ .table = item.table, .key = item.key }, item.depth, item.cost)) continue;
         var owned_item = try initFrontierState(
             alloc,
             item.key,
@@ -6737,16 +7553,16 @@ fn findDistributedShortestPath(
             request_work_budget,
         );
         errdefer owned_item.deinit(alloc);
-        try frontier.push(alloc, owned_item);
         try request_work_budget.consumeNode();
-        try request_work_budget.checkIntermediateStates(frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
-        _ = try best_cost.recordIfPareto(
-            alloc,
-            .{ .table = item.table, .key = item.key },
-            item.depth,
-            item.cost,
-        );
+        try frontier.push(&owned_item);
     }
+
+    var edge_routes = PathEdgeRoutes{ .memory = .{ .backing = alloc, .budget = request_work_budget } };
+    defer edge_routes.deinit();
+    var edge_batch = CanonicalEdgeBatch{ .tracked = .{ .backing = graph_memory_budget.reclaimingAllocator(alloc), .budget = request_work_budget }, .path_prefetch = true, .path_routes = &edge_routes };
+    defer edge_batch.deinit();
+    edge_batch.enableReclamation();
+    var window_remaining: usize = 0;
 
     while (frontier.pop()) |popped| {
         var item = popped;
@@ -6772,9 +7588,30 @@ fn findDistributedShortestPath(
 
         if (max_depth > 0 and item.depth >= max_depth) continue;
 
+        if (min_hops and worker.vtable.execute_graph_get_edges_batch != null and window_remaining == 0) {
+            var window: [64]FrontierState = undefined;
+            window[0] = item;
+            var count: usize = 1;
+            for (frontier.queue.items[frontier.head..]) |pending| {
+                if (count == window.len or pending.depth != item.depth) break;
+                window[count] = pending;
+                count += 1;
+            }
+            for (window[0..count]) |*entry| {
+                const path = state.path_states.items[entry.path_state_id.?];
+                entry.key = path.key;
+                entry.table = path.table;
+            }
+            const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = table_name, .index_name = graph_query.query.index_name, .ttl_now_ns = req.graph_ttl_now_ns, .consistency = consistency, .admission = admission, .physical_work_budget = request_work_budget, .count_expansion_nodes = false };
+            try edge_batch.prepare(reader, window[0..count], max_depth, graph_query.query.params);
+            window_remaining = count;
+        }
+        if (window_remaining > 0) window_remaining -= 1;
+
         const item_needs_canonical_edges = graph_canonical_edges or (item.table != null and
             try catalogGraphIndexNeedsCanonicalEdgeReads(alloc, catalog, item.table.?, graph_query.query.index_name));
-        if (item_needs_canonical_edges) {
+        const paged = min_hops and worker.vtable.execute_graph_get_edges_batch != null;
+        if (item_needs_canonical_edges or paged) {
             const reader = DistributedEdgeReader{
                 .catalog = catalog,
                 .worker = worker,
@@ -6784,73 +7621,90 @@ fn findDistributedShortestPath(
                 .consistency = consistency,
                 .admission = admission,
                 .physical_work_budget = request_work_budget,
+                .count_expansion_nodes = !min_hops,
+                .prefetched = if (min_hops) &edge_batch else null,
             };
-            const tagged_table = item.table orelse table_name;
-            const tables = [_][]const u8{ tagged_table, table_name };
-            const table_count: usize = if (std.mem.eql(u8, tagged_table, table_name)) 1 else 2;
-            for (tables[0..table_count]) |expansion_table| {
-                var step = try canonicalGraphStepAlloc(
-                    alloc,
-                    reader,
-                    expansion_table,
-                    item.table orelse table_name,
-                    item.key,
-                    graph_query.query.params,
-                    request_work_budget,
-                );
-                defer step.deinit(alloc);
-                const admitted = try graphResultNodeAdmissionMaskAlloc(
-                    alloc,
-                    admission,
-                    table_name,
-                    expansion_table,
-                    step.visibleNodes(),
-                );
-                defer alloc.free(admitted);
-                for (step.visibleNodes(), admitted) |node, allowed| {
-                    if (!allowed) continue;
-                    const node_table = canonicalExpandedNodeTable(table_name, expansion_table, node.table);
-                    const node_ref = graph_node_identity.Ref{ .table = node_table, .key = node.key };
-                    if (excluded_nodes) |set| if (set.contains(node_ref)) continue;
-                    if (excluded_edges) |set| {
-                        const physical_edge = node.path_edges.?[0];
-                        const exclusion_key = try allocRelationshipExclusionKey(
+            const parent = item;
+            {
+                const tagged_table = parent.table orelse table_name;
+                const tables = [_][]const u8{ tagged_table, table_name };
+                const table_count: usize = if (std.mem.eql(u8, tagged_table, table_name)) 1 else 2;
+                for (tables[0..table_count]) |expansion_table| {
+                    var stream: ?PathEdgeStream = if (paged) try PathEdgeStream.init(alloc, reader, &edge_routes, expansion_table, parent.key, graph_query.query.params) else null;
+                    defer if (stream) |*value| value.deinit();
+                    while (true) {
+                        var page: ?PathEdgeStream.Page = if (stream) |*value| value.nextPage(alloc) catch |err| return value.failure(err) else null;
+                        defer if (page) |*value| value.deinit(alloc);
+                        if (stream != null and page == null) break;
+                        var step = if (page) |*value| try canonicalGraphPageStepAlloc(alloc, reader, expansion_table, parent.table orelse table_name, parent.key, graph_query.query.params, request_work_budget, value) else try canonicalGraphStepAlloc(
                             alloc,
-                            .{ .table = item.table orelse table_name, .key = item.key },
-                            .{ .table = node_table orelse table_name, .key = node.key },
-                            physical_edge.traversal_direction,
-                            physical_edge.edge_type,
-                            physical_edge.edge_id,
-                            physical_edge.owner_document,
+                            reader,
+                            expansion_table,
+                            parent.table orelse table_name,
+                            parent.key,
+                            graph_query.query.params,
+                            request_work_budget,
                         );
-                        defer alloc.free(exclusion_key);
-                        if (set.contains(exclusion_key)) continue;
+                        defer step.deinit(alloc);
+                        const admitted = try graphResultNodeAdmissionMaskAlloc(
+                            alloc,
+                            admission,
+                            table_name,
+                            expansion_table,
+                            step.visibleNodes(),
+                        );
+                        defer alloc.free(admitted);
+                        for (step.visibleNodes(), admitted) |node, allowed| {
+                            if (!allowed) continue;
+                            const node_table = canonicalExpandedNodeTable(table_name, expansion_table, node.table);
+                            const node_ref = graph_node_identity.Ref{ .table = node_table, .key = node.key };
+                            if (excluded_nodes) |set| if (set.contains(node_ref)) continue;
+                            if (excluded_edges) |set| {
+                                const physical_edge = node.path_edges.?[0];
+                                const exclusion_key = try allocRelationshipExclusionKey(
+                                    alloc,
+                                    .{ .table = parent.table orelse table_name, .key = parent.key },
+                                    .{ .table = node_table orelse table_name, .key = node.key },
+                                    physical_edge.traversal_direction,
+                                    physical_edge.edge_type,
+                                    physical_edge.edge_id,
+                                    physical_edge.owner_document,
+                                );
+                                defer alloc.free(exclusion_key);
+                                if (set.contains(exclusion_key)) continue;
+                            }
+                            const candidate_cost = parent.cost + try edgeCost(parent, node, graph_query.query.params.weight_mode);
+                            const candidate_depth = parent.depth + 1;
+                            if (!try best_cost.recordIfPareto(alloc, node_ref, candidate_depth, candidate_cost)) continue;
+                            if (min_hops) try request_work_budget.consumeNode();
+                            const path_state_id = try appendPathStateFromWeightedStep(
+                                alloc,
+                                &state,
+                                parent,
+                                node,
+                                node_table,
+                                graph_query.query.params.weight_mode,
+                            );
+                            // Unit-cost edges settle on discovery. Waiting for the
+                            // target to leave the heap needlessly expands its peers.
+                            if (min_hops and target_set.contains(node_table, node.key))
+                                return try pathStateToGraphPath(alloc, state.path_states.items, path_state_id, request_work_budget);
+                            const path_state = state.path_states.items[path_state_id];
+                            var next_item = try initFrontierState(
+                                alloc,
+                                path_state.key,
+                                path_state.table,
+                                path_state.depth,
+                                path_state.distance,
+                                path_state.cost,
+                                path_state_id,
+                                request_work_budget,
+                            );
+                            errdefer next_item.deinit(alloc);
+                            try frontier.push(&next_item);
+                        }
+                        if (stream == null) break;
                     }
-                    const candidate_cost = item.cost + try edgeCost(item, node, graph_query.query.params.weight_mode);
-                    const candidate_depth = item.depth + 1;
-                    if (!try best_cost.recordIfPareto(alloc, node_ref, candidate_depth, candidate_cost)) continue;
-                    const path_state_id = try appendPathStateFromWeightedStep(
-                        alloc,
-                        &state,
-                        item,
-                        node,
-                        node_table,
-                        graph_query.query.params.weight_mode,
-                    );
-                    const path_state = state.path_states.items[path_state_id];
-                    var next_item = try initFrontierState(
-                        alloc,
-                        path_state.key,
-                        path_state.table,
-                        path_state.depth,
-                        path_state.distance,
-                        path_state.cost,
-                        path_state_id,
-                        request_work_budget,
-                    );
-                    errdefer next_item.deinit(alloc);
-                    try frontier.push(alloc, next_item);
-                    try request_work_budget.checkIntermediateStates(frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                 }
             }
             continue;
@@ -6882,11 +7736,13 @@ fn findDistributedShortestPath(
         const exclude_edge_keys = try collectExcludedEdgeKeys(alloc, excluded_edges);
         defer freeKeys(alloc, exclude_edge_keys);
         var one_frontier = [_]FrontierState{item};
-        var batches = try batchFrontierByGroup(alloc, catalog, worker, table_name, &one_frontier, max_depth, graph_query.query.params.direction, graph_query.query.index_name, consistency, null, admission);
+        const layer_items = &one_frontier;
+        var batches = try batchFrontierByGroup(alloc, catalog, worker, table_name, layer_items, max_depth, graph_query.query.params.direction, graph_query.query.index_name, consistency, null, admission);
         defer freeFrontierBatches(alloc, &batches);
         var batch_it = batches.iterator();
         while (batch_it.next()) |entry| {
-            var step_req = try makeGraphExpandRequestWithAlgebraicMode(alloc, graph_query, one_frontier[0..], entry.value_ptr.frontier_ids.items, exclude_node_refs, exclude_edge_keys, true, algebraic_semiring_selected);
+            var step_req = try makeGraphExpandRequestWithAlgebraicMode(alloc, graph_query, layer_items, entry.value_ptr.frontier_ids.items, exclude_node_refs, exclude_edge_keys, true, algebraic_semiring_selected);
+            step_req.work_limits = req.graph_execution_limits;
             step_req.ttl_now_ns = req.graph_ttl_now_ns;
             step_req.allow_legacy_wire_fallback = try catalogGraphIndexAllowsLegacyWire(alloc, catalog, entry.key_ptr.table_name, graph_query.query.index_name);
             if (request_work_budget.remaining_physical_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
@@ -6895,63 +7751,75 @@ fn findDistributedShortestPath(
             step_req.identity_read_generation = entry.value_ptr.identity_read_generation;
             defer step_req.deinit(alloc);
 
-            var step_result = try worker.executeGraphExpand(alloc, entry.key_ptr.group_id, entry.key_ptr.table_name, step_req, consistency);
-            defer step_result.deinit(alloc);
+            // Compatibility workers without edge-page support still run one
+            // vertex at a time. Bound the complete response and its decode
+            // workspace before dispatch, rather than charging after allocation.
+            var response_memory = graph_work_budget.RetainedAllocator{ .backing = alloc, .budget = request_work_budget };
+            defer std.debug.assert(response_memory.live_bytes == 0);
+            const response_alloc = response_memory.allocator();
+            var step_result = worker.executeGraphExpand(response_alloc, entry.key_ptr.group_id, entry.key_ptr.table_name, step_req, consistency) catch |err|
+                return if (err == error.OutOfMemory and response_memory.denied) error.GraphWorkBudgetExceeded else err;
+            defer step_result.deinit(response_alloc);
             if (step_result.scanned_rows > step_req.max_scanned_rows) return error.InvalidGraphExpandResponse;
-            try consumeDistributedExpansionWork(request_work_budget, step_result);
+            try consumeDistributedExpansionWorkWithNodeAccounting(request_work_budget, step_result, !min_hops);
 
-            if (step_result.expansions.len == 0) continue;
-            const step_graph = step_result.expansions[0].graph_result;
-            const admitted_nodes = try graphResultNodeAdmissionMaskAlloc(
-                alloc,
-                admission,
-                table_name,
-                entry.key_ptr.table_name,
-                step_graph.nodes,
-            );
+            const admitted_nodes = try graphExpansionNodeAdmissionMaskAlloc(alloc, admission, table_name, entry.key_ptr.table_name, step_result.expansions);
             defer alloc.free(admitted_nodes);
-            for (step_graph.nodes, admitted_nodes) |node, allowed| {
-                if (!allowed) continue;
-                const node_table = canonicalExpandedNodeTable(
-                    table_name,
-                    entry.key_ptr.table_name,
-                    node.table,
-                );
-                const node_ref = graph_node_identity.Ref{ .table = node_table, .key = node.key };
-                if (excluded_nodes) |set| {
-                    if (set.contains(node_ref)) continue;
+            var admission_offset: usize = 0;
+            for (step_result.expansions) |expansion| {
+                if (expansion.frontier_id >= layer_items.len or
+                    std.mem.indexOfScalar(u32, entry.value_ptr.frontier_ids.items, expansion.frontier_id) == null)
+                    return error.InvalidGraphExpandResponse;
+                const parent = layer_items[expansion.frontier_id];
+                if (!std.mem.eql(u8, expansion.frontier_key, parent.key)) return error.InvalidGraphExpandResponse;
+                const step_graph = expansion.graph_result;
+                const admitted = admitted_nodes[admission_offset..][0..step_graph.nodes.len];
+                admission_offset += step_graph.nodes.len;
+                for (step_graph.nodes, admitted) |node, allowed| {
+                    if (!allowed) continue;
+                    const node_table = canonicalExpandedNodeTable(
+                        table_name,
+                        entry.key_ptr.table_name,
+                        node.table,
+                    );
+                    const node_ref = graph_node_identity.Ref{ .table = node_table, .key = node.key };
+                    if (excluded_nodes) |set| {
+                        if (set.contains(node_ref)) continue;
+                    }
+
+                    const candidate_cost = parent.cost + try edgeCost(
+                        parent,
+                        node,
+                        graph_query.query.params.weight_mode,
+                    );
+                    const candidate_depth = parent.depth + 1;
+                    if (!try best_cost.recordIfPareto(alloc, node_ref, candidate_depth, candidate_cost)) continue;
+                    if (min_hops) try request_work_budget.consumeNode();
+                    const path_state_id = try appendPathStateFromWeightedStep(
+                        alloc,
+                        &state,
+                        parent,
+                        node,
+                        node_table,
+                        graph_query.query.params.weight_mode,
+                    );
+                    if (min_hops and target_set.contains(node_table, node.key))
+                        return try pathStateToGraphPath(alloc, state.path_states.items, path_state_id, request_work_budget);
+                    const path_state = state.path_states.items[path_state_id];
+
+                    var next_item = try initFrontierState(
+                        alloc,
+                        path_state.key,
+                        path_state.table,
+                        path_state.depth,
+                        path_state.distance,
+                        path_state.cost,
+                        path_state_id,
+                        request_work_budget,
+                    );
+                    errdefer next_item.deinit(alloc);
+                    try frontier.push(&next_item);
                 }
-
-                const candidate_cost = item.cost + try edgeCost(
-                    item,
-                    node,
-                    graph_query.query.params.weight_mode,
-                );
-                const candidate_depth = item.depth + 1;
-                if (!try best_cost.recordIfPareto(alloc, node_ref, candidate_depth, candidate_cost)) continue;
-                const path_state_id = try appendPathStateFromWeightedStep(
-                    alloc,
-                    &state,
-                    item,
-                    node,
-                    node_table,
-                    graph_query.query.params.weight_mode,
-                );
-                const path_state = state.path_states.items[path_state_id];
-
-                var next_item = try initFrontierState(
-                    alloc,
-                    path_state.key,
-                    path_state.table,
-                    path_state.depth,
-                    path_state.distance,
-                    path_state.cost,
-                    path_state_id,
-                    request_work_budget,
-                );
-                errdefer next_item.deinit(alloc);
-                try frontier.push(alloc, next_item);
-                try request_work_budget.checkIntermediateStates(frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
             }
         }
     }
@@ -7287,6 +8155,17 @@ fn appendIncomingProbeBatches(
     }
 }
 
+fn validateIncomingProjection(response: IncomingSourceGroupsResponse, count: usize, groups: []const u64) !void {
+    if (response.entries.len != count) return error.InvalidGraphIncomingRouteResult;
+    for (response.entries) |route| {
+        if (!route.complete and !response.complete) continue;
+        for (route.source_group_ids, 0..) |group, i| {
+            if (std.mem.indexOfScalar(u64, route.source_group_ids[0..i], group) != null or std.mem.indexOfScalar(u64, groups, group) == null)
+                return error.InvalidGraphIncomingRouteResult;
+        }
+    }
+}
+
 fn appendIncomingProbeBatchWindow(
     alloc: std.mem.Allocator,
     worker: Worker,
@@ -7321,16 +8200,11 @@ fn appendIncomingProbeBatchWindow(
         var route_response = route_response_value;
         defer route_response.deinit(alloc);
         route_projection_seen = true;
-        if (route_response.entries.len != keys.len) return error.InvalidGraphIncomingRouteResult;
+        try validateIncomingProjection(route_response, keys.len, group_ids);
         for (route_response.entries, frontier_ids, keys) |route, frontier_id, key| {
             const entry_complete = route.complete or route_response.complete;
             if (entry_complete) {
-                for (route.source_group_ids) |source_group_id| {
-                    if (!std.mem.containsAtLeast(u64, group_ids, 1, &.{source_group_id})) {
-                        return error.InvalidGraphIncomingRouteResult;
-                    }
-                    try appendFrontierBatch(alloc, batches, table_state, source_group_id, frontier_id);
-                }
+                for (route.source_group_ids) |source_group_id| try appendFrontierBatch(alloc, batches, table_state, source_group_id, frontier_id);
             } else {
                 try unresolved_frontier_ids.append(alloc, frontier_id);
                 try unresolved_keys.append(alloc, key);
@@ -8212,6 +9086,7 @@ fn executeGraphExpandBatchesParallel(
     include_paths: bool,
     algebraic_semiring_selected: bool,
     ttl_now_ns: u64,
+    work_limits: graph_work_budget.Limits,
     max_scanned_rows: u32,
     allow_legacy_wire_fallback: bool,
     consistency: raft_mod.ReadConsistency,
@@ -8230,6 +9105,7 @@ fn executeGraphExpandBatchesParallel(
             include_paths_inner: bool,
             algebraic_semiring_selected_inner: bool,
             ttl_now_ns_inner: u64,
+            work_limits_inner: graph_work_budget.Limits,
             max_scanned_rows_inner: u32,
             allow_legacy_wire_fallback_inner: bool,
             consistency_inner: raft_mod.ReadConsistency,
@@ -8249,6 +9125,7 @@ fn executeGraphExpandBatchesParallel(
                 return;
             };
             step_req.topology_epoch = entry.topology_epoch;
+            step_req.work_limits = work_limits_inner;
             step_req.ttl_now_ns = ttl_now_ns_inner;
             step_req.allow_legacy_wire_fallback = allow_legacy_wire_fallback_inner;
             step_req.max_scanned_rows = max_scanned_rows_inner;
@@ -8275,6 +9152,7 @@ fn executeGraphExpandBatchesParallel(
                 include_paths,
                 algebraic_semiring_selected,
                 ttl_now_ns,
+                work_limits,
                 max_scanned_rows,
                 allow_legacy_wire_fallback,
                 consistency,
@@ -9370,6 +10248,31 @@ pub fn parseGraphEdgesResponse(alloc: std.mem.Allocator, body: []const u8) !Grap
     return parseGraphEdgesResponseWithScratch(alloc, alloc, body);
 }
 
+/// Recover work accounting after response decoding runs out of memory. This
+/// bounded stack workspace never competes with the failed response allocator.
+/// Missing, duplicate, malformed or excessively nested reports stay unknown.
+pub fn graphEdgesResponseScannedRows(body: []const u8) ?usize {
+    var storage: [1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), body);
+    defer scanner.deinit();
+    if ((scanner.next() catch return null) != .object_begin) return null;
+    var rows: ?usize = null;
+    while ((scanner.peekNextTokenType() catch return null) != .object_end) {
+        const token = scanner.next() catch return null;
+        if (token != .string) return null;
+        if (std.mem.eql(u8, token.string, "scanned_rows")) {
+            if (rows != null) return null;
+            const count = scanner.next() catch return null;
+            if (count != .number) return null;
+            rows = std.fmt.parseInt(u32, count.number, 10) catch return null;
+        } else scanner.skipValue() catch return null;
+    }
+    _ = scanner.next() catch return null;
+    if ((scanner.next() catch return null) != .end_of_document) return null;
+    return rows;
+}
+
 /// Decode each edge directly into final ownership. Temporary typed parsing
 /// lives for one edge, rather than the entire shard response.
 pub fn parseGraphEdgesResponseWithScratch(alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, body: []const u8) !GraphEdgesResponse {
@@ -9454,6 +10357,14 @@ fn consumeDistributedExpansionWork(
     budget: *graph_pattern_mod.WorkBudget,
     response: GraphExpandResponse,
 ) !void {
+    return consumeDistributedExpansionWorkWithNodeAccounting(budget, response, true);
+}
+
+fn consumeDistributedExpansionWorkWithNodeAccounting(
+    budget: *graph_pattern_mod.WorkBudget,
+    response: GraphExpandResponse,
+    count_nodes: bool,
+) !void {
     try budget.consumePhysicalEdges(response.scanned_rows);
     var node_count: usize = 0;
     var owned_bytes: usize = 0;
@@ -9489,7 +10400,7 @@ fn consumeDistributedExpansionWork(
             }
         }
     }
-    try budget.consumeNodes(node_count);
+    if (count_nodes) try budget.consumeNodes(node_count);
     try budget.consumeEdges(node_count);
     try budget.consumeEdgeBytes(owned_bytes);
 }
@@ -10911,7 +11822,7 @@ fn appendPathStateFromWeightedStep(
     );
     errdefer path_state.deinit(alloc);
     path_state.root_id = if (path_state.parent) |ancestor_slot| state.path_states.items[ancestor_slot].root_id else @intCast(state.path_states.items.len);
-    try state.path_states.append(alloc, path_state);
+    try state.appendPath(alloc, &path_state);
     return @intCast(state.path_states.items.len - 1);
 }
 
@@ -11971,7 +12882,15 @@ pub fn encodeGraphExpandRequest(alloc: std.mem.Allocator, req: GraphExpandReques
     return encodeGraphExpandRequestWithWireMode(alloc, req, false);
 }
 
+fn graphExpandWireLimits(req: GraphExpandRequest) ?graph_work_budget.Limits {
+    const limits = req.work_limits orelse return null;
+    return if (std.meta.eql(limits, graph_work_budget.Limits{})) null else limits;
+}
+
 pub fn encodeLegacyGraphExpandRequest(alloc: std.mem.Allocator, req: GraphExpandRequest) ![]u8 {
+    // An old worker cannot honor non-default execution policy. Never silently
+    // drop it while negotiating the legacy wire format.
+    if (graphExpandWireLimits(req) != null) return error.UnsupportedQueryRequest;
     if (!req.allow_legacy_wire_fallback or req.max_scanned_rows != graph_pattern_mod.default_max_explored_edges)
         return error.GraphExploredEdgesBudgetExceeded;
     return encodeGraphExpandRequestWithWireMode(alloc, req, true);
@@ -12028,6 +12947,7 @@ fn encodeGraphExpandRequestWithWireMode(alloc: std.mem.Allocator, req: GraphExpa
         .topology_epoch = req.topology_epoch,
         .ttl_now_ns = if (legacy) null else req.ttl_now_ns,
         .max_scanned_rows = if (legacy) null else req.max_scanned_rows,
+        .work_limits = if (legacy) null else graphExpandWireLimits(req),
         .identity_read_generation = req.identity_read_generation,
         .params = .{
             .edge_types = req.params.edge_types,
@@ -12108,7 +13028,7 @@ fn appendRootPathState(
     var path_state = try initPathState(alloc, key, table, 0, 0, 0, null, null, state.work_budget);
     errdefer path_state.deinit(alloc);
     path_state.root_id = if (path_state.parent) |ancestor_slot| state.path_states.items[ancestor_slot].root_id else @intCast(state.path_states.items.len);
-    try state.path_states.append(alloc, path_state);
+    try state.appendPath(alloc, &path_state);
     return @intCast(state.path_states.items.len - 1);
 }
 
@@ -12191,7 +13111,7 @@ fn appendPathStateFromStep(
     );
     errdefer path_state.deinit(alloc);
     path_state.root_id = if (path_state.parent) |ancestor_slot| state.path_states.items[ancestor_slot].root_id else @intCast(state.path_states.items.len);
-    try state.path_states.append(alloc, path_state);
+    try state.appendPath(alloc, &path_state);
     return @intCast(state.path_states.items.len - 1);
 }
 
@@ -13084,8 +14004,9 @@ fn reconstructPath(
 
     var cursor: ?u32 = id;
     while (cursor) |current_id| {
+        const owned = try alloc.dupe(u8, path_states[current_id].key);
         write_index -= 1;
-        out[write_index] = try alloc.dupe(u8, path_states[current_id].key);
+        out[write_index] = owned;
         cursor = path_states[current_id].parent;
     }
     return out;
@@ -13112,11 +14033,9 @@ fn reconstructPathTables(
 
     var cursor: ?u32 = id;
     while (cursor) |current_id| {
+        const owned = if (path_states[current_id].table) |table| try alloc.dupe(u8, table) else null;
         write_index -= 1;
-        out[write_index] = if (path_states[current_id].table) |table|
-            try alloc.dupe(u8, table)
-        else
-            null;
+        out[write_index] = owned;
         cursor = path_states[current_id].parent;
     }
     return out;
@@ -13137,8 +14056,9 @@ fn reconstructPathEdges(
     var cursor: ?u32 = id;
     while (cursor) |current_id| {
         if (path_states[current_id].incoming_edge) |edge| {
+            const owned = try clonePathEdge(alloc, edge);
             write_index -= 1;
-            out[write_index] = try clonePathEdge(alloc, edge);
+            out[write_index] = owned;
         }
         cursor = path_states[current_id].parent;
     }
@@ -13661,6 +14581,7 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     req.identity_read_generation = 12345;
     req.ttl_now_ns = 5_000_000_000;
     req.max_scanned_rows = 23;
+    req.work_limits = .{ .max_explored_nodes = 200_000, .max_intermediate_states = 300_000, .max_retained_state_bytes = 128 * 1024 * 1024 };
     var filter = doc_set.ResolvedDocFilter{ .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 3, 5 }) };
     defer filter.deinit(alloc);
     req.resolved_doc_filter = &filter;
@@ -13702,6 +14623,14 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expectEqual(@as(?u64, 12345), parsed.identity_read_generation);
     try std.testing.expectEqual(@as(u64, 5_000_000_000), parsed.ttl_now_ns);
     try std.testing.expectEqual(@as(u32, 23), parsed.max_scanned_rows);
+    try std.testing.expectEqualDeep(req.work_limits, parsed.work_limits);
+    const search = try frontierItemToSearchRequest(alloc, parsed, parsed.frontier[0]);
+    defer freeExpandSearchRequest(alloc, search);
+    try std.testing.expectEqual(@as(usize, 200_000), search.graph_execution_limits.max_explored_nodes);
+    try std.testing.expectEqual(@as(usize, 300_000), search.graph_execution_limits.max_intermediate_states);
+    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), search.graph_execution_limits.max_retained_state_bytes);
+    try std.testing.expectEqual(@as(usize, 23), search.graph_execution_limits.max_explored_edges);
+    try std.testing.expectError(error.UnsupportedQueryRequest, encodeLegacyGraphExpandRequest(alloc, req));
     try std.testing.expect(parsed.resolved_doc_filter != null);
     try std.testing.expect(parsed.resolved_doc_filter_owned);
     try std.testing.expect(parsed.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
@@ -16583,14 +17512,14 @@ test "distributed graph path materialization preserves table provenance" {
     var shared = try initPathState(alloc, "shared", "entities", 1, 1, 1, root, null, null);
     var shared_owned = true;
     errdefer if (shared_owned) shared.deinit(alloc);
-    try state.path_states.append(alloc, shared);
+    try state.appendPath(alloc, &shared);
     shared_owned = false;
     const shared_id: u32 = @intCast(state.path_states.items.len - 1);
 
     var target = try initPathState(alloc, "doc:c", "entities", 2, 2, 2, shared_id, null, null);
     var target_owned = true;
     errdefer if (target_owned) target.deinit(alloc);
-    try state.path_states.append(alloc, target);
+    try state.appendPath(alloc, &target);
     target_owned = false;
     const target_id: u32 = @intCast(state.path_states.items.len - 1);
 
@@ -18025,7 +18954,7 @@ test "distributed graph metric post processing applies max results after filter 
         var gate = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&fixture), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
         gate.incoming_probe_options.work_budget = &work;
         defer gate.deinit();
-        var edge_cache = CanonicalEdgeBatch{ .tracked = .{ .backing = alloc, .budget = &work } };
+        var edge_cache = CanonicalEdgeBatch{ .tracked = .{ .backing = graph_memory_budget.reclaimingAllocator(alloc), .budget = &work } };
         defer edge_cache.deinit();
         var optional = TraversalReadCache{};
         defer optional.deinit();
@@ -18067,7 +18996,7 @@ test "distributed graph metric post processing applies max results after filter 
         var gate = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&fixture), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
         gate.incoming_probe_options.work_budget = &scratch_budget;
         defer gate.deinit();
-        var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = alloc, .budget = &scratch_budget } };
+        var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = graph_memory_budget.reclaimingAllocator(alloc), .budget = &scratch_budget } };
         defer cache.deinit();
         const reader = DistributedEdgeReader{ .catalog = FakeCatalog.iface(), .worker = FakeWorker.iface(&fixture), .source_table = "docs", .index_name = "graph_idx", .consistency = .read_index, .admission = &gate, .physical_work_budget = &scratch_budget, .prefetched = &cache };
         const frontier = [_]FrontierState{ .{ .key = @constCast(roots[0]) }, .{ .key = @constCast(roots[1]) } };
@@ -18993,4 +19922,1449 @@ test "system catalog evidence traversal preserves parallel paths and cycles unde
     try std.testing.expect(!request.params.deduplicate);
     try std.testing.expectEqual(@as(u32, 0), request.params.max_results);
     try std.testing.expect(supportsCrossRange(.{ .graph_queries = &.{named} }));
+}
+
+const ShortestPathTestHarness = struct {
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{ .{
+            .table_id = 7,
+            .name = "docs",
+            .description = "docs table",
+            .schema_json = "",
+            .read_schema_json = "",
+            .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"},\"canonical\":{\"type\":\"graph\",\"source\":{\"artifact\":\"facts\",\"nodes\":{\"source\":\"{{ _item.source }}\"},\"edge\":{\"edge_id\":\"{{ _doc.key }}\"}}}}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        }, .{
+            .table_id = 8,
+            .name = "entities",
+            .description = "entities",
+            .schema_json = "",
+            .read_schema_json = "",
+            .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        } };
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .range_id = 11, .start_key = "", .end_key = null },
+            .{ .group_id = 33, .table_id = 8, .range_id = 33, .start_key = "", .end_key = null },
+        };
+        const multi_ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .range_id = 11, .start_key = "", .end_key = "m" },
+            .{ .group_id = 22, .table_id = 7, .range_id = 22, .start_key = "m", .end_key = null },
+            .{ .group_id = 33, .table_id = 8, .range_id = 33, .start_key = "", .end_key = null },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = @ptrFromInt(1),
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .linearizable_routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn multiIface() table_catalog.CatalogSource {
+            var result = iface();
+            result.ptr = @ptrFromInt(2);
+            return result;
+        }
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(if (@intFromPtr(ptr) == 2) multi_ranges[0..] else ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(if (@intFromPtr(ptr) == 2) multi_ranges[0..] else ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+    };
+
+    const State = struct {
+        graph: *graph_mod.GraphIndex,
+        alloc: std.mem.Allocator = std.testing.allocator,
+        expanded: std.StringHashMapUnmanaged(void) = .empty,
+        calls: usize = 0,
+        largest_batch: usize = 0,
+        page_calls: usize = 0,
+        continuations: usize = 0,
+        pages: bool = true,
+        only_source: ?[]const u8 = null,
+        other: ?*graph_mod.GraphIndex = null,
+        wire: bool = true,
+        remote_wire: bool = false,
+        rank_by_group: bool = false,
+        conflict: bool = false,
+        repeat_page: bool = false,
+        incoming_groups: ?[]const u64 = null,
+        reject_pages: bool = false,
+        cold_routes: bool = false,
+        route_records: usize = 0,
+        probes: usize = 0,
+        largest_page: usize = 0,
+        reject_continuations: bool = false,
+        empty_prefix_once: bool = false,
+        small_initial_key: ?[]const u8 = null,
+    };
+    const FakeWorker = struct {
+        fn iface(state: *State) Worker {
+            return .{ .ptr = state, .vtable = if (state.cold_routes) &.{ .execute_graph_expand = expand, .execute_graph_hydrate = hydrate, .execute_graph_get_edges = edges, .execute_graph_get_edges_batch = page, .resolve_incoming_source_groups = incomingRoutes, .record_incoming_source_groups = recordRoutes } else if (state.incoming_groups != null) &.{ .execute_graph_expand = expand, .execute_graph_hydrate = hydrate, .execute_graph_get_edges = edges, .execute_graph_get_edges_batch = page, .resolve_incoming_source_groups = incomingRoutes } else if (state.pages) &.{ .execute_graph_expand = expand, .execute_graph_hydrate = hydrate, .execute_graph_get_edges = edges, .execute_graph_get_edges_batch = page } else &.{ .execute_graph_expand = expand, .execute_graph_hydrate = hydrate, .execute_graph_get_edges = edges } };
+        }
+        fn incomingRoutes(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, request: IncomingSourceGroupsRequest, _: raft_mod.ReadConsistency) !IncomingSourceGroupsResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), request.keys.len);
+            try std.testing.expect(request.identity_read_generation != null);
+            const entries = try a.alloc(IncomingSourceGroupEntry, 1);
+            errdefer a.free(entries);
+            entries[0] = .{ .source_group_ids = try a.dupe(u64, state.incoming_groups orelse &.{}), .complete = !state.cold_routes or state.route_records > 0 };
+            return .{ .entries = entries };
+        }
+        fn page(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.page_calls += 1;
+            state.largest_batch = @max(state.largest_batch, request.keys.len);
+            if (state.reject_pages or (state.reject_continuations and request.resume_cursor != null)) return error.GraphEdgesBatchUnsupported;
+            if (state.small_initial_key) |key| if (std.mem.eql(u8, key, request.key) and request.resume_cursor == null) {
+                try std.testing.expect(request.max_edges <= 64);
+                try std.testing.expect(request.max_owned_bytes <= 256 * 1024);
+            };
+            state.largest_page = @max(state.largest_page, request.max_edges);
+            if (state.only_source) |key| try std.testing.expectEqualStrings(key, request.key);
+            try std.testing.expect(request.max_edges <= graph_pattern_mod.default_max_explored_edges);
+            try std.testing.expect(request.max_scanned_rows <= graph_pattern_mod.default_max_explored_edges);
+            try std.testing.expect(request.max_owned_bytes <= graph_pattern_mod.default_max_explored_edge_bytes);
+            if (request.resume_cursor != null) state.continuations += 1;
+            const graph = if (group == 22) state.other orelse state.graph else state.graph;
+            var scoped = request;
+            if (state.repeat_page) scoped.resume_cursor = null;
+            const empty_keys = [_][]const u8{"@missing"};
+            if (group == 33) {
+                scoped.key = @constCast(empty_keys[0]);
+                scoped.keys = @constCast(&empty_keys);
+                scoped.resume_cursor = null;
+            }
+            const producer = if (state.remote_wire) state.alloc else a;
+            var result = if (state.empty_prefix_once) blk: {
+                // A valid empty prefix after skipped/expired physical rows and
+                // an indivisible payload says nothing about paging capability.
+                state.empty_prefix_once = false;
+                break :blk GraphEdgesResponse{ .edges = &.{}, .scanned_rows = 65, .key_offsets = try producer.dupe(u32, &.{0}) };
+            } else try @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(producer, graph, scoped, request.ttl_now_ns);
+            var moved = false;
+            defer if (!moved) result.deinit(producer);
+            if (state.rank_by_group) for ([_][]graph_mod.Edge{ result.edges, result.partial_edges }) |part| for (part) |*edge| {
+                if (edge.winner_key_hex.len > 0) producer.free(edge.winner_key_hex);
+                edge.winner_key_hex = "";
+                edge.winner_key_hex = try producer.dupe(u8, if (state.conflict or group == 22) "61" else "62");
+                edge.winner_rank = if (state.conflict or group == 22) 1 else 2;
+            };
+            if (state.wire) {
+                const scratch = if (state.remote_wire) request.scratch_allocator orelse a else a;
+                // Encoding belongs to the producer. Only the received body
+                // and decoding allocations consume coordinator memory.
+                const encoded = try encodeGraphEdgesResponse(producer, result);
+                defer producer.free(encoded);
+                if (state.remote_wire) {
+                    const body = try scratch.dupe(u8, encoded);
+                    defer scratch.free(body);
+                    return parseGraphEdgesResponseWithScratch(a, scratch, body);
+                }
+                return parseGraphEdgesResponse(a, encoded);
+            }
+            moved = true;
+            return result;
+        }
+        fn recordRoutes(ptr: *anyopaque, _: []const u8, request: IncomingSourceGroupsRequest, response: IncomingSourceGroupsResponse) !void {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), request.keys.len);
+            try std.testing.expect(response.complete and response.entries[0].complete);
+            // Shard 11 has only an expired physical row. It must remain in
+            // the reusable directory even though it has no live result.
+            try std.testing.expectEqualSlices(u64, &.{ 11, 22 }, response.entries[0].source_group_ids);
+            state.route_records += 1;
+        }
+        fn hydrate(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphHydrateRequest, _: raft_mod.ReadConsistency) !GraphHydrateResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            if (!state.cold_routes) return error.UnexpectedTestCall;
+            state.probes += 1;
+            try std.testing.expectEqual(@as(usize, 1), request.keys.len);
+            const live = try a.dupe(bool, &.{group == 22});
+            errdefer a.free(live);
+            const physical = try a.dupe(bool, &.{true});
+            return .{ .hits = &.{}, .has_incoming = live, .has_physical_incoming = physical, .incoming_index_identity = request.incoming_index_identity, .incoming_ttl_now_ns = request.incoming_ttl_now_ns, .incoming_scanned_rows = 1 };
+        }
+        fn edges(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            const key = try std.fmt.allocPrint(state.alloc, "{d}:{s}", .{ group, request.key });
+            if (state.expanded.contains(key)) {
+                state.alloc.free(key);
+                return error.DuplicateVertexExpansion;
+            }
+            state.expanded.put(state.alloc, key, {}) catch |err| {
+                state.alloc.free(key);
+                return err;
+            };
+            const result = try state.graph.getEdgesByTypesBoundedWithStatsAt(a, request.key, request.edge_types, request.direction, request.max_edges, request.max_owned_bytes, request.max_scanned_rows, request.ttl_now_ns);
+            return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
+        }
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphExpandRequest, _: raft_mod.ReadConsistency) !GraphExpandResponse {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            state.largest_batch = @max(state.largest_batch, request.frontier.len);
+            var out = std.ArrayListUnmanaged(GraphExpansion).empty;
+            errdefer {
+                for (out.items) |*expansion| expansion.deinit(a);
+                out.deinit(a);
+            }
+            var scans: usize = 0;
+            for (request.frontier) |item| {
+                // A repeated expansion is a regression even when a large
+                // request budget would mask it on a dense cyclic graph.
+                const owned_key = try std.fmt.allocPrint(state.alloc, "{d}:{s}", .{ group, item.key });
+                if (state.expanded.contains(owned_key)) {
+                    state.alloc.free(owned_key);
+                    return error.DuplicateVertexExpansion;
+                }
+                state.expanded.put(state.alloc, owned_key, {}) catch |err| {
+                    state.alloc.free(owned_key);
+                    return err;
+                };
+                var engine = graph_query_mod.GraphQueryEngine{ .alloc = a };
+                var result = try engine.execute(state.graph, .{ .query_type = .neighbors, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{item.key} }, .params = request.params }, &.{item.key});
+                errdefer result.deinit(a);
+                const key = try a.dupe(u8, item.key);
+                errdefer a.free(key);
+                const name = try a.dupe(u8, request.name);
+                errdefer a.free(name);
+                scans += result.nodes.len;
+                try out.append(a, .{ .frontier_id = item.id, .frontier_key = key, .graph_result = .{ .name = name, .nodes = result.nodes, .hits = &.{}, .total_hits = @intCast(result.nodes.len) } });
+            }
+            try std.testing.expect(scans <= request.max_scanned_rows);
+            // Deliberately reverse the wire order: parent IDs, not positions,
+            // determine path reconstruction in a batched response.
+            std.mem.reverse(GraphExpansion, out.items);
+            return .{ .expansions = try out.toOwnedSlice(a), .scanned_rows = @intCast(scans) };
+        }
+    };
+};
+
+test "distributed min-hop paths stream bounded pages and admit each vertex once" {
+    const alloc = std.testing.allocator;
+    const FakeCatalog = ShortestPathTestHarness.FakeCatalog;
+    const State = ShortestPathTestHarness.State;
+    const FakeWorker = ShortestPathTestHarness.FakeWorker;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var names: [8][16][16]u8 = undefined;
+    var keys: [8][16][]const u8 = undefined;
+    for (&keys, 0..) |*layer, depth| for (layer, 0..) |*key, column| {
+        key.* = try std.fmt.bufPrint(&names[depth][column], "n{d}:{d}", .{ depth, column });
+    };
+    var writes = std.ArrayListUnmanaged(graph_mod.BatchWrite).empty;
+    defer writes.deinit(alloc);
+    for (keys, 0..) |layer, depth| for (layer, 0..) |key, column| {
+        if (depth == 0 and column > 0) continue;
+        const targets: []const []const u8 = if (depth == 7) &.{keys[0][0]} else &keys[depth + 1];
+        for (targets) |target| {
+            try writes.append(alloc, .{ .source = key, .target = target, .edge_type = "FRIEND", .weight = 1 });
+        }
+    };
+    try graph.batchApply(writes.items, &.{});
+    const edge_count = writes.items.len;
+    // Separate components exercise page boundaries and a steady 64-state
+    // frontier without changing the cyclic component's exact edge budget.
+    for (keys) |layer| for (layer) |key| try graph.addEdge("wide", key, "FRIEND", 1, 0, 0, "");
+    var parent_names: [64][8]u8 = undefined;
+    var child_names: [64][8]u8 = undefined;
+    for (0..64) |i| {
+        const parent = try std.fmt.bufPrint(&parent_names[i], "p:{d:0>3}", .{i});
+        const child = try std.fmt.bufPrint(&child_names[i], "q:{d:0>3}", .{i});
+        try graph.addEdge("chain-source", parent, "FRIEND", 1, 0, 0, "");
+        try graph.addEdge(parent, child, "FRIEND", 1, 0, 0, "");
+    }
+    const payload = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, ' ');
+    try graph.addEdge("large", "target", "FRIEND", 1, 0, 0, payload);
+    for ([_]enum { reachable, no_path, canonical_no_path, exhausted, compatibility, wide_early, wide_late, frontier_boundary, memory, invalid_cursor, lost_paging }{ .reachable, .no_path, .canonical_no_path, .exhausted, .compatibility, .wide_early, .wide_late, .frontier_boundary, .memory, .invalid_cursor, .lost_paging }) |scenario| {
+        const canonical = scenario == .canonical_no_path;
+        const wide = scenario == .wide_early or scenario == .wide_late or scenario == .invalid_cursor or scenario == .lost_paging;
+        const missing = scenario == .no_path or canonical or scenario == .frontier_boundary;
+        const source: []const u8 = if (wide) "wide" else if (scenario == .frontier_boundary) "chain-source" else if (scenario == .memory) "large" else keys[0][0];
+        const target: []const u8 = if (missing) "missing" else if (scenario == .wide_early) keys[0][0] else if (scenario == .memory) "target" else keys[7][0];
+        const index_name: []const u8 = if (canonical) "canonical" else "graph_idx";
+        var state = State{ .graph = &graph, .pages = scenario != .compatibility, .only_source = if (wide) "wide" else null, .repeat_page = scenario == .invalid_cursor, .reject_continuations = scenario == .lost_paging };
+        defer {
+            var it = state.expanded.keyIterator();
+            while (it.next()) |key| alloc.free(key.*);
+            state.expanded.deinit(alloc);
+        }
+        const request = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+        const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{
+            .query_type = .shortest_path,
+            .index_name = index_name,
+            .start_nodes = .{ .keys = &.{ source, source } },
+            .target_nodes = .{ .keys = &.{target} },
+            .params = .{ .max_depth = 8, .weight_mode = .min_hops, .edge_types = &.{"FRIEND"} },
+        } };
+        const epoch = try table_catalog.topologyEpoch(alloc, FakeCatalog.iface(), "docs");
+        var admission = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&state), "docs", index_name, epoch, request, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        const edges_expected: usize = if (wide or scenario == .frontier_boundary) 128 else edge_count;
+        var budget = graph_work_budget.WorkBudget.init(if (wide or scenario == .frontier_boundary) 129 else 1 + 7 * keys[1].len, edges_expected);
+        if (scenario == .frontier_boundary) budget.max_intermediate_states = 64;
+        if (scenario == .exhausted or scenario == .memory) {
+            if (scenario == .memory) budget.max_retained_state_bytes = 128 * 1024 else budget.max_intermediate_states = 1;
+            try std.testing.expectError(error.GraphWorkBudgetExceeded, findDistributedShortestPath(alloc, FakeCatalog.iface(), FakeWorker.iface(&state), "docs", request, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null));
+            try std.testing.expectEqual(if (scenario == .memory) graph_work_budget.Dimension.retained_state_bytes else graph_work_budget.Dimension.intermediate_states, budget.exhaustion().?.dimension);
+            try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+            continue;
+        }
+        if (scenario == .lost_paging) {
+            try std.testing.expectError(error.TopologyChanged, findDistributedShortestPath(alloc, FakeCatalog.iface(), FakeWorker.iface(&state), "docs", request, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null));
+            try std.testing.expectEqual(@as(usize, 0), state.calls);
+            try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+            // A fresh whole-query attempt may safely negotiate scalar reads.
+            state.reject_pages = true;
+            var retry_budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = 10_000_000 });
+            var restarted = (try findDistributedShortestPath(alloc, FakeCatalog.iface(), FakeWorker.iface(&state), "docs", request, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &retry_budget, null, null, null)).?;
+            defer restarted.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), restarted.path.length);
+            try std.testing.expectEqual(@as(usize, 1), state.calls);
+            continue;
+        }
+        if (scenario == .invalid_cursor) {
+            try std.testing.expectError(error.InvalidGraphEdgesResponse, findDistributedShortestPath(alloc, FakeCatalog.iface(), FakeWorker.iface(&state), "docs", request, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null));
+            try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+            continue;
+        }
+        var result = try findDistributedShortestPath(alloc, FakeCatalog.iface(), FakeWorker.iface(&state), "docs", request, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null);
+        defer if (result) |*path| path.deinit(alloc);
+        if (state.pages) {
+            try std.testing.expect(state.page_calls > 0);
+            try std.testing.expectEqual(@as(usize, 0), state.calls);
+        } else try std.testing.expectEqual(@as(usize, 1), state.largest_batch);
+        if (missing) {
+            try std.testing.expect(result == null);
+            try std.testing.expectEqual(edges_expected, edges_expected - budget.remaining_edges);
+            try std.testing.expectEqual(edges_expected, edges_expected - budget.remaining_physical_edges);
+            try std.testing.expectEqual(@as(usize, 0), budget.remaining_nodes);
+        } else {
+            const path = result.?.path;
+            try std.testing.expectEqual(@as(u32, if (wide) 1 else 7), path.length);
+            try std.testing.expectEqualStrings(source, path.nodes[0]);
+            try std.testing.expectEqualStrings(target, path.nodes[path.nodes.len - 1]);
+            if (scenario == .wide_early) try std.testing.expectEqual(@as(usize, 1), state.page_calls);
+            if (scenario == .wide_late) try std.testing.expect(state.continuations > 0);
+            for (path.edges, 0..) |edge, i| {
+                try std.testing.expectEqualStrings(path.nodes[i], edge.source);
+                try std.testing.expectEqualStrings(path.nodes[i + 1], edge.target);
+            }
+        }
+    }
+}
+
+test "distributed min-hop pages preserve shard winners filters directions and Yen exclusions" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var first = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer first.close();
+    var second = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer second.close();
+    try first.batchApply(&.{
+        .{ .source = "a", .target = "b", .edge_type = "FRIEND", .edge_id = "one", .weight = 0.9 },
+        .{ .source = "a", .target = "b", .edge_type = "FRIEND", .edge_id = "two", .weight = 0.8 },
+    }, &.{});
+    try second.batchApply(&.{
+        .{ .source = "a", .target = "b", .edge_type = "FRIEND", .edge_id = "one", .weight = 0.2 },
+        .{ .source = "a", .target = "b", .edge_type = "FRIEND", .edge_id = "two", .weight = 0.3 },
+    }, &.{});
+    const catalog = H.FakeCatalog.multiIface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    for ([_]graph_mod.EdgeDirection{ .out, .in, .both }) |direction| {
+        var state = H.State{ .graph = &first, .other = &second, .rank_by_group = true };
+        var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        var query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{
+            .query_type = .shortest_path,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{if (direction == .in) "b" else "a"} },
+            .target_nodes = .{ .keys = &.{if (direction == .in) "a" else "b"} },
+            .params = .{ .direction = direction, .max_depth = 8, .weight_mode = .min_hops, .edge_types = &.{"FRIEND"} },
+        } };
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var found = (try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null)).?;
+        defer found.deinit(a);
+        try std.testing.expectEqual(@as(u32, 1), found.path.length);
+        try std.testing.expectEqual(@as(f64, 0.2), found.path.total_weight);
+        query.query.params.min_weight = 0.5;
+        var filtered_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        const filtered = try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &filtered_budget, null, null, null);
+        defer if (filtered) |path| {
+            var owned = path;
+            owned.deinit(a);
+        };
+        // The losing shard's weight passes, but only the global winner may
+        // enter the filter or become a path candidate.
+        try std.testing.expect(filtered == null);
+        query.query.params.min_weight = null;
+        query.query.query_type = .k_shortest_paths;
+        query.query.k = 2;
+        var yen_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var paths = try executeDistributedKShortestPaths(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &yen_budget);
+        defer paths.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), paths.paths.len);
+        try std.testing.expect(!std.mem.eql(u8, paths.paths[0].edges[0].edge_id, paths.paths[1].edges[0].edge_id));
+        state.conflict = true;
+        query.query.query_type = .shortest_path;
+        var conflict_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        try std.testing.expectError(error.GraphContributorConflict, findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &conflict_budget, null, null, null));
+    }
+}
+
+test "distributed min-hop pages preserve qualified cross-table shortest paths" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "a", .target = "shared", .edge_type = "FRIEND", .metadata_json = "{\"target_table\":\"entities\"}" },
+        .{ .source = "shared", .target = "target", .edge_type = "FRIEND", .metadata_json = "{\"source_table\":\"entities\"}" },
+    }, &.{});
+    const catalog = H.FakeCatalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    for ([_]graph_mod.EdgeDirection{ .out, .in, .both }) |direction| {
+        var state = H.State{ .graph = &graph };
+        var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{
+            .query_type = .shortest_path,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{if (direction == .in) "target" else "a"} },
+            .target_nodes = .{ .keys = &.{if (direction == .in) "a" else "target"} },
+            .params = .{ .direction = direction, .max_depth = 8, .edge_types = &.{"FRIEND"} },
+        } };
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var result = (try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null)).?;
+        defer result.deinit(a);
+        try std.testing.expectEqual(@as(u32, 2), result.path.length);
+        try std.testing.expectEqualStrings("shared", result.path.nodes[1]);
+        try std.testing.expectEqualStrings("entities", result.path.node_tables[1].?);
+        try std.testing.expect(result.path.node_tables[0] == null and result.path.node_tables[2] == null);
+    }
+}
+
+test "distributed min-hop pages preserve public and legacy depth-eight paths" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i" };
+    for (keys[0..8], keys[1..]) |source, target| try graph.addEdge(source, target, "FRIEND", 1, 0, 0, "");
+    const bodies = [_][]const u8{
+        \\{"limit":0,"graph_queries":{"sp":{"index":"graph_idx","shortest_path":{"from":{"key":"a"},"to":{"key":"i"},"edge_types":["FRIEND"],"direction":"out","max_depth":8,"objective":"min_hops"}}}}
+        ,
+        \\{"limit":0,"graph_searches":{"sp":{"type":"shortest_path","index_name":"graph_idx","start_nodes":{"keys":["a"]},"target_nodes":{"keys":["i"]},"params":{"edge_types":["FRIEND"],"direction":"out","max_depth":8,"weight_mode":"min_hops"}}}}
+        ,
+    };
+    for (bodies) |body| {
+        var owned = try query_contract.parseQueryRequest(a, null, "docs", body);
+        defer owned.deinit(a);
+        owned.req.identity_read_generation = 12345;
+        const catalog = H.FakeCatalog.iface();
+        const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+        var state = H.State{ .graph = &graph };
+        var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, owned.req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        for ([_]u32{ 7, 8 }) |max_depth| {
+            var query = owned.req.graph_queries[0];
+            query.query.params.max_depth = max_depth;
+            var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+            var path = try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", owned.req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null);
+            defer if (path) |*value| value.deinit(a);
+            try std.testing.expectEqual(max_depth == 8, path != null);
+            if (path) |value| {
+                try std.testing.expectEqual(@as(u32, 8), value.path.length);
+                try std.testing.expectEqual(@as(usize, 8), value.path.edges.len);
+                for (value.path.edges, keys[0..8], keys[1..]) |edge, source, target| {
+                    try std.testing.expectEqualStrings(source, edge.source);
+                    try std.testing.expectEqualStrings(target, edge.target);
+                }
+            }
+        }
+    }
+}
+
+test "distributed min-hop pages preserve exact incoming directory routes" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.addEdge("a", "b", "FRIEND", 1, 0, 0, "");
+    const catalog = H.FakeCatalog.multiIface();
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    for ([_][]const u64{ &.{22}, &.{}, &.{44}, &.{ 22, 22 } }, 0..) |groups, scenario| {
+        var state = H.State{ .graph = &graph, .incoming_groups = groups };
+        var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"b"} }, .target_nodes = .{ .keys = &.{"a"} }, .params = .{ .direction = .in, .max_depth = 8, .edge_types = &.{"FRIEND"} } } };
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        const result = findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null);
+        if (scenario >= 2) {
+            try std.testing.expectError(error.InvalidGraphIncomingRouteResult, result);
+        } else {
+            var path = try result;
+            defer if (path) |*value| value.deinit(a);
+            try std.testing.expectEqual(scenario == 0, path != null);
+            try std.testing.expectEqual(@as(usize, if (scenario == 0) 1 else 0), state.page_calls);
+        }
+    }
+}
+
+test "distributed min-hop pages preserve unfenced and unsupported reader compatibility" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var names: [95][16]u8 = undefined;
+    var writes: [96]graph_mod.BatchWrite = undefined;
+    writes[0] = .{ .source = "root", .target = "a-hub", .edge_type = "FRIEND" };
+    for (&names, 0..) |*name, i| writes[i + 1] = .{ .source = "root", .target = try std.fmt.bufPrint(name, "n:{d:0>3}", .{i}), .edge_type = "FRIEND" };
+    try graph.batchApply(&writes, &.{});
+    const metadata = try a.alloc(u8, 400 * 1024);
+    defer a.free(metadata);
+    @memset(metadata, ' ');
+    @memcpy(metadata[0..12], "{\"padding\":\"");
+    @memcpy(metadata[metadata.len - 2 ..], "\"}");
+    try graph.addEdge("a-hub", "terminal", "FRIEND", 1, 0, 0, metadata);
+    const catalog = H.FakeCatalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    for ([_]bool{ false, true }) |unfenced| {
+        if (unfenced) {
+            var batch = try graph.outgoing_store.beginBatch();
+            errdefer batch.abort();
+            try batch.delete("\x00graph:read-generation:graph_idx");
+            try batch.commit();
+        }
+        var state = H.State{ .graph = &graph, .reject_pages = !unfenced };
+        defer {
+            var it = state.expanded.keyIterator();
+            while (it.next()) |key| a.free(key.*);
+            state.expanded.deinit(a);
+        }
+        var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"root"} }, .target_nodes = .{ .keys = &.{"terminal"} }, .params = .{ .max_depth = 8, .edge_types = &.{"FRIEND"} } } };
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = 10_000_000 });
+        var path = (try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null)).?;
+        defer path.deinit(a);
+        try std.testing.expectEqual(@as(u32, 2), path.path.length);
+        try std.testing.expectEqual(metadata.len, path.path.edges[1].metadata.len);
+        if (unfenced) {
+            // The root retries its count window; the same-depth batch fits
+            // the hub payload directly. Neither read mutates the old index or
+            // infers a shard-wide capability from physical row counts.
+            try std.testing.expectEqual(@as(usize, 3), state.page_calls);
+            try std.testing.expectEqual(@as(usize, 0), state.calls);
+            var read = try graph.outgoing_store.beginRead();
+            defer read.abort();
+            try std.testing.expectError(error.NotFound, read.get("\x00graph:read-generation:graph_idx"));
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), state.page_calls);
+            try std.testing.expectEqual(@as(usize, 2), state.calls);
+        }
+    }
+}
+
+test "distributed min-hop pages preserve small initial reads after an empty prefix" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const metadata = try a.alloc(u8, 400 * 1024);
+    defer a.free(metadata);
+    @memset(metadata, ' ');
+    @memcpy(metadata[0..12], "{\"padding\":\"");
+    @memcpy(metadata[metadata.len - 2 ..], "\"}");
+    try graph.addEdge("root", "hub", "FRIEND", 1, 0, 0, metadata);
+    var names: [128][16]u8 = undefined;
+    var writes: [128]graph_mod.BatchWrite = undefined;
+    for (&names, 0..) |*name, i| writes[i] = .{ .source = "hub", .target = try std.fmt.bufPrint(name, "n:{d:0>3}", .{i}), .edge_type = "FRIEND" };
+    try graph.batchApply(&writes, &.{});
+    const catalog = H.FakeCatalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    var state = H.State{ .graph = &graph, .empty_prefix_once = true, .small_initial_key = "hub" };
+    var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+    defer admission.deinit();
+    const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"root"} }, .target_nodes = .{ .keys = &.{writes[0].target} }, .params = .{ .max_depth = 8, .edge_types = &.{"FRIEND"} } } };
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = 10_000_000 });
+    var result = (try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null)).?;
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(u32, 2), result.path.length);
+    try std.testing.expectEqual(@as(usize, 3), state.page_calls);
+}
+
+test "distributed min-hop pages preserve constrained remote payload decoding" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const metadata = try a.alloc(u8, 50 * 1024);
+    defer a.free(metadata);
+    @memset(metadata, '\n');
+    metadata[0] = '{';
+    metadata[metadata.len - 1] = '}';
+    for ([_][]const u8{ "n0", "n1", "n2", "n3" }) |target| try graph.addEdge("root", target, "FRIEND", 1, 0, 0, metadata);
+    const catalog = H.FakeCatalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    var state = H.State{ .graph = &graph, .remote_wire = true, .only_source = "root" };
+    var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+    defer admission.deinit();
+    const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"root"} }, .target_nodes = .{ .keys = &.{"n0"} }, .params = .{ .max_depth = 8, .edge_types = &.{"FRIEND"} } } };
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 512 * 1024 });
+    var result = (try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null)).?;
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(u32, 1), result.path.length);
+    try std.testing.expectEqual(@as(usize, 2), state.page_calls);
+}
+
+test "distributed min-hop page ownership transfers cached prefixes under allocation failure" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+            {
+                var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = a, .budget = &budget }, .path_prefetch = true };
+                defer cache.deinit();
+                cache.enableReclamation();
+                const c = cache.tracked.allocator();
+                _ = try cache.addTable("docs");
+                try cache.tables.items[0].keys.appendSlice(c, &.{ "a", "b" });
+                var response = GraphEdgesResponse{ .edges = &.{}, .scanned_rows = 2 };
+                var response_owned = true;
+                defer if (response_owned) response.deinit(c);
+                response.edges = try c.alloc(graph_mod.Edge, 2);
+                for (response.edges) |*edge| edge.* = .{ .source = "", .target = "", .edge_type = "", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" };
+                for (response.edges) |*edge| edge.* = try cloneOwnedGraphEdge(c, .{ .source = "root", .target = "node", .edge_type = "FRIEND", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{}" });
+                response.key_offsets = try c.dupe(u32, &.{ 0, 1, 2 });
+                response.key_scanned_rows = try c.dupe(u32, &.{ 1, 1 });
+                try cache.appendShard(.{ .table = 0, .group = 11, .result = response });
+                response_owned = false;
+                var memory = graph_work_budget.RetainedAllocator{ .backing = a, .budget = &budget };
+                var prefix = (try cache.takePage("docs", 11, "a", &memory)).?;
+                defer {
+                    prefix.deinit(memory.allocator());
+                    std.debug.assert(memory.live_bytes == 0);
+                }
+                cache.yieldForRead(budget.max_retained_state_bytes);
+                try std.testing.expectEqualStrings("{}", prefix.edges[0].metadata);
+            }
+            try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "distributed min-hop pages preserve linear indexed lookup across many shards" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    const NoReads = struct {
+        fn expand(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: GraphExpandRequest, _: raft_mod.ReadConsistency) !GraphExpandResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn hydrate(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: GraphHydrateRequest, _: raft_mod.ReadConsistency) !GraphHydrateResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn page(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+    for ([_]usize{ 32, 128, 512 }) |group_count| {
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        {
+            var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = a, .budget = &budget }, .path_prefetch = true };
+            defer cache.deinit();
+            cache.enableReclamation();
+            const c = cache.tracked.allocator();
+            for ([_][]const u8{ "docs", "entities" }) |logical| {
+                const entry = try cache.addTable(logical);
+                try entry.keys.appendSlice(c, &.{ "a", "b" });
+            }
+            // Identical group IDs in different tables must remain independent.
+            // Empty adjacency is the worst case for repeated cache lookups:
+            // each page supplies EOF without spending physical-edge budget.
+            for (0..group_count) |group| for (0..2) |table_id| {
+                var response = GraphEdgesResponse{ .edges = &.{}, .scanned_rows = 0 };
+                errdefer response.deinit(c);
+                response.key_offsets = try c.dupe(u32, &.{ 0, 0, 0 });
+                response.key_scanned_rows = try c.dupe(u32, &.{ 0, 0 });
+                try cache.appendShard(.{ .table = table_id, .group = 11 + group, .result = response });
+            };
+            {
+                const entry = cache.table("docs").?;
+                const keys = try c.dupe([]const u8, &.{"a"});
+                errdefer c.free(keys);
+                const ids = try c.dupe(u32, &.{0});
+                errdefer c.free(ids);
+                try entry.incoming.put(c, 11, .{ .keys = keys, .ids = ids });
+                entry.incoming_resolved = true;
+                entry.incoming_complete = 1;
+            }
+            const catalog = H.FakeCatalog.multiIface();
+            var unused: u8 = 0;
+            const worker = Worker{ .ptr = &unused, .vtable = &.{ .execute_graph_expand = NoReads.expand, .execute_graph_hydrate = NoReads.hydrate, .execute_graph_get_edges_batch = NoReads.page } };
+            const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+            var admission = GraphNodeAdmissionContext.init(a, catalog, worker, "docs", "graph_idx", epoch, .{ .identity_read_generation = 12345 }, null, &.{}, .{}, .read_index);
+            defer admission.deinit();
+            var routes = PathEdgeRoutes{ .memory = .{ .backing = a, .budget = &budget } };
+            defer routes.deinit();
+            const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = "docs", .index_name = "graph_idx", .admission = &admission, .consistency = .read_index, .physical_work_budget = &budget, .prefetched = &cache };
+            for ([_]graph_mod.EdgeDirection{ .out, .in }) |direction| {
+                const before = cache.lookup_work.lookups;
+                var stream = try PathEdgeStream.init(a, reader, &routes, "docs", "a", .{ .direction = direction });
+                defer stream.deinit();
+                try std.testing.expectEqual(before, cache.lookup_work.lookups);
+                try std.testing.expectEqual(@as(usize, if (direction == .out) 2 else 1), stream.shards.items.len);
+            }
+            cache.lookup_work = .{};
+            var memory = graph_work_budget.RetainedAllocator{ .backing = a, .budget = &budget };
+            for ([_][]const u8{ "b", "a" }) |key| for ([_][]const u8{ "entities", "docs" }) |logical| {
+                for (0..group_count) |reverse| {
+                    const group = 11 + group_count - reverse - 1;
+                    try std.testing.expect(cache.hasPage(logical, group, key));
+                    var page = (try cache.takePage(logical, group, key, &memory)).?;
+                    defer page.deinit(memory.allocator());
+                    try std.testing.expectEqual(@as(usize, 0), page.edges.len);
+                    try std.testing.expect(!cache.hasPage(logical, group, key));
+                }
+            };
+            // Three lookups per (table, key, group), each inspecting exactly
+            // one indexed response. This counts work rather than wall time.
+            try std.testing.expectEqual(12 * group_count, cache.lookup_work.lookups);
+            try std.testing.expectEqual(12 * group_count, cache.lookup_work.shard_visits);
+            try std.testing.expectEqual(@as(usize, 0), memory.live_bytes);
+            try std.testing.expectEqual(budget.max_edges, budget.remaining_physical_edges);
+            cache.clear();
+            try std.testing.expect(cache.table("docs") == null);
+            try std.testing.expect(!cache.hasPage("docs", 11, "a"));
+            _ = try cache.addTable("docs");
+            try cache.appendShard(.{ .table = 0, .group = 11, .result = .{ .edges = &.{} } });
+            try std.testing.expectEqual(@as(?usize, 0), cache.firstShard("docs", 11));
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    }
+}
+
+test "distributed min-hop pages preserve cached empty-key scan proofs" {
+    const a = std.testing.allocator;
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    {
+        var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = a, .budget = &budget }, .path_prefetch = true };
+        defer cache.deinit();
+        const c = cache.tracked.allocator();
+        _ = try cache.addTable("docs");
+        try cache.tables.items[0].keys.appendSlice(c, &.{ "a", "b" });
+        const offsets = try c.dupe(u32, &.{ 0, 0, 0 });
+        const scans = try c.dupe(u32, &.{ 10, 20 });
+        try cache.appendShard(.{ .table = 0, .group = 11, .result = .{ .edges = &.{}, .scanned_rows = 30, .key_offsets = offsets, .key_scanned_rows = scans } });
+        var required = graph_work_budget.RetainedAllocator{ .backing = a, .budget = &budget };
+        var first = (try cache.takePage("docs", 11, "a", &required)).?;
+        defer first.deinit(required.allocator());
+        try std.testing.expect(cache.hasPage("docs", 11, "b"));
+        var second = (try cache.takePage("docs", 11, "b", &required)).?;
+        defer second.deinit(required.allocator());
+        try std.testing.expectEqual(@as(u32, 10), first.scanned_rows);
+        try std.testing.expectEqual(@as(u32, 20), second.scanned_rows);
+        try std.testing.expectEqual(@as(usize, 0), required.live_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+test "distributed min-hop pages preserve required reads after reclaiming peer prefetch" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const metadata = try a.alloc(u8, 5 * 1024 * 1024);
+    defer a.free(metadata);
+    @memset(metadata, ' ');
+    metadata[0] = '{';
+    metadata[metadata.len - 1] = '}';
+    try graph.addEdge("root", "target", "FRIEND", 1, 0, 0, metadata);
+    const catalog = H.FakeCatalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    var fixture = H.State{ .graph = &graph, .wire = false, .only_source = "root" };
+    const worker = H.FakeWorker.iface(&fixture);
+    var admission = GraphNodeAdmissionContext.init(a, catalog, worker, "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+    defer admission.deinit();
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    var parent = graph_reclamation.Quota.init(a, 40 * 1024 * 1024);
+    defer parent.deinit();
+    {
+        var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = parent.allocator(), .budget = &budget }, .path_prefetch = true };
+        defer cache.deinit();
+        cache.enableReclamation();
+        const c = cache.tracked.allocator();
+        _ = try cache.addTable("docs");
+        const edges = try c.alloc(graph_mod.Edge, 1);
+        const peer = try c.alloc(u8, 32 * 1024 * 1024);
+        @memset(peer, ' ');
+        peer[0] = '{';
+        peer[peer.len - 1] = '}';
+        edges[0] = .{ .source = "", .target = "", .edge_type = "", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = peer };
+        try cache.appendShard(.{ .table = 0, .group = 22, .result = .{ .edges = edges } });
+        var routes = PathEdgeRoutes{ .memory = .{ .backing = a, .budget = &budget } };
+        defer routes.deinit();
+        const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = "docs", .index_name = "graph_idx", .admission = &admission, .consistency = .read_index, .physical_work_budget = &budget, .prefetched = &cache };
+        var stream = try PathEdgeStream.init(parent.allocator(), reader, &routes, "docs", "root", .{ .edge_types = &.{"FRIEND"} });
+        defer stream.deinit();
+        var page = (try stream.nextPage(a)).?;
+        defer page.deinit(a);
+        try std.testing.expectEqual(metadata.len, page.edges[0].metadata.len);
+        try std.testing.expectEqual(@as(usize, 2), fixture.page_calls);
+        try std.testing.expectEqual(@as(usize, 1), cache.retired_pages);
+        cache.yieldForRead(budget.max_retained_state_bytes);
+        try std.testing.expectEqualStrings("target", page.edges[0].target);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    try std.testing.expectEqual(@as(usize, 40 * 1024 * 1024), parent.available());
+}
+
+test "distributed min-hop pages preserve selective incoming batches after eviction" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    const Catalog = struct {
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .range_id = 11, .start_key = "", .end_key = "m" },
+            .{ .group_id = 22, .table_id = 7, .range_id = 22, .start_key = "m", .end_key = "z" },
+            .{ .group_id = 44, .table_id = 7, .range_id = 44, .start_key = "z", .end_key = null },
+        };
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            var result = try H.FakeCatalog.adminSnapshot(@ptrFromInt(2));
+            result.ranges = @constCast(&ranges);
+            return result;
+        }
+        fn routing(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{ .tables = @constCast(&H.FakeCatalog.tables), .ranges = @constCast(&ranges) };
+        }
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = @ptrFromInt(1), .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = H.FakeCatalog.freeAdminSnapshot, .routing_snapshot = routing, .linearizable_routing_snapshot = routing, .free_routing_snapshot = H.FakeCatalog.freeRoutingSnapshot } };
+        }
+    };
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.addEdge("p", "a", "FRIEND", 1, 0, 0, "");
+    try graph.addEdge("q", "b", "FRIEND", 1, 0, 0, "");
+    var impl = std.Io.Threaded.init(a, .{});
+    defer impl.deinit();
+    const Fixture = struct {
+        graph: *graph_mod.GraphIndex,
+        io: std.Io,
+        calls: std.atomic.Value(u32) = .init(0),
+        resolutions: usize = 0,
+        partial: bool = false,
+        fn fanout(ptr: *anyopaque) ?std.Io {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).io;
+        }
+        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, request: IncomingSourceGroupsRequest, _: raft_mod.ReadConsistency) !IncomingSourceGroupsResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolutions += 1;
+            try std.testing.expectEqual(@as(usize, 3), request.keys.len);
+            const entries = try alloc.alloc(IncomingSourceGroupEntry, 3);
+            errdefer alloc.free(entries);
+            var initialized: usize = 0;
+            errdefer for (entries[0..initialized]) |entry| alloc.free(entry.source_group_ids);
+            for (entries, request.keys) |*entry, key| {
+                const groups: []const u64 = if (std.mem.eql(u8, key, "a")) &.{11} else if (std.mem.eql(u8, key, "b")) &.{22} else &.{};
+                entry.* = .{ .source_group_ids = try alloc.dupe(u64, groups), .complete = !self.partial or !std.mem.eql(u8, key, "b") };
+                initialized += 1;
+            }
+            return .{ .entries = entries };
+        }
+        fn page(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(group == 11 or group == 22);
+            try std.testing.expectEqual(@as(usize, 1), request.keys.len);
+            try std.testing.expectEqualStrings(if (group == 11) "a" else "b", request.keys[0]);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, self.graph, request, request.ttl_now_ns);
+        }
+    };
+    var fixture = Fixture{ .graph = &graph, .io = impl.io() };
+    const worker = Worker{ .ptr = &fixture, .vtable = &.{ .execute_graph_expand = H.FakeWorker.expand, .execute_graph_hydrate = H.FakeWorker.hydrate, .execute_graph_get_edges_batch = Fixture.page, .resolve_incoming_source_groups = Fixture.resolve, .fanout_io = Fixture.fanout } };
+    const catalog = Catalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    var admission = GraphNodeAdmissionContext.init(a, catalog, worker, "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+    defer admission.deinit();
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    {
+        var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = graph_memory_budget.reclaimingAllocator(a), .budget = &budget }, .path_prefetch = true };
+        defer cache.deinit();
+        cache.enableReclamation();
+        const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = "docs", .index_name = "graph_idx", .admission = &admission, .consistency = .read_index, .physical_work_budget = &budget, .prefetched = &cache };
+        const frontier = [_]FrontierState{ .{ .key = @constCast("a"), .depth = 1 }, .{ .key = @constCast("b"), .depth = 1 }, .{ .key = @constCast("c"), .depth = 1 } };
+        try cache.prepare(reader, &frontier, 8, .{ .direction = .in, .edge_types = &.{"FRIEND"} });
+        try std.testing.expectEqual(@as(u32, 2), fixture.calls.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
+        try std.testing.expectEqual(@as(?bool, false), cache.incomingRoute("docs", 44, "a"));
+        try std.testing.expectEqual(@as(?bool, false), cache.incomingRoute("docs", 11, "c"));
+        var required = graph_work_budget.RetainedAllocator{ .backing = a, .budget = &budget };
+        var prefix = (try cache.takePage("docs", 11, "a", &required)).?;
+        defer {
+            prefix.deinit(required.allocator());
+            std.debug.assert(required.live_bytes == 0);
+        }
+        cache.yieldForRead(budget.max_retained_state_bytes);
+        try std.testing.expectEqualStrings("p", prefix.edges[0].source);
+        try std.testing.expectEqual(@as(?bool, true), cache.incomingRoute("docs", 22, "b"));
+        var routes = PathEdgeRoutes{ .memory = .{ .backing = a, .budget = &budget } };
+        defer routes.deinit();
+        var stream = try PathEdgeStream.init(a, reader, &routes, "docs", "b", .{ .direction = .in, .edge_types = &.{"FRIEND"} });
+        defer stream.deinit();
+        var page = (try stream.nextPage(a)).?;
+        defer page.deinit(a);
+        try std.testing.expectEqualStrings("q", page.edges[0].source);
+        try std.testing.expectEqual(@as(u32, 3), fixture.calls.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
+    }
+    fixture.partial = true;
+    {
+        var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = a, .budget = &budget }, .path_prefetch = true };
+        defer cache.deinit();
+        const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = "docs", .index_name = "graph_idx", .admission = &admission, .consistency = .read_index, .physical_work_budget = &budget };
+        const frontier = [_]FrontierState{ .{ .key = @constCast("a"), .depth = 1 }, .{ .key = @constCast("b"), .depth = 1 }, .{ .key = @constCast("c"), .depth = 1 } };
+        try cache.prepare(reader, &frontier, 8, .{ .direction = .in, .edge_types = &.{"FRIEND"} });
+        try std.testing.expectEqual(@as(u32, 4), fixture.calls.load(.monotonic));
+        try std.testing.expectEqual(@as(?bool, null), cache.incomingRoute("docs", 22, "b"));
+        try std.testing.expectEqual(@as(?bool, false), cache.incomingRoute("docs", 11, "c"));
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+test "distributed min-hop pages preserve exact path and label container accounting" {
+    const a = std.testing.allocator;
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    {
+        var state = QueryState{ .name = try a.dupe(u8, "paths"), .work_budget = &budget };
+        defer state.deinit(a);
+        for (0..256) |_| _ = try appendRootPathState(a, &state, "node", null);
+        while (state.path_states.items.len < state.path_states.capacity) _ = try appendRootPathState(a, &state, "node", null);
+        var payloads: usize = 0;
+        for (state.path_states.items) |item| payloads += item.retained_lease.bytes;
+        try std.testing.expectEqual(state.path_memory.?.live_bytes + payloads, budget.retained_state_bytes);
+        var next = try initPathState(a, "next", null, 0, 0, 0, null, null, &budget);
+        defer next.deinit(a);
+        budget.max_retained_state_bytes = budget.retained_state_bytes;
+        try std.testing.expectError(error.GraphWorkBudgetExceeded, state.appendPath(a, &next));
+        try std.testing.expectEqual(try pathStateRetainedBytes("next", null, null), next.retained_lease.bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    budget.max_retained_state_bytes = graph_work_budget.default_max_retained_state_bytes;
+    {
+        var labels = PathCostLabels.init(1024, &budget);
+        defer labels.deinit(a);
+        var name: [32]u8 = undefined;
+        for (0..256) |i| try std.testing.expect(try labels.recordIfPareto(a, .{ .table = null, .key = try std.fmt.bufPrint(&name, "n:{d}", .{i}) }, 1, 1));
+        for (0..128) |i| try std.testing.expect(try labels.recordIfPareto(a, .{ .table = null, .key = "weighted" }, @intCast(512 - i), @floatFromInt(i)));
+        try std.testing.expectEqual(labels.memory.?.live_bytes, budget.retained_state_bytes);
+        budget.max_retained_state_bytes = budget.retained_state_bytes;
+        try std.testing.expectError(error.GraphWorkBudgetExceeded, labels.recordIfPareto(a, .{ .table = null, .key = "new" }, 1, 1));
+        try std.testing.expectEqual(labels.memory.?.live_bytes, budget.retained_state_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+test "distributed min-hop pages preserve bounded parallel frontier batches" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.addEdge("a", "c", "FRIEND", 1, 0, 0, "");
+    try graph.addEdge("b", "d", "FRIEND", 1, 0, 0, "");
+    var impl = std.Io.Threaded.init(a, .{});
+    defer impl.deinit();
+    const Fixture = struct {
+        graph: *graph_mod.GraphIndex,
+        io: std.Io,
+        calls: std.atomic.Value(u32) = .init(0),
+        ready: std.Io.Event = .unset,
+        keys: usize = 2,
+        fn fanout(ptr: *anyopaque) ?std.Io {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).io;
+        }
+        fn page(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.keys, request.keys.len);
+            if (self.calls.fetchAdd(1, .monotonic) == 1) self.ready.set(self.io);
+            try self.ready.waitTimeout(self.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, self.graph, request, request.ttl_now_ns);
+        }
+    };
+    var fixture = Fixture{ .graph = &graph, .io = impl.io() };
+    const worker = Worker{ .ptr = &fixture, .vtable = &.{ .execute_graph_expand = H.FakeWorker.expand, .execute_graph_hydrate = H.FakeWorker.hydrate, .execute_graph_get_edges_batch = Fixture.page, .fanout_io = Fixture.fanout } };
+    const catalog = H.FakeCatalog.multiIface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    var admission = GraphNodeAdmissionContext.init(a, catalog, worker, "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+    defer admission.deinit();
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    var caller = std.heap.ArenaAllocator.init(a);
+    defer caller.deinit();
+    for ([_]usize{ 2, 1 }) |key_count| {
+        fixture.keys = key_count;
+        fixture.calls.store(0, .monotonic);
+        fixture.ready = .unset;
+        var batch = CanonicalEdgeBatch{ .tracked = .{ .backing = graph_memory_budget.reclaimingAllocator(caller.allocator()), .budget = &budget }, .path_prefetch = true };
+        defer batch.deinit();
+        const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = "docs", .index_name = "graph_idx", .admission = &admission, .consistency = .read_index, .physical_work_budget = &budget };
+        const frontier = [_]FrontierState{ .{ .key = @constCast("a"), .depth = 1, .distance = 1, .cost = 1 }, .{ .key = @constCast("b"), .depth = 1, .distance = 1, .cost = 1 } };
+        try batch.prepare(reader, frontier[0..key_count], 8, .{ .edge_types = &.{"FRIEND"} });
+        try std.testing.expectEqual(@as(u32, 2), fixture.calls.load(.monotonic));
+        try std.testing.expect(batch.hasPage("docs", 11, "a"));
+        if (key_count == 2) try std.testing.expect(batch.hasPage("docs", 22, "b"));
+        try std.testing.expectEqual(@as(usize, if (key_count == 2) 4 else 6), budget.max_edges - budget.remaining_physical_edges);
+    }
+    // A key outside the batch protocol's byte window remains a scalar
+    // demand read. Empty prefetch tables must not dispatch or index key zero.
+    const large_key = try a.alloc(u8, 64 * 1024 + 1);
+    defer a.free(large_key);
+    @memset(large_key, 'x');
+    {
+        var batch = CanonicalEdgeBatch{ .tracked = .{ .backing = graph_memory_budget.reclaimingAllocator(a), .budget = &budget }, .path_prefetch = true };
+        defer batch.deinit();
+        const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = "docs", .index_name = "graph_idx", .admission = &admission, .consistency = .read_index, .physical_work_budget = &budget };
+        const frontier = [_]FrontierState{.{ .key = large_key, .depth = 1, .distance = 1, .cost = 1 }};
+        try batch.prepare(reader, &frontier, 8, .{});
+        try std.testing.expectEqual(@as(u32, 2), fixture.calls.load(.monotonic));
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+test "distributed min-hop pages preserve tiny retained budgets for local reads" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.addEdge("root", "target", "FRIEND", 1, 0, 0, "");
+    const catalog = H.FakeCatalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    var state = H.State{ .graph = &graph, .wire = false };
+    var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+    defer admission.deinit();
+    const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"root"} }, .target_nodes = .{ .keys = &.{"target"} }, .params = .{ .max_depth = 8, .edge_types = &.{"FRIEND"} } } };
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 64 * 1024 });
+    var result = (try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null)).?;
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(u32, 1), result.path.length);
+    try std.testing.expectEqual(@as(usize, 1), state.page_calls);
+}
+
+test "distributed min-hop pages preserve frontier capacity accounting and raised state limits" {
+    for ([_]bool{ true, false }) |fifo| {
+        const a = std.testing.allocator;
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var frontier = PathFrontier{ .fifo = fifo, .memory = .{ .backing = a, .budget = &budget } };
+        defer frontier.deinit(a);
+        for (0..256) |_| {
+            var item = try initFrontierState(a, "node", null, 0, 0, 0, null, &budget);
+            errdefer item.deinit(a);
+            try frontier.push(&item);
+        }
+        while (frontier.pop()) |value| {
+            var item = value;
+            item.deinit(a);
+        }
+        try std.testing.expect(frontier.memory.live_bytes > 0);
+        try std.testing.expectEqual(frontier.memory.live_bytes, budget.retained_state_bytes);
+    }
+    const a = std.heap.smp_allocator;
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_intermediate_states = 100_001 });
+    var frontier = PathFrontier{ .fifo = true, .memory = .{ .backing = a, .budget = &budget } };
+    defer frontier.deinit(a);
+    for (0..100_001) |_| {
+        var item = try initFrontierState(a, "n", null, 0, 0, 0, null, &budget);
+        errdefer item.deinit(a);
+        try frontier.push(&item);
+    }
+    var excess = try initFrontierState(a, "n", null, 0, 0, 0, null, &budget);
+    defer excess.deinit(a);
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, frontier.push(&excess));
+    try std.testing.expectEqual(@as(usize, 100_001), frontier.count());
+}
+
+test "distributed min-hop page ownership preserves native failed read observations" {
+    const a = std.testing.allocator;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .lsm_memory });
+    defer graph.close();
+    try graph.addEdge("root", "a", "FRIEND", 1, 0, 0, "{}");
+    try graph.addEdge("root", "b", "FRIEND", 1, 0, 0, "{}");
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, index: *graph_mod.GraphIndex, failed_after_scan: *bool) !void {
+            var observed: ?usize = null;
+            var response = @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, index, .{ .index_name = @constCast("graph_idx"), .key = @constCast("root"), .keys = @constCast(&[_][]const u8{"root"}), .direction = .out, .allow_partial_keys = true, .physical_scan_observation = &observed }, 1) catch |err| {
+                try std.testing.expect(observed != null);
+                if (observed.? > 0) failed_after_scan.* = true;
+                return err;
+            };
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(@as(?usize, response.scanned_rows), observed);
+            try std.testing.expectEqual(@as(u32, 2), response.scanned_rows);
+        }
+    };
+    var failed_after_scan = false;
+    try std.testing.checkAllAllocationFailures(a, Runner.run, .{ &graph, &failed_after_scan });
+    try std.testing.expect(failed_after_scan);
+}
+
+test "distributed min-hop pages preserve failed prefetch scan observations" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .lsm_memory });
+    defer graph.close();
+    try graph.addEdge("a", "c", "FRIEND", 1, 0, 0, "");
+    try graph.addEdge("b", "d", "FRIEND", 1, 0, 0, "");
+    var impl = std.Io.Threaded.init(a, .{});
+    defer impl.deinit();
+    const Fixture = struct {
+        graph: *graph_mod.GraphIndex,
+        io: ?std.Io,
+        scanned: ?usize,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn fanout(ptr: *anyopaque) ?std.Io {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).io;
+        }
+        fn page(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.keys.len > 1) {
+                _ = self.calls.fetchAdd(1, .monotonic);
+                request.physical_scan_observation.?.* = self.scanned;
+                // Exceed the private/shared retained allowance before reading
+                // any rows (or after the explicitly reported attempted work).
+                const impossible = try alloc.alloc(u8, 128 * 1024 * 1024);
+                alloc.free(impossible);
+                return error.UnexpectedTestCall;
+            }
+            return @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(alloc, self.graph, request, request.ttl_now_ns);
+        }
+    };
+    for ([_]bool{ false, true }) |parallel| for ([_]?usize{ 0, 3, null }) |scanned| {
+        var fixture = Fixture{ .graph = &graph, .io = if (parallel) impl.io() else null, .scanned = scanned };
+        const worker = Worker{ .ptr = &fixture, .vtable = &.{ .execute_graph_expand = H.FakeWorker.expand, .execute_graph_hydrate = H.FakeWorker.hydrate, .execute_graph_get_edges_batch = Fixture.page, .fanout_io = Fixture.fanout } };
+        const catalog = H.FakeCatalog.multiIface();
+        const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+        var admission = GraphNodeAdmissionContext.init(a, catalog, worker, "docs", "graph_idx", epoch, .{ .identity_read_generation = 12345 }, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = 16384 });
+        {
+            var batch = CanonicalEdgeBatch{ .tracked = .{ .backing = a, .budget = &budget }, .path_prefetch = true };
+            defer batch.deinit();
+            batch.enableReclamation();
+            const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = "docs", .index_name = "graph_idx", .admission = &admission, .consistency = .read_index, .physical_work_budget = &budget, .prefetched = &batch };
+            const frontier = [_]FrontierState{ .{ .key = @constCast("a") }, .{ .key = @constCast("b") } };
+            const prepared = batch.prepare(reader, &frontier, 2, .{ .edge_types = &.{"FRIEND"} });
+            if (scanned == null) {
+                try std.testing.expectError(error.GraphWorkBudgetExceeded, prepared);
+                try std.testing.expect(batch.unobserved_prefetch_failure);
+            } else {
+                try prepared;
+                const failed_work = scanned.? * (if (parallel) @as(usize, 2) else 1);
+                try std.testing.expectEqual(failed_work, budget.max_edges - budget.remaining_physical_edges);
+                try std.testing.expect(budget.exhaustion() == null);
+                var routes = PathEdgeRoutes{ .memory = .{ .backing = a, .budget = &budget } };
+                defer routes.deinit();
+                for ([_][]const u8{ "a", "b" }) |key| {
+                    var stream = try PathEdgeStream.init(a, reader, &routes, "docs", key, .{ .edge_types = &.{"FRIEND"} });
+                    defer stream.deinit();
+                    var page = (try stream.nextPage(a)).?;
+                    defer page.deinit(a);
+                    try std.testing.expectEqual(@as(usize, 1), page.edges.len);
+                    try std.testing.expect(try stream.nextPage(a) == null);
+                }
+                try std.testing.expectEqual(failed_work + 4, budget.max_edges - budget.remaining_physical_edges);
+            }
+            try std.testing.expectEqual(@as(usize, if (parallel) 2 else 1), fixture.calls.load(.monotonic));
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    };
+}
+
+test "distributed min-hop pages preserve charged continuation overflow probes" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    const Fixture = struct {
+        calls: usize = 0,
+        overrun: u32,
+        fn page(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const first = self.calls == 1;
+            if (!first) {
+                try std.testing.expect(request.resume_cursor != null);
+                try std.testing.expectEqual(@as(u32, graph_pattern_mod.default_max_explored_edges), request.max_scanned_rows);
+            }
+            var response = GraphEdgesResponse{ .edges = &.{}, .scanned_rows = if (first) 1 else request.max_scanned_rows + self.overrun };
+            errdefer response.deinit(alloc);
+            const edge = try cloneOwnedGraphEdge(alloc, .{ .source = "root", .target = if (first) "a" else "b", .edge_type = "FRIEND", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
+            var edge_owned = true;
+            defer if (edge_owned) graph_mod.GraphIndex.freeEdge(alloc, edge);
+            const edges = try alloc.alloc(graph_mod.Edge, 1);
+            edges[0] = edge;
+            edge_owned = false;
+            if (first) {
+                response.partial_edges = edges;
+                response.partial_key = 0;
+                response.key_offsets = try alloc.dupe(u32, &.{0});
+                response.resume_cursor = try (graph_mod.EdgeScanCursor{ .direction = .out, .type_index = 0, .edge_type = @constCast("FRIEND"), .adjacent_key = @constCast("a") }).clone(alloc);
+            } else {
+                response.edges = edges;
+                response.key_offsets = try alloc.dupe(u32, &.{ 0, 1 });
+                response.key_scanned_rows = try alloc.dupe(u32, &.{response.scanned_rows});
+            }
+            return response;
+        }
+    };
+    for ([_]u32{ 1, 2, 1 }, 0..) |overrun, scenario| {
+        var fixture = Fixture{ .overrun = overrun };
+        const worker = Worker{ .ptr = &fixture, .vtable = &.{ .execute_graph_expand = H.FakeWorker.expand, .execute_graph_hydrate = H.FakeWorker.hydrate, .execute_graph_get_edges_batch = Fixture.page } };
+        const catalog = H.FakeCatalog.iface();
+        const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+        var admission = GraphNodeAdmissionContext.init(a, catalog, worker, "docs", "graph_idx", epoch, .{ .identity_read_generation = 12345 }, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = if (scenario == 2) graph_pattern_mod.default_max_explored_edges + 1 else 10_000_000 });
+        {
+            var routes = PathEdgeRoutes{ .memory = .{ .backing = a, .budget = &budget } };
+            defer routes.deinit();
+            const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = "docs", .index_name = "graph_idx", .admission = &admission, .consistency = .read_index, .physical_work_budget = &budget };
+            var stream = try PathEdgeStream.init(a, reader, &routes, "docs", "root", .{ .edge_types = &.{"FRIEND"} });
+            defer stream.deinit();
+            var first = (try stream.nextPage(a)).?;
+            defer first.deinit(a);
+            try std.testing.expectEqualStrings("a", first.edges[0].target);
+            if (overrun == 2) {
+                try std.testing.expectError(error.InvalidGraphEdgesResponse, stream.nextPage(a));
+            } else if (scenario == 2) {
+                try std.testing.expectError(error.GraphWorkBudgetExceeded, stream.nextPage(a));
+                try std.testing.expectEqual(graph_work_budget.Dimension.explored_edges, budget.exhaustion().?.dimension);
+            } else {
+                var next = (try stream.nextPage(a)).?;
+                defer next.deinit(a);
+                try std.testing.expectEqualStrings("b", next.edges[0].target);
+                try std.testing.expect(try stream.nextPage(a) == null);
+            }
+            try std.testing.expectEqual(@as(usize, if (scenario == 2) 1 else 1 + graph_pattern_mod.default_max_explored_edges + overrun), budget.max_edges - budget.remaining_physical_edges);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    }
+}
+
+test "distributed min-hop pages preserve serial prefetch cursors under an exact scan budget" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .lsm_memory });
+    defer graph.close();
+    try graph.addEdge("root", "a-hub", "FRIEND", 1, 0, 0, "");
+    try graph.addEdge("root", "b-peer", "FRIEND", 1, 0, 0, "");
+    try graph.addEdge("b-peer", "terminal", "FRIEND", 1, 0, 0, "");
+    var names: [2048][16]u8 = undefined;
+    var writes: [2048]graph_mod.BatchWrite = undefined;
+    for (&names, 0..) |*name, i| writes[i] = .{ .source = "a-hub", .target = try std.fmt.bufPrint(name, "n:{d:0>4}", .{i}), .edge_type = "FRIEND" };
+    for (0..8) |chunk| try graph.batchApply(writes[chunk * 256 ..][0..256], &.{});
+    const catalog = H.FakeCatalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    // Exercise both local ownership and wire decoding. With one shard and no
+    // fanout IO, the two-node frontier necessarily uses serial prefetch. Its
+    // scan allowance is smaller than the hub, so success requires resuming
+    // that prefix rather than discarding it and restarting the adjacency.
+    for ([_]bool{ false, true }) |wire| {
+        var state = H.State{ .graph = &graph, .wire = wire };
+        var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"root"} }, .target_nodes = .{ .keys = &.{"missing"} }, .params = .{ .max_depth = 2, .edge_types = &.{"FRIEND"} } } };
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = writes.len + 3 });
+        var result = try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null);
+        defer if (result) |*path| path.deinit(a);
+        try std.testing.expect(result == null);
+        try std.testing.expect(state.largest_batch == 2);
+        try std.testing.expect(state.continuations > 0);
+        try std.testing.expectEqual(@as(usize, 0), budget.remaining_physical_edges);
+        try std.testing.expectEqual(@as(usize, 0), budget.remaining_edges);
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    }
+}
+
+test "distributed min-hop pages preserve adaptive hub paging and early targets" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .lsm_memory });
+    defer graph.close();
+    var names: [2048][16]u8 = undefined;
+    var writes: [2048]graph_mod.BatchWrite = undefined;
+    for (&names, 0..) |*name, i| writes[i] = .{ .source = "hub", .target = try std.fmt.bufPrint(name, "n:{d:0>4}", .{i}), .edge_type = "FRIEND" };
+    for (0..8) |chunk| try graph.batchApply(writes[chunk * 256 ..][0..256], &.{});
+    const catalog = H.FakeCatalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    for ([_][]const u8{ writes[0].target, writes[2047].target, "missing" }, 0..) |target, scenario| {
+        var state = H.State{ .graph = &graph, .only_source = "hub" };
+        var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"hub"} }, .target_nodes = .{ .keys = &.{target} }, .params = .{ .max_depth = 1, .edge_types = &.{"FRIEND"} } } };
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var result = try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null);
+        defer if (result) |*path| path.deinit(a);
+        try std.testing.expectEqual(scenario != 2, result != null);
+        if (scenario == 0) {
+            try std.testing.expectEqual(@as(usize, 1), state.page_calls);
+            try std.testing.expectEqual(@as(usize, 64), state.largest_page);
+        } else {
+            try std.testing.expect(state.page_calls <= 5);
+            try std.testing.expect(state.largest_page > 64);
+            try std.testing.expectEqual(@as(usize, 2048), budget.max_edges - budget.remaining_physical_edges);
+        }
+    }
+}
+
+test "distributed min-hop pages preserve incoming route learning across queries" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.addEdge("a", "b", "FRIEND", 1, 0, 0, "");
+    const catalog = H.FakeCatalog.multiIface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    var state = H.State{ .graph = &graph, .cold_routes = true, .incoming_groups = &.{ 11, 22 } };
+    for (0..2) |_| {
+        var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"b"} }, .target_nodes = .{ .keys = &.{"a"} }, .params = .{ .direction = .in, .max_depth = 8, .edge_types = &.{"FRIEND"} } } };
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var result = (try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null)).?;
+        defer result.deinit(a);
+        try std.testing.expectEqual(@as(u32, 1), result.path.length);
+    }
+    try std.testing.expectEqual(@as(usize, 2), state.probes);
+    try std.testing.expectEqual(@as(usize, 1), state.route_records);
+    try std.testing.expectEqual(@as(usize, 3), state.page_calls);
+}
+
+test "distributed min-hop page ownership is allocation failure safe" {
+    const a = std.testing.allocator;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.addEdge("a", "b", "FRIEND", 1, 0, 0, "{\"target_table\":\"entities\"}");
+    try graph.addEdge("a", "c", "FRIEND", 1, 0, 0, "{\"target_table\":\"entities\"}");
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator, fixture: *graph_mod.GraphIndex, scalar: bool) !void {
+            const H = ShortestPathTestHarness;
+            const catalog = H.FakeCatalog.iface();
+            var state = H.State{ .graph = fixture, .reject_pages = scalar };
+            defer {
+                var it = state.expanded.keyIterator();
+                while (it.next()) |key| state.alloc.free(key.*);
+                state.expanded.deinit(state.alloc);
+            }
+            const epoch = try table_catalog.topologyEpoch(allocator, catalog, "docs");
+            const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+            var admission = GraphNodeAdmissionContext.init(allocator, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+            defer admission.deinit();
+            const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"a"} }, .target_nodes = .{ .keys = &.{"missing"} }, .params = .{ .max_depth = 8 } } };
+            var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+            var result = try findDistributedShortestPath(allocator, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = allocator, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null);
+            defer if (result) |*path| path.deinit(allocator);
+        }
+    };
+    for ([_]bool{ false, true }) |scalar| try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{ &graph, scalar });
+}
+
+test "shortest path production reader scans 122K edges within default budgets" {
+    // Allocation-failure and leak coverage lives in the focused ownership test.
+    // Production allocation keeps native fixture compaction practical at scale.
+    const a = std.heap.smp_allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .lsm_memory });
+    defer graph.close();
+    const keys = try a.alloc([]const u8, 10_000);
+    var initialized: usize = 0;
+    defer {
+        for (keys[0..initialized]) |key| a.free(key);
+        a.free(keys);
+    }
+    for (keys, 0..) |*key, i| {
+        key.* = try std.fmt.allocPrint(a, "User:{d}:", .{i});
+        initialized += 1;
+    }
+    var writes: [256]graph_mod.BatchWrite = undefined;
+    var used: usize = 0;
+    var count: usize = 0;
+    for (keys, 0..) |key, id| {
+        const degree: usize = if (id < 1716) 13 else 12;
+        for (0..degree) |offset| {
+            writes[used] = .{ .source = key, .target = keys[(id * 73 + (offset + 1) * 7919) % keys.len], .edge_type = "FRIEND", .weight = 1 };
+            used += 1;
+            count += 1;
+            if (used == writes.len) {
+                try graph.batchApply(&writes, &.{});
+                used = 0;
+            }
+        }
+    }
+    if (used > 0) try graph.batchApply(writes[0..used], &.{});
+    try std.testing.expectEqual(@as(usize, 121_716), count);
+    const catalog = H.FakeCatalog.iface();
+    var state = H.State{ .graph = &graph, .wire = false };
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+    defer admission.deinit();
+    const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{keys[2504]} }, .target_nodes = .{ .keys = &.{"missing"} }, .params = .{ .max_depth = 8, .edge_types = &.{"FRIEND"} } } };
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    var result = try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null);
+    defer if (result) |*path| path.deinit(a);
+    try std.testing.expect(result == null);
+    try std.testing.expectEqual(count, budget.max_edges - budget.remaining_edges);
+    try std.testing.expectEqual(count, budget.max_edges - budget.remaining_physical_edges);
+    try std.testing.expectEqual(keys.len, budget.max_nodes - budget.remaining_nodes);
+    std.debug.print("shortest-path scale: nodes={d} edges={d} page_calls={d} max_batch={d}\n", .{ keys.len, count, state.page_calls, state.largest_batch });
+    try std.testing.expect(state.page_calls < keys.len / 4);
+    try std.testing.expect(state.largest_batch > 1 and state.largest_batch <= 64);
+    try std.testing.expectEqual(@as(usize, 0), state.calls);
+    // Repeated named searches share one operator budget. Cross the former
+    // one-million default without building another large storage fixture.
+    var raised = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = 10_000_000, .max_explored_edge_bytes = 10 * graph_work_budget.default_max_explored_edge_bytes });
+    for (0..10) |_| {
+        var found = try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &raised, null, null, null);
+        defer if (found) |*path| path.deinit(a);
+        try std.testing.expect(found == null);
+    }
+    try std.testing.expectEqual(count * 10, raised.max_edges - raised.remaining_physical_edges);
+    try std.testing.expectEqual(count * 10, raised.max_edges - raised.remaining_edges);
+    try std.testing.expectEqual(@as(usize, 0), raised.remaining_nodes);
 }

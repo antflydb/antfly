@@ -183,6 +183,9 @@ pub fn checkCancelled(req: SearchRequest) !void {
 }
 
 pub const SearchProfile = struct {
+    /// Deterministic float16 screening performed by complete-snapshot search.
+    exact_projection_vectors_scored: u64 = 0,
+    exact_vectors_pruned_by_bound: u64 = 0,
     total_ns: u64 = 0,
     setup_ns: u64 = 0,
     runtime_txn_ns: u64 = 0,

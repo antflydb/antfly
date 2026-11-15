@@ -224,6 +224,16 @@ fn assessWithRuntimeFacts(
         );
     }
 
+    // GLiDE decision checkpoints run one bidirectional readout forward over
+    // their ModernBERT or Qwen3.5 backbone; they are never served generatively.
+    if (man.glide_declared) {
+        if (man.glide_unsupported)
+            return makeIncompatible(architecture, .unsafe_runtime, "unsupported GLiDE variant (looped, NVFP4, unknown prompt format, or mismatched backbone)");
+        if ((man.safetensors_path != null or man.safetensors_index_path != null) and !man.usesGgufWeights())
+            return makeCompatible(architecture, "GLiDE decision readout runtime");
+        return makeIncompatible(architecture, .incomplete_bundle, "GLiDE checkpoints are served from bf16 safetensors only");
+    }
+
     // The LightOn profile selects the integrated resident vision tower and
     // hybrid decoder. Keep generic Qwen3.5 and unsupported GGUF routes gated.
     if (man.isLightOnOcr3() and (man.safetensors_path != null or man.safetensors_index_path != null) and !man.usesGgufWeights())

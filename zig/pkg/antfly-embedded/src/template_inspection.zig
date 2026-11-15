@@ -55,6 +55,105 @@ pub fn mediaHelper(ctx: HelperContext) anyerror!Value {
     return .{ .safe_string = result };
 }
 
+/// Strip HTML tags and return plain text.
+pub fn scrubHtmlHelper(ctx: HelperContext) anyerror!Value {
+    if (ctx.params.len == 0) return .{ .string = "" };
+    const html = switch (ctx.params[0]) {
+        .string => |s| s,
+        else => return .{ .string = "" },
+    };
+
+    var result = std.ArrayListUnmanaged(u8).empty;
+    var in_tag = false;
+    var in_script = false;
+    var idx: usize = 0;
+    while (idx < html.len) {
+        if (html[idx] == '<') {
+            if (!in_script) {
+                // Check for script/style open tags
+                if (idx + 7 <= html.len and std.ascii.eqlIgnoreCase(html[idx..][0..7], "<script")) {
+                    in_script = true;
+                } else if (idx + 6 <= html.len and std.ascii.eqlIgnoreCase(html[idx..][0..6], "<style")) {
+                    in_script = true;
+                }
+            }
+            // Check for close tags
+            if (in_script) {
+                if (idx + 9 <= html.len and std.ascii.eqlIgnoreCase(html[idx..][0..9], "</script>")) {
+                    in_script = false;
+                    idx += 9;
+                    continue;
+                }
+                if (idx + 8 <= html.len and std.ascii.eqlIgnoreCase(html[idx..][0..8], "</style>")) {
+                    in_script = false;
+                    idx += 8;
+                    continue;
+                }
+            }
+            in_tag = true;
+            idx += 1;
+            continue;
+        }
+        if (html[idx] == '>') {
+            in_tag = false;
+            idx += 1;
+            continue;
+        }
+        if (!in_tag and !in_script) {
+            try result.append(ctx.arena, html[idx]);
+        }
+        idx += 1;
+    }
+
+    const trimmed = std.mem.trim(u8, result.items, &std.ascii.whitespace);
+    return .{ .string = try ctx.arena.dupe(u8, trimmed) };
+}
+
+fn templateNumber(value: Value) ?std.json.Value {
+    return switch (value) {
+        .integer => |n| .{ .integer = n },
+        .float => |n| .{ .float = n },
+        .number_string => |raw| .{ .number_string = raw },
+        else => null,
+    };
+}
+
+/// Equality comparison: {{#if (eq a b)}}
+pub fn eqHelper(ctx: HelperContext) anyerror!Value {
+    if (ctx.params.len < 2) return .{ .boolean = false };
+    const a = ctx.params[0];
+    const b = ctx.params[1];
+
+    if (templateNumber(a)) |left| {
+        const right = templateNumber(b) orelse return .{ .boolean = false };
+        return .{ .boolean = try @import("antfly_jsonschema").compareNumbers(ctx.arena, left, right) == .eq };
+    }
+    const equal = switch (a) {
+        .string => |s| switch (b) {
+            .string => |s2| std.mem.eql(u8, s, s2),
+            else => false,
+        },
+        .boolean => |bl| switch (b) {
+            .boolean => |bl2| bl == bl2,
+            else => false,
+        },
+        .null => switch (b) {
+            .null => true,
+            else => false,
+        },
+        else => false,
+    };
+
+    return .{ .boolean = equal };
+}
+
+/// Shared deterministic helpers for execution and dependency inspection.
+pub fn addPureHelpers(arena: Allocator, helpers: *hbs.HelperMap) !void {
+    try helpers.put(arena, "scrubHtml", hbs.Helper.from(&scrubHtmlHelper));
+    try helpers.put(arena, "eq", hbs.Helper.from(&eqHelper));
+    try helpers.put(arena, "media", hbs.Helper.from(&mediaHelper));
+}
+
 pub fn stripErrorDirectives(alloc: Allocator, text: []const u8) ![]const u8 {
     var result = std.ArrayListUnmanaged(u8).empty;
     const prefix_with_status = "<<<error:status=";
@@ -246,10 +345,15 @@ pub fn canReplayLocally(alloc: Allocator, source: []const u8, document: []const 
     defer arena.deinit();
     var used = false;
     var helpers: hbs.HelperMap = .{};
+    try addPureHelpers(arena.allocator(), &helpers);
     for ([_][]const u8{ "remoteMedia", "remotePDF", "remoteText", "transcribeAudio" }) |name|
         try helpers.put(arena.allocator(), name, hbs.Helper.withData(&Probe.remote, @ptrCast(&used)));
-    const rendered = try @import("template.zig").renderDocumentWithHelpers(alloc, source, document, &helpers);
-    defer alloc.free(rendered);
+    // Inspect exactly the executed branches with deterministic helpers, without
+    // importing transport, credentials or process-global transcription state.
+    const parsed = try @import("antfly-json").parseValueLossless(arena.allocator(), document);
+    const context = try jsonToValue(arena.allocator(), parsed.value);
+    const partials: std.StringArrayHashMapUnmanaged([]const u8) = .{};
+    _ = try hbs.render(arena.allocator(), source, context, &helpers, &partials);
     return !used;
 }
 
@@ -259,4 +363,14 @@ test "leann local replay inspects executed helpers without remote work" {
     try std.testing.expect(try canReplayLocally(a, "{{#if image}}{{remoteMedia url=image}}{{else}}{{body}}{{/if}}", "{\"body\":\"alpha\"}"));
     for ([_][]const u8{ "{{transcribeAudio url=image}}", "remote literal {{transcribeAudio url=image}}", "{{remoteMedia url=image mode=extract}}", "{{remotePDF url=image}}", "{{remoteText url=image}}", "{{#if (remoteText url=image)}}yes{{/if}}" }) |source|
         try std.testing.expect(!try canReplayLocally(a, source, "{\"image\":\"https://example.invalid/file.pdf\"}"));
+}
+
+test "local replay inspection shares exact numeric and HTML helper branches" {
+    const a = std.testing.allocator;
+    const numeric = "{{#if (eq count 9007199254740993)}}{{body}}{{else}}{{remoteText url=url}}{{/if}}";
+    try std.testing.expect(try canReplayLocally(a, numeric, "{\"count\":9007199254740993,\"body\":\"local\"}"));
+    try std.testing.expect(!try canReplayLocally(a, numeric, "{\"count\":9007199254740992,\"url\":\"https://example.invalid\"}"));
+    const html = "{{#if (eq (scrubHtml html) \"clean\")}}{{body}}{{else}}{{transcribeAudio url=url}}{{/if}}";
+    try std.testing.expect(try canReplayLocally(a, html, "{\"html\":\"<b>clean</b>\",\"body\":\"local\"}"));
+    try std.testing.expect(!try canReplayLocally(a, html, "{\"html\":\"<b>different</b>\",\"url\":\"https://example.invalid\"}"));
 }

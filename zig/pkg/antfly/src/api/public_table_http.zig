@@ -110,6 +110,7 @@ pub const TableApi = struct {
         InvalidBatchRequest,
         Forbidden,
         UnsupportedSyncLevel,
+        UnsupportedCommitRequirement,
         GraphMetricFeatureNotEnabled,
         GraphMetricMaterializationRejected,
         NotFound,
@@ -121,6 +122,7 @@ pub const TableApi = struct {
         ForeignKeyReferenced,
         MethodNotAllowed,
         Backpressured,
+        StorageDescriptorPressure,
         DenseRepairBackpressure,
         Unavailable,
         WriteUnavailable,
@@ -1778,6 +1780,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         error.RelationalIndexKeyTooLarge => return .{ .status = 413, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"RelationalIndexKeyTooLarge\",\"message\":\"encoded relational index keys, including the document ID, must not exceed 1048576 bytes\"}") },
         error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "write permission required for every table affected by this mutation") },
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
+        error.UnsupportedCommitRequirement => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported commit_requires on this mutation surface") },
         error.UnsupportedSyncLevel => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported sync_level") },
         error.GraphMetricFeatureNotEnabled => return .{
             .status = 422,
@@ -1803,6 +1806,12 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
             .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err) }, .{}),
         },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.StorageDescriptorPressure => return .{
+            .status = 503,
+            .json = true,
+            .body = try alloc.dupe(u8, "{\"error\":\"storage_descriptor_pressure\",\"message\":\"Storage file descriptors are exhausted. Reduce concurrent storage work and check RLIMIT_NOFILE and system file limits; see the production open-file limit guidance.\"}"),
+            .retry_after_seconds = 1,
+        },
         error.Backpressured => return .{
             .status = 429,
             .body = try alloc.dupe(u8, "{\"code\":\"table_backpressured\",\"message\":\"write capacity is temporarily exhausted\",\"retryable\":true,\"retry_after_ms\":1000}"),
@@ -3789,6 +3798,48 @@ test "public table batch handler returns concise dense repair backpressure" {
     try std.testing.expect(parsed.value.message.len != 0);
     try std.testing.expect(parsed.value.retryable);
     try std.testing.expectEqual(@as(u32, 1000), parsed.value.retry_after_ms);
+}
+
+test "public table batch handler returns actionable descriptor pressure" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteBatchError!void {
+            return error.StorageDescriptorPressure;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expect(resp.json);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "storage_descriptor_pressure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "RLIMIT_NOFILE") != null);
+    try std.testing.expectEqual(@as(?u32, 1), resp.retry_after_seconds);
 }
 
 test "public table batch handler maps unavailable errors" {

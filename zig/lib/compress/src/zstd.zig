@@ -21,11 +21,22 @@ pub fn decode(a: A, data: []const u8, limit: usize) ![]u8 {
     return decodeOptions(a, data, limit, .{});
 }
 pub fn decodeOptions(a: A, data: []const u8, limit: usize, options: Options) ![]u8 {
+    return decodeInternal(a, data, limit, options, null);
+}
+
+/// Decode into caller-owned output without a second decoded-page allocation.
+/// Frame windows remain bounded independently of the exact output size.
+pub fn decodeExact(a: A, data: []const u8, output: []u8, options: Options) !void {
+    _ = try decodeInternal(a, data, output.len, options, output);
+}
+
+fn decodeInternal(a: A, data: []const u8, limit: usize, options: Options, output: ?[]u8) ![]u8 {
     const Native = @import("zstd_native.zig");
     const dictionary = if (options.dictionary.len > 0) try Native.Dictionary.init(a, options.dictionary) else null;
     defer if (dictionary) |value| value.deinit(a);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
+    var written: usize = 0;
     var pos: usize = 0;
     while (pos < data.len) {
         const start = pos;
@@ -89,10 +100,24 @@ pub fn decodeOptions(a: A, data: []const u8, limit: usize, options: Options) ![]
         const buffer = try a.alloc(u8, @as(usize, window_len) + std.compress.zstd.block_size_max);
         defer a.free(buffer);
         var d = Native.init(&reader, buffer, .{ .window_len = window_len, .dictionary = dictionary, .verify_checksum = true });
+        if (output) |dest| {
+            const n = d.reader.readSliceShort(dest[written..]) catch |err| return d.err orelse err;
+            // Consume the frame terminator/checksum even when output filled
+            // exactly, and reject output beyond the caller's exact budget.
+            if (d.reader.takeByte()) |_| return error.StreamTooLong else |err| {
+                if (err != error.EndOfStream) return d.err orelse err;
+            }
+            written += n;
+            continue;
+        }
         const part = d.reader.allocRemaining(a, .limited(limit - out.items.len)) catch |err| return d.err orelse err;
         defer a.free(part);
         if (checksum) |expected| if (expected != @as(u32, @truncate(std.hash.XxHash64.hash(0, part)))) return error.ChecksumFailure;
         try out.appendSlice(a, part);
+    }
+    if (output) |dest| {
+        if (written != dest.len) return error.EndOfStream;
+        return dest;
     }
     return out.toOwnedSlice(a);
 }
@@ -122,6 +147,10 @@ test "Zstandard prefix decoding matches standard decoding across literal streams
         const expected = try reference.reader.allocRemaining(a, .limited(case.len + 1));
         defer a.free(expected);
         try std.testing.expectEqualSlices(u8, expected, actual);
+        const exact = try a.alloc(u8, case.len);
+        defer a.free(exact);
+        try decodeExact(a, case.frame, exact, .{});
+        try std.testing.expectEqualSlices(u8, expected, exact);
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(actual, &digest, .{});
         try std.testing.expectEqualStrings(case.sha256, &std.fmt.bytesToHex(digest, .lower));
@@ -134,4 +163,40 @@ test "Zstandard prefix decoding matches standard decoding across literal streams
             } else |_| {}
         }
     }
+}
+
+test "exact Zstandard pages use frame-sized scratch and enforce output bounds" {
+    // Single-segment raw frame, three decoded bytes. A query-sized allocator
+    // must not need the decoder's default eight-megabyte history window.
+    const frame = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 3, 0x19, 0, 0, 'a', 'b', 'c' };
+    var scratch: [256 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+    var output: [3]u8 = undefined;
+    try decodeExact(bounded.allocator(), &frame, &output, .{});
+    try std.testing.expectEqualStrings("abc", &output);
+    var short: [2]u8 = undefined;
+    try std.testing.expectError(error.StreamTooLong, decodeExact(std.testing.allocator, &frame, &short, .{}));
+    var long: [4]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, decodeExact(std.testing.allocator, &frame, &long, .{}));
+    try std.testing.expectError(error.InvalidZstd, decodeExact(std.testing.allocator, frame[0 .. frame.len - 1], &output, .{}));
+    try std.testing.expectError(error.WindowOversize, decodeExact(std.testing.allocator, &frame, &output, .{ .max_window_bytes = 2 }));
+    // Preserve concatenated and skippable frame semantics without allocating
+    // an intermediate decoded page per frame.
+    const skipped = [_]u8{ 0x50, 0x2a, 0x4d, 0x18, 1, 0, 0, 0, 99 };
+    var joined: [6]u8 = undefined;
+    try decodeExact(std.testing.allocator, &(frame ++ skipped ++ frame), &joined, .{});
+    try std.testing.expectEqualStrings("abcabc", &joined);
+}
+
+test "exact Zstandard decoding verifies checksums" {
+    const frame = [_]u8{
+        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x81, 0x00, 0x00, 0x0a, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xd7, 0x96, 0xbf, 0xba,
+    };
+    var output: [16]u8 = undefined;
+    try decodeExact(std.testing.allocator, &frame, &output, .{});
+    var corrupt = frame;
+    corrupt[corrupt.len - 1] ^= 1;
+    try std.testing.expectError(error.ChecksumFailure, decodeExact(std.testing.allocator, &corrupt, &output, .{}));
 }

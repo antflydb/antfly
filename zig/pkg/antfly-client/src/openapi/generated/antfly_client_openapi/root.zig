@@ -137,6 +137,7 @@ pub const ClusterStatus = types.ClusterStatus;
 pub const ClusterTopology = types.ClusterTopology;
 pub const CohereEmbedderConfig = types.CohereEmbedderConfig;
 pub const CohereRerankerConfig = types.CohereRerankerConfig;
+pub const CommitRequires = types.CommitRequires;
 pub const CommittedMutationOutcome = types.CommittedMutationOutcome;
 pub const ComposedQuerySource = types.ComposedQuerySource;
 pub const ComposedSourceOverlay = types.ComposedSourceOverlay;

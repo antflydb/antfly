@@ -55,6 +55,7 @@ pub const Loopback = struct {
     pub const Limits = struct {
         transport_memory_limit_bytes: usize = 16 * 1024 * 1024,
         max_request_body_bytes: usize = 64 * 1024,
+        max_h1_inflight_bodies: u32 = 1,
     };
 
     pub fn initWithCapacityAndBodyLimit(a: Allocator, node: *Node, capacity: u32, max_body_size: usize) !*Loopback {
@@ -93,7 +94,7 @@ pub const Loopback = struct {
             .max_headers = 32,
             .max_connections = capacity,
             .max_request_tasks = capacity,
-            .max_h1_inflight_bodies = 1,
+            .max_h1_inflight_bodies = limits.max_h1_inflight_bodies,
             .header_read_timeout_ms = short_timeout_ms,
             .body_read_timeout_ms = short_timeout_ms,
             .response_write_timeout_ms = short_timeout_ms,

@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
-  sql,
   type DatabaseIntrospector,
   type Kysely,
   type MigrationLockOptions,
+  sql,
   type TableMetadata,
 } from "kysely";
 import {

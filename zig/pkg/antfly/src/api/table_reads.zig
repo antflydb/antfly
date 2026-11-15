@@ -17023,6 +17023,7 @@ fn graphEdgesRemote(
     table_name: []const u8,
     req: distributed_graph.GraphEdgesRequest,
 ) !distributed_graph.GraphEdgesResponse {
+    if (req.physical_scan_observation) |observed| observed.* = 0;
     const scratch = req.scratch_allocator orelse alloc;
     var client = http_client.ApiHttpClient.init(scratch, executor);
     const body = try distributed_graph.encodeGraphEdgesRequest(scratch, req);
@@ -17032,10 +17033,12 @@ fn graphEdgesRemote(
     else
         null;
     if (req.keys.len != 0) {
+        if (req.physical_scan_observation) |observed| observed.* = null;
         var batch = client.fetchGroupGraphEdgesBatchWithControl(base_uri, group_id, table_name, body, req.timeout_ms, if (cancellation != null) &cancellation.? else null) catch |err| return if (req.allow_partial_keys and err == error.InvalidGraphEdgesWireRequest) error.GraphEdgesBatchUnsupported else err;
         defer batch.deinit(scratch);
-        return try distributed_graph.parseGraphEdgesResponseWithScratch(alloc, scratch, batch.body);
+        return decodeObservedGraphEdgesResponse(alloc, scratch, batch.body, req.physical_scan_observation);
     }
+    if (req.physical_scan_observation) |observed| observed.* = null;
     var result = client.fetchGroupGraphEdgesWithControl(
         base_uri,
         group_id,
@@ -17057,7 +17060,38 @@ fn graphEdgesRemote(
         );
     };
     defer result.deinit(scratch);
-    return try distributed_graph.parseGraphEdgesResponseWithScratch(alloc, scratch, result.body);
+    return decodeObservedGraphEdgesResponse(alloc, scratch, result.body, req.physical_scan_observation);
+}
+
+fn decodeObservedGraphEdgesResponse(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8, observation: ?*?usize) !distributed_graph.GraphEdgesResponse {
+    const response = distributed_graph.parseGraphEdgesResponseWithScratch(alloc, scratch, body) catch |err| {
+        if (err == error.OutOfMemory) if (observation) |observed| {
+            observed.* = distributed_graph.graphEdgesResponseScannedRows(body);
+        };
+        return err;
+    };
+    if (observation) |observed| observed.* = response.scanned_rows;
+    return response;
+}
+
+test "graph hydrate and edges remote retry legacy wire safely preserves failed decode observations" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var observed: ?usize = null;
+            var response = decodeObservedGraphEdgesResponse(a, a,
+                \\{"edges":[{"source":"root","target":"a","edge_type":"FRIEND","weight":1,"created_at":0,"updated_at":0,"metadata":"{}"}],"scanned_rows":23,"key_offsets":[0,1],"key_scanned_rows":[23]}
+            , &observed) catch |err| {
+                try std.testing.expectEqual(@as(?usize, 23), observed);
+                return err;
+            };
+            defer response.deinit(a);
+            try std.testing.expectEqual(@as(?usize, 23), observed);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    for ([_][]const u8{ "{}", "{\"scanned_rows\":1,\"scanned_rows\":2}", "{\"scanned_rows\":-1}", "{\"scanned_rows\":3} trailing", "{\"scanned_rows\":null}" }) |body| {
+        try std.testing.expect(distributed_graph.graphEdgesResponseScannedRows(body) == null);
+    }
 }
 
 test "graph hydrate and edges remote retry legacy wire safely" {

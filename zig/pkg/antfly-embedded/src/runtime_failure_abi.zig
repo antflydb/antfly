@@ -872,6 +872,14 @@ pub const Status = enum(u32) {
     cypher_invalid_regex = 912,
     storage_owner_admission_pending = 913,
     unsupported_node_filter_query = 914,
+    process_fd_quota_exceeded = 915,
+    system_fd_quota_exceeded = 916,
+    persistent_descriptor_admission_exhausted = 917,
+    storage_descriptor_pressure = 918,
+    unsupported_commit_requirement = 919,
+    commit_requirement_unavailable = 920,
+    commit_requirement_too_large = 921,
+    commit_requirement_failed = 922,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

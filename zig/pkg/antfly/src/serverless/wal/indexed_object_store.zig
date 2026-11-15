@@ -30,11 +30,17 @@ const DeferredTail = @import("deferred_tail.zig").Tail;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const IndexedObjectStore = struct {
+    pub const max_batch_payload_bytes: usize = 8 * 1024 * 1024;
+    // At most one encoded record/descriptor (bounded by the page-tree limit)
+    // and its decoded Record accompany the admitted catalog payload.
+    pub const catalog_recovery_bytes: usize = max_batch_payload_bytes + tree.max_record_bytes + @sizeOf(types.Record);
     alloc: A,
     client: objectstore.Client,
     bucket: []u8,
     prefix: []u8,
     max_attempts: usize = 8,
+    /// Selected explicitly by the persisted catalog-capable WAL layout.
+    catalog_fences_enabled: bool = false,
     /// Required for every mutation after native serving ownership is claimed.
     native_owner: ?[16]u8 = null,
     cancellation: ?objectstore.CancellationToken = null,
@@ -109,7 +115,27 @@ pub const IndexedObjectStore = struct {
     pub const DocumentIndex = struct { first_lsn: u64, root: ?tree.Ref = null };
     pub const ReadParent = struct { latest_lsn: u64, write_epoch: u64, physical_first_lsn: u64, records: ?tree.Ref = null };
     pub const Head = struct {
+        // Keep unfenced HEAD encodings readable by legacy binaries. Format 8
+        // deliberately exposes the new fields and requires upgraded readers.
+        pub fn jsonStringify(self: Head, writer: anytype) !void {
+            try writer.beginObject();
+            inline for (comptime std.meta.fieldNames(Head)) |name| {
+                const control = comptime std.mem.startsWith(u8, name, "catalog_");
+                if (!control or self.catalog_fenced) {
+                    const value = @field(self, name);
+                    if (@typeInfo(@TypeOf(value)) != .optional or value != null) {
+                        try writer.objectField(name);
+                        try writer.write(value);
+                    }
+                }
+            }
+            try writer.endObject();
+        }
+
         native_owner: ?[16]u8 = null,
+        catalog_fenced: bool = false,
+        catalog_epoch: u64 = 0,
+        catalog_pending_lsn: ?u64 = null,
         format: u32 = 2,
         external_payloads: ?bool = null,
         packed_pages: ?bool = null,
@@ -147,7 +173,7 @@ pub const IndexedObjectStore = struct {
     }
 
     pub fn walStore(self: *@This()) WalStore {
-        return .{ .allocator = self.alloc, .ptr = self, .vtable = &vtable };
+        return .{ .allocator = self.alloc, .ptr = self, .vtable = if (self.catalog_fences_enabled) &catalog_vtable else &vtable };
     }
 
     pub fn append(self: *@This(), namespace: []const u8, timestamp: u64, payload: []const u8) !u64 {
@@ -278,7 +304,16 @@ pub const IndexedObjectStore = struct {
         for (groups, pending[0..groups.len]) |group, *item| item.* = .{ .timestamp = group.timestamp, .payloads = group.payloads, .id = group.id };
         return self.appendGroups(namespace, pending[0..groups.len]);
     }
+    pub fn appendBatchIdempotentIfLatest(self: *@This(), namespace: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, expected_latest: u64) !BatchResult {
+        const results = try self.appendGroupsGuarded(namespace, &.{.{ .timestamp = timestamp, .payloads = payloads, .id = id }}, expected_latest, null, false);
+        defer self.alloc.free(results);
+        return results[0];
+    }
+
     fn appendGroups(self: *@This(), namespace: []const u8, groups: []const PendingGroup) ![]BatchResult {
+        return self.appendGroupsGuarded(namespace, groups, null, null, false);
+    }
+    fn appendGroupsGuarded(self: *@This(), namespace: []const u8, groups: []const PendingGroup, expected_latest: ?u64, catalog: ?u64, begin_catalog: bool) ![]BatchResult {
         if (groups.len == 0 or groups.len > 16) return error.InvalidWalBatch;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -297,7 +332,7 @@ pub const IndexedObjectStore = struct {
             for (group.payloads) |payload| {
                 if (payload.len > payload_store.max_bytes) return error.WalRecordTooLarge;
                 total = std.math.add(usize, total, payload.len + 32) catch return error.WalRecordTooLarge;
-                if (total > 8 * 1024 * 1024) return error.WalRecordTooLarge;
+                if (total > max_batch_payload_bytes) return error.WalRecordTooLarge;
                 var len: [8]u8 = undefined;
                 std.mem.writeInt(u64, &len, payload.len, .big);
                 hash.update(&len);
@@ -355,6 +390,10 @@ pub const IndexedObjectStore = struct {
                         continue;
                     }
                 }
+                if (expected_latest) |expected| if (current.value.latest_lsn != expected) return error.VersionConflict;
+                if (catalog) |epoch| {
+                    if (current.value.catalog_epoch != epoch or current.value.catalog_pending_lsn != null) return error.VersionConflict;
+                }
                 const first = last + 1;
                 last = std.math.add(u64, last, group.payloads.len) catch return error.WalLsnExhausted;
                 if (self.max_new_lsn) |maximum| if (last > maximum) return error.PublicationLagExceeded;
@@ -372,13 +411,18 @@ pub const IndexedObjectStore = struct {
                 results[index] = .{ .start_lsn = first, .end_lsn = last };
             }
             if (changes.items.len == 0) return results;
-            switch (if (external_payloads) @as(DeferredResult, .materialize) else try self.tryDeferred(&ctx, current, changes.items, operations.items, last)) {
+            switch (if (external_payloads or catalog != null) @as(DeferredResult, .materialize) else try self.tryDeferred(&ctx, current, changes.items, operations.items, last)) {
                 .committed => return results,
                 .contended => continue,
                 .materialize => {},
             }
             var updated = try self.applyChanges(pages, current.value, changes.items, operations.items);
             updated.latest_lsn = last;
+            if (catalog != null) updated.catalog_fenced = true;
+            if (begin_catalog) {
+                updated.catalog_epoch = std.math.add(u64, current.value.catalog_epoch, 1) catch return error.WalLsnExhausted;
+                updated.catalog_pending_lsn = last;
+            }
             if (external_payloads) updated.external_payloads = true;
             updated.inline_tail = if (self.inline_tail_enabled) InlineTail.fromRecord(changes.items[changes.items.len - 1].value.?) else null;
             try ctx.finishForest(&uploads, &updated);
@@ -389,6 +433,53 @@ pub const IndexedObjectStore = struct {
             return results;
         }
         return error.WalCommitContended;
+    }
+
+    pub fn catalogFence(self: *@This(), a: A, namespace: []const u8) !types.CatalogTransition {
+        if (!self.catalog_fences_enabled) return error.AtomicCatalogAdmissionUnsupported;
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        var head = try ctx.readHead();
+        defer head.deinit(self.alloc);
+        var result = types.CatalogTransition{ .fence = .{ .latest_lsn = head.value.latest_lsn, .epoch = head.value.catalog_epoch, .pending_lsn = head.value.catalog_pending_lsn } };
+        if (head.value.catalog_pending_lsn) |lsn| {
+            const records = try self.readRangeAlloc(a, namespace, .{ .start_lsn = lsn, .end_lsn = lsn, .max_records = 1, .max_bytes = catalog_recovery_bytes });
+            defer types.freeRecords(a, records);
+            if (records.len != 1) return error.InvalidWal;
+            result.payload = try a.dupe(u8, records[0].payload);
+        }
+        return result;
+    }
+    pub fn beginCatalogUpdate(self: *@This(), namespace: []const u8, payload: []const u8, expected_epoch: u64) !u64 {
+        if (!self.catalog_fences_enabled) return error.AtomicCatalogAdmissionUnsupported;
+        const result = try self.appendGroupsGuarded(namespace, &.{.{ .timestamp = 0, .payloads = &.{payload}, .id = null }}, null, expected_epoch, true);
+        self.alloc.free(result);
+        return expected_epoch + 1;
+    }
+    pub fn completeCatalogUpdate(self: *@This(), namespace: []const u8, epoch: u64) !void {
+        if (!self.catalog_fences_enabled) return error.AtomicCatalogAdmissionUnsupported;
+        var ctx = try Context.init(self, namespace, null);
+        defer ctx.deinit();
+        for (0..self.max_attempts) |_| {
+            var head = try ctx.readHead();
+            defer head.deinit(self.alloc);
+            if (head.value.catalog_epoch != epoch or head.value.catalog_pending_lsn == null) return;
+            var next = head.value;
+            next.catalog_pending_lsn = null;
+            ctx.writeHead(next, head.revision) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            return;
+        }
+        return error.WalCommitContended;
+    }
+    pub fn appendPrepared(self: *@This(), namespace: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, fence: types.CatalogFence) !BatchResult {
+        if (!self.catalog_fences_enabled) return error.AtomicCatalogAdmissionUnsupported;
+        if (fence.pending_lsn != null) return error.VersionConflict;
+        const result = try self.appendGroupsGuarded(namespace, &.{.{ .timestamp = timestamp, .payloads = payloads, .id = id }}, fence.latest_lsn, fence.epoch, false);
+        defer self.alloc.free(result);
+        return result[0];
     }
 
     fn lookupReceipts(self: *@This(), a: A, pages: tree.Store, head: Head, ids: []const []const u8) ![]?tree.BatchEntry {
@@ -542,6 +633,7 @@ pub const IndexedObjectStore = struct {
             if (record.next_cursor != encoded.len) return error.InvalidWal;
             if (record.lsn < index.first_lsn) continue;
             const mutation = try @import("../api/codec.zig").decodeMutationView(if (record.external_payload) try payload_store.load(a, pages, record.payload, payload_store.max_bytes) else record.payload);
+            if (mutation.kind == .catalog) continue;
             // Store small records in the authenticated index leaf. Large bodies
             // retain only their LSN and use the ordinary record tree on a hit.
             const value = try a.alloc(u8, 8 + if (!record.external_payload and encoded.len <= 1536) encoded.len else @as(usize, 0));
@@ -593,6 +685,7 @@ pub const IndexedObjectStore = struct {
             bytes += work_bytes;
             expected += 1;
             const mutation = try @import("../api/codec.zig").decodeMutationView(if (record.external_payload) try payload_store.load(a, pages, record.payload, payload_store.max_bytes) else record.payload);
+            if (mutation.kind == .catalog) continue;
             try identities.put(a, try a.dupe(u8, mutation.doc_id), {});
         }
         if (expected != end) return error.InvalidWal;
@@ -758,6 +851,7 @@ pub const IndexedObjectStore = struct {
                 // External bodies are never admitted to the deferred inline tail.
                 if (record.external_payload) return error.InvalidWal;
                 const mutation = @import("../api/codec.zig").decodeMutationView(record.payload) catch return .{};
+                if (mutation.kind == .catalog) continue;
                 if (!std.mem.eql(u8, id, mutation.doc_id)) continue;
                 if (encoded.len + @sizeOf(types.Record) > range.max_bytes) return error.WalReadBudgetExceeded;
                 const payload = if (record.external_payload) try payload_store.load(a, ctx.store(), record.payload, range.max_bytes -| (encoded.len + @sizeOf(types.Record))) else try a.dupe(u8, record.payload);
@@ -1259,8 +1353,8 @@ pub const IndexedObjectStore = struct {
             defer parsed.deinit();
             const head = parsed.value;
             if (head.native_owner) |owner| if (std.mem.allEqual(u8, &owner, 0)) return error.InvalidWal;
-            if ((head.packed_pages orelse false) != (head.format == 5) and head.format != 6 and head.format != 7) return error.InvalidWal;
-            if ((head.format != 7 and (head.deferred_indexes == true) != (head.format == 6)) or (head.deferred_tail != null and head.deferred_indexes != true)) return error.InvalidWal;
+            if ((head.packed_pages orelse false) != (head.format == 5) and head.format != 6 and head.format != 7 and head.format != 8) return error.InvalidWal;
+            if ((head.format != 7 and head.format != 8 and (head.deferred_indexes == true) != (head.format == 6)) or (head.deferred_tail != null and head.deferred_indexes != true)) return error.InvalidWal;
             if (head.deferred_tail) |*tail| try tail.validate(head.latest_lsn);
             const base_latest = head.latest_lsn - if (head.deferred_tail) |*tail| tail.count() else @as(usize, 0);
             self.pack_enabled = self.owner.packed_pages_enabled or (head.packed_pages orelse false);
@@ -1269,14 +1363,14 @@ pub const IndexedObjectStore = struct {
                 self.bounded_roots = true;
             } else if (self.owner.managed_reads) return error.WalReaderContractMissing;
             try check(self);
-            if ((head.format != 1 and head.format != 2 and head.format != 3 and head.format != 4 and head.format != 5 and head.format != 6 and head.format != 7) or head.write_epoch == 0 or head.physical_first_lsn == 0 or head.physical_first_lsn > head.first_lsn or head.physical_first_lsn > base_latest + 1 or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
+            if ((head.format != 1 and head.format != 2 and head.format != 3 and head.format != 4 and head.format != 5 and head.format != 6 and head.format != 7 and head.format != 8) or head.write_epoch == 0 or head.physical_first_lsn == 0 or head.physical_first_lsn > head.first_lsn or head.physical_first_lsn > base_latest + 1 or head.first_lsn == 0 or head.latest_lsn == std.math.maxInt(u64) or
                 head.first_lsn > head.latest_lsn + 1 or (base_latest >= head.physical_first_lsn and head.records == null)) return error.InvalidWal;
-            if ((head.external_payloads == true) != (head.format == 7)) return error.InvalidWal;
+            if (head.format != 8 and (head.external_payloads == true) != (head.format == 7)) return error.InvalidWal;
             if (head.format < 4 and (head.document_index != null or head.read_parent != null or head.gc_documents != null)) return error.InvalidWal;
             if (head.format < 4 and (head.format == 3) != (head.inline_tail != null)) return error.InvalidWal;
             if (head.document_index) |index| {
                 if (index.first_lsn == 0 or index.first_lsn > head.latest_lsn + 1) return error.InvalidWal;
-                if (base_latest >= @max(index.first_lsn, head.physical_first_lsn) and index.root == null) return error.InvalidWal;
+                if (base_latest >= @max(index.first_lsn, head.physical_first_lsn) and index.root == null and !head.catalog_fenced) return error.InvalidWal;
                 if (index.root) |ref| {
                     try ref.validate();
                     if (ref.records > head.latest_lsn) return error.InvalidWal;
@@ -1296,6 +1390,9 @@ pub const IndexedObjectStore = struct {
                     if (head.gc_records != null or head.gc_operations != null or head.gc_documents != null or head.gc_retired_before != 0) return error.InvalidWal;
                 } else if (head.gc_retired_before < 2 or head.gc_retired_before > head.write_epoch) return error.InvalidWal;
             }
+            if ((head.format == 8) != head.catalog_fenced) return error.InvalidWal;
+            if (head.catalog_fenced and !self.owner.catalog_fences_enabled) return error.CatalogWalActivationRequired;
+            if (head.catalog_pending_lsn) |lsn| if (!head.catalog_fenced or lsn < head.first_lsn or lsn > head.latest_lsn) return error.InvalidWal;
             if (head.inline_tail) |tail| {
                 const record = codec.parseRecord(tail.bytes[0..tail.len], 0) catch return error.InvalidWal;
                 if (record.lsn != head.latest_lsn or record.next_cursor != tail.len or head.first_lsn > head.latest_lsn) return error.InvalidWal;
@@ -1313,6 +1410,7 @@ pub const IndexedObjectStore = struct {
         }
         fn writeHead(self: *@This(), head: Head, revision: ?objectstore.ObjectRevision) !void {
             try check(self);
+            if (head.catalog_pending_lsn) |lsn| if (head.first_lsn > lsn) return error.CatalogUpdateInProgress;
             try self.owner.requireOwner(head);
             const a = self.owner.alloc;
             const key = try std.fmt.allocPrint(a, "{s}/HEAD", .{self.root});
@@ -1320,12 +1418,12 @@ pub const IndexedObjectStore = struct {
             var upgraded = head;
             upgraded.packed_pages = if (self.pack_enabled or (head.packed_pages orelse false)) true else null;
             if (upgraded.first_lsn > upgraded.latest_lsn) upgraded.inline_tail = null;
-            upgraded.format = if (upgraded.external_payloads == true) 7 else if (upgraded.deferred_indexes == true) 6 else if (upgraded.packed_pages == true) 5 else if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else if (upgraded.inline_tail != null) 3 else 2;
+            upgraded.format = if (upgraded.catalog_fenced) 8 else if (upgraded.external_payloads == true) 7 else if (upgraded.deferred_indexes == true) 6 else if (upgraded.packed_pages == true) 5 else if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else if (upgraded.inline_tail != null) 3 else 2;
             var bytes = try std.json.Stringify.valueAlloc(a, upgraded, .{ .emit_null_optional_fields = false });
             if (bytes.len > 4096 and upgraded.inline_tail != null) {
                 a.free(bytes);
                 upgraded.inline_tail = null;
-                upgraded.format = if (upgraded.external_payloads == true) 7 else if (upgraded.deferred_indexes == true) 6 else if (upgraded.packed_pages == true) 5 else if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else 2;
+                upgraded.format = if (upgraded.catalog_fenced) 8 else if (upgraded.external_payloads == true) 7 else if (upgraded.deferred_indexes == true) 6 else if (upgraded.packed_pages == true) 5 else if (upgraded.document_index != null or upgraded.read_parent != null or upgraded.gc_documents != null) 4 else 2;
                 bytes = try std.json.Stringify.valueAlloc(a, upgraded, .{ .emit_null_optional_fields = false });
             }
             defer a.free(bytes);
@@ -1533,6 +1631,7 @@ pub const IndexedObjectStore = struct {
         .append_idempotent = erasedIdempotent,
         .append_batch = erasedUnkeyedBatch,
         .append_batch_idempotent = erasedBatch,
+        .append_batch_idempotent_if_latest = erasedConditionalBatch,
         .append_idempotent_if_latest = erasedConditional,
         .read_snapshot = erasedSnapshot,
         .read_point_alloc = erasedPoint,
@@ -1561,6 +1660,35 @@ pub const IndexedObjectStore = struct {
     fn erasedUnkeyedBatch(raw: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8) !BatchResult {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return self.appendBatch(ns, timestamp, payloads);
+    }
+    const catalog_vtable: WalStore.VTable = blk: {
+        var value = vtable;
+        value.catalog_fence = erasedCatalogFence;
+        value.begin_catalog_update = erasedBeginCatalog;
+        value.complete_catalog_update = erasedCompleteCatalog;
+        value.append_prepared = erasedPrepared;
+        break :blk value;
+    };
+
+    fn erasedCatalogFence(ptr: *anyopaque, a: A, ns: []const u8) !types.CatalogTransition {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.catalogFence(a, ns);
+    }
+    fn erasedBeginCatalog(ptr: *anyopaque, ns: []const u8, payload: []const u8, epoch: u64) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.beginCatalogUpdate(ns, payload, epoch);
+    }
+    fn erasedCompleteCatalog(ptr: *anyopaque, ns: []const u8, epoch: u64) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.completeCatalogUpdate(ns, epoch);
+    }
+    fn erasedPrepared(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, fence: types.CatalogFence) !BatchResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.appendPrepared(ns, timestamp, payloads, id, fence);
+    }
+    fn erasedConditionalBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, expected: u64) !BatchResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.appendBatchIdempotentIfLatest(ns, timestamp, payloads, id, expected);
     }
     fn erasedBatch(raw: *anyopaque, ns: []const u8, t: u64, payloads: []const []const u8, id: []const u8) !BatchResult {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -2476,4 +2604,80 @@ test "serverless indexed WAL captured reader preserves cuts budgets cancellation
             try std.testing.expectError(error.WalSnapshotExpired, expiring.next(a));
         }
     }
+}
+
+test "commit requirements conditional WAL batch has no stale prefix and replays its receipt" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var wal = try IndexedObjectStore.init(a, client, "db", "gated");
+    defer wal.deinit();
+    var erased = wal.walStore();
+    try std.testing.expect(erased.supportsConditionalBatchAppend());
+    _ = try wal.append("docs", 1, "concurrent source");
+    try std.testing.expectError(error.VersionConflict, erased.appendBatchIdempotentIfLatest("docs", 2, &.{ "first", "second" }, "gate", 0));
+    try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
+    const accepted = try erased.appendBatchIdempotentIfLatest("docs", 2, &.{ "first", "second" }, "gate", 1);
+    try std.testing.expectEqual(@as(u64, 2), accepted.start_lsn);
+    try std.testing.expectEqual(@as(u64, 3), accepted.end_lsn);
+    // The durable receipt wins over a now-stale read fence.
+    try std.testing.expectEqual(accepted, try erased.appendBatchIdempotentIfLatest("docs", 2, &.{ "first", "second" }, "gate", 1));
+    try std.testing.expectError(error.WalIdempotencyConflict, erased.appendBatchIdempotentIfLatest("docs", 2, &.{ "changed", "second" }, "gate", 1));
+    try std.testing.expectEqual(@as(u64, 3), try wal.latestLsn("docs"));
+}
+
+test "commit requirements catalog epoch fences source admission and survives WAL intent recovery" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var wal = try IndexedObjectStore.init(a, client, "db", "catalog-admission");
+    defer wal.deinit();
+    wal.catalog_fences_enabled = true;
+    const source = try @import("../api/codec.zig").encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = "doc", .body = "{}" });
+    defer a.free(source);
+    const intent = try @import("../api/codec.zig").encodeMutationAlloc(a, .{ .kind = .catalog, .doc_id = "", .body = "{\"policy\":{}}" });
+    defer a.free(intent);
+    var before = try wal.catalogFence(a, "docs");
+    defer before.deinit(a);
+    const epoch = try wal.beginCatalogUpdate("docs", intent, before.fence.epoch);
+    var pending = try wal.catalogFence(a, "docs");
+    defer pending.deinit(a);
+    try std.testing.expectEqualStrings(intent, pending.payload.?);
+    try std.testing.expectError(error.VersionConflict, wal.appendPrepared("docs", 2, &.{source}, "stale", before.fence));
+    try std.testing.expectError(error.VersionConflict, wal.appendPrepared("docs", 2, &.{source}, "pending", pending.fence));
+    try std.testing.expectError(error.CatalogUpdateInProgress, wal.truncatePrefix("docs", pending.fence.latest_lsn + 1));
+    try wal.completeCatalogUpdate("docs", epoch);
+    var admitted = try wal.catalogFence(a, "docs");
+    defer admitted.deinit(a);
+    _ = try wal.appendPrepared("docs", 3, &.{source}, "fresh", admitted.fence);
+    // Durable receipt replay wins even after the catalog epoch advances again.
+    _ = try wal.beginCatalogUpdate("docs", intent, admitted.fence.epoch);
+    _ = try wal.appendPrepared("docs", 3, &.{source}, "fresh", admitted.fence);
+}
+
+test "commit requirements catalog recovery hydrates the maximum admitted intent" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var wal = try IndexedObjectStore.init(a, client, "db", "maximum-catalog");
+    defer wal.deinit();
+    try std.testing.expect(!wal.walStore().supportsCatalogFences());
+    wal.catalog_fences_enabled = true;
+    const payload = try a.alloc(u8, IndexedObjectStore.max_batch_payload_bytes - 32);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    _ = try wal.beginCatalogUpdate("docs", payload, 0);
+    var pending = try wal.catalogFence(a, "docs");
+    defer pending.deinit(a);
+    try std.testing.expectEqualSlices(u8, payload, pending.payload.?);
+    try wal.completeCatalogUpdate("docs", pending.fence.epoch);
+    var complete = try wal.catalogFence(a, "docs");
+    defer complete.deinit(a);
+    try std.testing.expect(complete.payload == null);
 }

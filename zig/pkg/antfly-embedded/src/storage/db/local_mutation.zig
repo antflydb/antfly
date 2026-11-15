@@ -134,7 +134,7 @@ pub fn ImplementationFor(comptime D: type) type {
                 alloc: Allocator,
                 db: anytype,
                 doc_key: []const u8,
-                artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+                artifact_delete_keys: anytype,
             ) !void {
                 for (self.groups.items) |group| {
                     const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", group.artifact_name);
@@ -253,6 +253,11 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
         pub const generatedPrecomputeModeForSyncLevel = preparation.generatedPrecomputeModeForSyncLevel;
+        pub const capturePreparedEnrichments = preparation.capturePreparedEnrichments;
+        pub const validatePreparedEnrichments = preparation.validatePreparedEnrichments;
+        pub const restorePreparedEnrichments = preparation.restorePreparedEnrichments;
+        pub const restorePreparedEnrichmentsForRows = preparation.restorePreparedEnrichmentsForRows;
+        pub const generatedPrecomputeMode = preparation.generatedPrecomputeMode;
         pub const graphMutationIdentityEql = materialization.graphMutationIdentityEql;
         pub const hasConfiguredResolvers = materialization.hasConfiguredResolvers;
         pub const hasCoordinatedConstraints = commit.hasCoordinatedConstraints;
@@ -755,6 +760,7 @@ pub fn ImplementationFor(comptime D: type) type {
         // actual owner. The synchronous worker never copies owned descriptors.
         pub const PreparedBatchOwner = struct {
             const NativeBoundary = @import("../named_callback.zig").Boundary(struct { get_fn: @FieldType(PreparedBatchOwner, "get_fn"), wait_fn: @FieldType(PreparedBatchOwner, "wait_fn"), resolved_wait_fn: @FieldType(PreparedBatchOwner, "resolved_wait_fn") });
+            preparation_context: ?@import("antfly_inference_execution_context").RequestContext = null,
             callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
             recovery: bool,
             context: *anyopaque,
@@ -879,6 +885,7 @@ pub fn ImplementationFor(comptime D: type) type {
                 };
                 var view: PreparedBatchOwner = undefined;
                 inline for (@typeInfo(Execution).@"struct".field_names) |field| @field(view, field) = &@field(receiver, field);
+                view.preparation_context = null;
                 view.callback_dispatch = NativeBoundary.local_dispatch;
                 view.recovery = Receiver == *Execution;
                 view.context = @ptrCast(receiver);

@@ -62,6 +62,8 @@ pub const Options = struct {
     specialty_profile: ?@import("../models/gliner_specialty_qualification.zig").Profile = null,
     /// Admitted accelerator classification rows per physical forward.
     classification_batch_items: usize = 1,
+    /// Padded tokens per physical classification forward, shared with admission.
+    classification_batch_tokens: usize = std.math.maxInt(usize),
     /// Trusted, caller-owned logits from a drained shared classification forward.
     classification_results: ?[]const ItemLogits = null,
     /// Physical PII encoder/head rows, admitted with padded word/label geometry.
@@ -988,7 +990,31 @@ fn executePiiBatches(cb: *const compute.ComputeBackend, allocator: Allocator, co
 pub fn classificationBatchItems(request: *const wire.Request, request_plan: *const Plan, options: Options) usize {
     if (options.classification_batch_items <= 1 or request.items.len <= 1 or !canBatchClassifications(request, request_plan)) return 1;
     const admitted = if (options.specialty_profile == .gliguard) @min(options.classification_batch_items, 8) else options.classification_batch_items;
-    return @min(admitted, request.items.len);
+    const token_limited = if (options.classification_batch_tokens == std.math.maxInt(usize))
+        admitted
+    else
+        @max(1, options.classification_batch_tokens / @max(1, maxPlannedSequenceTokens(request_plan)));
+    return @min(admitted, token_limited, request.items.len);
+}
+
+test "GLiNER Decide Metal classification batches respect padded token admission" {
+    const a = std.testing.allocator;
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"m","schema":{"classifications":[{"name":"intent","labels":["sales","support"]}]},"inputs":[{"content":"a"},{"content":"b"},{"content":"c"},{"content":"d"},{"content":"e"},{"content":"f"},{"content":"g"},{"content":"h"}]}
+    , .{});
+    defer request.deinit();
+    var ids: [384]i64 = @splat(1);
+    var samples: [1]processor.Sample = undefined;
+    samples[0].input_ids = &ids;
+    var batches: [1]processor.PreparedBatch = undefined;
+    batches[0].samples = &samples;
+    var ranges = [_]TaskRange{.{ .start = 0, .end = 1 }};
+    var items: [8]PreparedItem = undefined;
+    for (&items) |*item| item.* = .{ .batches = &batches, .ranges = &ranges, .prompt_tokens = 384 };
+    const prepared = Plan{ .items = &items, .prompt_tokens = 8 * 384 };
+    const policy = @import("../models/gliner_decide_qualification.zig").MetalExecutionPolicy{};
+    const options = Options{ .classification_batch_items = policy.batch_items, .classification_batch_tokens = policy.padded_batch_tokens };
+    try std.testing.expectEqual(@as(usize, 2), classificationBatchItems(&request, &prepared, options));
 }
 
 test "gliner span v2 batch admission preserves serial scratch for split tasks" {
@@ -1057,7 +1083,7 @@ pub fn executePlanned(cb: ?*const compute.ComputeBackend, allocator: Allocator, 
         if (backend.kind() != .native and backend.kind() != .metal and backend.kind() != .cuda and backend.kind() != .wasm) return error.UnsupportedExtractionBackend;
     }
     if (request_plan.items.len != request.items.len) return error.InvalidExtractionInput;
-    if (options.classification_batch_items == 0) return error.InvalidExtractionInput;
+    if (options.classification_batch_items == 0 or options.classification_batch_tokens == 0) return error.InvalidExtractionInput;
     if (options.extraction_batch_items == 0) return error.InvalidExtractionInput;
     if (options.decide_request != null and request.items.len != 1) return error.InvalidExtractionInput;
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);

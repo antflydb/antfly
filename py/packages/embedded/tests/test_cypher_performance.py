@@ -72,17 +72,34 @@ def scalar_graph_db(require_native, tmp_path_factory, request):
 
 
 def populate(db, count):
-    for start in range(0, count, 500):
-        db.sql(
-            "INSERT INTO docs (_id,id,score) VALUES "
-            + ",".join(f"('n{i}','n{i}',{i})" for i in range(start, min(start + 500, count)))
-        )
+    # These fixtures exercise query plans, not SQL INSERT parsing or per-row
+    # autocommit. Use the public batch boundary to build the identical corpus,
+    # then drain derived work once before handing it to a query or mutation.
+    # The mutation tests below still execute their original SQL statements.
+    with db.open_table("docs") as table:
+        for start in range(0, count, 1000):
+            table.batch_json(
+                {
+                    "inserts": {f"n{i}": {"id": f"n{i}", "score": i} for i in range(start, min(start + 1000, count))},
+                    "sync_level": "write",
+                }
+            )
+    db.run_until_idle()
 
 
 @pytest.fixture(scope="module", params=[af.Storage.LITE, af.Storage.DIRECTORY])
 def ranked_graph_db(require_native, tmp_path_factory, request):
     """Query-only planner consumers share the same complete indexed corpus."""
-    storage = request.param
+    yield from _ranked_graph_fixture(tmp_path_factory, request.param)
+
+
+@pytest.fixture(scope="module", params=[af.Storage.LITE, af.Storage.DIRECTORY])
+def selective_ranked_graph_db(require_native, tmp_path_factory, request):
+    """Keep the additional ID index isolated from the other planner fixtures."""
+    yield from _ranked_graph_fixture(tmp_path_factory, request.param, index_id=True)
+
+
+def _ranked_graph_fixture(tmp_path_factory, storage, *, index_id=False):
     root = tmp_path_factory.mktemp("ranked-graph")
     path = root / ("graph.aflite" if storage == af.Storage.LITE else "graph")
     opener = af.create_with_options if storage == af.Storage.LITE else af.open_with_options
@@ -91,9 +108,13 @@ def ranked_graph_db(require_native, tmp_path_factory, request):
         # Keep the population above the unordered-source limit, including
         # native paging and large-offset coverage. Mutation cases build their
         # own writable databases; query limits and state remain per request.
-        populate(db, 13000)
+        # Admit empty indexes before the single corpus load. These tests
+        # qualify query plans; rebuilding historical source windows is covered
+        # by the private mutation/rebuild fixtures below.
         db.sql("CREATE INDEX ranked ON docs(score DESC)")
-        db.run_until_idle()
+        if index_id:
+            db.sql("CREATE INDEX by_id ON docs(id)")
+        populate(db, 13000)
         # Retain the owner: indexed Lite reads currently need the serving
         # owner's statement leases. These consumers issue queries only; every
         # mutation/rebuild regression continues using the private graph_db.
@@ -7632,13 +7653,8 @@ def test_empty_indexed_order_preserves_a_zero_anchor_budget(graph_db):
         ("n.id='n0'", [0], 1),
     ],
 )
-def test_ordered_node_reads_preserve_selective_access_paths(graph_db, predicate, expected, budget):
-    populate(graph_db, 13000)
-    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
-    graph_db.run_until_idle()
-    graph_db.sql("CREATE INDEX by_id ON docs(id)")
-    graph_db.run_until_idle()
-    result = graph_db.cypher_json(
+def test_ordered_node_reads_preserve_selective_access_paths(selective_ranked_graph_db, predicate, expected, budget):
+    result = selective_ranked_graph_db.cypher_json(
         "g",
         {
             "query": f"MATCH (n:D) WHERE {predicate} RETURN n.score ORDER BY n.score DESC LIMIT {len(expected)}",
@@ -8567,9 +8583,8 @@ def test_unbounded_key_domains_and_cardinality_skip_duplicate_runs(graph_db):
 
 @pytest.mark.parametrize("count", [8000, 50000])
 def test_ordered_group_offset_does_not_retain_discarded_output(graph_db, count):
-    populate(graph_db, count)
     graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
-    graph_db.run_until_idle()
+    populate(graph_db, count)
     ordered = sorted((f"n{i}", str(i)) for i in range(count))
     observers = "count(*),min(n.score),max(n.score)" if count == 8000 else "count(*)"
     for skip, limit in ((count - 100, 5), (count - 1, None), (count + 1000, 5)):
@@ -8731,6 +8746,10 @@ OBSERVER_DOMAIN_ROWS = 16384
 
 
 def scope_domains(db, count):
+    # Build the same complete indexed corpus through one batch, avoiding two
+    # historical backfills in fixtures whose assertions concern query work.
+    db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    db.sql("CREATE INDEX ranked ON docs(score DESC)")
     with db.open_table("docs") as table:
         table.batch(
             [
@@ -8739,8 +8758,6 @@ def scope_domains(db, count):
             ],
             timestamp=1,
         )
-    db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
-    db.sql("CREATE INDEX ranked ON docs(score DESC)")
     db.run_until_idle()
 
 
@@ -9016,12 +9033,12 @@ def test_sql_filtered_observers_and_constant_admission_have_bounded_work(observe
 
 def test_sql_observer_windows_bound_high_cardinality_groups(graph_db):
     count = 64000
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
     with graph_db.open_table("docs") as table:
         table.batch(
             [af.WriteIntent(key=f"k{i:06}", value={"id": f"k{i:06}", "score": i % 3}) for i in range(count)],
             timestamp=1,
         )
-    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
     graph_db.run_until_idle()
     empty_null_partition = graph_db.cypher_json(
         "g",

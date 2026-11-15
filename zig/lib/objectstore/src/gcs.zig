@@ -1352,15 +1352,10 @@ fn enforceExclusiveStartAfter(alloc: Allocator, result: *types.ListResult, start
 }
 
 pub fn jsonApiConfigAlloc(alloc: Allocator, bucket: []const u8) !Config {
-    return .{
-        .transport = .json_api,
-        .bucket = try alloc.dupe(u8, bucket),
-        .json_api = .{
-            .endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/storage/v1"),
-            .upload_endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/upload/storage/v1"),
-            .auth = .none,
-        },
-    };
+    const owned_bucket = try alloc.dupe(u8, bucket);
+    errdefer alloc.free(owned_bucket);
+    const api = try jsonApiClientConfigAlloc(alloc);
+    return .{ .transport = .json_api, .bucket = owned_bucket, .json_api = api };
 }
 
 pub fn jsonApiClientConfigAlloc(alloc: Allocator) !JsonApiConfig {
@@ -1380,8 +1375,14 @@ pub fn jsonApiClientConfigWithBearerTokenAlloc(
 ) !JsonApiConfig {
     var cfg = try jsonApiClientConfigAlloc(alloc);
     errdefer cfg.deinit(alloc);
-    cfg.auth = .{ .bearer_token = try alloc.dupe(u8, bearer_token) };
-    if (project_id) |value| cfg.project_id = try alloc.dupe(u8, value);
+    // Finish fallible construction before publishing a tagged-union payload.
+    // Error cleanup must only observe fully initialized owned credentials.
+    const owned_token = try alloc.dupe(u8, bearer_token);
+    cfg.auth = .{ .bearer_token = owned_token };
+    if (project_id) |value| {
+        const owned = try alloc.dupe(u8, value);
+        cfg.project_id = owned;
+    }
     return cfg;
 }
 
@@ -1441,7 +1442,10 @@ pub fn clientConfigForCredentialsAlloc(
             source_owned = false;
             source_allocation_owned = false;
             errdefer value.deinit(alloc);
-            if (project_id orelse account_project_id) |selected_project_id| value.project_id = try alloc.dupe(u8, selected_project_id);
+            if (project_id orelse account_project_id) |selected_project_id| {
+                const owned = try alloc.dupe(u8, selected_project_id);
+                value.project_id = owned;
+            }
             break :blk value;
         },
     };
@@ -1488,30 +1492,34 @@ pub fn jsonApiClientConfigFromEnvWithAuthoritiesAlloc(
 
     if ((try envOwned(alloc, "GCS_BEARER_TOKEN")) orelse (try envOwned(alloc, "GOOGLE_OAUTH_ACCESS_TOKEN"))) |token| {
         defer alloc.free(token);
-        cfg.auth = .{ .bearer_token = try alloc.dupe(u8, token) };
+        const owned_token = try alloc.dupe(u8, token);
+        cfg.auth = .{ .bearer_token = owned_token };
     } else {
         const scope = if (configured_scope) |value|
             try alloc.dupe(u8, value)
         else
             (try envOwned(alloc, "GCS_OAUTH_SCOPE")) orelse try alloc.dupe(u8, google_auth.default_scope);
         defer alloc.free(scope);
-        cfg.auth = .{ .google_token_source = try google_auth.tokenSourceFromEnvWithAuthoritiesAlloc(
+        const source = try google_auth.tokenSourceFromEnvWithAuthoritiesAlloc(
             alloc,
             scope,
             network_io,
             filesystem_io,
-        ) };
+        );
+        cfg.auth = .{ .google_token_source = source };
     }
 
     const explicit_project_id = (try envOwned(alloc, "GOOGLE_CLOUD_PROJECT")) orelse try envOwned(alloc, "GCLOUD_PROJECT");
     defer if (explicit_project_id) |value| alloc.free(value);
     if (explicit_project_id) |value| {
-        cfg.project_id = try alloc.dupe(u8, value);
+        const owned = try alloc.dupe(u8, value);
+        cfg.project_id = owned;
     } else if (switch (cfg.auth) {
         .google_token_source => |source| source.cfg.projectId(),
         else => null,
     }) |value| {
-        cfg.project_id = try alloc.dupe(u8, value);
+        const owned = try alloc.dupe(u8, value);
+        cfg.project_id = owned;
     }
 
     if (try envOwned(alloc, "GCS_JSON_API_ENDPOINT")) |value| {
@@ -1532,11 +1540,10 @@ pub fn jsonApiConfigWithBearerTokenAlloc(
     bearer_token: []const u8,
     project_id: ?[]const u8,
 ) !Config {
-    var cfg = try jsonApiConfigAlloc(alloc, bucket);
-    errdefer cfg.deinit(alloc);
-    cfg.json_api.?.auth = .{ .bearer_token = try alloc.dupe(u8, bearer_token) };
-    if (project_id) |value| cfg.json_api.?.project_id = try alloc.dupe(u8, value);
-    return cfg;
+    const owned_bucket = try alloc.dupe(u8, bucket);
+    errdefer alloc.free(owned_bucket);
+    const api = try jsonApiClientConfigWithBearerTokenAlloc(alloc, bearer_token, project_id);
+    return .{ .transport = .json_api, .bucket = owned_bucket, .json_api = api };
 }
 
 pub fn objectMediaUrlAlloc(alloc: Allocator, cfg: Config, key: []const u8) ![]u8 {
@@ -3056,6 +3063,18 @@ test "GCS shared credential factory rolls back every allocation failure" {
         }
     };
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "GCS owned configuration constructors roll back every allocation failure" {
+    const Harness = struct {
+        fn run(a: Allocator, bearer: bool) !void {
+            var cfg = if (bearer) try jsonApiConfigWithBearerTokenAlloc(a, "bucket", "fixture-token", "project") else try jsonApiConfigAlloc(a, "bucket");
+            defer cfg.deinit(a);
+            try std.testing.expectEqualStrings("bucket", cfg.bucket);
+            if (bearer) try std.testing.expectEqualStrings("fixture-token", cfg.json_api.?.auth.bearer_token);
+        }
+    };
+    inline for (.{ false, true }) |bearer| try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{bearer});
 }
 
 test "GCS expired operation deadline fails before transport dispatch" {

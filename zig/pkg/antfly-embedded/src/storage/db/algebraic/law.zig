@@ -206,7 +206,9 @@ fn addTupleValues(alloc: Allocator, values: *std.StringHashMapUnmanaged(void), e
     }
     for (parts) |part| {
         if (values.contains(part)) continue;
-        try values.put(alloc, try alloc.dupe(u8, part), {});
+        const owned = try alloc.dupe(u8, part);
+        errdefer alloc.free(owned);
+        try values.put(alloc, owned, {});
     }
 }
 

@@ -25,6 +25,7 @@ const physical_local_write = @import("antfly_local_sources").api_local_table_wri
 const local_write_test_hooks = @import("antfly_local_sources").api_local_write_test_hooks;
 const builtin = @import("builtin");
 const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
+const storage_descriptor_errors = @import("storage_descriptor_errors.zig");
 const std = @import("std");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = @import("antfly_local_sources").api_local_table_writes.control_only_storage_sources;
@@ -561,7 +562,7 @@ fn isTransientReplayVisibilityError(err: anyerror) bool {
 fn isTransientWriterOpenConflict(err: anyerror) bool {
     return err == error.LsmRootWriterAlreadyOpen or
         err == error.WriterLocked or
-        err == error.PersistentDescriptorAdmissionExhausted;
+        storage_descriptor_errors.isPressure(err);
 }
 
 fn isTransientRestoreRepairError(err: anyerror) bool {
@@ -655,6 +656,7 @@ var test_before_index_activation_enqueue_hook: ?local_write_test_hooks.TestExecu
 var test_before_post_create_runtime_status_publish_hook: ?local_write_test_hooks.TestExecutionHook = null;
 var test_before_structural_index_reconcile_hook: ?*const fn (*db_mod.DB) anyerror!void = null;
 var test_before_startup_catch_up_replay_hook: ?TestStartupCatchUpReplayPassHook = null;
+var test_writer_open_descriptor_error: anyerror = error.PersistentDescriptorAdmissionExhausted;
 var test_writer_open_persistent_descriptor_failures_remaining: std.atomic.Value(u32) = .init(0);
 var test_recovery_intent_read_failures_remaining: std.atomic.Value(u32) = .init(0);
 var test_dropped_table_job_submit_failures_remaining: std.atomic.Value(u32) = .init(0);
@@ -12021,7 +12023,7 @@ pub const ProvisionedTableWriteSource = struct {
         const deadline_ns = platform_time.monotonicNs() +| replicated_apply_writer_open_timeout_ns;
         while (true) {
             const open_result: anyerror!ProvisionedTableWriteCache.CachedDb = if (consumeTestWriterOpenPersistentDescriptorFailure())
-                error.PersistentDescriptorAdmissionExhausted
+                test_writer_open_descriptor_error
             else
                 cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, mode);
             const cached = open_result catch |err| switch (err) {
@@ -12046,7 +12048,8 @@ pub const ProvisionedTableWriteSource = struct {
                     lockAtomic(&self.local_db_mutex);
                     continue;
                 },
-                error.PersistentDescriptorAdmissionExhausted => {
+                else => {
+                    if (!storage_descriptor_errors.isPressure(err)) return err;
                     var evicted_cache: ?*ProvisionedTableWriteCache = null;
                     if (try cache.evictOneInactiveEntryForDescriptorPressureLocked(group_id, table_name)) {
                         evicted_cache = cache;
@@ -12065,7 +12068,6 @@ pub const ProvisionedTableWriteSource = struct {
                     lockAtomic(&self.local_db_mutex);
                     continue;
                 },
-                else => return err,
             };
             return cached;
         }
@@ -12555,7 +12557,7 @@ pub const ProvisionedTableWriteSource = struct {
                         return error.TopologyChanged;
                 }
                 const open_result: anyerror!db_mod.DB = if (consumeTestWriterOpenPersistentDescriptorFailure())
-                    error.PersistentDescriptorAdmissionExhausted
+                    test_writer_open_descriptor_error
                 else if (prepared_open.?.indexes_json) |value|
                     openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                         cache.alloc,
@@ -12607,45 +12609,43 @@ pub const ProvisionedTableWriteSource = struct {
                         .text_merge = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
                     });
 
-                const opened_value = open_result catch |err| switch (err) {
-                    error.PersistentDescriptorAdmissionExhausted => {
-                        lockAtomic(&self.local_db_mutex);
-                        const evicted = cache.evictOneInactiveEntryForDescriptorPressureLocked(group_id, table_name) catch |evict_err| {
-                            self.local_db_mutex.unlock();
-                            return evict_err;
-                        };
+                const opened_value = open_result catch |err| {
+                    if (!storage_descriptor_errors.isPressure(err)) return err;
+                    lockAtomic(&self.local_db_mutex);
+                    const evicted = cache.evictOneInactiveEntryForDescriptorPressureLocked(group_id, table_name) catch |evict_err| {
                         self.local_db_mutex.unlock();
-                        if (!evicted) {
-                            // The process pool is shared by the serving and startup
-                            // caches. Drop the currently-held open lock before the
-                            // coordinated slow path acquires both caches in address
-                            // order, then revalidate this prepared open after the
-                            // victim has synchronously released its lifetime FDs.
-                            cache.unlockOpenMutex();
-                            cache_open_locked = false;
-                            const cross_cache_evicted = self.reclaimInactiveEntryAcrossWriteCachesForDescriptorPressure(
-                                cache,
-                                group_id,
-                                table_name,
-                            ) catch |reclaim_err| {
-                                cache.lockOpenMutex();
-                                cache_open_locked = true;
-                                return reclaim_err;
-                            };
+                        return evict_err;
+                    };
+                    self.local_db_mutex.unlock();
+                    if (!evicted) {
+                        // The process pool is shared by the serving and startup
+                        // caches. Drop the currently-held open lock before the
+                        // coordinated slow path acquires both caches in address
+                        // order, then revalidate this prepared open after the
+                        // victim has synchronously released its lifetime FDs.
+                        cache.unlockOpenMutex();
+                        cache_open_locked = false;
+                        const cross_cache_evicted = self.reclaimInactiveEntryAcrossWriteCachesForDescriptorPressure(
+                            cache,
+                            group_id,
+                            table_name,
+                        ) catch |reclaim_err| {
                             cache.lockOpenMutex();
                             cache_open_locked = true;
-                            if (!cross_cache_evicted) return err;
-                            retry_prepared_open = true;
-                            break null;
-                        }
+                            return reclaim_err;
+                        };
+                        cache.lockOpenMutex();
+                        cache_open_locked = true;
+                        if (!cross_cache_evicted) return err;
+                        retry_prepared_open = true;
+                        break null;
+                    }
 
-                        // This path already owns cache.open_mutex. Close the
-                        // selected DB synchronously so its lifetime lock permits
-                        // are released before retrying the physical open.
-                        cache.drainPendingClosesAssumeOpenMutexHeld();
-                        continue;
-                    },
-                    else => return err,
+                    // This path already owns cache.open_mutex. Close the
+                    // selected DB synchronously so its lifetime lock permits
+                    // are released before retrying the physical open.
+                    cache.drainPendingClosesAssumeOpenMutexHeld();
+                    continue;
                 };
                 break opened_value;
             };
@@ -21153,6 +21153,8 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn canCoalesceProvisionedGroupBatch(self: *ProvisionedTableWriteSource, group: GroupBatch, req: db_mod.types.BatchRequest) bool {
         if (self.write_cache == null) return false;
+        // Each gated request owns its prepared source and output fences.
+        if (req.commit_requires != null or req.prepared_enrichments_json != null) return false;
         if (group.transforms.items.len != 0) return false;
         if (req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0) return false;
         return switch (req.sync_level) {
@@ -21684,6 +21686,8 @@ pub const ProvisionedTableWriteSource = struct {
             var accepted_groups: usize = 0;
             for (grouped.items) |group| {
                 batcher.batchGroupRoutedWithCancellation(alloc, group.route_fence orelse return error.CatalogRouteFenceRequired, table_name, .{
+                    .commit_requires = req.commit_requires,
+                    .prepared_enrichments_json = req.prepared_enrichments_json,
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
                     .transforms = group.transforms.items,
@@ -22406,13 +22410,14 @@ pub const ProvisionedTableWriteSource = struct {
             error.MultipleGroups => return null,
             else => return err,
         };
-        if (group_id_opt == null) return .{ .committed = .{ .participant_count = 0 } };
+        if (group_id_opt == null) return if (table_req.commit_requires == .direct_enrichments) null else .{ .committed = .{ .participant_count = 0 } };
 
         // The outer table request prevents a topology publication between the
         // one-participant proof above and the ordinary atomic batch admission.
         // `batch` retains the established schema, cache, coalescing, HA, and
         // sync-level behavior used by all non-transactional shard writes.
         const applied = self.batchWithVisibilityCancellation(alloc, table_req.table_name, .{
+            .commit_requires = table_req.commit_requires,
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
             .transforms = table_req.transforms,
@@ -22479,10 +22484,14 @@ pub const ProvisionedTableWriteSource = struct {
             error.MultipleGroups => return null,
             else => return err,
         };
-        const route = selected_route orelse return .{ .committed = .{ .participant_count = 0 } };
+        const route = selected_route orelse if (table_req.commit_requires == .direct_enrichments)
+            routing.resolveRouteForKey("") orelse return error.NotFound
+        else
+            return .{ .committed = .{ .participant_count = 0 } };
 
         const batcher = self.raft_batcher orelse return null;
         const req: db_mod.types.BatchRequest = .{
+            .commit_requires = table_req.commit_requires,
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
             .transforms = table_req.transforms,
@@ -23448,7 +23457,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (context.route_fence) |fence| {
             if (req.restore_staging_scope != null or fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
             const deadline = self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }) orelse self.catalog.budget(null).nowNs() +| std.time.ns_per_s * 5;
-            guarded_admission = try self.acquireRoutedWriteAdmission(alloc, table_name, fence, deadline, context.cancellation);
+            // A gated Raft writer prepares outside catalog admission. The
+            // DataServer reacquires this exact route fence after inference.
+            if (req.commit_requires != .direct_enrichments or self.raft_batcher == null)
+                guarded_admission = try self.acquireRoutedWriteAdmission(alloc, table_name, fence, deadline, context.cancellation);
         }
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
         self.beginGroupOperation(table_name, group_id);
@@ -23461,6 +23473,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .row_policy_database = req.row_policy_database,
                 .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
                 .normalized_graph_rows = req.normalized_graph_rows,
+                .commit_requires = req.commit_requires,
+                .prepared_enrichments_json = req.prepared_enrichments_json,
                 .writes = transactionWritesAsBatchWrites(req.writes),
                 .deletes = req.deletes,
                 .transforms = req.transforms,
@@ -23491,6 +23505,8 @@ pub const ProvisionedTableWriteSource = struct {
                 .row_policy_database = req.row_policy_database,
                 .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
                 .normalized_graph_rows = req.normalized_graph_rows,
+                .commit_requires = req.commit_requires,
+                .prepared_enrichments_json = req.prepared_enrichments_json,
                 .writes = transactionWritesAsBatchWrites(req.writes),
                 .deletes = req.deletes,
                 .transforms = req.transforms,
@@ -26235,6 +26251,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .table_name = table_name,
                         };
                         try cached.db.batchWithDocumentArtifactChildRangeDispatcher(.{
+                            .commit_requires = req.commit_requires,
+                            .prepared_enrichments_json = req.prepared_enrichments_json,
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
                             .transforms = group.transforms.items,
@@ -26248,6 +26266,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                     },
                     .remote => |remote| {
                         const body = try encodeRemoteBatchRequest(alloc, .{
+                            .commit_requires = req.commit_requires,
+                            .prepared_enrichments_json = req.prepared_enrichments_json,
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
                             .transforms = group.transforms.items,
@@ -26872,6 +26892,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             .row_policy_database = req.row_policy_database,
             .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
             .normalized_graph_rows = req.normalized_graph_rows,
+            .commit_requires = req.commit_requires,
+            .prepared_enrichments_json = req.prepared_enrichments_json,
             .writes = transactionWritesAsBatchWrites(req.writes),
             .deletes = req.deletes,
             .transforms = req.transforms,
@@ -27816,16 +27838,7 @@ fn applyGroupBatchUnchecked(
     cancellation: db_mod.types.CancellationToken,
 ) !void {
     local_write_test_hooks.runTestBeforeBatchExecutionHook();
-    const batch_req: db_mod.types.BatchRequest = .{
-        .writes = group.writes.items,
-        .deletes = group.deletes.items,
-        .transforms = group.transforms.items,
-        .graph_writes = req.graph_writes,
-        .graph_deletes = req.graph_deletes,
-        .predicates = req.predicates,
-        .timestamp_ns = req.timestamp_ns,
-        .sync_level = req.sync_level,
-    };
+    const batch_req = groupBatchRequest(group, req);
     if (req.reject_graph_transform_projections) {
         try db.batchTransactionCompatibleWithVisibilityCancellation(batch_req, cancellation);
     } else {
@@ -27835,21 +27848,11 @@ fn applyGroupBatchUnchecked(
 }
 
 fn groupBatchRequest(group: GroupBatch, req: db_mod.types.BatchRequest) db_mod.types.BatchRequest {
-    return .{
-        .writes = group.writes.items,
-        .deletes = group.deletes.items,
-        .transforms = group.transforms.items,
-        .graph_writes = req.graph_writes,
-        .graph_deletes = req.graph_deletes,
-        .predicates = req.predicates,
-        .timestamp_ns = req.timestamp_ns,
-        .sync_level = req.sync_level,
-        .reject_graph_transform_projections = req.reject_graph_transform_projections,
-        .split_checkpoint = req.split_checkpoint,
-        .split_replication = req.split_replication,
-        .split_transition = req.split_transition,
-        .transaction = req.transaction,
-    };
+    var grouped = req;
+    grouped.writes = group.writes.items;
+    grouped.deletes = group.deletes.items;
+    grouped.transforms = group.transforms.items;
+    return grouped;
 }
 
 /// Apply one already-committed storage-owner command using only persisted local
@@ -33438,7 +33441,11 @@ fn consumerTests() type {
         }
 
         test "persistent descriptor exhaustion is a retryable writer-open conflict" {
-            try std.testing.expect(isTransientWriterOpenConflict(error.PersistentDescriptorAdmissionExhausted));
+            for (storage_descriptor_errors.failures) |failure| {
+                try std.testing.expect(isTransientWriterOpenConflict(failure));
+            }
+            try std.testing.expect(!isTransientWriterOpenConflict(error.InputOutput));
+            try std.testing.expect(!isTransientWriterOpenConflict(error.OutOfMemory));
         }
 
         test "full text memory attribution aggregation includes norm bytes" {
@@ -33933,6 +33940,7 @@ fn consumerTests() type {
             const Capture = struct {
                 calls: usize = 0,
                 transforms: usize = 0,
+                requirement: ?db_mod.types.CommitRequires = null,
 
                 fn batchGroup(
                     ptr: *anyopaque,
@@ -33944,6 +33952,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.calls += 1;
                     self.transforms = req.transforms.len;
+                    self.requirement = req.commit_requires;
                 }
 
                 fn batchGroupRouted(ptr: *anyopaque, allocator: std.mem.Allocator, route_capability: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
@@ -33997,6 +34006,21 @@ fn consumerTests() type {
             try std.testing.expect(ordinary == .committed);
             try std.testing.expectEqual(@as(usize, 1), capture.calls);
             try std.testing.expectEqual(@as(usize, 1), capture.transforms);
+            for ([_]db_mod.types.CommitRequires{ .direct_enrichments, .none }) |requirement| {
+                _ = try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{.{
+                    .table_name = "docs",
+                    .commit_requires = requirement,
+                    .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+                }}, .write, .none);
+                try std.testing.expectEqual(requirement, capture.requirement.?);
+            }
+            const before_empty = capture.calls;
+            _ = try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{.{
+                .table_name = "docs",
+                .commit_requires = .direct_enrichments,
+            }}, .write, .none);
+            try std.testing.expectEqual(before_empty + 1, capture.calls);
+            try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, capture.requirement.?);
         }
 
         test "provisioned stateless batch retries definite aborts to the production bound" {
@@ -46028,174 +46052,188 @@ fn implementationTests() type {
         }
 
         test "prepared writer open evicts an inactive sibling group before retrying descriptor pressure" {
-            const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
-            defer tmp.cleanup();
+            for (storage_descriptor_errors.failures) |failure| {
+                for ([_]bool{ false, true }) |already_locked| {
+                    test_writer_open_descriptor_error = failure;
+                    defer test_writer_open_descriptor_error = error.PersistentDescriptorAdmissionExhausted;
+                    const alloc = std.testing.allocator;
+                    var tmp = std.testing.tmpDir(.{});
+                    defer tmp.cleanup();
 
-            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/descriptor-pressure-cache", .{tmp.sub_path});
-            defer alloc.free(root);
-            const victim_path = try std.fmt.allocPrint(alloc, "{s}/group-7001", .{root});
-            defer alloc.free(victim_path);
-            const active_path = try std.fmt.allocPrint(alloc, "{s}/group-7002", .{root});
-            defer alloc.free(active_path);
+                    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/descriptor-pressure-cache", .{tmp.sub_path});
+                    defer alloc.free(root);
+                    const victim_path = try std.fmt.allocPrint(alloc, "{s}/group-7001", .{root});
+                    defer alloc.free(victim_path);
+                    const active_path = try std.fmt.allocPrint(alloc, "{s}/group-7002", .{root});
+                    defer alloc.free(active_path);
 
-            const Catalog = struct {
-                fn iface() table_catalog.CatalogSource {
-                    return .{
-                        .ptr = undefined,
-                        .vtable = &.{
-                            .admin_snapshot = adminSnapshot,
-                            .free_admin_snapshot = freeAdminSnapshot,
-                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
-                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
-                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
-                        },
+                    const Catalog = struct {
+                        fn iface() table_catalog.CatalogSource {
+                            return .{
+                                .ptr = undefined,
+                                .vtable = &.{
+                                    .admin_snapshot = adminSnapshot,
+                                    .free_admin_snapshot = freeAdminSnapshot,
+                                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                                },
+                            };
+                        }
+
+                        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                            return .{
+                                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                                    .{ .table_id = 7, .name = "docs", .indexes_json = tables_api.default_indexes_json },
+                                })[0..]),
+                                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                                    .{ .group_id = 7002, .table_id = 7, .start_key = "", .end_key = null },
+                                })[0..]),
+                                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                            };
+                        }
+
+                        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
                     };
+
+                    var cache = ProvisionedTableWriteCache.init(alloc);
+                    defer cache.deinit();
+                    var source = ProvisionedTableWriteSource.init(root, Catalog.iface());
+                    defer source.deinit();
+                    source.write_cache = &cache;
+
+                    var victim = try cache.getOrOpenLocked(victim_path, Catalog.iface(), 7001, 1, "docs");
+                    victim.deinit(alloc);
+
+                    test_writer_open_persistent_descriptor_failures_remaining.store(1, .release);
+                    defer test_writer_open_persistent_descriptor_failures_remaining.store(0, .release);
+                    var active = if (already_locked) opened: {
+                        lockAtomic(&source.local_db_mutex);
+                        defer source.local_db_mutex.unlock();
+                        break :opened try source.getOrOpenCachedDbModeAlreadyLocked(&cache, active_path, 7002, 1, "docs", .default_async);
+                    } else try source.getOrOpenCachedDbModeAtGeneration(
+                        alloc,
+                        &cache,
+                        active_path,
+                        7002,
+                        1,
+                        "docs",
+                        .default_async,
+                        null,
+                        null,
+                        null,
+                        .{},
+                    );
+                    defer active.deinit(alloc);
+
+                    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+                    try std.testing.expectEqual(@as(u64, 7002), cache.entries.items[0].group_id);
+                    try std.testing.expectEqualStrings("docs", cache.entries.items[0].table_name);
+                    try std.testing.expectEqual(@as(usize, 0), cache.closing_entries.items.len);
+                    try std.testing.expectEqual(@as(u32, 0), test_writer_open_persistent_descriptor_failures_remaining.load(.acquire));
+
+                    try std.testing.expect(!(try cache.evictOneInactiveEntryForDescriptorPressureLocked(9999, "unrelated")));
+                    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
                 }
-
-                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-                    return .{
-                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{
-                            .{ .table_id = 7, .name = "docs", .indexes_json = tables_api.default_indexes_json },
-                        })[0..]),
-                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
-                            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
-                            .{ .group_id = 7002, .table_id = 7, .start_key = "", .end_key = null },
-                        })[0..]),
-                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-                    };
-                }
-
-                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-            };
-
-            var cache = ProvisionedTableWriteCache.init(alloc);
-            defer cache.deinit();
-            var source = ProvisionedTableWriteSource.init(root, Catalog.iface());
-            defer source.deinit();
-            source.write_cache = &cache;
-
-            var victim = try cache.getOrOpenLocked(victim_path, Catalog.iface(), 7001, 1, "docs");
-            victim.deinit(alloc);
-
-            test_writer_open_persistent_descriptor_failures_remaining.store(1, .release);
-            defer test_writer_open_persistent_descriptor_failures_remaining.store(0, .release);
-            var active = try source.getOrOpenCachedDbModeAtGeneration(
-                alloc,
-                &cache,
-                active_path,
-                7002,
-                1,
-                "docs",
-                .default_async,
-                null,
-                null,
-                null,
-                .{},
-            );
-            defer active.deinit(alloc);
-
-            try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
-            try std.testing.expectEqual(@as(u64, 7002), cache.entries.items[0].group_id);
-            try std.testing.expectEqualStrings("docs", cache.entries.items[0].table_name);
-            try std.testing.expectEqual(@as(usize, 0), cache.closing_entries.items.len);
-            try std.testing.expectEqual(@as(u32, 0), test_writer_open_persistent_descriptor_failures_remaining.load(.acquire));
-
-            try std.testing.expect(!(try cache.evictOneInactiveEntryForDescriptorPressureLocked(9999, "unrelated")));
-            try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+            }
         }
 
         test "prepared writer open reclaims descriptor capacity from startup cache" {
-            const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
-            defer tmp.cleanup();
+            for (storage_descriptor_errors.failures) |failure| {
+                test_writer_open_descriptor_error = failure;
+                defer test_writer_open_descriptor_error = error.PersistentDescriptorAdmissionExhausted;
+                const alloc = std.testing.allocator;
+                var tmp = std.testing.tmpDir(.{});
+                defer tmp.cleanup();
 
-            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cross-cache-descriptor-pressure", .{tmp.sub_path});
-            defer alloc.free(root);
-            const db_path = try std.fmt.allocPrint(alloc, "{s}/group-7001", .{root});
-            defer alloc.free(db_path);
+                const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cross-cache-descriptor-pressure", .{tmp.sub_path});
+                defer alloc.free(root);
+                const db_path = try std.fmt.allocPrint(alloc, "{s}/group-7001", .{root});
+                defer alloc.free(db_path);
 
-            const Catalog = struct {
-                fn iface() table_catalog.CatalogSource {
-                    return .{
-                        .ptr = undefined,
-                        .vtable = &.{
-                            .admin_snapshot = adminSnapshot,
-                            .free_admin_snapshot = freeAdminSnapshot,
-                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
-                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
-                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
-                        },
-                    };
-                }
+                const Catalog = struct {
+                    fn iface() table_catalog.CatalogSource {
+                        return .{
+                            .ptr = undefined,
+                            .vtable = &.{
+                                .admin_snapshot = adminSnapshot,
+                                .free_admin_snapshot = freeAdminSnapshot,
+                                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                            },
+                        };
+                    }
 
-                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-                    return .{
-                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{
-                            .{ .table_id = 7, .name = "docs", .indexes_json = tables_api.default_indexes_json },
-                        })[0..]),
-                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
-                            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
-                        })[0..]),
-                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-                    };
-                }
+                    fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                        return .{
+                            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                            .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                                .{ .table_id = 7, .name = "docs", .indexes_json = tables_api.default_indexes_json },
+                            })[0..]),
+                            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                                .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                            })[0..]),
+                            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                        };
+                    }
 
-                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-            };
+                    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                };
 
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
-            var startup_cache = ProvisionedTableWriteCache.init(alloc);
-            defer startup_cache.deinit();
-            var source = ProvisionedTableWriteSource.init(root, Catalog.iface());
-            defer source.deinit();
-            source.bindWriteCaches(&write_cache, &startup_cache);
+                var write_cache = ProvisionedTableWriteCache.init(alloc);
+                defer write_cache.deinit();
+                var startup_cache = ProvisionedTableWriteCache.init(alloc);
+                defer startup_cache.deinit();
+                var source = ProvisionedTableWriteSource.init(root, Catalog.iface());
+                defer source.deinit();
+                source.bindWriteCaches(&write_cache, &startup_cache);
 
-            var victim = try startup_cache.getOrOpenLockedMode(
-                db_path,
-                Catalog.iface(),
-                7001,
-                1,
-                "docs",
-                .startup_catch_up,
-            );
-            victim.deinit(alloc);
-            try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
-            try std.testing.expectEqual(@as(usize, 1), startup_cache.entries.items.len);
+                var victim = try startup_cache.getOrOpenLockedMode(
+                    db_path,
+                    Catalog.iface(),
+                    7001,
+                    1,
+                    "docs",
+                    .startup_catch_up,
+                );
+                victim.deinit(alloc);
+                try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+                try std.testing.expectEqual(@as(usize, 1), startup_cache.entries.items.len);
 
-            test_writer_open_persistent_descriptor_failures_remaining.store(1, .release);
-            defer test_writer_open_persistent_descriptor_failures_remaining.store(0, .release);
-            var active = try source.getOrOpenCachedDbModeAtGeneration(
-                alloc,
-                &write_cache,
-                db_path,
-                7001,
-                2,
-                "docs",
-                .default_async,
-                null,
-                null,
-                null,
-                .{},
-            );
-            defer active.deinit(alloc);
+                test_writer_open_persistent_descriptor_failures_remaining.store(1, .release);
+                defer test_writer_open_persistent_descriptor_failures_remaining.store(0, .release);
+                var active = try source.getOrOpenCachedDbModeAtGeneration(
+                    alloc,
+                    &write_cache,
+                    db_path,
+                    7001,
+                    2,
+                    "docs",
+                    .default_async,
+                    null,
+                    null,
+                    null,
+                    .{},
+                );
+                defer active.deinit(alloc);
 
-            try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
-            try std.testing.expectEqual(@as(u64, 7001), write_cache.entries.items[0].group_id);
-            try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
-            try std.testing.expectEqual(@as(usize, 0), startup_cache.entries.items.len);
-            try std.testing.expectEqual(@as(usize, 0), startup_cache.retired_entries.items.len);
-            try std.testing.expectEqual(@as(usize, 0), startup_cache.closing_entries.items.len);
-            try std.testing.expectEqual(@as(u32, 0), test_writer_open_persistent_descriptor_failures_remaining.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+                try std.testing.expectEqual(@as(u64, 7001), write_cache.entries.items[0].group_id);
+                try std.testing.expectEqual(@as(u64, 2), write_cache.entries.items[0].lsm_root_generation);
+                try std.testing.expectEqual(@as(usize, 0), startup_cache.entries.items.len);
+                try std.testing.expectEqual(@as(usize, 0), startup_cache.retired_entries.items.len);
+                try std.testing.expectEqual(@as(usize, 0), startup_cache.closing_entries.items.len);
+                try std.testing.expectEqual(@as(u32, 0), test_writer_open_persistent_descriptor_failures_remaining.load(.acquire));
+            }
         }
 
         test "forwarded write sources use the local writer owner dirty lifecycle" {

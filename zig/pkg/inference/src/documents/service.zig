@@ -1104,13 +1104,6 @@ pub fn Service(comptime Node: type) type {
                 try ir.transformTables(tables, view.raster_to_source, offset, binding.output_origin == .interpretation);
                 return .{ .text = page.text, .model = binding.model, .origin = ir.inheritOrigin(page.origin, binding.output_origin), .status = page.status, .regions = regions, .tables = tables, .fields = page.fields };
             }
-            const Cancel = struct {
-                fn cancelled(ptr: *const anyopaque) bool {
-                    const ctl: *const Control = @ptrCast(@alignCast(ptr));
-                    ctl.check() catch return true;
-                    return false;
-                }
-            };
             const pinned = try self.verifyBinding(a, binding);
             const request = readers.EncodedRequest{
                 .allow_incomplete = true,
@@ -1122,7 +1115,7 @@ pub fn Service(comptime Node: type) type {
             defer permit.deinit();
             const batch = if (self.reader_batcher) |batcher| try batcher.read(a, pinned.path, request, self.control, run) else direct: {
                 run.physicalCall();
-                break :direct try self.node.readEncodedImagesReportedDirectWithContext(a, pinned.path, request, self.control.deadline_ns, .{ .ptr = &self.control, .is_cancelled_fn = Cancel.cancelled });
+                break :direct try self.node.readEncodedImagesReportedDirectWithControl(a, pinned.path, request, self.control);
             };
             _ = try self.verifyBinding(a, binding);
             if (batch.usage) |usage| {
@@ -1786,6 +1779,7 @@ fn dataUri(a: A, mime: []const u8, bytes: []const u8) ![]const u8 {
 test "document nested composites share one budget and one rendered view" {
     const Fake = struct {
         reads: usize = 0,
+        borrowed_request: bool = false,
         last_max_tokens: ?i64 = null,
         structured: bool = false,
         narrow_child: bool = false,
@@ -1823,10 +1817,11 @@ test "document nested composites share one budget and one rendered view" {
         fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             return .{ .data = @import("antfly_documents").fixtures.get("one-pixel.png") };
         }
-        fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, request: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, model: []const u8, request: readers.EncodedRequest, control: Control) !readers.BatchResult {
             try std.testing.expectEqualStrings("leaf", model);
             try std.testing.expectEqual(@as(usize, 1), request.images.len);
             try std.testing.expectEqualStrings("image/png", request.images[0].mime_type);
+            self.borrowed_request = control.request_slot_admitted;
             self.reads += 1;
             self.last_max_tokens = request.max_tokens;
             const results = try a.alloc(readers.Result, 1);
@@ -1863,11 +1858,12 @@ test "document nested composites share one budget and one rendered view" {
     fake.malformed_vision = false;
     const result = try Service(Fake).readJson(&fake, a,
         \\{"model":"parent","documents":[{"id":"receipt","url":"fixture","media_type":"image/png"}]}
-    , .{});
+    , .{ .request_slot_admitted = true });
     defer a.free(result);
     var parsed = try std.json.parseFromSlice(V, a, result, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), fake.reads);
+    try std.testing.expect(fake.borrowed_request);
     const encoded = try Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = @import("antfly_documents").fixtures.get("one-pixel.png"), .mime_type = "IMAGE/PNG; charset=binary", .item_id = "receipt", .page_number = 11 }} }, .{});
     defer a.free(encoded);
     var encoded_result = try std.json.parseFromSlice(V, a, encoded, .{});
@@ -2045,7 +2041,7 @@ test "document extraction keeps independent sources atomic and reuses retained r
             const value = if (self.disagree and std.mem.eql(u8, name, "verifier")) "wrong" else content.string[0..5];
             return .{ .allocator = a, .json = try std.json.Stringify.valueAlloc(a, .{ .object = "extraction", .model = name, .schema_version = effective_version, .data = .{.{ .structures = .{ .record = .{.{ .value = .{ .value = value, .start = @as(u32, 0), .end = @as(u32, 5) } }} } }}, .usage = .{ .input_tokens = @as(u32, 4), .output_tokens = @as(u32, 0) } }, .{}) };
         }
-        fn readEncodedImagesReportedDirectWithContext(_: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) anyerror!readers.BatchResult {
+        fn readEncodedImagesReportedDirectWithControl(_: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: Control) anyerror!readers.BatchResult {
             return error.UnexpectedCall;
         }
         fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
@@ -2393,7 +2389,7 @@ test "document equal text retains provenance unless an independent literal reade
         fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             return .{ .data = @import("antfly_documents").fixtures.get("one-pixel.png") };
         }
-        fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, model: []const u8, _: readers.EncodedRequest, _: Control) !readers.BatchResult {
             self.calls += 1;
             const initial = std.mem.eql(u8, model, "initial");
             const declared = if (initial) self.initial_origin else if (std.mem.eql(u8, model, "verifier")) self.verifier_origin.? else c.Origin.transcription;
@@ -2541,7 +2537,7 @@ test "document preflight rejects verifier aliases and specialists retain indepen
             self.downloads += 1;
             return .{ .data = @import("antfly_documents").fixtures.get("one-pixel.png") };
         }
-        fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, model: []const u8, _: readers.EncodedRequest, _: Control) !readers.BatchResult {
             self.calls += 1;
             const initial = std.mem.eql(u8, model, "initial");
             const verifier = std.mem.eql(u8, model, "verifier");
@@ -2641,7 +2637,7 @@ test "document primitive table reports corroborate composed flat table views" {
         pub fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             return .{ .data = @import("antfly_documents").fixtures.get("one-pixel.png") };
         }
-        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        pub fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, model: []const u8, _: readers.EncodedRequest, _: Control) !readers.BatchResult {
             const items = try a.alloc(readers.Result, 1);
             items[0] = .{ .text = if (std.mem.eql(u8, model, "initial")) "bad" else "caption", .document_json = if (std.mem.eql(u8, model, "initial"))
                 \\{"text":"bad","origin":"transcription","status":"complete","regions":[{"id":0,"text":"bad","label":"table","bbox":[0,0,1,1]}]}
@@ -2706,7 +2702,7 @@ test "document extraction consumes qualified table cells from fresh and retained
             self.downloads += 1;
             return .{ .data = @import("antfly_documents").fixtures.get("one-pixel.png") };
         }
-        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        pub fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: Control) !readers.BatchResult {
             const items = try a.alloc(readers.Result, 1);
             const cells = [_]c.Cell{.{ .row = 0, .column = 0, .text = "12.50" }};
             const tables = [_]c.Table{.{ .id = 1, .rows = 1, .columns = 1, .cells = &cells, .origin = self.cell_origin }};
@@ -2789,7 +2785,7 @@ test "document regional encoding bounds every provider and nested view before di
         fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             return .{ .data = @import("antfly_documents").fixtures.get("crop-byte-limit.png") };
         }
-        fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, model: []const u8, req: readers.EncodedRequest, _: Control) !readers.BatchResult {
             const info = try image.inspectEncoded(req.images[0].bytes);
             try std.testing.expectEqual(@as(u32, 256), info.width);
             try std.testing.expectEqual(@as(u32, 256), info.height);
@@ -2866,7 +2862,7 @@ test "document checked projection and table validation agree across fresh and re
         pub fn readDocumentArtifact(self: *@This(), a: A, _: []const u8) ![]u8 {
             return a.dupe(u8, self.retained);
         }
-        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        pub fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: Control) !readers.BatchResult {
             self.calls += 1;
             const items = try a.alloc(readers.Result, 1);
             items[0] = .{ .text = "Total 12.50", .completion = .complete, .document_json = self.raw_report };
@@ -3000,7 +2996,7 @@ test "document routers share abstention semantics and retain accepted structure"
         pub fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             return error.UnexpectedCall;
         }
-        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        pub fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: Control) !readers.BatchResult {
             self.reads += 1;
             var page = try std.json.parseFromSliceLeaky(V, a,
                 \\{"text":"Visible","status":"complete","fields":{"amount":12.5},"tables":[{"id":0,"rows":1,"columns":1,"cells":[{"row":0,"column":0,"text":"Visible"}]}]}
@@ -3082,7 +3078,7 @@ test "document specialists nested readers and verifiers receive identical alpha 
         pub fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             return error.UnexpectedCall;
         }
-        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, name: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        pub fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, name: []const u8, req: readers.EncodedRequest, _: Control) !readers.BatchResult {
             self.reads += 1;
             const initial = std.mem.eql(u8, name, "initial");
             if (!initial) {
@@ -3154,7 +3150,7 @@ fn expectExtractionParameterDepth(field: []const u8, depth: usize, expected: any
         pub fn readDocumentArtifact(_: *@This(), _: A, _: []const u8) ![]u8 {
             return error.UnexpectedCall;
         }
-        pub fn readEncodedImagesReportedDirectWithContext(_: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        pub fn readEncodedImagesReportedDirectWithControl(_: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: Control) !readers.BatchResult {
             return error.UnexpectedCall;
         }
         pub fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {
@@ -3220,7 +3216,7 @@ test "document parallel pages finish out of order with canonical output and shar
         pub fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             return .{ .data = @import("antfly_documents").fixtures.get("two-pages.pdf") };
         }
-        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        pub fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, _: Control) !readers.BatchResult {
             _ = self.calls.fetchAdd(1, .monotonic);
             const number = req.images[0].page_number.?;
             if (!self.batching and number == 1) try self.second_finished.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } });
@@ -3338,7 +3334,7 @@ test "document pixel ownership settles failed crop encoding before a sibling adm
         fn documentResolveBinding(_: *@This(), _: A, binding: c.Binding) !c.Snapshot {
             return .{ .binding = binding, .path = binding.model, .identity = @splat(0) };
         }
-        fn readEncodedImagesReportedDirectWithContext(self: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        fn readEncodedImagesReportedDirectWithControl(self: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: Control) !readers.BatchResult {
             self.calls += 1;
             return error.UnexpectedCall;
         }
@@ -3457,7 +3453,7 @@ test "document durable shared leaf receipts count measured work once across sour
         fn documentDownload(_: *@This(), _: A, _: []const u8, _: usize, _: Control) !struct { data: []const u8 } {
             return .{ .data = @import("antfly_documents").fixtures.get("one-pixel.png") };
         }
-        fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, _: []const u8, _: readers.EncodedRequest, _: Control) !readers.BatchResult {
             self.calls += 1;
             const items = try a.alloc(readers.Result, 1);
             items[0] = .{ .text = "Total", .completion = .complete };
@@ -3656,7 +3652,7 @@ const AudioPlanTestNode = struct {
             \\{"object":"extraction","schema_version":2,"data":[{"entities":[{"label":"person","text":"Alice","start":0,"end":5,"score":0.9}]}],"usage":{"input_tokens":4,"output_tokens":0}}
         ) };
     }
-    fn readEncodedImagesReportedDirectWithContext(_: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: ?u64, _: anytype) anyerror!readers.BatchResult {
+    fn readEncodedImagesReportedDirectWithControl(_: *@This(), _: A, _: []const u8, _: readers.EncodedRequest, _: Control) anyerror!readers.BatchResult {
         return error.UnexpectedCall;
     }
     fn invokeCloudflare(_: *@This(), _: A, _: c.Binding, _: V, _: Control, _: *c.Run) anyerror!V {

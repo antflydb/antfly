@@ -2769,6 +2769,7 @@ fn searchProfiledRequestAttempt(
         .cosine => vec.norm(req.query),
         .inner_product => 0,
     };
+    scratch.certified_query_norm_upper = if (exhaustive_coverage) vec.projectionQueryNormUpper(req.query) else 0;
     const search_width = req.search_width orelse self.config.search_width;
     const epsilon = req.epsilon orelse self.config.epsilon;
     const rerank_factor: usize = req.rerank_factor orelse search_mod.rerankFactor(epsilon);
@@ -2853,7 +2854,10 @@ fn searchProfiledRequestAttempt(
     defer filter_state.deinit(self.alloc);
     const global_plan_prepared = try prepareGlobalSubgroupPlan(self, &txn, &scratch_handle, req, &filter_state, coverage_policy, @intCast(@min(@as(u64, search_width) + 1, published_snapshot.node_count)));
 
-    var approx_results = try search_results.ApproxSearchResults.initCapacity(self.alloc, req.k, candidate_limit, candidate_limit);
+    var approx_results = if (exhaustive_coverage)
+        try search_results.ApproxSearchResults.initExactCapacity(self.alloc, req.k, candidate_limit)
+    else
+        try search_results.ApproxSearchResults.initCapacity(self.alloc, req.k, candidate_limit, candidate_limit);
     errdefer approx_results.deinit();
     profile.setup_ns += elapsed_fn_u64(setup_start);
 
@@ -4238,7 +4242,7 @@ fn scoreNativeLeafScan(
         // Dirty/native row manifests have no subgroup permutation or duplicate
         // float16 plane. Preserve the global planner's fallback/order contract.
         if (scratch.global_subgroups.active) try drainGlobalSubgroups(self, txn, scratch, req, approx_query, results, profile, false, now, elapsed);
-        if (filter_state.isTrivial() and req.key_predicate == null and req.filter_prefix.len == 0 and req.distance_over == null and req.distance_under == null) {
+        if (!search_types.requiresExhaustiveCoverage(req) and filter_state.isTrivial() and req.key_predicate == null and req.filter_prefix.len == 0 and req.distance_over == null and req.distance_under == null) {
             const Sink = struct {
                 target: *search_results.ApproxSearchResults,
                 ids: [8]u64 = undefined,
@@ -4470,7 +4474,25 @@ fn scoreLeafMemberIds(
     comptime use_search_cache: bool,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
-) !void {
+) anyerror!void {
+    // Exact scoring streams fixed-size waves, even when a dirty/underfilled
+    // topology has an oversized posting. Preserve the complete membership
+    // validation performed by the caller, but never decode/retain an entire
+    // posting's wide vector payload just to select its top-k contribution.
+    const exact_wave_size = 128;
+    if (search_types.requiresExhaustiveCoverage(req) and member_ids.len > exact_wave_size) {
+        profile.max_leaf_vectors_considered = @max(profile.max_leaf_vectors_considered, member_ids.len);
+        const plane = if (native_projections) |value| if (value.validFor(member_ids.len, self.config.dims)) value else null else null;
+        var begin: usize = 0;
+        while (begin < member_ids.len) {
+            try search_types.checkCancelled(req);
+            const end = @min(member_ids.len, begin + exact_wave_size);
+            try scoreLeafMemberIds(self, txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids[begin..end], null, if (plane) |value| value.slice(begin, end) else null, null, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
+            begin = end;
+        }
+        return;
+    }
+    try search_types.checkCancelled(req);
     var start = now_fn_u64();
     if (scratch.global_subgroups.active) {
         if (native_quantized != null and native_subgroups != null and native_projections == null and leaf_has_fresh_stored_payload and std.meta.activeTag(native_quantized.?.*) == .rabit) {
@@ -4566,6 +4588,7 @@ fn scoreLeafMemberIds(
                 continue;
             }
             scratch.key_views[prefix_count] = metadata;
+            scratch.metadata[prefix_count] = metadata;
             scratch.member_ids[prefix_count] = member_id;
             scratch.positions[prefix_count] = original_index;
             prefix_count += 1;
@@ -4586,6 +4609,7 @@ fn scoreLeafMemberIds(
                     }
                     scratch.member_ids[selected] = scratch.member_ids[index];
                     scratch.positions[selected] = scratch.positions[index];
+                    scratch.metadata[selected] = scratch.metadata[index];
                     selected += 1;
                 }
                 begin = end;
@@ -4828,29 +4852,93 @@ fn scoreLeafMemberIds(
         }
     }
 
-    noteLeafScanBytes(profile, scoring_member_ids.len, @as(u64, self.config.dims) *| @sizeOf(f32));
     const fetch_member_ids = scratch.vector_ids[0..scoring_member_ids.len];
+    // Complete coverage still observes every posting and validates its members.
+    // A deterministic projection interval can nevertheless prove that a member
+    // cannot beat the exact top-k already accumulated. Never use RaBitQ's
+    // probabilistic error estimates for this decision, and keep equal bounds
+    // for public tie ordering. Dirty/legacy postings retain authoritative scans.
+    const exact_cutoff = if (!approximate_scoring)
+        exactTopKCutoff(results, req.k)
+    else
+        null;
+    const screening_plane = if (exact_cutoff != null and leaf_has_fresh_stored_payload)
+        if (native_projections) |plane|
+            if (plane.validFor(member_ids.len, self.config.dims) and plane.checksums.len == member_ids.len) plane else null
+        else
+            null
+    else
+        null;
+    const screening_query_norm = scratch.certified_query_norm_upper;
+    const ScreeningIndex = childType(@TypeOf(self));
+    const external_screening = if (comptime @hasDecl(ScreeningIndex, "scoreExternalVectorsBoundedWithScratch"))
+        if (exact_cutoff != null and screening_plane == null and indexHasExternalVectorLoader(self))
+            try self.scoreExternalVectorsBoundedWithScratch(txn, scoring_member_ids, exact_query, exact_query_measure, screening_query_norm, scratch.distances[0..scoring_member_ids.len], scratch.error_bounds[0..scoring_member_ids.len], scratch.metadata[0..scoring_member_ids.len], req.filter_prefix.len > 0 or req.key_predicate != null, scratch.vector_views, scratch.lookups, scratch.key_views, scratch.values, scratch.vector_batch, profile)
+        else
+            false
+    else
+        false;
     var fetch_count: usize = 0;
+    var full_precision_count: usize = 0;
+    const projection_count_before = profile.exact_projection_vectors_scored;
     for (scoring_member_ids, 0..) |member_id, i| {
         if (i % 256 == 0) try search_types.checkCancelled(req);
+        if (external_screening) {
+            // Some source rows (WAL values and decoded cache hits) already
+            // have authoritative scores. Consume them once, including strict
+            // distance predicates, rather than fetching/scoring them again.
+            const distance = scratch.distances[i];
+            if (scratch.error_bounds[i] == 0 and std.math.isFinite(distance)) {
+                full_precision_count += 1;
+                if (!has_extra_filters or try memberMatchesRequestWithCachePolicy(self, txn, member_id, distance, 0, scoring_req, &empty_filter_state, false, use_search_cache)) {
+                    results.addResult(member_id, distance, 0);
+                    profile.exact_vectors_scored += 1;
+                }
+                continue;
+            }
+            profile.exact_projection_vectors_scored += 1;
+            if (projectionCannotBeatExactCutoff(scratch.distances[i], scratch.error_bounds[i], exact_cutoff.?)) {
+                profile.exact_vectors_pruned_by_bound += 1;
+                continue;
+            }
+        }
+        // An existing full-vector cache hit is cheaper than two scoring
+        // passes. Check it before decoding the optional native projection.
         if (use_search_cache) {
             if (borrowCachedVectorHandle(self, txn, member_id)) |cached_handle| {
                 profile.vector_cache_hits += 1;
                 var handle = cached_handle;
                 defer handle.deinit();
                 const dist = vec.distanceToQuery(exact_query, exact_query_measure, handle.view(), self.config.metric);
-                if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false, use_search_cache)) {
-                    continue;
-                }
+                if (!approximate_scoring and !std.math.isFinite(dist)) return error.IncompletePublishedSnapshot;
+                full_precision_count += 1;
+                if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false, use_search_cache)) continue;
                 results.addResult(member_id, dist, 0);
                 profile.exact_vectors_scored += 1;
                 continue;
             }
         }
+        if (screening_plane) |plane| {
+            const row = original_positions[i];
+            try plane.validateRow(row);
+            const bounded = vec.certifiedDistanceToQueryF16(exact_query, exact_query_measure, screening_query_norm, plane.values[row * plane.dims ..][0..plane.dims], plane.scales[row], plane.error_norms[row], plane.decoded_norm_lower_bounds[row], self.config.metric);
+            profile.exact_projection_vectors_scored += 1;
+            if (std.math.isFinite(plane.error_norms[row]) and plane.error_norms[row] >= 0 and
+                projectionCannotBeatExactCutoff(bounded.distance, bounded.error_bound, exact_cutoff.?))
+            {
+                profile.exact_vectors_pruned_by_bound += 1;
+                continue;
+            }
+        }
         if (!indexHasExternalVectorLoader(self)) profile.vector_cache_misses += 1;
         fetch_member_ids[fetch_count] = member_id;
+        if (external_screening) scratch.metadata[fetch_count] = scratch.metadata[i];
         fetch_count += 1;
+        full_precision_count += 1;
     }
+    const projection_count = profile.exact_projection_vectors_scored - projection_count_before;
+    const score_bytes = (@as(u64, @intCast(full_precision_count)) *| @sizeOf(f32) +| projection_count *| @sizeOf(f16)) *| self.config.dims;
+    noteLeafScanBytes(profile, 1, score_bytes);
 
     if (fetch_count == 0) return;
 
@@ -4858,7 +4946,9 @@ fn scoreLeafMemberIds(
     var external_scored = false;
     const Index = comptime childType(@TypeOf(self));
     if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalVectorsSortedWithScratch")) {
-        external_scored = if (!use_search_cache and comptime @hasDecl(Index, "scoreExternalVectorsSortedWithScratchUncached"))
+        external_scored = if (comptime @hasDecl(Index, "scoreExternalVectorsWithScratchProfiled"))
+            try self.scoreExternalVectorsWithScratchProfiled(txn, fetch_member_ids[0..fetch_count], exact_query, exact_query_measure, exact_distances, scratch.metadata[0..fetch_count], scratch.vector_views, scratch.lookups, scratch.key_views, scratch.values, scratch.vector_batch, external_screening, profile, use_search_cache)
+        else if (!use_search_cache and comptime @hasDecl(Index, "scoreExternalVectorsSortedWithScratchUncached"))
             try self.scoreExternalVectorsSortedWithScratchUncached(
                 txn,
                 fetch_member_ids[0..fetch_count],
@@ -4943,12 +5033,44 @@ fn scoreLeafMemberIds(
         if (dist_index % 256 == 0) try search_types.checkCancelled(req);
         const member_id = fetch_member_ids[member_index];
         const dist = exact_distances[dist_index];
+        if (!approximate_scoring and !std.math.isFinite(dist)) return error.IncompletePublishedSnapshot;
         if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false, use_search_cache)) {
             continue;
         }
         results.addResult(member_id, dist, 0);
         profile.exact_vectors_scored += 1;
     }
+}
+
+fn exactTopKCutoff(results: *const search_results.ApproxSearchResults, k: usize) ?f32 {
+    if (k == 0 or results.items.items.len < k) return null;
+    // Complete-snapshot scoring admits finite authoritative scores only. The
+    // max-heap root is therefore the cutoff; do not scan O(k) per posting.
+    const worst = results.items.peek() orelse return null;
+    if (worst.error_bound != 0 or !std.math.isFinite(worst.distance)) return null;
+    return worst.distance;
+}
+
+fn projectionCannotBeatExactCutoff(distance: f32, error_bound: f32, cutoff: f32) bool {
+    return std.math.isFinite(distance) and std.math.isFinite(error_bound) and
+        error_bound >= 0 and std.math.isFinite(cutoff) and distance - error_bound > cutoff;
+}
+
+test "exact projection screening retains overlaps ties and unresolved bounds" {
+    try std.testing.expect(projectionCannotBeatExactCutoff(3, 0.5, 2));
+    try std.testing.expect(!projectionCannotBeatExactCutoff(3, 1, 2));
+    try std.testing.expect(!projectionCannotBeatExactCutoff(3, 2, 2));
+    try std.testing.expect(!projectionCannotBeatExactCutoff(3, -1, 2));
+    try std.testing.expect(!projectionCannotBeatExactCutoff(3, std.math.inf(f32), 2));
+    try std.testing.expect(!projectionCannotBeatExactCutoff(std.math.nan(f32), 0, 2));
+    var results = try search_results.ApproxSearchResults.initCapacity(std.testing.allocator, 2, 2, 2);
+    defer results.deinit();
+    results.addResult(1, 1, 0);
+    try std.testing.expect(exactTopKCutoff(&results, 2) == null);
+    results.addResult(2, 2, 0);
+    try std.testing.expectEqual(@as(?f32, 2), exactTopKCutoff(&results, 2));
+    results.items.items[0].error_bound = 0.01;
+    try std.testing.expect(exactTopKCutoff(&results, 2) == null);
 }
 
 pub fn rerankResults(

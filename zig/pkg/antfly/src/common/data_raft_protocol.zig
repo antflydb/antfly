@@ -40,7 +40,10 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 29;
+pub const batch_protocol_version: u16 = 30;
+/// Version 30 applies immutable direct producer effects atomically with their
+/// source. Older members must reject the envelope before admitting the source.
+pub const batch_prepared_enrichments_protocol_version: u16 = 30;
 /// Version 29 understands dense text-origin and int8-stub flags. Activation
 /// certifies every applying replica before these envelopes or fragments appear.
 pub const batch_dense_artifact_flags_protocol_version: u16 = 29;

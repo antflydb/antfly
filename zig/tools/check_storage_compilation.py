@@ -857,12 +857,12 @@ def main() -> None:
                         "ZIG_LOCAL_CACHE_DIR": ".zig-cache",
                         "ZIG_GLOBAL_CACHE_DIR": ".zig-global-cache",
                     },
-                    # The cold graph has several independent archives and
-                    # owner/consumer executables. A newly started compiler is
-                    # not stalled because earlier units consumed 30 minutes.
-                    # Keep the original bound per compiler/idle period, plus
-                    # an absolute one-hour bound for the complete cold graph.
-                    timeout_seconds=3600 if label.endswith("cold") else 1800,
+                    # Contract mutations can rebuild several independent
+                    # archives and consumer executables, just like a cold
+                    # graph. Bound each compiler/idle period separately: a
+                    # six-minute final compiler is not stalled because earlier
+                    # units consumed the graph's first 24 minutes.
+                    timeout_seconds=3600,
                     compiler_timeout_seconds=1800,
                 )
             except BaseException as err:

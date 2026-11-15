@@ -200,6 +200,29 @@ pub const MmapRegion = struct {
         advise(@constCast(bytes.ptr), bytes.len, .sequential);
     }
 
+    /// A consumer-scoped hint, never a prefetch or an allocation. The mapping
+    /// owner must outlive the scope. Reject unrelated/owned buffers so advice
+    /// cannot alter allocator pages. Call only after workspace admission.
+    pub const SequentialRead = struct {
+        bytes: []const u8 = &.{},
+
+        pub fn begin(mapping: ?[]const u8, bytes: []const u8) SequentialRead {
+            const source = mapping orelse return .{};
+            const start = @intFromPtr(bytes.ptr);
+            const base = @intFromPtr(source.ptr);
+            if (bytes.len == 0 or start < base) return .{};
+            const offset = start - base;
+            if (offset > source.len or bytes.len > source.len - offset) return .{};
+            adviseBytesSequential(bytes);
+            return .{ .bytes = bytes };
+        }
+
+        pub fn deinit(self: *SequentialRead) void {
+            adviseBytesRandom(self.bytes);
+            self.bytes = &.{};
+        }
+    };
+
     /// Restore sparse inference access after a bounded scan of borrowed mmap
     /// bytes. Like the sequential hint, this cannot fail the owning operation.
     pub fn adviseBytesRandom(bytes: []const u8) void {
@@ -942,4 +965,19 @@ test "retained ONNX borrowed graph mappings leave acquisition handles open" {
     try std.testing.expectEqual(@as(usize, bytes.len), try file.readPositionalAll(io, &bytes, 0));
     try std.testing.expectEqualStrings("graph bytes", &bytes);
     try std.testing.expectError(error.FileTooLarge, MmapRegion.initFromFile(file, 3));
+}
+
+test "consumer sequential advice is confined to the selected mapping span" {
+    var region = try mmapTempCopy(std.testing.allocator, "native-cpu-sequential-scan", "checkpoint selected tensor trailing tensor");
+    defer region.deinit();
+    region.adviseRandom();
+    var scan = MmapRegion.SequentialRead.begin(region.data, region.data[11..26]);
+    try std.testing.expectEqualSlices(u8, "selected tensor", scan.bytes);
+    scan.deinit();
+    scan.deinit();
+    try std.testing.expectEqual(@as(usize, 0), scan.bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), MmapRegion.SequentialRead.begin(null, region.data).bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), MmapRegion.SequentialRead.begin(region.data, "heap allocation").bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), MmapRegion.SequentialRead.begin(region.data[11..26], region.data[11..27]).bytes.len);
+    try std.testing.expectEqualSlices(u8, "checkpoint selected tensor trailing tensor", region.data);
 }

@@ -122,10 +122,12 @@ private struct FeedbackView: View {
           phase == .failed || phase == .ready || phase == .noSpeech ? "Dismiss" : "Cancel",
           action: cancel)
       }
-      if !note.isEmpty { Text(note).font(.caption).lineLimit(2) }
+      if phase == .failed && !note.isEmpty { Text(note).font(.caption).lineLimit(2) }
       if phase == .failed || phase == .ready { Text(message).font(.caption).lineLimit(2) }
-      if !raw.isEmpty { Text(raw).font(.caption).lineLimit(3) }
-      if !draft.isEmpty {
+      if (phase == .ready || phase == .failed) && !raw.isEmpty {
+        Text(raw).font(.caption).lineLimit(3)
+      }
+      if phase == .failed && !draft.isEmpty {
         Text("Cleanup preview: " + draft).lineLimit(2).foregroundStyle(.secondary)
       }
       if phase == .ready && !raw.isEmpty { Button("Copy", action: copy) }

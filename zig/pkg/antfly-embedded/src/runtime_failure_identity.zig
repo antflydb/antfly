@@ -31,6 +31,10 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .storage_descriptor_pressure, .err = error.StorageDescriptorPressure },
+    .{ .status = .process_fd_quota_exceeded, .err = error.ProcessFdQuotaExceeded },
+    .{ .status = .system_fd_quota_exceeded, .err = error.SystemFdQuotaExceeded },
+    .{ .status = .persistent_descriptor_admission_exhausted, .err = error.PersistentDescriptorAdmissionExhausted },
     .{ .status = .unsupported_node_filter_query, .err = error.UnsupportedNodeFilterQuery },
     .{ .status = .storage_owner_admission_pending, .err = error.StorageOwnerAdmissionPending },
     .{ .status = .raft_apply_writer_unavailable, .err = error.RaftApplyWriterUnavailable },
@@ -672,6 +676,10 @@ const mappings = [_]Mapping{
     .{ .status = .storage_unavailable, .err = error.StorageUnavailable },
     .{ .status = .transaction_too_large, .err = error.TransactionTooLarge },
     .{ .status = .unsupported_operation, .err = error.UnsupportedOperation },
+    .{ .status = .unsupported_commit_requirement, .err = error.UnsupportedCommitRequirement },
+    .{ .status = .commit_requirement_unavailable, .err = error.CommitRequirementUnavailable },
+    .{ .status = .commit_requirement_too_large, .err = error.CommitRequirementTooLarge },
+    .{ .status = .commit_requirement_failed, .err = error.CommitRequirementFailed },
     .{ .status = .incomplete_seed_artifact, .err = error.IncompleteSeedArtifact },
     .{ .status = .invalid_artifact_boundary, .err = error.InvalidArtifactBoundary },
     .{ .status = .invalid_artifact_chunk_size, .err = error.InvalidArtifactChunkSize },
@@ -1263,4 +1271,15 @@ test "storage owner lease admission retains its independent stable identity" {
 
 test "unsupported graph node filter survives the storage boundary" {
     try std.testing.expectError(error.UnsupportedNodeFilterQuery, statusToError(statusFromError(error.UnsupportedNodeFilterQuery)));
+}
+
+test "descriptor pressure preserves actionable identities across storage owners" {
+    inline for (.{ error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.PersistentDescriptorAdmissionExhausted, error.StorageDescriptorPressure }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expect(value != .internal);
+        try std.testing.expectError(err, statusToError(value));
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try validateFailureEnvelope(value, &failure, abi.abi_version);
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
 }

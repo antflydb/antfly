@@ -384,7 +384,7 @@ pub const ManagedRuntime = struct {
         };
         try self.chargeWork(.wal_collection, 1);
         const result = collector.step(namespace, .{ .ptr = &bridge, .is_cancelled_fn = ObjectsBridge.canceled }) catch |err| switch (err) {
-            error.ImmutableLogFenced, error.CollectionSuperseded, error.CollectionBusy, error.CollectionConflict, error.CollectionStepExpired, error.WalSnapshotExpired, error.WalCommitContended, error.PreconditionFailed => {
+            error.CatalogUpdateInProgress, error.ImmutableLogFenced, error.CollectionSuperseded, error.CollectionBusy, error.CollectionConflict, error.CollectionStepExpired, error.WalSnapshotExpired, error.WalCommitContended, error.PreconditionFailed => {
                 stats.wal_collection_deferred += 1;
                 return;
             },
@@ -448,6 +448,131 @@ pub const ManagedRuntime = struct {
         self.compactor = compactor;
     }
 
+    /// Request-owned provider handles keep admission independent of the
+    /// background worker's mutable provider selection and publication lock.
+    pub fn prepareDirectMutations(self: *ManagedRuntime, namespace: []const u8, mutations: []const api_mod.DocumentMutation, cancellation: CancellationToken) ![]api_mod.DocumentMutation {
+        return self.prepareDirectMutationsWithContext(namespace, mutations, .{ .io = self.io, .deadline_ns = null, .cancellation = cancellation });
+    }
+
+    pub fn prepareDirectMutationsWithContext(self: *ManagedRuntime, namespace: []const u8, mutations: []const api_mod.DocumentMutation, context: @import("antfly_inference_execution_context").RequestContext) ![]api_mod.DocumentMutation {
+        try context.check();
+        var provider_options = self.cfg.embedder_options;
+        provider_options.setup_context = context;
+        if (mutations.len > 1024) return error.CommitRequirementTooLarge;
+        var source_bytes: usize = 0;
+        for (mutations) |mutation| {
+            if (mutation.kind != .upsert and mutation.kind != .delete) return error.InvalidDocumentMutation;
+            if ((mutation.kind == .upsert) != (mutation.body != null)) return error.InvalidDocumentMutation;
+            source_bytes = std.math.add(usize, source_bytes, mutation.doc_id.len + (if (mutation.body) |body| body.len else @as(usize, 0)) + 32) catch return error.CommitRequirementTooLarge;
+            if (source_bytes > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
+        }
+        var enricher = if (self.enricher) |resources| enrichment_mod.SparseEnricher.init(self.alloc, resources.artifacts, resources.manifests, resources.progress, resources.wal) else null;
+        defer if (enricher) |*value| value.deinit();
+        var policy = try self.catalog.getPolicy(namespace);
+        var status = try self.catalog.buildStatus(namespace);
+        defer status.deinit(self.alloc);
+        policy.enrichment_enabled = status.enrichment_enabled;
+        policy.chunk_preview_enabled = status.chunk_preview_enabled;
+        policy.chunk_embeddings_enabled = status.chunk_embeddings_enabled;
+        policy.rerank_terms_enabled = status.rerank_terms_enabled;
+        if (enrichment_mod.builtinPipelineForPolicy(policy).len != 0 and enricher == null) return error.CommitRequirementUnavailable;
+        var digest = try @import("../build/document_facts_builder.zig").fingerprint(self.alloc, policy, "{}");
+        var exclude_model_sources = false;
+        if (try self.catalog.getTableForNamespaceAlloc(self.alloc, namespace)) |record| {
+            var table = record;
+            defer table.deinit(self.alloc);
+            var indexes = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
+            defer indexes.deinit();
+            digest = try @import("../build/document_facts_builder.zig").fingerprint(self.alloc, policy, table.indexes_json);
+            exclude_model_sources = try @import("../build/document_facts_builder.zig").hasModelSources(self.alloc, table.indexes_json);
+            if (policy.enrichment_enabled and policy.lexical_sparse_model_preference != .deterministic_only) {
+                if (try managed_embedder.ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(self.alloc, indexes.value, provider_options)) |handle| {
+                    errdefer handle.deinit(self.alloc);
+                    try enricher.?.setSparseEmbedder(handle, firstSparseIndexNameFromIndexesJson(indexes.value) orelse "serverless_sparse");
+                }
+            }
+            if (policy.chunk_embeddings_enabled and policy.chunk_embeddings_model_preference != .deterministic_only and !exclude_model_sources) {
+                if (try managed_embedder.ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(self.alloc, indexes.value, provider_options)) |handle| {
+                    errdefer handle.deinit(self.alloc);
+                    try enricher.?.setChunkEmbedder(handle, firstDenseIndexNameFromIndexesJson(indexes.value) orelse "serverless_dense", denseDimsFromIndexesJson(indexes.value) orelse 8);
+                }
+            }
+        }
+        if (enricher) |*value| {
+            value.prepared_catalog = digest;
+            try value.captureDirectProviders(context);
+        }
+        const pipeline = enrichment_mod.builtinPipelineForPolicy(policy);
+        var eligible: usize = 0;
+        for (pipeline.slice()) |spec| if (!exclude_model_sources or spec.stage != .chunk_embeddings) {
+            eligible += 1;
+        };
+        if (pipeline.len != 0 and eligible == 0) return error.UnsupportedCommitRequirement;
+        const output = try self.alloc.alloc(api_mod.DocumentMutation, mutations.len);
+        errdefer self.alloc.free(output);
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |*mutation| mutation.deinit(self.alloc);
+        var bytes: usize = 0;
+        var window_start: usize = 0;
+        while (window_start < mutations.len) {
+            var window_end = window_start;
+            var window_bytes: usize = 0;
+            var bodies: [32][]const u8 = undefined;
+            var body_count: usize = 0;
+            while (window_end < mutations.len and window_end - window_start < 32) {
+                const mutation = mutations[window_end];
+                const size = mutation.doc_id.len + (if (mutation.body) |body| body.len else 0);
+                if (window_end != window_start and size > 256 * 1024 -| window_bytes) break;
+                window_bytes +|= size;
+                if (mutation.body) |body| {
+                    bodies[body_count] = body;
+                    body_count += 1;
+                }
+                window_end += 1;
+            }
+            var quota = @import("antfly_platform").allocator.reclamation.Quota.init(self.alloc, 64 * 1024 * 1024);
+            defer quota.deinit();
+            var cache = if (enricher) |*value| blk: {
+                value.direct_output_limit = 8 * 1024 * 1024 -| bytes;
+                break :blk value.prewarmDirectWindow(quota.allocator(), bodies[0..body_count], policy, exclude_model_sources) catch |err| {
+                    try context.check();
+                    if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
+                    return err;
+                };
+            } else null;
+            defer if (cache) |*value| value.deinit();
+            if (enricher) |*value| value.direct_cache = if (cache) |*memo| memo else null;
+            defer if (enricher) |*value| {
+                value.direct_cache = null;
+            };
+            for (mutations[window_start..window_end], output[window_start..window_end]) |mutation, *out| {
+                try context.check();
+                const id = try self.alloc.dupe(u8, mutation.doc_id);
+                errdefer self.alloc.free(id);
+                const body = if (mutation.kind == .upsert) blk: {
+                    const source = mutation.body orelse return error.InvalidDocumentBody;
+                    if (source.len > 8 * 1024 * 1024 -| bytes) return error.CommitRequirementTooLarge;
+                    if (enricher) |*value| value.direct_output_limit = 8 * 1024 * 1024 -| bytes -| id.len -| 64;
+                    const prepared = if (enricher) |*value| try value.prepareDirectBody(source, policy, exclude_model_sources) else try self.alloc.dupe(u8, source);
+                    defer self.alloc.free(prepared);
+                    break :blk try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(self.alloc, prepared, source.len);
+                } else if (mutation.kind == .delete) null else return error.InvalidDocumentMutation;
+                errdefer if (body) |value| self.alloc.free(value);
+                bytes = std.math.add(usize, bytes, id.len + (if (body) |value| value.len else @as(usize, 0)) + 32) catch return error.CommitRequirementTooLarge;
+                if (bytes > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
+                out.* = .{ .kind = if (body != null) .prepared else .delete, .doc_id = id, .body = body };
+                initialized += 1;
+            }
+            window_start = window_end;
+        }
+        if (enricher) |*value| {
+            if (value.chunk_embedder) |provider| if (value.prepared_dense_generation) |generation| try provider.requireTextGeneration(self.alloc, value.chunk_embedding_name.?, generation);
+            if (value.sparse_embedder) |provider| try provider.requireRevision(self.alloc, value.sparse_embedding_name.?, value.prepared_sparse_revision);
+        }
+        try context.check();
+        return output;
+    }
+
     pub fn setEnricher(self: *ManagedRuntime, enricher: enrichment_mod.SparseEnricher) void {
         self.enricher = enricher;
     }
@@ -508,6 +633,8 @@ pub const ManagedRuntime = struct {
             var table = table_record;
             defer table.deinit(self.alloc);
 
+            enricher.prepared_catalog = try @import("../build/document_facts_builder.zig").fingerprint(self.alloc, effective_policy, table.indexes_json);
+
             // Only model-backed stages need an embedder. Parse once and build
             // only the relevant provider set so deterministic stages avoid
             // configuration churn and an unrelated provider cannot block the
@@ -548,6 +675,7 @@ pub const ManagedRuntime = struct {
             // Namespace-only records predate the table catalog. Preserve their
             // fallback enrichment behavior without retaining a previous
             // namespace's managed embedder configuration.
+            enricher.prepared_catalog = try @import("../build/document_facts_builder.zig").fingerprint(self.alloc, effective_policy, "{}");
             enricher.clearSparseEmbedder();
             enricher.clearChunkEmbedder();
             enricher.clearModelChunker();

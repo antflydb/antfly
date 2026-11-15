@@ -189,7 +189,7 @@ private func final(_ sequence: Int, _ text: String, _ start: Int) -> Recognition
     recognize: { _, commit in commit ? [final(2, "revised", 0)] : [final(1, "original", 0)] },
     clean: { DictationResult(raw: $0, text: $0) })
   try await pipeline.append(Data([1]))
-  await #expect(throws: DictationError.self) { try await pipeline.finish(Data()) }
+  await #expect(throws: LiveDictation.RecognitionFailure.self) { try await pipeline.finish(Data()) }
 }
 
 private final class RecoveryProtocol: URLProtocol, @unchecked Sendable {
@@ -351,4 +351,155 @@ private actor FormattingCleaner {
   let result = try await pipeline.finish(Data())
   #expect(result.text == "Hello" && result.formatting?.pressEnter == true)
   #expect(await cleaner.inputs == ["Hello press enter"])
+}
+
+@Test func nativeSegmentAssemblyPreservesMultilingualTextThroughCleanup() async throws {
+  for (language, first, second, expected) in [
+    ("ja-JP", "こんにちは", "世界", "こんにちは世界"),
+    ("zh-CN", "你好", "世界", "你好世界"),
+    ("en-US", "Hello", " world.", "Hello world."),
+    ("ja-JP", "Hello", "world", "Hello world"),
+    ("zh-CN", "Hello", "world", "Hello world"),
+    ("th-TH", "Hello", "world", "Hello world"),
+  ] {
+    for cleanup in [false, true] {
+      let pipeline = LiveDictation(
+        incremental: true, needsCleanup: cleanup, cumulativeCleanup: true,
+        language: language, preserveRecognitionWhitespace: true,
+        recognize: { _, commit in
+          commit ? [final(2, second, 100)] : [final(1, first, 0)]
+        }, clean: { DictationResult(raw: $0, text: $0) })
+      try await pipeline.append(Data([1]))
+      let result = try await pipeline.finish(Data())
+      #expect(result.raw == expected)
+      #expect(result.text == expected)
+    }
+  }
+}
+
+@Test func finalRecognitionFailureFallsBackButCleanupAndCancellationDoNot() async throws {
+  for fallbackAllowed in [false, true] {
+    let pipeline = LiveDictation(
+      incremental: false, needsCleanup: false,
+      recognize: { _, _ in throw DictationError.invalid("Final recognition failed") },
+      clean: { DictationResult(raw: $0, text: $0) })
+    do {
+      let result = try await pipeline.finishWithRecognitionFallback(
+        Data(), allowFallback: fallbackAllowed
+      ) {
+        DictationResult(raw: "recorded", text: "recorded")
+      }
+      #expect(fallbackAllowed && result.text == "recorded")
+    } catch is LiveDictation.RecognitionFailure { #expect(!fallbackAllowed) }
+  }
+  for cancel in [false, true] {
+    let pipeline = LiveDictation(
+      incremental: false, needsCleanup: true,
+      recognize: { _, _ in
+        if cancel { throw CancellationError() }
+        return [final(1, "speech", 0)]
+      }, clean: { _ in throw DictationError.invalid("Cleanup failed") })
+    await #expect(throws: (any Error).self) {
+      try await pipeline.finishWithRecognitionFallback(Data(), allowFallback: true) {
+        Issue.record("Cleanup failures and cancellation must not retry recognition")
+        return DictationResult(raw: "unexpected", text: "unexpected")
+      }
+    }
+  }
+}
+
+@Test(.timeLimit(.minutes(1))) func cleanupPhaseIsVisibleBeforeIncrementalWorkerFinishes()
+  async throws
+{
+  let cleaner = Cleaner(block: true)
+  let visible = Signal()
+  let pipeline = LiveDictation(
+    incremental: true, needsCleanup: true,
+    recognize: { _, commit in commit ? [] : [final(1, "hello", 0)] },
+    clean: { await cleaner.clean($0) },
+    observe: { event in
+      if event.phase == .cleaning && event.raw == "hello" { await visible.send() }
+    })
+  try await pipeline.append(Data([1]))
+  await cleaner.began.wait()
+  let finishing = Task { try await pipeline.finish(Data()) }
+  await visible.wait()
+  await cleaner.release.send()
+  #expect(try await finishing.value.text == "HELLO")
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func cancelingSubmissionCancelsIndependentCleanupBeforeAwaitingTeardown() async throws {
+  let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let began = Signal()
+  let cleaning = Signal()
+  let canceled = Signal()
+  let pipeline = LiveDictation(
+    incremental: true, needsCleanup: true,
+    recognize: { _, commit in commit ? [] : [final(1, "speech", 0)] },
+    clean: { _ in
+      await began.send()
+      do {
+        try await Task.sleep(for: .seconds(30))
+        Issue.record("Cleanup should be canceled before its normal completion")
+        return DictationResult(raw: "speech", text: "speech")
+      } catch {
+        await canceled.send()
+        throw error
+      }
+    },
+    observe: { event in
+      if event.phase == .cleaning { await cleaning.send() }
+    })
+  try await pipeline.append(Data([1]))
+  await began.wait()
+  let store = Store(directory: root, registerHotkey: false)
+  let snapshot = store.config
+  store.runSubmission(preset: snapshot.preset(for: nil), snapshot: snapshot, destination: nil) {
+    try await pipeline.finish(Data())
+  }
+  await cleaning.wait()
+  store.cancel()
+  await canceled.wait()
+  await store.pipelineTeardownTask?.value
+  #expect(store.state == .idle && store.result.isEmpty)
+  await store.prepareToQuit()
+}
+
+@Test func tailRecoveryDistinguishesLiveOverflowFromInvalidCapture() async throws {
+  for allowFallback in [false, true] {
+    let pipeline = LiveDictation(
+      incremental: false, needsCleanup: false,
+      recognize: { _, _ in
+        Issue.record("Overflow must not commit an incomplete tail")
+        return []
+      },
+      clean: { DictationResult(raw: $0, text: $0) })
+    do {
+      let result = try await pipeline.finishWithRecognitionFallback(
+        tail: { throw LiveAudioOverflow() }, allowFallback: allowFallback
+      ) { DictationResult(raw: "preserved clip", text: "preserved clip") }
+      #expect(allowFallback && result.text == "preserved clip")
+    } catch is LiveDictation.RecognitionFailure { #expect(!allowFallback) }
+    await pipeline.cancel()
+  }
+  for cancel in [false, true] {
+    let pipeline = LiveDictation(
+      incremental: false, needsCleanup: false, recognize: { _, _ in [] },
+      clean: { DictationResult(raw: $0, text: $0) })
+    await #expect(throws: (any Error).self) {
+      try await pipeline.finishWithRecognitionFallback(
+        tail: {
+          if cancel { throw CancellationError() }
+          throw DictationError.invalid("Complete recording is invalid")
+        }, allowFallback: true
+      ) {
+        Issue.record("Invalid capture and cancellation cannot use recorded fallback")
+        return DictationResult(raw: "unexpected", text: "unexpected")
+      }
+    }
+    await pipeline.cancel()
+  }
 }

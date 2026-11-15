@@ -1,0 +1,46 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const context = @import("context.zig");
+const driver = @import("driver.zig");
+pub const Module = struct {
+    module: driver.CUmodule = null,
+    function: driver.CUfunction = null,
+    pub fn deinit(self: *Module, ctx: *context.CudaContext) void {
+        if (self.module != null) {
+            ctx.makeCurrent() catch return;
+            _ = ctx.driver.fns.cuModuleUnload(self.module);
+        }
+        self.* = .{};
+    }
+    pub fn run(self: *Module, ctx: *context.CudaContext, pointers: [3]driver.CUdeviceptr, count: u32) !void {
+        try ctx.makeCurrent();
+        if (self.module == null) {
+            var module: driver.CUmodule = null;
+            const image = @embedFile("glide_activation.ptx") ++ "\x00";
+            try ctx.driver.check(ctx.driver.fns.cuModuleLoadDataEx(&module, image.ptr, 0, null, null));
+            errdefer _ = ctx.driver.fns.cuModuleUnload(module);
+            var function: driver.CUfunction = null;
+            try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, "glide_silu_up_f16"));
+            self.module = module;
+            self.function = function;
+        }
+        var p = pointers;
+        var n = count;
+        var args = [_]?*anyopaque{ &p[0], &p[1], &p[2], &n };
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(self.function, (count + 255) / 256, 1, 1, 256, 1, 1, 0, ctx.stream, &args, null));
+        ctx.noteKernelLaunch();
+    }
+};

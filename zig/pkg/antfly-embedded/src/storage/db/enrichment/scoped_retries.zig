@@ -979,7 +979,7 @@ test "scoped retry workset allocation failures preserve ownership" {
             restored.retire(a, ready.tokens);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "scoped retry workset oversized identity allocation failures preserve ownership" {
@@ -1010,7 +1010,7 @@ test "scoped retry workset oversized identity allocation failures preserve owner
             try std.testing.expectEqualSlices(u8, document, ready.groups[0].doc_key);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{key});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{key});
 }
 
 test "scoped retry workset maximum metadata fits binary and incremental persistence" {
@@ -1099,7 +1099,7 @@ test "scoped retry workset indexed budgets survive replacement retirement and al
             try std.testing.expect(!try restored.hasLogical(a, 8));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "privacy retry workset preserves empty document tickets and exclusive cursors" {

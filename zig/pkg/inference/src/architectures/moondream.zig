@@ -101,8 +101,11 @@ pub const Config = struct {
 };
 
 /// True when a config.json declares the Moondream2 composite model.
-pub fn isMoondreamConfig(allocator: std.mem.Allocator, config_json: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return false;
+pub fn isMoondreamConfig(allocator: std.mem.Allocator, config_json: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const value = parsed.value.object.get("model_type") orelse return false;
@@ -324,6 +327,10 @@ pub fn encodeImage(
     pixels_chw: []const f32,
     host_attention: bool,
 ) ![]f32 {
+    return encodeImageWithIo(cb, allocator, config, pixels_chw, host_attention, null);
+}
+
+pub fn encodeImageWithIo(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, pixels_chw: []const f32, host_attention: bool, io: ?std.Io) ![]f32 {
     const tokens = config.imageTokens();
     const vd = config.vision_hidden_size;
 
@@ -355,7 +362,7 @@ pub fn encodeImage(
 
     for (0..config.vision_num_layers) |layer| {
         try cb.checkExecutionControl();
-        const next = try visionBlock(cb, allocator, config, hidden, tokens, layer, host_attention);
+        const next = try visionBlock(cb, allocator, config, hidden, tokens, layer, host_attention, io);
         cb.free(hidden);
         hidden = next;
     }
@@ -396,6 +403,7 @@ fn visionBlock(
     tokens: usize,
     layer: usize,
     host_attention: bool,
+    io: ?std.Io,
 ) !CT {
     const vd = config.vision_hidden_size;
     var buf: [160]u8 = undefined;
@@ -428,7 +436,7 @@ fn visionBlock(
             for (0..tokens) |r| {
                 for (0..3) |part| @memcpy(parts[part * tokens * vd + r * vd ..][0..vd], host[r * 3 * vd + part * vd ..][0..vd]);
             }
-            const out = try attentionHostParallel(allocator, parts[0 .. tokens * vd], parts[tokens * vd ..][0 .. tokens * vd], parts[2 * tokens * vd ..][0 .. tokens * vd], tokens, config.vision_num_heads, config.visionHeadDim(), false);
+            const out = try attentionHostParallelWithIo(allocator, parts[0 .. tokens * vd], parts[tokens * vd ..][0 .. tokens * vd], parts[2 * tokens * vd ..][0 .. tokens * vd], tokens, config.vision_num_heads, config.visionHeadDim(), false, io);
             defer allocator.free(out);
             const shape = [_]i32{ @intCast(tokens), @intCast(vd) };
             const attn = try cb.fromFloat32Shape(out, &shape);
@@ -513,6 +521,7 @@ pub const KvState = struct {
     /// Host backends compute prefill attention with the head-parallel host
     /// flash kernel below; device backends use `gqaCausalAttention`.
     host_prefill_attention: bool = false,
+    host_attention_io: ?std.Io = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !KvState {
         var manager = runtime.kv.manager.KvManager.init(allocator);
@@ -709,7 +718,7 @@ fn decoderBlock(
         const attn = if (past == 0) blk_prefill: {
             try kv.manager.writeLayerKvSuffix(kv.sequence_id, layer, total, rows, k, v);
             if (kv.host_prefill_attention) {
-                const out = try causalAttentionHostParallel(allocator, q, k, v, rows, config.num_heads, head_dim);
+                const out = try attentionHostParallelWithIo(allocator, q, k, v, rows, config.num_heads, head_dim, true, kv.host_attention_io);
                 defer allocator.free(out);
                 break :blk_prefill try cb.fromFloat32Shape(out, &shape);
             }
@@ -783,12 +792,21 @@ pub fn attentionHostParallel(
     head_dim: usize,
     causal: bool,
 ) ![]f32 {
-    const width = num_heads * head_dim;
-    if (q.len != rows * width or k.len != rows * width or v.len != rows * width) return error.InvalidAttentionShape;
-    const output = try allocator.alloc(f32, rows * width);
+    return attentionHostParallelWithIo(allocator, q, k, v, rows, num_heads, head_dim, causal, null);
+}
+
+pub fn attentionHostParallelWithIo(allocator: std.mem.Allocator, q: []const f32, k: []const f32, v: []const f32, rows: usize, num_heads: usize, head_dim: usize, causal: bool, io: ?std.Io) ![]f32 {
+    if (io) |handle| try handle.checkCancel();
+    if (num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+    const width = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    const elements = std.math.mul(usize, rows, width) catch return error.InvalidAttentionShape;
+    if (q.len != elements or k.len != elements or v.len != elements) return error.InvalidAttentionShape;
+    const output = try allocator.alloc(f32, elements);
     errdefer allocator.free(output);
-    const cpus = std.Thread.getCpuCount() catch 1;
-    const workers = @max(@as(usize, 1), @min(@min(cpus, 8), num_heads));
+    if (rows == 0) return output;
+    const cpus = linalg.pool.cachedCpuCount();
+    const worker_cap = linalg.pool.max_workers;
+    const workers = @max(@as(usize, 1), @min(@min(cpus, worker_cap), num_heads));
 
     const Worker = struct {
         q: []const f32,
@@ -801,21 +819,22 @@ pub fn attentionHostParallel(
         head_start: usize,
         head_end: usize,
         query_offset: usize,
-        failed: bool = false,
+        packed_buf: []f32,
+        workspace: linalg.FlashCausalAttentionWorkspace,
+        failure: ?anyerror = null,
 
-        fn run(self: *@This()) void {
-            self.runInner() catch {
-                self.failed = true;
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.runInner() catch |err| {
+                self.failure = err;
             };
         }
 
         fn runInner(self: *@This()) !void {
-            const a = std.heap.page_allocator;
             const heads = self.head_end - self.head_start;
             const sub = heads * self.head_dim;
             const col = self.head_start * self.head_dim;
-            const packed_buf = try a.alloc(f32, 3 * self.rows * sub);
-            defer a.free(packed_buf);
+            const packed_buf = self.packed_buf;
             const pq = packed_buf[0 .. self.rows * sub];
             const pk = packed_buf[self.rows * sub ..][0 .. self.rows * sub];
             const pv = packed_buf[2 * self.rows * sub ..][0 .. self.rows * sub];
@@ -824,15 +843,28 @@ pub fn attentionHostParallel(
                 @memcpy(pk[r * sub ..][0..sub], self.k[r * self.width + col ..][0..sub]);
                 @memcpy(pv[r * sub ..][0..sub], self.v[r * self.width + col ..][0..sub]);
             }
-            const out = try linalg.flashCausalAttentionHost(a, pq, pk, pv, null, null, 0, 1, self.rows, self.rows, self.query_offset, 0, heads, heads, self.head_dim);
-            defer a.free(out);
+            const out = try linalg.flashCausalAttentionHostWithWorkspace(&self.workspace, pq, pk, pv, null, null, 0, 1, self.rows, self.rows, self.query_offset, 0, heads, heads, self.head_dim);
             for (0..self.rows) |r| @memcpy(self.out[r * self.width + col ..][0..sub], out[r * sub ..][0..sub]);
         }
     };
 
-    var states: [8]Worker = undefined;
-    var threads: [8]?std.Thread = @splat(null);
+    var states: [linalg.pool.max_workers]Worker = undefined;
+    var jobs: [linalg.pool.max_workers]linalg.pool.Job = undefined;
+    var prepared: usize = 0;
+    defer for (states[0..prepared]) |*state| {
+        state.workspace.deinit(allocator);
+        allocator.free(state.packed_buf);
+    };
+    // Reserve all worker storage serially through the caller's allocator. The
+    // request allocator is deliberately not thread-safe; workers only compute.
     for (0..workers) |w| {
+        const head_start = num_heads / workers * w + @min(w, num_heads % workers);
+        const head_end = num_heads / workers * (w + 1) + @min(w + 1, num_heads % workers);
+        const heads = head_end - head_start;
+        const packed_len = try std.math.mul(usize, 3, try std.math.mul(usize, rows, heads * head_dim));
+        const packed_buf = try allocator.alloc(f32, packed_len);
+        errdefer allocator.free(packed_buf);
+        const workspace = try linalg.FlashCausalAttentionWorkspace.init(allocator, 1, rows, rows, heads, head_dim);
         states[w] = .{
             .q = q,
             .k = k,
@@ -841,18 +873,19 @@ pub fn attentionHostParallel(
             .rows = rows,
             .width = width,
             .head_dim = head_dim,
-            .head_start = num_heads * w / workers,
-            .head_end = num_heads * (w + 1) / workers,
+            .head_start = head_start,
+            .head_end = head_end,
             .query_offset = if (causal) 0 else rows,
+            .packed_buf = packed_buf,
+            .workspace = workspace,
         };
+        jobs[w] = .{ .fn_ptr = Worker.run, .ctx = &states[w] };
+        prepared += 1;
     }
-    // Worker 0 runs on the calling thread; spawn failures fall back inline.
-    for (1..workers) |w| threads[w] = std.Thread.spawn(.{}, Worker.run, .{&states[w]}) catch null;
-    states[0].run();
-    for (1..workers) |w| {
-        if (threads[w]) |t| t.join() else states[w].run();
-    }
-    for (states[0..workers]) |state| if (state.failed) return error.OutOfMemory;
+    // The shared executor bounds background threads across concurrent callers,
+    // handles unavailable capacity inline, and drains every job before cleanup.
+    if (io) |handle| try linalg.pool.dispatchJobsIo(handle, jobs[0..workers]) else linalg.pool.dispatchJobs(jobs[0..workers]);
+    for (states[0..workers]) |state| if (state.failure) |err| return err;
     return output;
 }
 
@@ -880,8 +913,8 @@ test "parseConfig reads the expanded transformers.js PhiConfig" {
     );
     try std.testing.expectEqual(@as(usize, 32), config.rotary_dim);
     try std.testing.expectEqual(@as(usize, 8192), config.intermediate_size);
-    try std.testing.expect(!isMoondreamConfig(std.testing.allocator, "{\"model_type\":\"phi\"}"));
-    try std.testing.expect(isMoondreamConfig(std.testing.allocator, "{\"model_type\":\"moondream1\"}"));
+    try std.testing.expect(!try isMoondreamConfig(std.testing.allocator, "{\"model_type\":\"phi\"}"));
+    try std.testing.expect(try isMoondreamConfig(std.testing.allocator, "{\"model_type\":\"moondream1\"}"));
     try std.testing.expectError(error.InvalidMoondreamConfig, parseConfig(std.testing.allocator, "{\"model_type\":\"phi\"}"));
 }
 
@@ -972,4 +1005,66 @@ test "bidirectional host attention averages over every key" {
     defer a.free(causal);
     try std.testing.expectApproxEqAbs(@as(f32, 2), causal[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 3), causal[1], 1e-6);
+}
+
+fn checkMoondreamProbeAllocationFailures(allocator: std.mem.Allocator) !void {
+    try std.testing.expect(try isMoondreamConfig(allocator, "{\"model_type\":\"moondream1\"}"));
+}
+
+test "moondream configuration probe preserves allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkMoondreamProbeAllocationFailures, .{});
+    try std.testing.expect(!try isMoondreamConfig(std.testing.allocator, "invalid json"));
+}
+
+fn checkHostAttentionAllocationFailures(allocator: std.mem.Allocator) !void {
+    const q = [_]f32{ 1, 1, 1, 1 };
+    const k = [_]f32{ 0, 0, 0, 0 };
+    const v = [_]f32{ 2, 3, 4, 5 };
+    const result = try attentionHostParallel(allocator, &q, &k, &v, 2, 2, 1, false);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 3, 4 }, result);
+}
+
+test "moondream parallel host attention rolls back every preparation allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkHostAttentionAllocationFailures, .{});
+}
+
+test "moondream parallel host attention accounts worker storage before dispatch" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Scope = @import("../pipelines/preprocessing_memory.zig").Scope;
+    const Session = @import("../backends/session.zig").Session;
+    // The global output alone fits. Packed QKV plus per-worker output and tile
+    // scratch do not; these previously bypassed the supplied allocator.
+    var controller = memory.AdmissionController{};
+    const session = Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1024, .scratch_limit_bytes = 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var scope = Scope.child(std.testing.allocator, session, null);
+    defer scope.deinit();
+    const a = try scope.allocator();
+    const q: [64]f32 = @splat(1);
+    try std.testing.expectError(error.OutOfMemory, attentionHostParallel(a, &q, &q, &q, 16, 2, 2, false));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, scope.failure(error.OutOfMemory));
+    try scope.trim();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "moondream caller executor preserves causal and bidirectional attention and cancellation" {
+    const q: [18]f32 = @splat(0.25);
+    const k: [18]f32 = @splat(-0.5);
+    var v: [18]f32 = undefined;
+    for (&v, 0..) |*value, i| value.* = @floatFromInt(i);
+    for ([_]bool{ false, true }) |causal| {
+        const expected = try attentionHostParallel(std.testing.allocator, &q, &k, &v, 3, 3, 2, causal);
+        defer std.testing.allocator.free(expected);
+        const actual = try attentionHostParallelWithIo(std.testing.allocator, &q, &k, &v, 3, 3, 2, causal, std.testing.io);
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualSlices(f32, expected, actual);
+    }
+    const Cancelled = struct {
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    var vtable = std.Io.failing.vtable.*;
+    vtable.checkCancel = Cancelled.check;
+    try std.testing.expectError(error.Canceled, attentionHostParallelWithIo(std.testing.failing_allocator, &q, &k, &v, 3, 3, 2, false, .{ .vtable = &vtable, .userdata = null }));
 }

@@ -8,6 +8,58 @@ and decoding retain the shared bounded host stages and transfer diagnostics.
 
 ## Build
 
+### Original GLiNER2.5-Decide on L4
+
+The pinned original DeBERTa FP32 and split Q8_0 artifacts accept up to 32
+classification inputs, executed in physical batches of at most eight rows.
+Both retain FP32 attention, including the 128–256-token region where generic
+DeBERTa execution can select FP16 attention. The FP32 artifact uses FP32 cuBLAS
+projections. The Q8 artifact retains its quantized tensors and adds bounded,
+model-owned FP16 encoder projection mirrors for cuBLAS; embeddings and task
+heads keep their existing representations. These mirrors are reserved at model
+admission, and both variants reserve a shared 32 MiB matmul workspace per run.
+
+Build the HTTP server, loaded-model benchmark and focused serving tests:
+
+```sh
+zig build --build-file zig/pkg/inference/build.zig \
+  http-server bench-gliner25-decide-build gliner25-decide-cuda-serving-test-build \
+  -Doptimize=fast -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89
+
+ANTFLY_GLINER_DECIDE_REQUIRE_SERVING_TESTS=1 \
+ANTFLY_GLINER_DECIDE_MODEL=/path/to/original-fp32 \
+ANTFLY_GLINER_DECIDE_Q8_MODEL=/path/to/published-q8 \
+  zig-out/bin/gliner25-decide-cuda-serving-tests
+```
+
+The focused gate requires both real artifacts and checks mixed-schema order,
+physical batch bounds, rejection at 33, and queued cancellation without CUDA
+launches or leaked admission leases. It excludes the unrelated base/multi-model
+serving closure. For the FP32 attention boundary regression on SM89, run:
+
+```sh
+python zig/pkg/inference/scripts/gliner25/verify_decide_lengths_cuda.py \
+  --model /path/to/original-fp32 \
+  --native zig-out/bin/antfly-inference-gliner25-decide-bench \
+  --http zig-out/bin/antfly-inference-http-server --out /path/to/new-length-results
+```
+
+`benchmark_decide_hotel_cuda.py` compares warm HTTP or loaded-model latency to
+upstream Python, with fresh alternating processes and process-attributed PSS +
+NVML memory sampling. Use `--model` for the Python FP32 checkpoint and
+`--native-model` for an independently qualified native artifact. For Q8, pass
+`--allow-label-differences` to retain quantization disagreements in the report;
+this is not an exact-parity qualification. Run each `--batches 1`, `8`, or `32`
+cell separately for meaningful per-cell memory peaks. All output directories
+must be new. GPU monitoring follows process IDs across physical devices,
+independently of `CUDA_VISIBLE_DEVICES` ordinal remapping.
+
+The Python helpers need the upstream `gliner2`, CUDA PyTorch, `psutil` and
+`nvidia-ml-py` packages. `test_benchmark_decide_hotel_cuda.py` tests memory
+attribution without those optional packages or a GPU.
+
+### Boundary models
+
 From the repository root, using the repository-pinned Zig toolchain:
 
 ```sh

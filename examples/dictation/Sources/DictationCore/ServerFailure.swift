@@ -24,6 +24,10 @@ public struct ServerFailure: LocalizedError, Sendable {
         .trimmingCharacters(in: .whitespacesAndNewlines).prefix(2048))
   }
   public var errorDescription: String? {
+    if message.contains("AppleSpeechAssetsMissing") || code == "AppleSpeechAssetsMissing" {
+      return
+        "Apple speech needs language assets on the Mac running Antfly. For the bundled engine, enable Apple speech downloads in Settings → Speech & text, then try dictation again. For an external server, ask its administrator to enable download_assets."
+    }
     var text = "Antfly HTTP \(status)" + (code.map { " (\($0))" } ?? "")
     if !message.isEmpty { text += ": " + message }
     switch status {

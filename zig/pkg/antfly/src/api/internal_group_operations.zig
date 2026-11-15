@@ -15,6 +15,7 @@
 
 //! Transport-neutral operations for internal group coordination.
 
+const storage_descriptor_errors = @import("storage_descriptor_errors.zig");
 const std = @import("std");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const batch_api = @import("antfly_local_sources").api_internal_batch;
@@ -294,6 +295,7 @@ pub const Operations = struct {
     }
 
     fn mapCommonReadError(err: anyerror) ?Error {
+        if (storage_descriptor_errors.isPressure(err)) return error.StorageReadTemporarilyUnavailable;
         if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
         if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
         return switch (err) {
@@ -1388,6 +1390,7 @@ pub const Operations = struct {
 };
 
 fn mapLookupError(err: anyerror) Error {
+    if (storage_descriptor_errors.isPressure(err)) return error.StorageReadTemporarilyUnavailable;
     return switch (err) {
         error.Timeout => error.DeadlineExceeded,
         error.Cancelled, error.Canceled => error.Canceled,
@@ -1400,7 +1403,6 @@ fn mapLookupError(err: anyerror) Error {
         error.UnknownGroup,
         error.ReadUnavailable,
         => error.GroupLeaderUnavailable,
-        error.PersistentDescriptorAdmissionExhausted,
         error.ResourceBudgetExceeded,
         error.WriterLocked,
         error.LsmRootWriterAlreadyOpen,
@@ -2250,6 +2252,7 @@ fn consumerTests() type {
                 fn source(self: *@This()) table_reads.TableReadSource {
                     return .{ .ptr = self, .vtable = &.{
                         .lookup = lookup,
+                        .lookup_group_local = groupLookup,
                         .scan = scan,
                         .query = publicQuery,
                         .query_group_local = groupQuery,
@@ -2262,8 +2265,13 @@ fn consumerTests() type {
                     } };
                 }
 
-                fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
-                    return null;
+                fn lookup(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.scan_error;
+                }
+
+                fn groupLookup(raw: *anyopaque, allocator: std.mem.Allocator, _: u64, table: []const u8, key: []const u8, options: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+                    return lookup(raw, allocator, table, key, options, consistency);
                 }
 
                 fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
@@ -2324,6 +2332,16 @@ fn consumerTests() type {
                 mapLookupError(error.ResourceBudgetExceeded),
             );
             try std.testing.expectEqual(error.Internal, mapLookupError(error.CorruptInput));
+            for (storage_descriptor_errors.failures) |failure| {
+                fake.scan_error = failure;
+                try std.testing.expectEqual(error.StorageReadTemporarilyUnavailable, Operations.mapCommonReadError(failure).?);
+                try std.testing.expectEqual(error.StorageReadTemporarilyUnavailable, mapLookupError(failure));
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.lookup(alloc, .{}, .{ .group_id = 7, .table_name = "docs", .key = "key" }));
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.scan(alloc, .{}, 7, "docs", "", "", .{}));
+            }
+            fake.scan_error = error.InputOutput;
+            try std.testing.expectError(error.Internal, operations.lookup(alloc, .{}, .{ .group_id = 7, .table_name = "docs", .key = "key" }));
+            try std.testing.expect(Operations.mapCommonReadError(error.InputOutput) == null);
             const sink = table_reads.ScanStreamSink{ .context = null, .start_fn = FakeReads.unexpectedStart, .write_fn = FakeReads.unexpectedWrite };
             for ([_]anyerror{ error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadUnavailable }) |failure| {
                 fake.scan_error = failure;

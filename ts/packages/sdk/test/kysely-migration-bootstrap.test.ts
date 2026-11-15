@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import { Kysely, PostgresDialect, type DatabaseIntrospector } from "kysely";
+import { type DatabaseIntrospector, Kysely, PostgresDialect } from "kysely";
 import { expect, it, vi } from "vitest";
 import { createMigrationBootstrap } from "../src/kysely-migrations.js";
 

@@ -57,6 +57,10 @@ pub const Overlay = struct {
             self.bytes = std.math.add(usize, self.bytes, record.payload.len + @sizeOf(Mutation) + 64) catch return error.WalReadBudgetExceeded;
             if (self.bytes > self.max_bytes) return error.WalReadBudgetExceeded;
             var mutation = try codec.decodeMutationAlloc(alloc, record.payload);
+            if (mutation.kind == .catalog) {
+                mutation.deinit(alloc);
+                continue;
+            }
             errdefer mutation.deinit(alloc);
             const old = try self.by_id.getOrPut(alloc, mutation.doc_id);
             if (old.found_existing) {
@@ -115,9 +119,9 @@ pub const Overlay = struct {
     pub fn lookup(self: *Overlay, id: []const u8) !Lookup {
         const mutation = self.by_id.getPtr(id) orelse return .unchanged;
         if (mutation.kind == .delete) return .deleted;
-        if (mutation.kind == .checkpoint or mutation.kind == .enriched) {
+        if (mutation.kind == .checkpoint or (mutation.kind == .enriched or mutation.kind == .prepared)) {
             const raw = mutation.body orelse return error.InvalidDocumentBody;
-            const resolved = if (mutation.kind == .enriched) resolved: {
+            const resolved = if ((mutation.kind == .enriched or mutation.kind == .prepared)) resolved: {
                 const body = try @import("../build/document_facts.zig").parseEnrichedBody(raw);
                 break :resolved try self.alloc.dupe(u8, body.body);
             } else resolved: {
