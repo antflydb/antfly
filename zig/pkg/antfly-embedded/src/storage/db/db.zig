@@ -107780,7 +107780,7 @@ test "db run_until_idle does not hang on an edges-only row when a generated enri
     try std.testing.expect(std.mem.indexOf(u8, b_value, "hello") != null);
 }
 
-test "collectTextDocumentWritesForIndex tolerates a missing document only when told to give up" {
+test "collectTextDocumentWritesForIndex requires durable evidence before retiring a missing document" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -107792,13 +107792,8 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
     defer db.close();
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
 
-    // "doc:never" is targeted for full-text replay but was never written --
-    // the same shape a thin-replay-reconstructed synthetic upsert has for an
-    // `_edges`-only document (issue #938): no primary row will ever appear
-    // for it. Without tolerate_missing_replay_documents this is the ordinary
-    // "not visible yet, retry" signal; with it (set only after bounded
-    // retries on this exact window have been exhausted) it must be a no-op
-    // skip instead.
+    // Absence alone cannot distinguish a legitimate pending producer from
+    // a damaged source row. Both retain debt until evidence or repair arrives.
     const documents = [_]derived_types.DerivedDocument{.{
         .key = "doc:never",
         .targets = &.{.{ .kind = .full_text, .index_name = "ft_v1" }},
@@ -107829,18 +107824,16 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
             "ft_v1",
             false,
             db.core.index_manager.byte_range,
-            .{ .tolerate_missing_replay_documents = true },
+            .{},
         );
         defer collected.deinit();
-        try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+        try std.testing.expectEqual(@as(usize, 1), collected.missing_required);
         try std.testing.expectEqual(@as(usize, 0), collected.docs.items.len);
     }
 
-    // A skipped document is not silently lost: it is counted per owner and
-    // index, both directly and through the same status listDerivedReplayDebt
-    // surfaces.
+    // Retrying never records a successful skip or manufactures coverage.
     try std.testing.expectEqual(
-        @as(u64, 1),
+        @as(u64, 0),
         db.core.index_manager.resource_manager.?.replayDocumentNotVisibleSkippedTotal(
             resource_manager_mod.replayOwnerIdFromPtr(db.core.index_manager),
             "ft_v1",
@@ -107854,7 +107847,7 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
     var saw_ft_v1 = false;
     for (debt) |status| {
         if (!std.mem.eql(u8, status.index_name, "ft_v1")) continue;
-        try std.testing.expectEqual(@as(u64, 1), status.replay_document_not_visible_skipped);
+        try std.testing.expectEqual(@as(u64, 0), status.replay_document_not_visible_skipped);
         saw_ft_v1 = true;
     }
     try std.testing.expect(saw_ft_v1);
@@ -154889,4 +154882,35 @@ test "db replay retires deleted parent or certified chunk tail but rejects missi
     try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
     try std.testing.expectEqual(@as(usize, 0), collected.items.len);
     try std.testing.expectError(error.ArtifactCatalogCorrupt, collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &.{.{ .key = chunk }}, db.core.index_manager.byte_range, .{}, null));
+}
+
+test "db pending producer replay never ages missing full text input into completed coverage" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const sequence = db.core.store.reserveNextReplaySequence(1);
+    const batch = derived_types.DerivedBatch{ .documents = &.{.{ .key = "pending", .targets = &.{.{ .kind = .full_text, .index_name = "text" }} }} };
+    var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, sequence);
+    defer change_journal_mod.deinitRecord(alloc, &record);
+    const encoded = try change_journal_mod.encodeRecord(alloc, record);
+    defer alloc.free(encoded);
+    try replay_stream_mod.appendOpaque(alloc, db.core.store, sequence, encoded);
+    // Cross the old retry threshold without sleeping or running a worker.
+    const manager = db.core.index_manager.resource_manager.?;
+    const owner = resource_manager_mod.replayOwnerIdFromPtr(db.core.index_manager);
+    var attempts: usize = 0;
+    while (!manager.shouldEscalateReplayDocumentNotVisible(owner, "text", sequence)) : (attempts += 1) {
+        try std.testing.expect(attempts < 100_000);
+    }
+    try std.testing.expectError(error.ReplayDocumentNotVisible, db.runDerivedUntil(sequence));
+    try std.testing.expectEqual(@as(u64, 0), try db.core.loadAppliedSequence(alloc, "text"));
+    try std.testing.expectEqual(@as(u64, 0), manager.replayDocumentNotVisibleSkippedTotal(owner, "text"));
+    const stored = try internal_keys.documentKeyAlloc(alloc, "pending");
+    defer alloc.free(stored);
+    try db.core.store.putBatch(&.{.{ .key = stored, .value = "{\"body\":\"arrived\"}" }}, &.{});
+    try db.runDerivedUntil(sequence);
+    try std.testing.expectEqual(sequence, try db.core.loadAppliedSequence(alloc, "text"));
 }

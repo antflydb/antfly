@@ -28130,7 +28130,7 @@ test "index alias Raft admission permits rollout and fences returning legacy sto
         try std.testing.expect(!try hasIndexAliasesTxn(&txn, group));
     }
     var modern = legacy;
-    modern.artifact_sources_protocol_version = 3;
+    modern.artifact_sources_protocol_version = 4;
     const new_store = try encodeStoreRecord(a, modern);
     defer a.free(new_store);
     try txn.put(try storeKeyForGroup(&buf, group, modern.store_id), new_store);

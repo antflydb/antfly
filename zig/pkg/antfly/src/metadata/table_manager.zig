@@ -16,8 +16,9 @@
 const std = @import("std");
 
 // Version 2 additionally enforces managed privacy sources and read fences.
-/// v1: artifact sources; v2: privacy serving; v3: opaque index alias catalog state.
-pub const artifact_sources_protocol_version: u16 = 3;
+/// v1: artifact sources; v2: privacy serving; v3: opaque index alias catalog state;
+/// v4: lifecycle-scoped alias deletion validators.
+pub const artifact_sources_protocol_version: u16 = 4;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
@@ -948,7 +949,7 @@ pub fn privacyProtocolSupported(reporter_incarnation: u64, protocol_version: u16
 }
 
 pub fn indexAliasesProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
-    return reporter_incarnation != 0 and protocol_version >= 3 and artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
+    return reporter_incarnation != 0 and protocol_version >= 4 and artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
 }
 
 pub fn denseNativeStorageProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {

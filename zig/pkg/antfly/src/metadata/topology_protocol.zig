@@ -121,8 +121,9 @@ const std = @import("std");
 /// Version 87 admits bootstrap selectors in reader protocol 100 publications.
 /// Version 88 admits bounded inline map navigation in reader protocol 101.
 /// Version 90 admits table-scoped index aliases and durable retry receipts.
-pub const current_version: u16 = 90;
-pub const index_aliases_version: u16 = 90;
+/// Version 91 admits lifecycle-scoped alias deletion validators.
+pub const current_version: u16 = 91;
+pub const index_aliases_version: u16 = 91;
 pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
     return @import("antfly_local_sources").api_index_metadata.aliases.uses(a, indexes_json);
 }

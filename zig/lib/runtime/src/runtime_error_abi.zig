@@ -1113,6 +1113,8 @@ pub const Detail = enum(c_int) {
     catalog_changed,
     index_referenced_by_alias,
     index_alias_graph_conflict,
+    index_alias_precondition_required,
+    index_alias_precondition_failed,
 };
 
 pub const Status = extern struct {
@@ -1130,6 +1132,8 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.IndexAliasPreconditionRequired => status(.conflict, .index_alias_precondition_required),
+        error.IndexAliasPreconditionFailed => status(.conflict, .index_alias_precondition_failed),
         error.IndexReferencedByAlias => status(.conflict, .index_referenced_by_alias),
         error.IndexAliasGraphConflict => status(.conflict, .index_alias_graph_conflict),
         error.CatalogChanged => status(.conflict, .catalog_changed),
@@ -2345,6 +2349,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
+        .index_alias_precondition_required => "IndexAliasPreconditionRequired",
+        .index_alias_precondition_failed => "IndexAliasPreconditionFailed",
         .index_referenced_by_alias => "IndexReferencedByAlias",
         .index_alias_graph_conflict => "IndexAliasGraphConflict",
         .hierarchy_cursor_stale => "HierarchyCursorStale",
@@ -3851,7 +3857,7 @@ test "positional IO errors preserve identity without becoming retryable pressure
 }
 
 test "index dependency conflicts preserve identity across owner callbacks" {
-    for ([_]anyerror{ error.IndexReferencedByAlias, error.IndexAliasGraphConflict }) |err| {
+    for ([_]anyerror{ error.IndexReferencedByAlias, error.IndexAliasGraphConflict, error.IndexAliasPreconditionRequired, error.IndexAliasPreconditionFailed }) |err| {
         const result = statusFromError(err);
         try std.testing.expectEqual(@backingInt(Code.conflict), result.code);
         try std.testing.expectEqual(err, errorFromStatus(result));

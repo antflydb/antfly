@@ -27,7 +27,6 @@ const relational_store = @import("relational_store.zig");
 const doc_identity = @import("doc_identity.zig");
 const lookup_key_scratch = @import("lookup_key_scratch.zig");
 const document_read_scratch = @import("document_read_scratch.zig");
-const resource_manager_mod = @import("../resource_manager.zig");
 fn monotonicTimeNs() u64 {
     return @import("antfly_platform").time.monotonicNs();
 }
@@ -59,12 +58,6 @@ pub const CollectDocumentWritesProfile = struct {
 pub const CollectTextDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
     relational_base_rows: bool = false,
-    /// Set once replay of this window has retried error.ReplayDocumentNotVisible
-    /// past the bounded limit (see ResourceManager.shouldEscalateReplayDocumentNotVisible).
-    /// A document that is still missing is then skipped and logged once
-    /// instead of counted toward missing_required, so the window can advance
-    /// instead of retrying forever.
-    tolerate_missing_replay_documents: bool = false,
 };
 
 pub const CollectDocumentWritesOptions = struct {
@@ -424,14 +417,6 @@ pub fn collectTextDocumentWritesForIndex(
     for (pending.items, 0..) |item, i| {
         if (read_values[i] == null and try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
         const value = read_values[i] orelse item.inline_value orelse {
-            if (opts.tolerate_missing_replay_documents) {
-                std.log.warn(
-                    "full-text replay giving up on a document with no visible content after bounded retries index={s} key={s}",
-                    .{ index_name, item.doc_key },
-                );
-                if (index_manager.resource_manager) |manager| manager.recordReplayDocumentNotVisibleSkipped(resource_manager_mod.replayOwnerIdFromPtr(index_manager), index_name);
-                continue;
-            }
             result.missing_required += 1;
             continue;
         };

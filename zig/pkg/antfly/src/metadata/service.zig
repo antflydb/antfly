@@ -3645,7 +3645,9 @@ pub fn transitionRequiredCoordinatedDecoderVersion(a: std.mem.Allocator, command
     var required = (try transitionBaseDecoderVersion(a, command));
     switch (command) {
         .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
-            if (record.artifact_sources_protocol_version >= 3) required = @max(required, metadata_topology_protocol.index_aliases_version);
+            if (record.artifact_sources_protocol_version >= 4) {
+                required = @max(required, metadata_topology_protocol.index_aliases_version);
+            } else if (record.artifact_sources_protocol_version >= 3) required = @max(required, 90);
         },
         .upsert_table => |table| required = @max(required, (try tableDecoderVersion(a, table))),
         .compare_and_replace_table => |cas| required = @max(required, @max((try tableDecoderVersion(a, cas.expected)), (try tableDecoderVersion(a, cas.replacement)))),
@@ -3685,7 +3687,8 @@ test "index alias decoder floor composes with table features and preserves CAS h
     try std.testing.expectEqual(floor, (try transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_replace_table = .{ .expected = aliases, .replacement = plain } })));
     try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(0, 3));
     try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, 2));
-    try std.testing.expect(metadata_table_manager.indexAliasesProtocolSupported(7, 3));
+    try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, 3));
+    try std.testing.expect(metadata_table_manager.indexAliasesProtocolSupported(7, 4));
     try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, metadata_table_manager.artifact_sources_protocol_version + 1));
     const Check = struct {
         fn run(allocator: std.mem.Allocator, command: metadata_storage.TransitionCommand, expected: u16) !void {
@@ -23991,7 +23994,7 @@ test "index alias legacy store admission uses only the durable presence lookup" 
     try requireIndexAliasStoreAdmission(&service, record);
     service.store.present = true;
     try std.testing.expectError(error.IndexAliasProtocolUpgradeRequired, requireIndexAliasStoreAdmission(&service, record));
-    record.artifact_sources_protocol_version = 3;
+    record.artifact_sources_protocol_version = 4;
     try requireIndexAliasStoreAdmission(&service, record);
     record.artifact_sources_protocol_version = 2;
     record.live = false;

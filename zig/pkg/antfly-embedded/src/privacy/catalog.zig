@@ -561,8 +561,14 @@ pub fn install(a: A, indexes_json: []const u8, resource: Resource) ![]u8 {
     if (resource.policy.mode == .redact_for_search_and_ai or prior_protective) {
         var consumers = root.object.iterator();
         while (consumers.next()) |entry| {
-            if (index_metadata.isOpaqueEntry(entry.key_ptr.*) or entry.value_ptr.* != .object or
-                !entry.value_ptr.object.contains("type")) continue;
+            if (index_metadata.isOpaqueEntry(entry.key_ptr.*) or entry.value_ptr.* != .object) continue;
+            // Legacy full-text defaults may be stored as {}. Normalize them on
+            // demotion as well as protection so replacement owns a fresh fence.
+            if (!entry.value_ptr.object.contains("type") and std.mem.startsWith(u8, entry.key_ptr.*, "full_text_index_v"))
+                try string(scratch, entry.value_ptr, "type", "full_text");
+            if (!entry.value_ptr.object.contains("type")) continue;
+            const logical_incarnation = @import("../api/index_incarnation.zig").get(entry.value_ptr.*) orelse 0;
+            _ = entry.value_ptr.object.swapRemove("_coverage_incarnation");
             if (same_policy_generation) {
                 if (live.value.object.get(entry.key_ptr.*)) |existing| {
                     if (@import("../api/index_incarnation.zig").get(existing)) |incarnation| {
@@ -575,7 +581,7 @@ pub fn install(a: A, indexes_json: []const u8, resource: Resource) ![]u8 {
             identity.update(&resource.policy_version);
             var counters: [16]u8 = undefined;
             std.mem.writeInt(u64, counters[0..8], resource.generation, .little);
-            std.mem.writeInt(u64, counters[8..16], @import("../api/index_incarnation.zig").get(entry.value_ptr.*) orelse 0, .little);
+            std.mem.writeInt(u64, counters[8..16], logical_incarnation, .little);
             identity.update(&counters);
             identity.update(entry.key_ptr.*);
             const incarnation = (identity.final() & std.math.maxInt(i63)) | 1;
@@ -1275,4 +1281,29 @@ test "privacy policy replacement retains pre-upgrade incarnations on identical P
     try @import("../api/index_aliases.zig").validateDependencyMutation(a, before, after);
     const root = (try std.json.parseFromSlice(std.json.Value, a, after, .{})).value;
     try std.testing.expectEqual(@as(?u64, 42), @import("../api/index_incarnation.zig").get(root.object.get("full_text_index_v0").?));
+}
+
+test "privacy policy replacement normalizes legacy generations through demotion and restore validation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const aliases = @import("../api/index_aliases.zig");
+    const tables = @import("../api/tables.zig");
+    var policy = contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} };
+    const logical = "{\"full_text_index_v0\":{},\"dense\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"_coverage_incarnation\":42,\"embedder\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}}";
+    var raw = try install(a, logical, try next(a, null, policy, null));
+    try tables.validateStoredIndexesJson(a, raw);
+    var root = (try std.json.parseFromSlice(std.json.Value, a, raw, .{})).value;
+    // A pre-upgrade protected consumer may have only an implicit generation.
+    _ = root.object.getPtr("dense").?.object.swapRemove("_index_incarnation");
+    raw = try std.json.Stringify.valueAlloc(a, root, .{});
+    for ([_]contract.Mode{ .redact_for_search_and_ai, .monitor }) |mode| {
+        const resource = (try current(a, (try std.json.parseFromSlice(std.json.Value, a, raw, .{})).value)).?.value;
+        policy.mode = mode;
+        policy.replacement = .mask;
+        const updated = try install(a, raw, try next(a, resource, policy, try etag(a, resource)));
+        try aliases.validateDependencyMutation(a, raw, updated);
+        try tables.validateStoredIndexesJson(a, updated);
+        raw = updated;
+    }
 }

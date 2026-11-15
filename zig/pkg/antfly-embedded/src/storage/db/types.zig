@@ -5197,6 +5197,7 @@ pub const DerivedWorkerStats = struct {
     workers: u64 = 0,
     failed_workers: u64 = 0,
     workers_with_replay_debt: u64 = 0,
+    workers_waiting_for_replay_input: u64 = 0,
     max_replay_lag_sequences: u64 = 0,
     recoverable_retries: u64 = 0,
     writer_locked_retries: u64 = 0,

@@ -78,7 +78,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     privacy_step.dependOn(&b.addRunArtifact(privacy_tests).step);
     const privacy_transition_tests = b.addTest(.{
         .root_module = privacy_mod,
-        .filters = &.{ "privacy API and transport contracts", "privacy policy replacement", "privacy new index migration" },
+        .filters = &.{ "privacy API and transport contracts", "privacy policy replacement", "privacy new index migration", "privacy model migration", "index alias legacy incarnation", "index alias conditional deletion", "alias deletion rejects validators" },
     });
     b.step("antfly-privacy-transition-test", "Verify policy generation replacement and protected model migration")
         .dependOn(&b.addRunArtifact(privacy_transition_tests).step);

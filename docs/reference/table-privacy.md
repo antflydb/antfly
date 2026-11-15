@@ -331,13 +331,32 @@ index through the normal create-index API. Antfly attaches it to the current
 protected artifact graph in the same catalog commit. Existing index generations
 and privacy inspection receipts remain usable. Wait for the new index to become
 complete, then move the serving index alias with `expected_index` set to the old
-physical index. Raw external vectors and unsupported graph consumers are rejected.
+physical index. After cutover, delete the unreferenced old physical index through
+the normal delete-index API. Its private chunk/embedding producers retire in the
+same catalog mutation, so later writes no longer invoke its model. Shared
+producers and the protected serving guard remain owned by their surviving
+consumers. Raw external vectors and unsupported graph consumers are rejected.
 Repeating an identical creation request preserves the physical generation.
 
 Semantic policy changes (including producer revision or replacement style)
 replace dependent consumer generations and backfill them under the new policy.
 Identical policy PUTs and execution-only tuning preserve existing generations.
 An alias that still references a changed consumer blocks the policy replacement
-with HTTP 409 `IndexReferencedByAlias`. Move or remove that alias before changing
-the policy; rebind only after the protected index is complete. Protection remains
-active throughout the transition.
+with HTTP 409 `IndexReferencedByAlias`. Remove every alias referencing a changed consumer before changing the policy;
+rebind only after the protected index is complete. To remove an alias, GET
+`/tables/{tableName}/index-aliases/{aliasName}` and DELETE the same path with
+`If-Match` set to that response's exact `ETag`. Missing validators return 428,
+stale validators return 412, and a repeated deletion returns 404. This CAS also
+protects against deleting a concurrently recreated alias or one restored from a backup. Physical indexes and
+retained PUT idempotency receipts remain intact. Protection remains
+active throughout the transition. Alias mutations require metadata protocol 91
+and store artifact-source protocol 4 so older owners cannot misread the new
+validator state.
+
+Missing producer input does not become a successful replay merely because a retry
+limit elapsed. Its journal window remains pending until input arrives, a durable
+source deletion or generation proves it retired, or explicit repair resolves the
+missing state. Workers park instead of polling the same failed window; source or
+producer commits and explicit repair notifications wake them, including repairs
+at the same replay sequence. Reopening retries retained debt. This applies to
+full-text consumers as well as vector consumers.

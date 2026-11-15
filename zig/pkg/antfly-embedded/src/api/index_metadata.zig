@@ -20,7 +20,7 @@ const std = @import("std");
 pub const aliases = @import("index_aliases.zig");
 
 pub fn isOpaqueEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, aliases.key) or std.mem.eql(u8, name, aliases.receipts_key) or std.mem.eql(u8, name, "_privacy") or std.mem.eql(u8, name, "_resolver_record_store") or std.mem.eql(u8, name, "_resolver_record_owners") or
+    return std.mem.eql(u8, name, aliases.key) or std.mem.eql(u8, name, aliases.receipts_key) or std.mem.eql(u8, name, "_index_alias_epoch") or std.mem.eql(u8, name, "_privacy") or std.mem.eql(u8, name, "_resolver_record_store") or std.mem.eql(u8, name, "_resolver_record_owners") or
         std.mem.eql(u8, name, "_resolver_curation") or
         std.mem.eql(u8, name, "_resolver_namespaces") or
         std.mem.eql(u8, name, "_curation_proposals");

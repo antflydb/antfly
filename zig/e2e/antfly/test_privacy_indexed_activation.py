@@ -30,7 +30,7 @@ from requests.exceptions import ReadTimeout
 @pytest.fixture
 def privacy_provider(request):
     native = request.param if hasattr(request, "param") else False
-    calls = {"embed": [], "extract": [], "paths": [], "batches": []}
+    calls = {"embed": [], "extract": [], "paths": [], "batches": [], "embed_models": []}
     behavior = {"deny": False, "embed_gate": Event(), "embed_held": Event()}
     behavior["embed_gate"].set()
 
@@ -88,6 +88,7 @@ def privacy_provider(request):
                 if isinstance(inputs, str):
                     inputs = [inputs]
                 calls["embed"].extend(inputs)
+                calls["embed_models"].append(body["model"])
                 if not behavior["embed_gate"].is_set():
                     behavior["embed_held"].set()
                 assert behavior["embed_gate"].wait(timeout=60)
@@ -96,7 +97,15 @@ def privacy_provider(request):
                     {
                         "object": "list",
                         "data": [
-                            {"object": "embedding", "index": i, "embedding": [1.0, 0.0]}
+                            {
+                                "object": "embedding",
+                                "index": i,
+                                "embedding": (
+                                    [0.0, 1.0]
+                                    if body["model"] == "fixture-v2"
+                                    else [1.0, 0.0]
+                                ),
+                            }
                             for i in range(len(inputs))
                         ],
                     },
@@ -186,14 +195,14 @@ def policy(endpoint):
     }
 
 
-def query(api, table, index="a0"):
+def query(api, table, index="a0", vector=None):
     try:
         response = api.s.post(
             api.url + "/query",
             json={
                 "table": table,
                 "indexes": [index],
-                "embeddings": {index: [1.0, 0.0]},
+                "embeddings": {index: vector or [1.0, 0.0]},
                 "fields": ["body"],
                 "limit": 100,
             },
@@ -213,8 +222,8 @@ def query(api, table, index="a0"):
     return row["hits"]["hits"]
 
 
-def redacted(api, table, docs, index="a0"):
-    hits = query(api, table, index)
+def redacted(api, table, docs, index="a0", vector=None):
+    hits = query(api, table, index, vector)
     if hits is None:
         return None
     for hit in hits:
@@ -378,9 +387,9 @@ def test_privacy_policy_replacement_and_new_model_migration(
             },
         },
     )
-    assert wait_until(lambda: redacted(api, table, docs, "b"), timeout_s=60), (
-        api.debug_logs()
-    )
+    assert wait_until(
+        lambda: redacted(api, table, docs, "b", [0.0, 1.0]), timeout_s=60
+    ), api.debug_logs()
     assert redacted(api, table, docs, "search")
     # The existing producer's inspection receipts are shared with B.
     assert len(calls["extract"]) == before
@@ -393,7 +402,17 @@ def test_privacy_policy_replacement_and_new_model_migration(
             "require": "complete",
         },
     )
-    assert redacted(api, table, docs, "search")
+    hits = redacted(api, table, docs, "search", [0.0, 1.0])
+    assert hits and all(hit["_score"] > 0.99 for hit in hits), hits
+    # The old model can be decommissioned while protection remains active.
+    response = api.s.delete(api.url + f"/tables/{table}/indexes/a0", timeout=20)
+    assert response.status_code == 201, response.text
+    previous_models = len(calls["embed_models"])
+    docs["d0"]["body"] += " Updated after retirement."
+    api.batch_write(table, inserts=docs, sync_level="full_index")
+    assert redacted(api, table, docs, "search", [0.0, 1.0])
+    assert calls["embed_models"][previous_models:]
+    assert set(calls["embed_models"][previous_models:]) == {"fixture-v2"}
     current = api.get(path)
     blocked = current["policy"]
     blocked["replacement"] = "category"
@@ -403,11 +422,37 @@ def test_privacy_policy_replacement_and_new_model_migration(
     assert response.status_code == 409, response.text
     assert response.json()["code"] == "IndexReferencedByAlias"
     assert api.get(path)["etag"] == current["etag"]
+    alias_resource = api.s.get(api.url + alias, timeout=20)
+    assert alias_resource.status_code == 200, alias_resource.text
+    alias_tag = alias_resource.headers["ETag"]
+    response = api.s.delete(api.url + alias, timeout=20)
+    assert response.status_code == 428, response.text
+    response = api.s.delete(api.url + alias, headers={"If-Match": "*"}, timeout=20)
+    assert response.status_code == 412, response.text
+    response = api.s.delete(
+        api.url + alias, headers={"If-Match": alias_tag}, timeout=20
+    )
+    assert response.status_code == 200, response.text
+    assert api.s.get(api.url + alias, timeout=20).status_code == 404
+    response = api.s.put(
+        api.url + path, json=blocked, headers={"If-Match": current["etag"]}, timeout=20
+    )
+    assert response.status_code == 202, response.text
+    assert wait_until(
+        lambda: redacted(api, table, docs, "b", [0.0, 1.0]), timeout_s=60
+    ), api.debug_logs()
+    api.put(
+        alias, {"index": "b", "idempotency_key": "recreated", "require": "complete"}
+    )
+    response = api.s.delete(
+        api.url + alias, headers={"If-Match": alias_tag}, timeout=20
+    )
+    assert response.status_code == 412, response.text
     if api.supports_restart:
         api.restart_server()
-        assert wait_until(lambda: redacted(api, table, docs, "search"), timeout_s=60), (
-            api.debug_logs()
-        )
+        assert wait_until(
+            lambda: redacted(api, table, docs, "search", [0.0, 1.0]), timeout_s=60
+        ), api.debug_logs()
 
 
 def test_privacy_held_update_delete_crash_recovers_current_sources(
