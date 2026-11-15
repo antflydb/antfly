@@ -222,11 +222,19 @@ def test_readonly_snapshot_without_sidecar_in_readonly_directory(tmp_path: Path)
                     # the first reader still owns the fallback inode fence.
                     with antfly_embedded.open(snapshot, mode=antfly_embedded.OpenMode.READONLY) as second:
                         assert second.sql("SELECT name FROM items")["rows"] == [["before"]]
-                        # The lock sidecar is the lock authority and must not
-                        # appear. The writer's FIFO admission queue
-                        # (<sidecar>.q) only orders writers and may.
+                        # The old per-inode flock sidecar (`<db>.lock`) and
+                        # its writer FIFO ticket directory (`<sidecar>.q`)
+                        # are both replaced by the single shared lock
+                        # region (`<db>.aflite-lock`, design doc §8.1/§8.7);
+                        # neither of the old names is ever created anymore.
+                        # The writer's own open above made the directory
+                        # writable again, so it is this process -- not the
+                        # second reader -- that lazily creates the region
+                        # the moment it needs cross-process coordination;
+                        # that file is now the legitimate lock authority.
                         assert not (directory / f"{snapshot.name}.lock").exists()
-                        assert set(directory.iterdir()) <= {snapshot, directory / f"{snapshot.name}.lock.q"}
+                        assert not (directory / f"{snapshot.name}.lock.q").exists()
+                        assert set(directory.iterdir()) <= {snapshot, directory / f"{snapshot.name}.aflite-lock"}
                         with pytest.raises(antfly_embedded.BusyError):
                             writer.sql("UPDATE items SET name = 'after' WHERE id = 1")
                     assert cursor.fetch(10)["result"]["rows"] == [["before"]]
