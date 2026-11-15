@@ -4409,6 +4409,10 @@ pub const Store = struct {
             }
             return err;
         };
+        // See `reopenRegionAfterGenerationSwap`'s own doc comment --
+        // automatic (background-worker-driven) vacuum swaps generations
+        // exactly like the manual `vacuumWithCancel` path above.
+        self.reopenRegionAfterGenerationSwap();
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
@@ -4698,6 +4702,12 @@ pub const Store = struct {
         // before the run, not re-derived from "now" once it returns.
         const vacuum_started = self.maintenance_policy.snapshot();
         const report = try self.performVacuum(cancel, false, false);
+        // By now every defer inside `performVacuum` (including the
+        // `image.deinit()` that closes the retired generation's own last
+        // reference) has already run -- see `reopenRegionAfterGenerationSwap`'s
+        // own doc comment for why this, not anywhere inside `performVacuum`
+        // itself, is the right place.
+        self.reopenRegionAfterGenerationSwap();
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
@@ -4709,6 +4719,45 @@ pub const Store = struct {
         // `Policy.worthwhile`'s own doc comment.
         self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redo_log_capacity);
         return report;
+    }
+
+    /// After `performVacuum` successfully swaps in a new generation
+    /// (`NativeFile.replaceWithPreparedGeneration`, via `publishVacuum`),
+    /// `inode_lock.rebind` only lazily invalidates this process's own
+    /// cached `shared_lock_region` for the new inode: the sidecar itself
+    /// still carries the *previous* generation's stamped `db_inode` until
+    /// something reopens it. Left purely lazy, the next opener is
+    /// routinely a brand-new, unrelated connection (a fresh
+    /// `CopyStableSnapshotFile`/readonly open of this same path moments
+    /// after the swap) whose own `Region.open` then finds that stale stamp
+    /// and -- correctly, by design -- refuses to rebuild it rather than
+    /// risk corrupting a still-live peer's mapping ("shared lock region
+    /// refuses a db_inode mismatch instead of rebuilding under a live
+    /// peer"). That refusal then forces the legacy flock fallback, which
+    /// this same process's own parked writer lease (see `WriterLane`) can
+    /// hold open indefinitely -- a same-process reader stuck on that
+    /// fallback never gets it released on its own (`checkin`'s foreign-
+    /// waiter check is keyed by pid, so a same-process reader never counts
+    /// as foreign), so the stale stamp does not resolve itself later
+    /// either; it needs an actual reopen.
+    ///
+    /// By the time this runs, `performVacuum`'s own `image.deinit()` (its
+    /// `defer`, already fired by the time `performVacuum` returned to this
+    /// caller) has closed the retired generation's own last reference --
+    /// the one live claim `replaceWithPreparedGeneration`'s own `rebind`
+    /// could not itself have closed yet (see that function's own doc
+    /// comment: `prepared`, not yet closed there, still owns it). This is
+    /// therefore the earliest point nothing in this process is left
+    /// holding the retired generation, so a fresh `ensureRegion` here can
+    /// usually succeed immediately and re-stamp the sidecar with the new
+    /// `db_inode` before any other opener ever has a chance to see the
+    /// stale one. Best-effort: a genuinely still-live reader of the
+    /// retired generation (same process or foreign) correctly refuses this
+    /// too, exactly as it always has -- this just means the ordinary lazy
+    /// reopen on the next access still has to do the work later.
+    fn reopenRegionAfterGenerationSwap(self: *Store) void {
+        const io = self.file.runtime();
+        if (self.file.inode_lock_ref.load(.acquire)) |entry| _ = inode_lock.ensureRegion(entry, io) catch {};
     }
 
     /// `from_background_worker`: see `maintainOnceWithCancel`'s own doc
