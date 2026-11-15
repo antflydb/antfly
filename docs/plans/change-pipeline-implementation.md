@@ -1931,6 +1931,38 @@ This registration does not implement a public feed owner, policy binding,
 scheduling, coherent bootstrap, typed pgoutput producer or destination adapters.
 Those and the remaining full issue acceptance contracts are still required.
 
+## In progress: private distributed transaction completion evidence
+
+`storage/transaction_completion.zig` in the embedded owner defines a bounded,
+versioned private manifest and certificate, exported through
+`committed_frame.completion`. The manifest binds transaction/admission identity,
+original coordinator namespace/owner, commit version, and the exact ordered
+participant namespaces, owner fences, locators and effect/guard/checkpoint roles.
+Every participant needs a matching positive resolution at a canonical native or
+Raft position. A resolution either binds an exact retained effect frame or a
+positive zero-effect decision; missing frames or filtered events cannot supply
+that decision. Completeness requires the exact frozen member set, including
+read-only members. Digests use explicit domains and length framing; validation
+hashes the manifest once rather than once per participant. Membership and counts
+are private and cannot enter the public authorized projection.
+
+Five direct frame/completion tests passed in
+`transaction-completion-frame-test.log`, including corrupted/partial evidence,
+stale owners, changed admission/coordinator fences, invalid positions and initial
+allocation failure. Source catalog generation completed. The regular build gate
+is `transaction-completion-test`, also included in the unit aggregate.
+
+This is the structural contract, not a durable certificate producer or evidence
+of distributed feed support. Required integration remains: reserve bounded
+completion storage before prepare votes; persist each native frame/zero-effect
+resolution atomically; retain the original frozen routing/manifest through
+recovery; assemble only after every participant resolves; publish retained
+completion evidence to the relevant history owners before releasing coordinator
+recovery debt; preserve it through coordinator GC and topology transfer; and have
+the authorized delivery owner verify it before exposing completion. Existing
+coordinated frames remain rejected by the public-projection provider until those
+production invariants and failure/recovery tests are implemented.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

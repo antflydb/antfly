@@ -1,0 +1,277 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Private distributed completion evidence. Structural validation is not a
+//! substitute for native authority: producers must persist each resolution
+//! atomically with the indicated frame or zero-effect decision, then retain the
+//! complete certificate independently of coordinator transaction GC. Consumers
+//! must verify the serving owner/cut before trusting this private evidence.
+//! Participant membership and diagnostic counts must never cross the public
+//! authorized-projection boundary.
+const std = @import("std");
+const A = std.mem.Allocator;
+pub const Digest = [32]u8;
+pub const Namespace = [24]u8;
+pub const max_participants = 1024;
+pub const max_locator_bytes = 1024;
+pub const max_bytes = 16 * 1024 * 1024;
+pub const Roles = struct {
+    pub const effects: u8 = 1;
+    pub const guards: u8 = 2;
+    pub const checkpoint: u8 = 4;
+};
+fn nonzero(value: anytype) bool {
+    return !std.mem.allEqual(u8, &value, 0);
+}
+fn same(left: anytype, right: @TypeOf(left)) bool {
+    return std.mem.eql(u8, &left, &right);
+}
+fn number(sha: *std.crypto.hash.sha2.Sha256, value: u64) void {
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, value, .big);
+    sha.update(&raw);
+}
+pub const Participant = struct {
+    namespace: Namespace,
+    owner_fence: Digest,
+    roles: u8,
+    /// Exact original routing locator, not a name resolved against a later
+    /// topology. Its owner fence binds the physical generation.
+    locator: []const u8,
+    fn validate(self: Participant) !void {
+        if (!nonzero(self.namespace) or !nonzero(self.owner_fence) or self.roles == 0 or self.roles & ~@as(u8, 7) != 0 or self.locator.len == 0 or self.locator.len > max_locator_bytes or !std.unicode.utf8ValidateSlice(self.locator)) return error.InvalidTxnRecord;
+    }
+};
+pub const Manifest = struct {
+    version: u16 = 1,
+    transaction_id: [16]u8,
+    admission_digest: Digest,
+    coordinator_namespace: Namespace,
+    coordinator_fence: Digest,
+    commit_version: u64,
+    participants: []const Participant,
+    pub fn validate(self: Manifest) !void {
+        if (self.version != 1 or !nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.coordinator_namespace) or !nonzero(self.coordinator_fence) or self.commit_version == 0 or self.participants.len == 0 or self.participants.len > max_participants) return error.InvalidTxnRecord;
+        for (self.participants, 0..) |participant, i| {
+            try participant.validate();
+            if (i != 0 and std.mem.order(u8, &self.participants[i - 1].namespace, &participant.namespace) != .lt) return error.InvalidTxnRecord;
+        }
+    }
+    pub fn digest(self: Manifest) Digest {
+        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        sha.update("antfly:transaction-completion-manifest:v1");
+        number(&sha, self.version);
+        sha.update(&self.transaction_id);
+        sha.update(&self.admission_digest);
+        sha.update(&self.coordinator_namespace);
+        sha.update(&self.coordinator_fence);
+        number(&sha, self.commit_version);
+        number(&sha, self.participants.len);
+        for (self.participants) |participant| {
+            sha.update(&participant.namespace);
+            sha.update(&participant.owner_fence);
+            sha.update(&.{participant.roles});
+            number(&sha, participant.locator.len);
+            sha.update(participant.locator);
+        }
+        return sha.finalResult();
+    }
+};
+/// Same canonical native/Raft source position carried by committed frames.
+/// Native: positive sequence in bytes 0..8, zeros 8..31, kind 2 in byte 31.
+/// Raft: positive term/index in bytes 0..16, zeros 16..31, kind 1 in byte 31.
+pub fn validatePosition(position: Digest) !void {
+    const end: usize = switch (position[31]) {
+        1 => blk: {
+            if (std.mem.readInt(u64, position[0..8], .little) == 0 or std.mem.readInt(u64, position[8..16], .little) == 0) return error.InvalidTxnRecord;
+            break :blk 16;
+        },
+        2 => blk: {
+            if (std.mem.readInt(u64, position[0..8], .little) == 0) return error.InvalidTxnRecord;
+            break :blk 8;
+        },
+        else => return error.InvalidTxnRecord,
+    };
+    if (!std.mem.allEqual(u8, position[end..31], 0)) return error.InvalidTxnRecord;
+}
+pub const Effects = struct { sequence: u64, frame_digest: Digest };
+pub const Outcome = union(enum) {
+    effects: Effects,
+    /// Positive native resolution evidence. Absence of a frame or a filtered
+    /// public event is never evidence that a participant had no effects.
+    no_effect: Digest,
+};
+pub const Resolution = struct {
+    namespace: Namespace,
+    owner_fence: Digest,
+    manifest_digest: Digest,
+    commit_version: u64,
+    source_position: Digest,
+    outcome: Outcome,
+    pub fn validate(self: Resolution, manifest: Manifest, participant: Participant) !void {
+        try manifest.validate();
+        try self.validateBound(manifest.digest(), manifest.commit_version, participant);
+    }
+    fn validateBound(self: Resolution, manifest_digest: Digest, commit_version: u64, participant: Participant) !void {
+        if (!same(self.namespace, participant.namespace) or !same(self.owner_fence, participant.owner_fence) or !same(self.manifest_digest, manifest_digest) or self.commit_version != commit_version) return error.InvalidTxnRecord;
+        try validatePosition(self.source_position);
+        switch (self.outcome) {
+            .effects => |effects| if (participant.roles & Roles.effects == 0 or effects.sequence == 0 or !nonzero(effects.frame_digest)) return error.InvalidTxnRecord,
+            .no_effect => |proof| if (!nonzero(proof)) return error.InvalidTxnRecord,
+        }
+    }
+    fn hashInto(self: Resolution, sha: *std.crypto.hash.sha2.Sha256) void {
+        sha.update(&self.namespace);
+        sha.update(&self.owner_fence);
+        sha.update(&self.manifest_digest);
+        number(sha, self.commit_version);
+        sha.update(&self.source_position);
+        switch (self.outcome) {
+            .effects => |effects| {
+                sha.update(&.{1});
+                number(sha, effects.sequence);
+                sha.update(&effects.frame_digest);
+            },
+            .no_effect => |proof| {
+                sha.update(&.{2});
+                sha.update(&proof);
+            },
+        }
+    }
+};
+pub const Certificate = struct {
+    version: u16 = 1,
+    manifest: Manifest,
+    resolutions: []const Resolution,
+    pub fn validate(self: Certificate) !void {
+        if (self.version != 1) return error.InvalidTxnRecord;
+        try self.manifest.validate();
+        if (self.resolutions.len != self.manifest.participants.len) return error.InvalidTxnRecord;
+        const manifest_digest = self.manifest.digest();
+        for (self.resolutions, self.manifest.participants) |resolution, participant| try resolution.validateBound(manifest_digest, self.manifest.commit_version, participant);
+    }
+    pub fn digest(self: Certificate) Digest {
+        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        sha.update("antfly:transaction-completion-certificate:v1");
+        number(&sha, self.version);
+        sha.update(&self.manifest.digest());
+        number(&sha, self.resolutions.len);
+        for (self.resolutions) |resolution| resolution.hashInto(&sha);
+        return sha.finalResult();
+    }
+};
+pub const Envelope = struct { certificate: Certificate, digest: Digest };
+pub fn encode(a: A, certificate: Certificate) ![]u8 {
+    try certificate.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, Envelope{ .certificate = certificate, .digest = certificate.digest() }, .{});
+    errdefer a.free(bytes);
+    if (bytes.len > max_bytes) return error.HistoryTooLarge;
+    return bytes;
+}
+pub fn parse(a: A, bytes: []const u8) !std.json.Parsed(Envelope) {
+    if (bytes.len == 0 or bytes.len > max_bytes) return error.InvalidTxnRecord;
+    var parsed = std.json.parseFromSlice(Envelope, a, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidTxnRecord,
+    };
+    errdefer parsed.deinit();
+    try parsed.value.certificate.validate();
+    if (!same(parsed.value.digest, parsed.value.certificate.digest())) return error.InvalidTxnRecord;
+    return parsed;
+}
+
+test "transaction completion requires exact frozen members including positive zero effect resolution" {
+    const a = std.testing.allocator;
+    const members = [_]Participant{
+        .{ .namespace = @splat(1), .owner_fence = @splat(2), .roles = Roles.effects, .locator = "original-writer" },
+        .{ .namespace = @splat(3), .owner_fence = @splat(4), .roles = Roles.guards | Roles.checkpoint, .locator = "original-read-only" },
+    };
+    const manifest: Manifest = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = @splat(1), .coordinator_fence = @splat(2), .commit_version = 7, .participants = &members };
+    var position: Digest = @splat(0);
+    std.mem.writeInt(u64, position[0..8], 8, .little);
+    position[31] = 2;
+    var resolutions = [_]Resolution{
+        .{ .namespace = members[0].namespace, .owner_fence = members[0].owner_fence, .manifest_digest = manifest.digest(), .commit_version = 7, .source_position = position, .outcome = .{ .effects = .{ .sequence = 9, .frame_digest = @splat(10) } } },
+        .{ .namespace = members[1].namespace, .owner_fence = members[1].owner_fence, .manifest_digest = manifest.digest(), .commit_version = 7, .source_position = position, .outcome = .{ .no_effect = @splat(11) } },
+    };
+    const certificate: Certificate = .{ .manifest = manifest, .resolutions = &resolutions };
+    try certificate.validate();
+    const bytes = try encode(a, certificate);
+    defer a.free(bytes);
+    var decoded = try parse(a, bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(certificate.digest(), decoded.value.certificate.digest());
+    var partial = certificate;
+    partial.resolutions = resolutions[0..1];
+    try std.testing.expectError(error.InvalidTxnRecord, partial.validate());
+    const original = resolutions[1];
+    resolutions[1].outcome = .{ .no_effect = @splat(0) };
+    try std.testing.expectError(error.InvalidTxnRecord, certificate.validate());
+    resolutions[1] = original;
+    resolutions[1].namespace = resolutions[0].namespace;
+    try std.testing.expectError(error.InvalidTxnRecord, certificate.validate());
+    resolutions[1] = original;
+    resolutions[1].owner_fence[0] ^= 1;
+    try std.testing.expectError(error.InvalidTxnRecord, certificate.validate());
+    resolutions[1] = original;
+    resolutions[1].manifest_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidTxnRecord, certificate.validate());
+    resolutions[1] = original;
+    resolutions[1].commit_version += 1;
+    try std.testing.expectError(error.InvalidTxnRecord, certificate.validate());
+    resolutions[1] = original;
+    resolutions[1].source_position[30] = 1;
+    try std.testing.expectError(error.InvalidTxnRecord, certificate.validate());
+    resolutions[1] = original;
+    resolutions[1].outcome = resolutions[0].outcome;
+    try std.testing.expectError(error.InvalidTxnRecord, certificate.validate());
+    resolutions[1] = original;
+    var changed = certificate;
+    changed.manifest.admission_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidTxnRecord, changed.validate());
+    changed = certificate;
+    changed.manifest.coordinator_fence[0] ^= 1;
+    try std.testing.expectError(error.InvalidTxnRecord, changed.validate());
+    var reversed = members;
+    std.mem.swap(Participant, &reversed[0], &reversed[1]);
+    changed = certificate;
+    changed.manifest.participants = &reversed;
+    try std.testing.expectError(error.InvalidTxnRecord, changed.validate());
+    const corrupt = try std.json.Stringify.valueAlloc(a, Envelope{ .certificate = certificate, .digest = @splat(0) }, .{});
+    defer a.free(corrupt);
+    try std.testing.expectError(error.InvalidTxnRecord, parse(a, corrupt));
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, parse(failing.allocator(), bytes));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "transaction completion source positions require canonical positive native or raft authority" {
+    var position: Digest = @splat(0);
+    try std.testing.expectError(error.InvalidTxnRecord, validatePosition(position));
+    position[31] = 1;
+    std.mem.writeInt(u64, position[0..8], 9, .little);
+    try std.testing.expectError(error.InvalidTxnRecord, validatePosition(position));
+    std.mem.writeInt(u64, position[8..16], 12, .little);
+    try validatePosition(position);
+    position[16] = 1;
+    try std.testing.expectError(error.InvalidTxnRecord, validatePosition(position));
+    position[16] = 0;
+    position[31] = 2;
+    try std.testing.expectError(error.InvalidTxnRecord, validatePosition(position));
+    @memset(position[8..16], 0);
+    try validatePosition(position);
+    position[31] = 3;
+    try std.testing.expectError(error.InvalidTxnRecord, validatePosition(position));
+}

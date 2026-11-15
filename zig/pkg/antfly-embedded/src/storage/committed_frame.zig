@@ -20,6 +20,11 @@ const std = @import("std");
 const A = std.mem.Allocator;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
+/// Private whole-transaction evidence. Frames alone prove only local effects.
+pub const completion = @import("transaction_completion.zig");
+test "committed frame completion contract discovery" {
+    _ = completion;
+}
 pub const chunk_bytes = 1024 * 1024;
 pub const max_bytes = 256 * 1024 * 1024;
 pub const max_events = 65536;
