@@ -5,7 +5,7 @@ const ops = @import("../ops/ops.zig");
 const capture = @import("capture.zig");
 const prepared = @import("captured_forward.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
-const Kind = enum { conv1d, conv2d, grid_grouped, grid_depthwise, sdpa_token, sdpa_heads, sdpa_bias, causal, cross, relative, gqa, marker_head, interleaved_pairs, segment_grouped };
+const Kind = enum { conv1d, conv2d, grid_grouped, grid_depthwise, sdpa_token, sdpa_heads, sdpa_bias, causal, cross, relative, gqa, marker_head, interleaved_pairs, segment_grouped, spatial_rotary };
 const Fixture = struct {
     kind: Kind,
     bf16_probability: bool = false,
@@ -49,6 +49,15 @@ const Fixture = struct {
             defer cb.free(second_sum);
             break :paired try cb.add(first_sum, second_sum);
         } else if (self.kind == .marker_head) (try @import("../architectures/gliner_decision_head.zig").forwardCt(cb, allocator, x, inputs[1].tensor.asInt64(), inputs[2].tensor.asInt64(), 2, 3, 2, 2)).logits else switch (self.kind) {
+            .spatial_rotary => spatial: {
+                const shape = inputs[0].tensor.shape;
+                if (!(try cb.tensorShapeMatches(x, shape) orelse false)) return error.InvalidInputShape;
+                const paired = try cb.primConcatPrim(x, x, 1, shape, shape);
+                defer cb.free(paired);
+                const selected = (try cb.takeRows(paired, &.{ 2, 0, 2 }, 3, 32)) orelse return error.UnsupportedPrimitiveOp;
+                defer cb.free(selected);
+                break :spatial (try cb.visionRope(selected, 3, 8, 10000, &.{ 0, 2, 1, 3, 0, 2 })) orelse return error.UnsupportedPrimitiveOp;
+            },
             .conv1d, .conv2d, .grid_grouped, .grid_depthwise => convolution: {
                 const weight = try cb.getWeight("weight");
                 defer cb.free(weight);
@@ -140,10 +149,12 @@ fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_p
         .gqa => &.{ 3, 8 },
         .marker_head => &.{ 6, 2 },
         .interleaved_pairs => &.{ 2, 4 },
+        .spatial_rotary => &.{ 3, 16 },
         else => &.{ 6, 4 },
     };
     try inputs.append(a, .{ .tensor = try numbers(a, "x", shape, 0) });
     switch (kind) {
+        .spatial_rotary => {},
         .conv1d => {
             try source.putWeight("weight", &.{ 4, 2, 3 });
             try source.putWeight("bias", &.{4});
@@ -193,7 +204,8 @@ fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_p
         .relative, .sdpa_heads, .sdpa_token, .sdpa_bias, .cross => true,
         else => false,
     };
-    for (0..if (kind == .marker_head or dynamic_mask) @as(usize, 3) else 1) |iteration| {
+    for (0..if (kind == .marker_head or kind == .spatial_rotary or dynamic_mask) @as(usize, 3) else 1) |iteration| {
+        if (kind == .spatial_rotary) inputs.items[0].tensor.asFloat32Mut()[0] = @as(f32, @floatFromInt(iteration)) / 3;
         if (dynamic_mask and iteration != 0) {
             const input = &inputs.items[if (kind == .relative) @as(usize, 5) else 3].tensor;
             const mask: []i64 = @alignCast(std.mem.bytesAsSlice(i64, input.data));
@@ -234,6 +246,9 @@ test "captured primitive PJRT grouped token-grid convolution matches native" {
 }
 test "captured primitive PJRT depthwise token-grid convolution matches native" {
     try qualify(.grid_depthwise);
+}
+test "captured primitive PJRT spatial rotary preserves independent axes and runtime pixels" {
+    try qualify(.spatial_rotary);
 }
 test "captured primitive PJRT masked token-major attention matches native" {
     try qualify(.sdpa_token);

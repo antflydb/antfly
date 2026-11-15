@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Prepared text IDs/masks through normalized vector readback, shared with HTTP.
+//! Text and ordered media through normalized vector readback, shared with HTTP.
 const std = @import("std");
 const internal = @import("inference_internal");
 const factory = internal.architectures.session_factory;
@@ -24,10 +24,11 @@ const Backend = enum { native, metal, cuda, pjrt };
 const Session = internal.backends.Session;
 const Tensor = internal.backends.Tensor;
 
-const Case = struct { name: []const u8, token_ids: []const i64, attention_mask: ?[]const i64 = null, dimensions: usize = 768 };
+const Content = struct { text: ?[]const u8 = null, image: ?[]const u8 = null, audio: ?[]const u8 = null, sha256: ?[]const u8 = null };
+const Case = struct { name: []const u8, token_ids: []const i64 = &.{}, attention_mask: ?[]const i64 = null, dimensions: usize = 768, content: []const Content = &.{} };
 const Suite = struct { cases: []const Case };
 const Memory = if (@import("build_options").enable_metal) internal.metal_runtime.RawRuntimeMemoryStats else struct {};
-const Measurement = struct { name: []const u8, tokens: usize, samples_seconds: []f64, vector: []f32, host_peak_bytes: usize, host_live_after_release: usize, gpu_memory: []Memory, vm_measured_before: [3]u64, vm_measured_after: [3]u64 };
+const Measurement = struct { name: []const u8, tokens: usize, timing_scope: []const u8, samples_seconds: []f64, vector: []f32, host_peak_bytes: usize, host_live_after_release: usize, gpu_memory: []Memory, vm_measured_before: [3]u64, vm_measured_after: [3]u64 };
 fn now() !u64 {
     var ts: std.posix.timespec = undefined;
     if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return error.ClockFailed;
@@ -111,6 +112,11 @@ pub fn main(init: std.process.Init) !void {
     }
     if (!metal) factory.attachIo(session, init.io);
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.WrongArchitecture;
+    const has_content = for (parsed.value.cases) |case| {
+        if (case.content.len != 0) break true;
+    } else false;
+    const tokenizer = if (has_content) try internal.server.model_manager.loadHuggingFaceTokenizerFromDir(a, model.?) else null;
+    defer if (tokenizer) |value| value.deinitSelf();
     var measurements = std.ArrayList(Measurement).empty;
     for (parsed.value.cases) |case| {
         if (selected.items.len != 0) {
@@ -121,9 +127,33 @@ pub fn main(init: std.process.Init) !void {
             };
             if (!matched) continue;
         }
-        // Media soft tokens must be constructed by the processor, not treated
-        // as text IDs by this benchmark.
-        if (std.mem.eql(u8, case.name, "image") or std.mem.eql(u8, case.name, "audio") or std.mem.eql(u8, case.name, "mixed")) return error.TextOnlyBenchmark;
+        // Encoded fixture I/O is outside timing; decode, preprocessing, media
+        // towers, composition and the embedding encoder use the public path.
+        if (case.content.len != 0 and (case.token_ids.len != 0 or case.attention_mask != null)) return error.AmbiguousBenchmarkInput;
+        if (case.content.len == 0 and case.token_ids.len == 0) return error.MissingBenchmarkInput;
+        if (case.content.len == 0) for (case.token_ids) |id| {
+            if (id == 258880 or id == 258881 or id == 258884) return error.MissingBenchmarkMedia;
+        };
+        const parts = try a.alloc(pipeline.Part, case.content.len);
+        for (case.content, parts) |part, *dest| {
+            if (@as(usize, @intFromBool(part.text != null)) + @intFromBool(part.image != null) + @intFromBool(part.audio != null) != 1) return error.InvalidBenchmarkContent;
+            if (part.text) |value| {
+                if (part.sha256 != null) return error.InvalidFixtureHash;
+                dest.* = .{ .text = value };
+            } else {
+                const path = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(suite_path.?) orelse ".", part.image orelse part.audio.? });
+                const media_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 * 1024 * 1024));
+                if (part.sha256) |expected| {
+                    var digest: [32]u8 = undefined;
+                    if (expected.len != 64) return error.InvalidFixtureHash;
+                    _ = std.fmt.hexToBytes(&digest, expected) catch return error.InvalidFixtureHash;
+                    var actual: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(media_bytes, &actual, .{});
+                    if (!std.mem.eql(u8, &digest, &actual)) return error.FixtureChanged;
+                }
+                dest.* = if (part.image != null) .{ .image = media_bytes } else .{ .audio = .{ .bytes = media_bytes } };
+            }
+        }
         const mask = case.attention_mask orelse blk: {
             const values = try a.alloc(i64, case.token_ids.len);
             @memset(values, 1);
@@ -136,11 +166,17 @@ pub fn main(init: std.process.Init) !void {
         var peak: usize = 0;
         var vm_before: [3]u64 = @splat(0);
         var vm_after: [3]u64 = @splat(0);
+        var input_tokens = case.token_ids.len;
         for (0..warmups + n) |iteration| {
             var bounded = Bounded{ .backing = pipeline.workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 };
             {
                 if (iteration == warmups) vm_before = try vmCounters();
-                const measured = try measureIteration(session, bounded.allocator(), cfg, case, mask, backend);
+                const measured = if (parts.len == 0) try measureIteration(session, bounded.allocator(), cfg, case, mask, backend) else media: {
+                    const started = try now();
+                    const result = try pipeline.embed(bounded.allocator(), session, tokenizer.?.tokenizer(), .{ .content = parts }, .{ .dimensions = case.dimensions }, null, .{ .io = init.io, .native_call_policy = .in_process });
+                    input_tokens = result.input_tokens;
+                    break :media Iteration{ .vector = result.vector, .elapsed = try now() - started };
+                };
                 defer bounded.allocator().free(measured.vector);
                 if (iteration + 1 == warmups + n) vm_after = try vmCounters();
                 gpu_memory[iteration] = measured.memory;
@@ -150,11 +186,11 @@ pub fn main(init: std.process.Init) !void {
             if (bounded.live != 0) return error.WorkspaceLeak;
             peak = @max(peak, bounded.peak);
         }
-        try measurements.append(a, .{ .name = case.name, .tokens = case.token_ids.len, .samples_seconds = samples, .vector = vector, .host_peak_bytes = peak, .host_live_after_release = 0, .gpu_memory = gpu_memory, .vm_measured_before = vm_before, .vm_measured_after = vm_after });
+        try measurements.append(a, .{ .name = case.name, .tokens = input_tokens, .timing_scope = if (parts.len == 0) "prepared text IDs through synchronized vector readback" else "encoded media bytes and text through decode, preprocessing, towers, composition, encoder and synchronized vector readback; fixture I/O excluded", .samples_seconds = samples, .vector = vector, .host_peak_bytes = peak, .host_live_after_release = 0, .gpu_memory = gpu_memory, .vm_measured_before = vm_before, .vm_measured_after = vm_after });
         std.debug.print("encoder {s}: {d} samples, host peak {d}\n", .{ case.name, n, peak });
     }
     if (measurements.items.len == 0) return error.NoCases;
-    const report = try std.json.Stringify.valueAlloc(a, .{ .version = 1, .timing_scope = "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback", .backend = @tagName(backend), .memory_scope = "tracked Antfly host workspace; provider heaps excluded", .call_includes_public_session = backend == .pjrt or backend == .cuda, .compiled_call_includes_public_session = backend == .pjrt, .cuda_policy = factory.getEmbeddingGemma2CudaPolicy(session), .pjrt_precision = @tagName(pjrt_precision), .pjrt_pool_cap_bytes = pjrt_capacity, .pjrt_device_bytes = pjrt_device_bytes, .warmups = warmups, .vm_counters_available = @import("build_options").enable_metal, .cases = measurements.items }, .{ .whitespace = .indent_2 });
+    const report = try std.json.Stringify.valueAlloc(a, .{ .version = 2, .timing_scope = "see each case; media and prepared-text scopes differ", .backend = @tagName(backend), .memory_scope = "benchmark request/output allocator; media pipeline internal workspace and provider heaps excluded", .call_includes_public_session = backend == .pjrt or backend == .cuda, .compiled_call_includes_public_session = backend == .pjrt, .cuda_policy = factory.getEmbeddingGemma2CudaPolicy(session), .pjrt_precision = @tagName(pjrt_precision), .pjrt_pool_cap_bytes = pjrt_capacity, .pjrt_device_bytes = pjrt_device_bytes, .warmups = warmups, .vm_counters_available = @import("build_options").enable_metal, .cases = measurements.items }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output orelse return error.MissingOutput, .data = report });
 }
 

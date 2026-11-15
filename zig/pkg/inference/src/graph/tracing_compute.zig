@@ -300,6 +300,7 @@ pub const TracingCompute = struct {
         .conv2d = &conv2dOp,
         .rope = &ropeOp,
         .ropePerItem = &ropePerItemOp,
+        .visionRope = &visionRopeOp,
         .gqaCausalAttention = &gqaCausalAttentionOp,
         .gqaPagedAttention = &gqaPagedAttentionOp,
         .fromFloat32 = &fromFloat32Op,
@@ -308,6 +309,7 @@ pub const TracingCompute = struct {
         .multiplyScalar = &multiplyScalarOp,
         .maskedMeanBatch = &maskedMeanBatchOp,
         .tensorShape = &tensorShapeOp,
+        .tensorShapeMatches = &tensorShapeMatchesOp,
         .tensorDType = &tensorDTypeOp,
         .convertDType = &convertDTypeOp,
         .takeRows = &takeRowsOp,
@@ -348,6 +350,7 @@ pub const TracingCompute = struct {
         .reshapeOp = &primitiveReshape,
         .transposeOp = &primitiveTranspose,
         .broadcastInDimOp = &primitiveBroadcast,
+        .concatPrimOp = &primitiveConcat,
     };
 
     fn fromCtx(ctx: *anyopaque) *TracingCompute {
@@ -368,6 +371,17 @@ pub const TracingCompute = struct {
 
     fn prefetchWeightHint(_: *anyopaque, _: []const u8, _: u32) void {}
     fn drainPrefetchBudget(_: *anyopaque, _: usize) void {}
+
+    fn primitiveConcat(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_dims: []const i64, b_dims: []const i64) anyerror!CT {
+        const tc = fromCtx(ctx);
+        const left = nodeIdFromCT(a);
+        const right = nodeIdFromCT(b);
+        const a_shape = tc.graph.node(left).output_shape;
+        const b_shape = tc.graph.node(right).output_shape;
+        if (!std.mem.eql(i64, a_shape.dims[0..a_shape.rank()], a_dims) or !std.mem.eql(i64, b_shape.dims[0..b_shape.rank()], b_dims)) return error.InvalidInputShape;
+        var builder = Builder.init(&tc.graph);
+        return tc.makeHandleExact(try builder.concat(left, right, axis));
+    }
 
     fn primitiveNegate(ctx: *anyopaque, input: CT) anyerror!CT {
         const tc = fromCtx(ctx);
@@ -610,17 +624,23 @@ pub const TracingCompute = struct {
             if (active == 0) return error.EmptyEmbeddingInput;
         };
         var builder = Builder.init(&tc.graph);
-        const shape3 = Shape.init(.f32, &.{ @intCast(batch), @intCast(sequence), @intCast(width) });
-        const shaped = try builder.reshape(nodeIdFromCT(input), shape3);
-        const flags_shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(sequence) });
-        const comparison = if (mask) |values| (try tc.maskVisibility(values, batch, sequence)).node else try tc.broadcastNode(try tc.typedConstant(&.{1}, Shape.init(.bool_, &.{})), &.{}, Shape.init(.bool_, flags_shape.dims[0..flags_shape.rank()]));
-        const flags_node = try builder.convertDtype(comparison, .f32);
-        const zero = try builder.scalarConst(.f32, 0);
-        const selected = try tc.graph.addNode(.{ .op = .{ .where_select = {} }, .output_shape = shape3, .inputs = .{ try tc.broadcastNode(comparison, &.{ 0, 1 }, Shape.init(.bool_, shape3.dims[0..shape3.rank()])), shaped, try tc.broadcastNode(zero, &.{}, shape3), null_node }, .num_inputs = 3 });
-        const sums = try builder.reshape(try builder.reduceSum(selected, &.{1}), Shape.init(.f32, &.{ @intCast(batch), @intCast(width) }));
-        const count_node = try builder.reshape(try builder.reduceSum(flags_node, &.{1}), Shape.init(.f32, &.{@intCast(batch)}));
         const mean_shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(width) });
-        var result = try builder.div(sums, try tc.broadcastNode(count_node, &.{0}, mean_shape));
+        // A single already-pooled vector needs no mask, sum, count or division
+        // by one. Keep normalization's F32 max/sum boundaries unchanged.
+        var result = if (mask == null and sequence == 1)
+            try builder.reshape(nodeIdFromCT(input), mean_shape)
+        else pool: {
+            const shape3 = Shape.init(.f32, &.{ @intCast(batch), @intCast(sequence), @intCast(width) });
+            const shaped = try builder.reshape(nodeIdFromCT(input), shape3);
+            const flags_shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(sequence) });
+            const comparison = if (mask) |values| (try tc.maskVisibility(values, batch, sequence)).node else try tc.broadcastNode(try tc.typedConstant(&.{1}, Shape.init(.bool_, &.{})), &.{}, Shape.init(.bool_, flags_shape.dims[0..flags_shape.rank()]));
+            const flags_node = try builder.convertDtype(comparison, .f32);
+            const zero = try builder.scalarConst(.f32, 0);
+            const selected = try tc.graph.addNode(.{ .op = .{ .where_select = {} }, .output_shape = shape3, .inputs = .{ try tc.broadcastNode(comparison, &.{ 0, 1 }, Shape.init(.bool_, shape3.dims[0..shape3.rank()])), shaped, try tc.broadcastNode(zero, &.{}, shape3), null_node }, .num_inputs = 3 });
+            const sums = try builder.reshape(try builder.reduceSum(selected, &.{1}), Shape.init(.f32, &.{ @intCast(batch), @intCast(width) }));
+            const count_node = try builder.reshape(try builder.reduceSum(flags_node, &.{1}), Shape.init(.f32, &.{@intCast(batch)}));
+            break :pool try builder.div(sums, try tc.broadcastNode(count_node, &.{0}, mean_shape));
+        };
         if (dimensions != width) result = try builder.sliceLastDim(result, 0, @intCast(dimensions));
         if (normalize) {
             const shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(dimensions) });
@@ -643,6 +663,11 @@ pub const TracingCompute = struct {
         return switch (dtype) {
             inline else => |tag| @field(@import("../backends/tensor.zig").DType, @tagName(tag)),
         };
+    }
+
+    fn tensorShapeMatchesOp(ctx: *anyopaque, value: CT, dims: []const i64) anyerror!?bool {
+        const shape = fromCtx(ctx).graph.node(nodeIdFromCT(value)).output_shape;
+        return std.mem.eql(i64, shape.dims[0..shape.rank()], dims);
     }
 
     fn convertDTypeOp(ctx: *anyopaque, value: CT, target: ops.GraphDType) anyerror!?CT {
@@ -959,7 +984,7 @@ pub const TracingCompute = struct {
             } else return error.UnsupportedAttentionBias;
             score = try builder.add(score, normalized);
         }
-        const negative = try tc.broadcastNode(try builder.scalarConst(.f32, -std.math.inf(f32)), &.{}, score_shape);
+        const negative = if (mask.len != 0 or causal) try tc.broadcastNode(try builder.scalarConst(.f32, -std.math.inf(f32)), &.{}, score_shape) else null_node;
         var empty_row = false;
         if (mask.len != 0) {
             const visibility = try tc.maskVisibility(mask, batch, keys);
@@ -1333,6 +1358,11 @@ pub const TracingCompute = struct {
 
     // ── RoPE ──────────────────────────────────────────────────────────
 
+    fn visionRopeOp(ctx: *anyopaque, input: CT, rows: usize, dim: usize, theta: f32, positions: []const u32) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        return tc.makeHandleExact(try @import("rotary_program.zig").emitVision(&tc.graph, nodeIdFromCT(input), rows, dim, theta, positions));
+    }
+
     fn ropeOp(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT {
         const tc = fromCtx(ctx);
         const in_id = nodeIdFromCT(input);
@@ -1581,6 +1611,24 @@ pub const TracingCompute = struct {
         const tc = fromCtx(ctx);
         const in_id = nodeIdFromCT(request.input);
         const out_shape = Shape.init(.f32, &.{ @intCast(request.rows), @intCast(request.dim) });
+        if (tc.last_moe_select_routes == null_node) {
+            // Ordinary indexed rows are not a routed-expert placeholder.
+            // Retain their explicit indices as a canonical gather, including
+            // duplicates and permutations used by position/pooling adapters.
+            const shape = tc.graph.node(in_id).output_shape;
+            if (shape.rank() != 2 or shape.dim(0) <= 0 or shape.dim(1) != request.dim or request.row_ids.len != request.rows) return error.InvalidInputShape;
+            const indices = try tc.allocator.alloc(i64, request.rows);
+            defer tc.allocator.free(indices);
+            for (indices, request.row_ids) |*index, row| {
+                if (row >= shape.dim(0)) return error.InvalidRowIndex;
+                index.* = row;
+            }
+            var builder = Builder.init(&tc.graph);
+            const selected = try builder.tensorConstBytes(std.mem.sliceAsBytes(indices), Shape.init(.i64, &.{@intCast(request.rows)}));
+            return tc.makeHandle(try builder.gather(in_id, selected, out_shape));
+        }
+        // Historical MoE routing carries runtime route ownership through this
+        // marker; preserve that separate contract until its typed migration.
         const id = try tc.graph.addNode(.{
             .op = .{ .fused_take_rows = .{
                 .rows = @intCast(request.rows),

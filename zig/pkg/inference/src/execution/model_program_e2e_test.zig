@@ -6,6 +6,172 @@ const Tensor = @import("../backends/tensor.zig").Tensor;
 const factory = @import("../architectures/session_factory.zig");
 const encoder = @import("../architectures/embedding_gemma2.zig");
 
+test "model program real EG2 media stages preserve native image composition and embedding" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    if (!platform.env.getenvBool("ANTFLY_EG2_PJRT_QUALIFICATION")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const capture = @import("capture.zig");
+    const projector = @import("../architectures/gemma4_projector.zig");
+    const media = @import("embedding_media_frontend.zig");
+    const ops = @import("../ops/ops.zig");
+    const Source = struct {
+        session: @import("../backends/backends.zig").Session,
+        cfg: encoder.Config,
+        stage: enum { vision, composition, embedding } = .vision,
+        fn expectValues(self: *const @This(), expected: []const f32, actual: []const f32) !void {
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual) |want, got| {
+                try std.testing.expect(std.math.isFinite(want) and std.math.isFinite(got));
+                // Intermediate activations can be hundreds in magnitude; the
+                // normalized embedding retains its original absolute budget.
+                const intermediate = self.stage != .embedding;
+                const tolerance: f32 = if (intermediate) 5e-4 + @abs(want) * 1e-4 else 1e-4;
+                try std.testing.expectApproxEqAbs(want, got, tolerance);
+            }
+        }
+        fn create(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!ops.ComputeBackend {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return factory.getComputeBackend(self.session, allocator);
+        }
+        fn import(_: *anyopaque, cb: *const ops.ComputeBackend, input: *const Tensor, _: std.mem.Allocator) anyerror!ops.CT {
+            const native: *@import("../ops/native_compute.zig").NativeCompute = @ptrCast(@alignCast(cb.ptr));
+            return native.importHostTensor(input);
+        }
+        fn forward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const capture.Input) anyerror![]capture.Output {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.stage == .embedding) return media.run(self.cfg, cb, allocator, inputs);
+            const value = if (self.stage == .composition) try media.compose(self.cfg, cb, allocator, inputs) else image: {
+                const shape = inputs[3].tensor.shape;
+                const pixels = try cb.fromFloat32Shape(inputs[3].tensor.asFloat32(), &.{ 1, 3, @intCast(shape[2]), @intCast(shape[3]) });
+                defer cb.free(pixels);
+                break :image (try projector.encodeEmbeddingGemma2PixelTensorResident(cb, allocator, pixels, @intCast(shape[3]), @intCast(shape[2]))).tensor;
+            };
+            errdefer cb.free(value);
+            const outputs = try allocator.alloc(capture.Output, 1);
+            outputs[0] = .{ .name = "result", .value = value };
+            return outputs;
+        }
+    };
+    const session = try factory.createNativeSession(a, model);
+    defer session.close();
+    var source = Source{ .session = session, .cfg = factory.getEmbeddingGemma2Config(session).? };
+    var reference = try Source.create(&source, a);
+    defer reference.deinit();
+    var client = try @import("pjrt").pjrt.Client.initFromEnv(a);
+    defer client.deinit();
+    var caches = [_]@import("captured_forward.zig").Cache{ .{}, .{} };
+    defer for (&caches) |*cache| cache.deinit(a);
+    // The small asymmetric grid is the routine regression. Qualification can
+    // select the real invoice without changing the binary or model assets.
+    var fixture = if (platform.env.getenvBool("ANTFLY_EG2_PJRT_MEDIA_FULL_IMAGE"))
+        try projector.prepareEmbeddingGemma2Image(a, @embedFile("../models/testdata/lightonocr3/invoice.png"))
+    else small: {
+        const pixels = try a.alloc(f32, 3 * 48 * 96);
+        for (pixels, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 251)) / 250;
+        break :small projector.PreparedImage{ .allocator = a, .pixels = pixels, .geometry = .{ .width = 96, .height = 48, .grid_x = 6, .grid_y = 3, .pooled_x = 2, .pooled_y = 1 } };
+    };
+    defer fixture.deinit();
+    const media_tokens = fixture.geometry.tokenCount();
+    // Match the public processor's BOS/image-start/soft-rows/image-end/EOS
+    // framing; numerical qualification uses an actual supported image input.
+    const sequence = media_tokens + 4;
+    const token_ids = try a.alloc(i64, sequence);
+    defer a.free(token_ids);
+    @memset(token_ids, 258880);
+    token_ids[0] = 2;
+    token_ids[1] = 255999;
+    token_ids[sequence - 2] = 258882;
+    token_ids[sequence - 1] = 1;
+    const visibility = try a.alloc(i64, sequence);
+    defer a.free(visibility);
+    @memset(visibility, 1);
+    const row_ids = try a.alloc(i64, sequence);
+    defer a.free(row_ids);
+    for (row_ids, token_ids, 0..) |*row, token, index| row.* = @intCast(if (token == 258880) sequence + index - 2 else index);
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, @intCast(sequence) }, token_ids);
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", ids.shape, visibility);
+    defer mask.deinit();
+    var rows = try Tensor.initInt64(a, "media_rows", ids.shape, row_ids);
+    defer rows.deinit();
+    var pixels = try Tensor.initFloat32(a, "pixel_values", &.{ 1, 3, @intCast(fixture.geometry.height), @intCast(fixture.geometry.width) }, fixture.pixels);
+    defer pixels.deinit();
+    var width = try Tensor.initInt64(a, "output_dimensions", &.{1}, &.{768});
+    defer width.deinit();
+    const inputs = [_]capture.Input{ .{ .tensor = ids }, .{ .tensor = mask, .specialize = true }, .{ .tensor = rows, .specialize = true }, .{ .tensor = pixels }, .{ .tensor = width, .specialize = true } };
+    for (0..2) |iteration| {
+        pixels.asFloat32Mut()[0] = @as(f32, @floatFromInt(iteration)) / 2;
+        // Borrowed prepared pixels let the original eager patch extractor
+        // remain independent of the compiled reshape/transpose implementation.
+        const image = projector.PreparedImage{ .allocator = a, .pixels = pixels.asFloat32Mut(), .geometry = fixture.geometry };
+        const projected = try projector.encodePreparedEmbeddingGemma2Image(&reference, a, image);
+        defer a.free(projected.embeddings);
+        const weight = try reference.getWeight("language_model.embed_tokens.weight");
+        defer reference.free(weight);
+        const raw = try reference.embeddingLookup(weight, ids.asInt64(), sequence, 512);
+        defer reference.free(raw);
+        const composed = try reference.toFloat32(raw, a);
+        defer a.free(composed);
+        for (composed) |*value| value.* *= @sqrt(@as(f32, 512));
+        @memcpy(composed[2 * 512 ..][0 .. media_tokens * 512], projected.embeddings);
+        const input = try reference.fromFloat32Shape(composed, &.{ @intCast(sequence), 512 });
+        defer reference.free(input);
+        const pooled = try encoder.forwardPooledEmbeddingsCT(&reference, a, source.cfg, input, mask.asInt64(), 1, sequence, 768);
+        defer reference.free(pooled);
+        const embedding = try reference.toFloat32(pooled, a);
+        defer a.free(embedding);
+        for ([_]@TypeOf(source.stage){ .vision, .composition, .embedding }) |stage| {
+            source.stage = stage;
+            const want = switch (stage) {
+                .vision => projected.embeddings,
+                .composition => composed,
+                .embedding => embedding,
+            };
+            const eager = try Source.forward(&source, &reference, a, &inputs);
+            defer a.free(eager);
+            defer for (eager) |value| reference.free(value.value);
+            const actual_eager = try reference.toFloat32(eager[0].value, a);
+            defer a.free(actual_eager);
+            std.debug.print("EG2 media stage={s} iteration={d} eager\n", .{ @tagName(stage), iteration });
+            try source.expectValues(want, actual_eager);
+            for ([_]@import("precision.zig").Policy{ .f32, .bf16 }, 0..) |precision, precision_index| {
+                const cache = &caches[precision_index];
+                const forward = capture.Forward{ .context = &source, .fingerprint = 100 + @as(u64, @backingInt(stage)), .precision = precision, .output_names = if (stage == .embedding) &.{"sentence_embedding"} else &.{"result"}, .run = Source.forward };
+                const output = try cache.run(a, .{ .context = &source, .create = Source.create, .import = Source.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client), .pjrt_precision = precision } }, forward, &inputs, a, null);
+                defer a.free(output);
+                defer for (output) |*value| value.deinit();
+                std.debug.print("EG2 media stage={s} iteration={d} PJRT {s}\n", .{ @tagName(stage), iteration, @tagName(precision) });
+                if (precision == .f32) {
+                    try source.expectValues(want, output[0].asFloat32());
+                } else {
+                    var dot: f64 = 0;
+                    var expected_norm: f64 = 0;
+                    var actual_norm: f64 = 0;
+                    for (want, output[0].asFloat32()) |expected, actual| {
+                        try std.testing.expect(std.math.isFinite(actual));
+                        dot += @as(f64, expected) * actual;
+                        expected_norm += @as(f64, expected) * expected;
+                        actual_norm += @as(f64, actual) * actual;
+                    }
+                    const cosine = dot / @sqrt(expected_norm * actual_norm);
+                    std.debug.print("EG2 media BF16 cosine={d}\n", .{cosine});
+                    try std.testing.expect(cosine >= 0.999);
+                }
+            }
+        }
+    }
+    var peak_constant_pool: usize = 0;
+    for (&caches) |*cache| {
+        try std.testing.expectEqual(@as(u64, 3), cache.entries.stats.builds);
+        for (cache.entries.entries.items) |entry| peak_constant_pool = @max(peak_constant_pool, entry.program.graph.constant_pool.items.len);
+    }
+    // Attention masks stay symbolic; compiling the full image must not expand
+    // them into multi-gigabyte constants or wrap later publication offsets.
+    try std.testing.expect(peak_constant_pool < 64 * 1024 * 1024);
+    std.debug.print("EG2 captured media peak constant pool={d} bytes\n", .{peak_constant_pool});
+}
+
 test "model program real EG2 PJRT public embedding outputs match native across cache hits" {
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
     const model = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;

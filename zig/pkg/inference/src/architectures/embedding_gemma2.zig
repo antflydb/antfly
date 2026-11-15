@@ -930,7 +930,7 @@ test "token embedding normalizer retains its scalar storage precision" {
     try std.testing.expectEqual(@sqrt(@as(f32, 512)), tokenEmbeddingScale(.f32, 512));
 }
 
-fn textEmbeddings(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
+pub fn textEmbeddings(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
     _ = allocator;
     if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm and cb.kind() != .graph) return error.UnsupportedEmbeddingGemma2Backend;
     if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;

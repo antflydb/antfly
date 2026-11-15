@@ -866,6 +866,35 @@ pub fn encodeEmbeddingGemma2VideoPatches(cb: *const ComputeBackend, allocator: s
 /// Device tensors can enter the patch projection without a prepared-pixel readback.
 pub const EncodedDeviceImage = struct { tensor: CT, tokens: usize };
 
+/// Normalized NCHW pixels enter the existing image tower using only shared
+/// tensor operations. Spatial dimensions are processor-selected multiples of
+/// 48; patch extraction remains a reshape/transpose in compiled execution.
+pub fn encodeEmbeddingGemma2PixelTensorResident(cb: *const ComputeBackend, a: std.mem.Allocator, pixels: CT, width: usize, height: usize) !EncodedDeviceImage {
+    if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0 or width / 48 * (height / 48) > 280) return error.InvalidTensorShape;
+    const cfg = embeddingGemma2ImageConfig();
+    const g = Geometry{ .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
+    const half = try cb.fromFloat32Shape(&.{0.5}, &.{});
+    defer cb.free(half);
+    const centered = try cb.primSubtract(pixels, half);
+    defer cb.free(centered);
+    const scaled_pixels = (try cb.multiplyScalar(centered, 2)) orelse return error.UnsupportedPrimitiveOp;
+    defer cb.free(scaled_pixels);
+    const layout = [_]i64{ 1, 3, @intCast(g.grid_y), 16, @intCast(g.grid_x), 16 };
+    const shaped = try cb.primReshape(scaled_pixels, &layout);
+    defer cb.free(shaped);
+    const ordered = try cb.primTranspose(shaped, &.{ 0, 2, 4, 3, 5, 1 }, &layout);
+    defer cb.free(ordered);
+    const patches = try cb.primReshape(ordered, &.{ @intCast(g.grid_x * g.grid_y), 768 });
+    defer cb.free(patches);
+    var weights = ProjectorWeights.initHuggingFace(cb, a);
+    defer weights.deinit();
+    const weight = try weights.linearCt("v.patch_embd.weight", 768, cfg.vision_hidden);
+    defer cb.free(weight);
+    const hidden = try cb.linearNoBias(patches, weight, g.grid_x * g.grid_y, 768, cfg.vision_hidden);
+    const encoded = try encodeVisionHiddenResident(cb, a, &weights, cfg, hidden, g, 1);
+    return .{ .tensor = encoded.embeddings, .tokens = encoded.tokens };
+}
+
 pub fn encodeEmbeddingGemma2VideoTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32) !EncodedImage {
     const result = try encodeEmbeddingGemma2VideoTensorResident(cb, allocator, input, width, height);
     defer cb.free(result.tensor);
@@ -6464,7 +6493,7 @@ fn addPositionEmbeddingsBatchTensor(cb: *const ComputeBackend, allocator: std.me
         }
         return publishSourceStoredTensor(cb, storage, try cb.add(input, offsets));
     }
-    if ((cb.kind() == .cuda or cb.kind() == .metal) and cb.vtable.takeRows != null and cb.vtable.reshapeOp != null and cb.vtable.transposeOp != null) {
+    if ((cb.kind() == .cuda or cb.kind() == .metal or cb.kind() == .graph) and cb.vtable.takeRows != null and cb.vtable.reshapeOp != null and cb.vtable.transposeOp != null) {
         const table = try store.cachedWeightCt("v.position_embd.weight");
         return addPositionRowsResident(cb, allocator, table, cfg.vision_hidden, input, geometry, batch);
     }

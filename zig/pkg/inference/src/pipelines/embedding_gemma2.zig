@@ -713,7 +713,7 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
 
 fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllocator, session: Session, tokenizer: Tokenizer, group: Group, input_options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache, native_allocator: ?*@import("../backends/admitted_allocator.zig").AdmittedAllocator) !Result {
     if (session.backend() == .pjrt) for (group.content) |part| {
-        if (part != .text) return error.UnsupportedCompiledMediaProgram;
+        if (part != .text) return embedCompiledImage(bounded.allocator(), session, tokenizer, group, input_options, lock, control);
     };
     var native_run: ?@import("../backends/admitted_allocator.zig").AdmittedAllocator.RunScope = null;
     defer if (native_run) |*run| run.deinit();
@@ -895,6 +895,95 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     errdefer a.free(vector);
     try effective.check();
     return .{ .vector = vector, .input_tokens = count };
+}
+
+/// The public compiled path captures the tower, composition and backbone as
+/// one program. Only image decoding/resizing and tokenization run on the host;
+/// projected soft tokens never make a device-to-host-to-device round trip.
+fn embedCompiledImage(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
+    const effective = control orelse Control{};
+    try validateGroupContent(group, options, false);
+    const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
+    if (!cfg.vision) return error.NoVisionSession;
+    var image_part: ?Part = null;
+    var has_text = false;
+    for (group.content) |part| switch (part) {
+        .text => has_text = true,
+        .image, .raster => {
+            if (image_part != null) return error.UnsupportedCompiledImageCohort;
+            image_part = part;
+        },
+        else => return error.UnsupportedCompiledMediaProgram,
+    };
+    const part = image_part orelse return error.MissingInputs;
+    const scope = @import("antfly_image").work_control.Scope.enter(effective.imageWorkControl());
+    defer scope.deinit();
+    var image = if (part == .image) try projector.prepareEmbeddingGemma2Image(a, part.image) else try projector.prepareEmbeddingGemma2Raster(a, part.raster);
+    defer image.deinit();
+    const media_tokens = image.geometry.tokenCount();
+    var rendered = std.ArrayListUnmanaged(u8).empty;
+    defer rendered.deinit(a);
+    if (has_text) {
+        if (group.title) |title| {
+            const prefix = try std.fmt.allocPrint(a, "title: {s} | text: ", .{title});
+            defer a.free(prefix);
+            try rendered.appendSlice(a, prefix);
+        } else try rendered.appendSlice(a, try encoder.taskPrefix(options.task_type));
+    }
+    var ordered = try @import("embedding_gemma2_content.zig").OrderedText.init(&rendered, a, "", false);
+    for (group.content) |content| {
+        try effective.check();
+        try ordered.beginPart();
+        switch (content) {
+            .text => |text| try rendered.appendSlice(a, text),
+            .image, .raster => {
+                try rendered.appendSlice(a, "<|image>");
+                for (0..media_tokens) |_| try rendered.appendSlice(a, "<|image|>");
+                try rendered.appendSlice(a, "<image|>");
+            },
+            else => unreachable,
+        }
+    }
+    var tokens = try tokenizer.encodeForModel(a, rendered.items, options.max_tokens + 1);
+    defer tokens.deinit();
+    var count: usize = 0;
+    for (tokens.attention_mask) |bit| count += @intFromBool(bit != 0);
+    if (count == 0 or count > options.max_tokens) return error.EmbeddingInputTooLong;
+    const ids = try a.alloc(i64, count);
+    defer a.free(ids);
+    const mask = try a.alloc(i64, count);
+    defer a.free(mask);
+    const rows = try a.alloc(i64, count);
+    defer a.free(rows);
+    var media: usize = 0;
+    for (ids, mask, rows, tokens.ids[0..count], tokens.attention_mask[0..count], 0..) |*id, *visible, *row, token, bit, index| {
+        id.* = token;
+        visible.* = bit;
+        row.* = @intCast(if (token == 258880) count + media else index);
+        media += @intFromBool(token == 258880);
+    }
+    if (media != media_tokens) return error.InvalidMediaRows;
+    const T = @import("../backends/tensor.zig").Tensor;
+    const shape = [_]i64{ 1, @intCast(count) };
+    const pixel_shape = [_]i64{ 1, 3, @intCast(image.geometry.height), @intCast(image.geometry.width) };
+    const width = [_]i64{@intCast(options.dimensions)};
+    const inputs = [_]T{
+        .{ .name = "input_ids", .dtype = .i64, .data = std.mem.sliceAsBytes(ids), .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false },
+        .{ .name = "attention_mask", .dtype = .i64, .data = std.mem.sliceAsBytes(mask), .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false },
+        .{ .name = "media_rows", .dtype = .i64, .data = std.mem.sliceAsBytes(rows), .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false },
+        .{ .name = "pixel_values", .dtype = .f32, .data = std.mem.sliceAsBytes(image.pixels), .shape = &pixel_shape, .allocator = a, .owns_data = false, .owns_shape = false },
+        .{ .name = "output_dimensions", .dtype = .i64, .data = @constCast(std.mem.sliceAsBytes(&width)), .shape = &.{1}, .allocator = a, .owns_data = false, .owns_shape = false },
+    };
+    var waiter = Scheduler.Waiter{};
+    try enterModel(session, lock, effective, &waiter);
+    defer leaveModel(lock, &waiter);
+    const outputs = try session.runWithControl(&inputs, a, control);
+    defer a.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    if (outputs.len != 1 or outputs[0].dtype != .f32 or !std.mem.eql(i64, outputs[0].shape, &.{ 1, @intCast(options.dimensions) })) return error.InvalidEmbeddingOutputShape;
+    const vector = outputs[0].asFloat32();
+    for (vector) |value| if (!std.math.isFinite(value)) return error.NonFiniteEmbeddingOutput;
+    return .{ .vector = try a.dupe(f32, vector), .input_tokens = count };
 }
 
 /// Independent windows share backbone execution, never attention or pooling.

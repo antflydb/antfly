@@ -40,6 +40,8 @@ const null_node = node_mod.null_node;
 const OpCode = node_mod.OpCode;
 const Shape = shape_mod.Shape;
 
+const max_folded_constant_bytes = 16 * 1024 * 1024;
+
 pub const ConstFoldResult = struct {
     graph: Graph,
     /// old_id -> new_id mapping. Caller must free.
@@ -70,6 +72,14 @@ pub fn fold(allocator: std.mem.Allocator, graph: *const Graph) !ConstFoldResult 
     defer allocator.free(redirect);
     for (0..count) |i| redirect[i] = @intCast(i);
 
+    // Dead branches (including unused attention masks) must never allocate
+    // folded payloads. Retain VJP alternates through the same reachability
+    // contract used by the rebuild below.
+    const reachable = try allocator.alloc(bool, count);
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    for (graph.outputs.items) |id| markReachable(graph, reachable, redirect, id);
+
     // Track which nodes are constant (original constants + folded nodes).
     const is_const = try allocator.alloc(bool, count);
     defer allocator.free(is_const);
@@ -93,6 +103,12 @@ pub fn fold(allocator: std.mem.Allocator, graph: *const Graph) !ConstFoldResult 
     for (0..count) |i| {
         const id: NodeId = @intCast(i);
         const n = graph.node(id);
+        if (!reachable[i]) continue;
+        // A broadcast remains cheaper as an operation than as a dense blob.
+        // Apply this budget before every evaluator, including the F32 fallback
+        // after the typed shape evaluator declines an oversized expansion.
+        const elements = n.output_shape.numElements() orelse continue;
+        if (elements < 0 or elements > max_folded_constant_bytes / n.output_shape.dtype.byteSize()) continue;
 
         // Skip constants and parameters — nothing to fold.
         switch (n.op) {
@@ -647,7 +663,7 @@ fn foldTypedShapeTransform(comptime T: type, allocator: std.mem.Allocator, graph
     const attrs = source.op.constant;
     const input = graph.constantDataAs(T, attrs.data_offset, attrs.data_len);
     const count = n.output_shape.numElements() orelse return null;
-    if (count < 0 or count > 16 * 1024 * 1024 / @sizeOf(T)) return null;
+    if (count < 0 or count > max_folded_constant_bytes / @sizeOf(T)) return null;
     const result = switch (n.op) {
         .reshape => |r| blk: {
             if (r.runtime_shape or input.len != count) return null;
@@ -1916,4 +1932,52 @@ test "BF16 constants preserve nonfinite values signed zero and nearest-even ties
     var output: [12]u8 align(8) = undefined;
     try std.testing.expect(try convertDtypeBytes(std.testing.allocator, std.mem.sliceAsBytes(&values), .f32, &output, .bf16, values.len));
     try std.testing.expectEqualSlices(u16, &.{ 0x3f80, 0x3f82, 0x8000, 0x7f80, 0xff80, 0x7fc0 }, std.mem.bytesAsSlice(u16, &output));
+}
+
+test "fold skips dead dense masks and preserves later BF16 constants" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const negative = try b.scalarConst(.f32, -std.math.inf(f32));
+    // These unused masks would expand to more than the pool's 32-bit address
+    // space. Their symbolic representation needs only one scalar constant.
+    for (0..16) |_| _ = try g.addNode(.{
+        .op = .{ .broadcast_in_dim = .{ .target_shape = Shape.init(.f32, &.{ 12, 2430, 2430 }), .num_axes = 0 } },
+        .output_shape = Shape.init(.f32, &.{ 12, 2430, 2430 }),
+        .inputs = .{ negative, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    const ones: [768]f32 = @splat(1);
+    const original = try b.tensorConst(&ones, Shape.init(.f32, &.{768}));
+    const published = try b.convertDtype(try b.convertDtype(original, .bf16), .f32);
+    try g.markOutput(published);
+    var result = try fold(a, &g);
+    defer result.deinit();
+    try std.testing.expect(result.graph.constant_pool.items.len < 64 * 1024);
+    const output = result.graph.node(result.graph.outputs.items[0]);
+    try std.testing.expect(output.op == .constant);
+    const values = result.graph.constantData(output.op.constant.data_offset, output.op.constant.data_len);
+    try std.testing.expectEqualSlices(f32, &ones, values);
+}
+
+test "fold leaves large reachable broadcasts symbolic in the F32 fallback" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const one = try b.scalarConst(.f32, 1);
+    const shape = Shape.init(.f32, &.{ 2, 2048, 2048 });
+    const broadcast = try g.addNode(.{
+        .op = .{ .broadcast_in_dim = .{ .target_shape = shape, .num_axes = 0 } },
+        .output_shape = shape,
+        .inputs = .{ one, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    try g.markOutput(broadcast);
+    var result = try fold(a, &g);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), result.num_folded);
+    try std.testing.expectEqual(@as(usize, @sizeOf(f32)), result.graph.constant_pool.items.len);
+    try std.testing.expect(result.graph.node(result.graph.outputs.items[0]).op == .broadcast_in_dim);
 }
