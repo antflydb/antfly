@@ -13368,18 +13368,52 @@ pub const NativeFile = struct {
         if (self.stagingTransaction() and mutations.len >= TransactionWrites.max_keys) {
             // The caller already owns a complete batch until this call returns.
             // Consume it directly instead of copying it into bounded staging
-            // and rebuilding the same index for every staging-sized chunk.
+            // and rebuilding the same index for every staging-sized chunk --
+            // but only for a non-diverting commit, where that rebuild cost is
+            // real. `writes.pages.diverting` (computed by `transactionWrites`
+            // from the same `self.redo`/`checkpointing`/`overLargeTransactionThreshold`
+            // condition `flushTransactionWrites` uses) means this transaction
+            // logs mutations logically instead of building real pages; taking
+            // this branch anyway would run `putIndexedDocumentBatch`'s real
+            // `IndexEditor`/bulk-builder pass straight through
+            // `writes.pages`, writing document and document-index *B-tree*
+            // pages into a diverting, no-ledger `PageAllocator`
+            // (`pageAllocatorForDivertingCommit`'s own doc comment: no
+            // `.ledger` is ever attached to it). `PageWriteBatch.flushCount`'s
+            // diverting branch stages those pages into
+            // `RedoCommitState.pending`/`appendPending` the same way it
+            // stages an external value chain's pages -- but
+            // `appendPending`'s own doc comment is explicit that only
+            // external value chains are meant to land there, never B-tree
+            // pages, because `checkpointRedoLog`'s `has_logical_work`
+            // check (`redo.shared.count(...) != 0` across all three roots)
+            // assumes page-shaped writes never accumulate without an
+            // accompanying logical mutation in the same commit. A bulk
+            // batch taking this shortcut stages B-tree pages with no
+            // logical mutation to go with them, so that check sees no
+            // logical work, treats the fold as a no-op, and the ledger
+            // never learns about the newly built pages at all --
+            // `check()`'s reachability walk then finds them referenced
+            // but uncounted and fails with `error.InvalidNativeAllocator`,
+            // even though the commit itself reported success. Falling
+            // through to the per-mutation `stageMutation` loop below is
+            // exactly as cheap under diverting as this shortcut: logging a
+            // mutation logically never rebuilds an index, regardless of
+            // how many `TransactionWrites.max_keys`-sized chunks a large
+            // batch spills across.
             try self.flushTransactionWrites();
             const writes = try self.transactionWrites();
-            self.flushing_transaction = true;
-            self.transaction_pages = &writes.pages;
-            defer {
-                self.transaction_pages = null;
-                self.flushing_transaction = false;
+            if (!writes.pages.diverting) {
+                self.flushing_transaction = true;
+                self.transaction_pages = &writes.pages;
+                defer {
+                    self.transaction_pages = null;
+                    self.flushing_transaction = false;
+                }
+                try self.putDocumentBatch(mutations);
+                try writes.pages.flush();
+                return;
             }
-            try self.putDocumentBatch(mutations);
-            try writes.pages.flush();
-            return;
         }
         if (self.stagingTransaction()) {
             for (mutations) |m| try self.stageMutation(.documents, .{ .key = m.key, .value = m.value, .is_delete = m.is_delete, .external_value_root_page = m.external_value_root_page, .external_value_len = m.external_value_len }, .{});
@@ -34936,5 +34970,89 @@ test "lite redo plus indexed reclamation check() passes across repeated mid-sess
         try file.checkpointRedoLog();
         const report = try file.check();
         try std.testing.expect(report.valid);
+    }
+}
+
+// perf/lwa-bulk-alloc: `putDocumentBatch`'s own `mutations.len >=
+// TransactionWrites.max_keys` shortcut used to build a real document
+// index straight through `putIndexedDocumentBatch`'s bulk-builder branch
+// (`previous.document_index_root_page == 0 and mutationKeysSorted(mutations)`)
+// even when the transaction was diverting -- i.e. even when
+// `transactionWrites()` handed it a no-ledger `pageAllocatorForDivertingCommit`
+// allocator, because a redo log was enabled and this transaction was
+// neither `checkpointRedoLog`'s own fold nor over the large-transaction
+// fallback threshold. That allocator's page writes land in
+// `RedoCommitState.pending` via `PageWriteBatch.flushCount`'s diverting
+// branch -- the same place `appendPending`'s own doc comment says only
+// an external value chain's pages are ever meant to go, never a B-tree
+// page -- because `checkpointRedoLog`'s `has_logical_work` check assumes
+// page-shaped writes never accumulate without an accompanying logical
+// mutation in the same commit. A bulk batch that takes the real-build
+// shortcut stages document and document-index pages with no logical
+// mutation to match, so that check sees no logical work, the fold is a
+// no-op, and the ledger never learns about the new pages -- `check()`'s
+// reachability walk then finds them referenced but uncounted and fails
+// with `error.InvalidNativeAllocator`, even though the commit itself
+// reported success. Fixed by only taking the real-build shortcut when
+// `!writes.pages.diverting`; a diverting bulk batch now falls through to
+// the ordinary per-mutation `stageMutation` loop, which logs each
+// mutation logically (cheap under diverting -- no index rebuild).
+test "lite redo log bulk-built document index over max_keys passes check() after commit, fold, and reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-bulk-alloc.aflite");
+    defer a.free(path);
+
+    const count = 1200;
+    try std.testing.expect(count >= TransactionWrites.max_keys);
+    const keys = try a.alloc([16]u8, count);
+    defer a.free(keys);
+    const values = try a.alloc([256]u8, count);
+    defer a.free(values);
+    const mutations = try a.alloc(DocumentMutation, count);
+    defer a.free(mutations);
+    for (mutations, 0..) |*mutation, i| {
+        @memset(&values[i], 'v');
+        mutation.* = .{ .key = try std.fmt.bufPrint(&keys[i], "bulk-{d:0>11}", .{i}), .value = &values[i] };
+    }
+
+    // Control: the same bulk batch with no redo log must already be
+    // valid -- confirms any failure below is specific to the redo path,
+    // not the bulk-builder itself.
+    {
+        const plain_path = try std.fmt.allocPrint(a, "{s}.plain", .{path});
+        defer a.free(plain_path);
+        var plain = try NativeFile.createWithIo(a, std.testing.io, plain_path, .{ .indexed_reclamation = true });
+        defer plain.close();
+        try plain.putDocumentBatch(mutations);
+        try std.testing.expect((try plain.check()).valid);
+    }
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 4 * 1024 * 1024);
+    errdefer file.close();
+    try file.beginTransaction();
+    try file.putDocumentBatch(mutations);
+    try file.commitTransaction();
+
+    try std.testing.expect((try file.check()).valid);
+
+    try file.checkpointRedoLog();
+    try std.testing.expect((try file.check()).valid);
+
+    for (mutations) |mutation| {
+        const value = (try file.getDocumentAlloc(a, mutation.key)) orelse return error.TestExpectedEqual;
+        defer a.free(value);
+        try std.testing.expectEqualSlices(u8, mutation.value, value);
+    }
+
+    file.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    try std.testing.expect((try reopened.check()).valid);
+    for (mutations) |mutation| {
+        const value = (try reopened.getDocumentAlloc(a, mutation.key)) orelse return error.TestExpectedEqual;
+        defer a.free(value);
+        try std.testing.expectEqualSlices(u8, mutation.value, value);
     }
 }
