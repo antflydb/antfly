@@ -1390,6 +1390,54 @@ pub const WriterLane = struct {
         return lease;
     }
 
+    /// `Owner.acquireMaintenancePathLeaseAssumeLocked`/
+    /// `tryWriterLeaseAssumeLocked` acquire a lease on this same lane --
+    /// by taking what `takeParkedForRoot`/`takeParkedAnyRoot` hand back,
+    /// or by a fresh kernel acquisition when neither has anything parked
+    /// -- without ever touching `checked_out` at all: this struct's own
+    /// "at most one writer is ever checked out of the lane at a time"
+    /// invariant (its own doc comment above) was never extended to cover
+    /// a maintenance-held lease, only `checkout`/`checkin`'s own pair.
+    /// With nothing marking the lane busy, `WriterLane.checkout`'s cold
+    /// path (`!self.checked_out`) sees the lane as free the moment
+    /// `takeParkedForRoot`/`takeParkedAnyRoot` clears `self.parked` for
+    /// maintenance, and proceeds straight to `Connection.
+    /// acquireForOwnCheckout`'s own *fresh* kernel acquisition -- which
+    /// self-conflicts with (races) the lease maintenance is still
+    /// actively using, rather than queuing behind it. That let a
+    /// foreground commit land while a maintenance commit's own
+    /// fsync/publish was still in flight on a different `NativeFile`
+    /// instance on the same inode, corrupting the `active_writer` backstop
+    /// (perf/lwa-xproc-writers item 7: "stale writer base reached
+    /// publishCheckpoint" / "NativeFile publishing without holding the
+    /// writer lease", and the page-kind corruption it leads to under
+    /// sustained load). Call this once a maintenance acquisition succeeds
+    /// (`Owner.enterMaintenanceWriter`, guarded by that function's own
+    /// `maintenance_writer_references == 0 -> 1` transition so nested
+    /// re-entry on the same root never calls this twice) and
+    /// `clearCheckedOutByMaintenance` once that lease is fully released
+    /// (`Owner.leaveMaintenanceWriter`, at the matching `-> 0` transition).
+    pub fn markCheckedOutByMaintenance(self: *WriterLane) void {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        self.checked_out = true;
+        self.mutex.unlock(io);
+    }
+
+    /// Pairs with `markCheckedOutByMaintenance`; see its own doc comment.
+    /// A waiter here only ever polls `checked_out` with its own bounded
+    /// backoff (`waitParkedForStore`) rather than blocking on a condition
+    /// variable, so no wake is needed -- the next poll simply observes
+    /// `false` and (finding nothing parked, since the maintenance lease
+    /// this guarded was closed, never parked) falls through to its own
+    /// fresh kernel acquisition, which now safely succeeds.
+    pub fn clearCheckedOutByMaintenance(self: *WriterLane) void {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        self.checked_out = false;
+        self.mutex.unlock(io);
+    }
+
     /// Like `takeParkedForStore`, but when nothing is parked *yet* only
     /// because this same process's lane is still between `checkout` and
     /// `checkin` (`checked_out`), wait for it instead of handing the
@@ -1605,12 +1653,27 @@ pub const WriterLane = struct {
         };
         const own_pid = antfly_platform.process.currentId() orelse 0;
         const now = std.Io.Clock.awake.now(io).nanoseconds;
-        const foreign_overdue = lease.othersWaitingAcrossProcesses(own_pid) and now - lease.acquired_ns >= foreign_fairness_quantum_ns;
+        const foreign_waiting = lease.othersWaitingAcrossProcesses(own_pid);
+        const foreign_overdue = foreign_waiting and now - lease.acquired_ns >= foreign_fairness_quantum_ns;
         const idle_overdue = now - self.parked_since_ns >= parked_idle_release_ns;
         if (!foreign_overdue and !idle_overdue) {
             self.mutex.unlock(io);
-            const quantum_remaining = lease.acquired_ns + foreign_fairness_quantum_ns - now;
             const idle_remaining = self.parked_since_ns + parked_idle_release_ns - now;
+            // No foreign waiter to be fair to right now: `lease.acquired_ns`
+            // is this lease's original kernel acquisition, which a
+            // same-process warm handoff (`checkout`'s own "no self-replacement"
+            // fast path, and this same lane's own `checkin` park) never
+            // refreshes, so after many back-to-back same-process writes it
+            // can be arbitrarily older than `foreign_fairness_quantum_ns`.
+            // Bounding the wait by that stale timestamp regardless made this
+            // return the 1ms floor on every call for as long as writes kept
+            // landing, for a fairness window protecting nobody -- the perf
+            // regression perf/lwa-xproc-writers item 5 traced "no-consumer
+            // path 1037"'s 27-41 unwanted background turns to. Only let the
+            // quantum bound the wait once a foreign waiter actually exists
+            // to need it.
+            if (!foreign_waiting) return @max(1 * std.time.ns_per_ms, idle_remaining);
+            const quantum_remaining = lease.acquired_ns + foreign_fairness_quantum_ns - now;
             return @max(1 * std.time.ns_per_ms, @min(quantum_remaining, idle_remaining));
         }
         self.parked = null;
@@ -2705,6 +2768,16 @@ pub const Owner = struct {
             else => return err,
         };
         errdefer lease.close();
+        // See `WriterLane.markCheckedOutByMaintenance`'s own doc comment:
+        // neither handoff branch above nor a fresh kernel acquisition ever
+        // marks this lane busy on its own, so a concurrent/subsequent
+        // `WriterLane.checkout` would otherwise see `checked_out == false`
+        // and race this lease with its own fresh acquisition instead of
+        // queuing behind it. Cleared by the matching `errdefer` on any
+        // early return below, or by `leaveMaintenanceWriter` at the
+        // matching `maintenance_writer_references -> 0` transition.
+        self.writer_lane.markCheckedOutByMaintenance();
+        errdefer self.writer_lane.clearCheckedOutByMaintenance();
         // The hold starts here: admission checks and rebases run under it.
         const held_from = nowNs();
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
@@ -2782,6 +2855,11 @@ pub const Owner = struct {
         // this lease; waking replay here makes each idle turn schedule itself.
         // Generated and replay publications notify at their commit boundary.
         lease.close();
+        // Pairs with `enterMaintenanceWriter`'s own `markCheckedOutByMaintenance`
+        // call: this lease is fully released (never parked for reuse --
+        // maintenance always closes, see `WriterLane.markCheckedOutByMaintenance`'s
+        // own doc comment), so the lane is no longer busy on its account.
+        self.writer_lane.clearCheckedOutByMaintenance();
         // Status readers serialize publication_stats under the gate; record
         // before releasing it.
         MaintenanceHoldSites.record(self.publication_stats.maintenance_hold_sites.writer(@fromBackingInt(@intCast(root.maintenance_writer_scope))), root.maintenance_writer_held_from);
@@ -3600,7 +3678,39 @@ pub const Owner = struct {
                 next_wait_ms = @intCast(@divCeil(earliest_turn_ns - now, std.time.ns_per_ms));
                 continue;
             }
-            if (comptime h.builtin.is_test) _ = self.test_background_turn_count.fetchAdd(1, .release);
+            // `maintenanceTurn()` unconditionally acquires a real
+            // maintenance path lease for a `.native` profile owner
+            // (`acquireMaintenancePathLeaseAssumeLocked`, gated only on
+            // `independent = self.options.profile == .native`) before it
+            // ever looks at demand, replay debt or retirement -- so merely
+            // *calling* it costs a cross-process lease acquisition even
+            // when it finds nothing. `WriterLane.maintainParkedWriterLaneMs`
+            // re-arms `next_wait_ms` to a finite wait on every iteration
+            // while a lease stays parked (the common case for back-to-back
+            // same-process writes), which otherwise wakes this loop on that
+            // cadence for as long as writes keep landing, regardless of
+            // whether anything but that parked lease itself needs
+            // attention -- already fully serviced, inline, by the call
+            // above. Skip the turn entirely, not just the counting, when
+            // nothing concrete says one is needed: no freshly scheduled
+            // follow-up (`earliest_turn_ns`), no registered catalog demand
+            // (or unestablished `self.current`), no owner-level pending
+            // flag (replay debt, retirement, startup backfill -- all set
+            // by a *previous* turn or an explicit notifyMutation/notifyDemand,
+            // never only discovered by this one), no storage reclamation in
+            // flight, and no mid-round table cursor. A genuinely idle,
+            // no-consumer owner never has any of these set (its own
+            // foreground writes only wake it when `registeredDemand().any()`
+            // is true -- `notifyDemand`'s own doc comment), so this cannot
+            // starve real work, only the lease-parking timer's own spurious
+            // wakes.
+            if (earliest_turn_ns == 0 and !self.registeredDemandOrUnknown() and !self.maintenance_pending and
+                !self.maintenance_storage_pending and self.maintenance_table_cursor == 0)
+            {
+                next_wait_ms = self.maintenanceWaitMillis(false);
+                earliest_turn_ns = 0;
+                continue;
+            }
             const pending = self.maintenanceTurn() catch |err| blk: {
                 // Capture/control failures otherwise disappear before the
                 // detached replay diagnostics can observe them.
@@ -3610,6 +3720,9 @@ pub const Owner = struct {
                 self.gate.mutex.unlock(io);
                 break :blk true;
             };
+            if (comptime h.builtin.is_test) {
+                if (pending) _ = self.test_background_turn_count.fetchAdd(1, .release);
+            }
             // A scheduling quantum belongs to a fair round, not each idle
             // namespace. Otherwise 45 unrelated tables add 4.5 seconds to
             // every activation, delivery, claim and publication observation.

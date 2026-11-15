@@ -6257,12 +6257,46 @@ pub const Store = struct {
         self.writer_ticketed = true;
     }
 
+    /// Full release: the ordinary writer *slot* (WS2's early, opportunistic
+    /// release -- see this function's own callers) together with
+    /// `writer_admission`, immediately. Only safe when no durability wait is
+    /// still coming for this transaction -- an abort, or a `commitStaged`
+    /// that never reached staging. A transaction whose writes were *staged*
+    /// and are now awaiting durability must instead release the slot via
+    /// `releaseWriterSlotKeepingAdmission` and defer `releaseAdmissionOnly`
+    /// to its own `StagedCommit.waitSequence` -- see that split's own doc
+    /// comment for why.
     pub fn releaseWriterSlot(self: *Store) void {
+        self.releaseWriterSlotKeepingAdmission();
+        self.releaseAdmissionOnly();
+    }
+
+    /// Owner-level cross-instance/cross-process writer admission (set only
+    /// on a maintenance snapshot's detached `NativeFile`, via
+    /// `Owner.enterMaintenanceWriter` in lite_connection.zig) guarantees no
+    /// *other* `NativeFile` instance on the same inode -- the live
+    /// foreground root, while this is a detached maintenance snapshot, or
+    /// vice versa -- begins its own transaction before this one's commit
+    /// actually publishes. That is a stronger promise than the ordinary
+    /// writer *slot* below, which only serializes who may *stage* the next
+    /// write against this exact `Store` instance, not who must wait for
+    /// this one's fsync (WS2's whole point). Releasing both together at the
+    /// same early, pre-durability point -- as a bare `releaseWriterSlot`
+    /// call from `Txn.commitStaged` used to, unconditionally -- let a
+    /// foreground commit land on the *other* instance while this one's own
+    /// fsync/publish was still in flight, corrupting the `active_writer`
+    /// backstop (`inode_lock.zig`'s own doc comment) and occasionally
+    /// `publishCheckpoint`'s "stale writer base" assertion
+    /// (perf/lwa-xproc-writers item 7). A caller that stages successfully
+    /// must call this instead of `releaseWriterSlot`, then release
+    /// admission itself, unconditionally exactly once, only after this
+    /// transaction's own commit is confirmed durable -- see
+    /// `StagedCommit.waitSequence`'s own `releaseAdmissionOnly` call.
+    pub fn releaseWriterSlotKeepingAdmission(self: *Store) void {
         const io = self.file.runtime();
         self.writer_mutex.lockUncancelable(io);
         defer {
             self.writer_mutex.unlock(io);
-            if (self.writer_admission) |admission| admission.leave(admission.ptr);
             // Opportunistic, not blocking (WS2): `Txn.commit` releases the
             // writer slot right after staging, specifically so the next
             // writer can open and stage into the same group while this
@@ -6309,6 +6343,14 @@ pub const Store = struct {
         if (self.writer_ticketed) self.serving_writer_ticket +%= 1;
         self.writer_ticketed = false;
         self.writer_ready.broadcast(io);
+    }
+
+    /// The deferred half of `releaseWriterSlotKeepingAdmission` -- see its
+    /// own doc comment. A no-op when `writer_admission` is unset (every
+    /// ordinary, non-maintenance `Store`), so calling this unconditionally
+    /// from a durability-wait completion is harmless for those.
+    pub fn releaseAdmissionOnly(self: *Store) void {
+        if (self.writer_admission) |admission| admission.leave(admission.ptr);
     }
 
     const NativeBackendStore = backend_adapter.Store(Store, Txn, Txn, Txn, .{
@@ -6990,6 +7032,19 @@ pub const Txn = struct {
                 self.allocator.free(ctx.mutations);
                 self.allocator.destroy(ctx);
             };
+            // Release `writer_admission` only once this request's own
+            // commit has actually resolved -- durable, or definitively
+            // failed -- never merely staged. `commitStaged` already
+            // released the ordinary writer *slot* via
+            // `releaseWriterSlotKeepingAdmission`; this is the deferred
+            // other half. See that split's own doc comment
+            // (perf/lwa-xproc-writers item 7): releasing admission this
+            // late, unconditionally (success or error), is what keeps a
+            // different `NativeFile` instance on the same inode from
+            // beginning its own transaction while this one's commit is
+            // still in flight.
+            const admission_store: ?*Store = if (self.staged) |staged| staged.store else if (self.ride_along_ticket) |ticket| ticket.store else null;
+            defer if (admission_store) |store| store.releaseAdmissionOnly();
             var sequence: u64 = 0;
             if (self.staged) |staged| {
                 staged.drive();
@@ -7100,7 +7155,12 @@ pub const Txn = struct {
         } else try store.enqueue(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
-            store.releaseWriterSlot();
+            // Keep `writer_admission` held past this point: staging is not
+            // durability. `StagedCommit.waitSequence` releases it once this
+            // request's own ticket actually resolves -- see
+            // `releaseWriterSlotKeepingAdmission`'s own doc comment
+            // (perf/lwa-xproc-writers item 7).
+            store.releaseWriterSlotKeepingAdmission();
             self.writer_reserved = false;
         }
 
@@ -10561,6 +10621,135 @@ test "lite writer slot is free for the next writer while a commit's fsync is in 
     defer read.abort();
     try std.testing.expectEqualStrings("1", try read.get("a"));
     try std.testing.expectEqualStrings("2", try read.get("b"));
+}
+
+test "lite writer admission stays held until a commit is durable, unlike the writer slot" {
+    // perf/lwa-xproc-writers item 7 regression: `writer_admission.leave()`
+    // used to fire at the same early point as the ordinary writer slot's
+    // release -- right after staging, before the fsync/publish that makes
+    // the commit durable (WS2's deliberate, documented optimization for
+    // the slot alone, proven by the sibling "writer slot is free..." test
+    // above: "the next writer can open and stage into the same group
+    // while this one's commit -- fsync included -- is still running").
+    // That pipelining is safe for the ordinary slot; it is not safe for a
+    // maintenance snapshot's `writer_admission`, which additionally
+    // guarantees no *other* `NativeFile` instance on the same inode -- the
+    // live foreground root, while this is a detached maintenance snapshot,
+    // or vice versa -- begins its own transaction before this one's commit
+    // actually publishes. Releasing it early let a foreground commit land
+    // on the other instance while this one's own fsync/publish was still
+    // in flight, corrupting the `active_writer` backstop (inode_lock.zig's
+    // own doc comment) -- surfacing live as "stale writer base reached
+    // publishCheckpoint" or "NativeFile publishing without holding the
+    // writer lease". Gate this commit's fsync and prove admission is
+    // still held the whole time it is paused there, unlike the writer
+    // slot itself.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Admission = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        fn enter(ptr: *anyopaque, _: PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.active.fetchAdd(1, .acq_rel);
+        }
+        fn leave(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.active.fetchSub(1, .acq_rel);
+        }
+    };
+    const Gate = struct {
+        var armed: std.atomic.Value(bool) = .init(false);
+        var started: std.atomic.Value(bool) = .init(false);
+        var proceed: std.atomic.Value(bool) = .init(false);
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (armed.swap(false, .acq_rel)) {
+                started.store(true, .release);
+                while (!proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            }
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    const Worker = struct {
+        store: *Store,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            var write = self.store.beginWrite() catch |err| {
+                self.result = err;
+                return;
+            };
+            write.put("a", "1") catch |err| {
+                self.result = err;
+                write.abort();
+                return;
+            };
+            self.result = write.commit();
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "admission-held-through-durability.aflite");
+    defer alloc.free(path);
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Gate.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io });
+    defer store.close();
+    // Otherwise the store's own internal reclamation maintenance (unrelated
+    // to this admission hook, and opportunistically kicked by
+    // `releaseWriterSlotKeepingAdmission`'s own defer block the instant the
+    // writer slot frees) can also enter this same `writer_admission` and
+    // make `admission.active` briefly 2, which this test's assertion would
+    // misread as a double-entry violation rather than the unrelated,
+    // harmless concurrency it actually is.
+    store.maintenance_start_suppressed = true;
+    // A brand-new store's *first* write also commits its own root
+    // incarnation/catalog bootstrap record, a second, sequential (not
+    // concurrent) admission-guarded commit alongside the document write
+    // itself -- see "lite detached writer admission..." above, which
+    // tolerates exactly this as `entered == 2` after one `commit()` call.
+    // Get that one-time bootstrap out of the way on a plain, ungated write
+    // before wiring the fake admission below, so the gated commit this
+    // test actually measures is an ordinary, already-bootstrapped one.
+    {
+        var bootstrap = try store.beginWrite();
+        errdefer bootstrap.abort();
+        try bootstrap.put("bootstrap", "0");
+        try bootstrap.commit();
+    }
+    var admission: Admission = .{};
+    store.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer store.writer_admission = null;
+
+    var worker = Worker{ .store = &store };
+    Gate.started.store(false, .release);
+    Gate.proceed.store(false, .release);
+    Gate.armed.store(true, .release);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer {
+        Gate.proceed.store(true, .release);
+        if (!joined) thread.join();
+        Gate.armed.store(false, .release);
+    }
+    try waitForGateStartedForTest(store.file.runtime(), &Gate.started);
+    // The commit is staged and paused inside its own (gated) fsync, not yet
+    // durable. Unlike the writer slot (proven free by the sibling test
+    // above), admission must still be held: nothing else may begin its own
+    // transaction on whatever `NativeFile` instance this admission guards
+    // until this commit actually publishes. `>= 1`, not `== 1`: a single
+    // logical `commit()` can itself stage more than one admission-guarded
+    // sub-write sequentially (e.g. index-catalog bookkeeping alongside the
+    // primary document write) before either one's deferred release runs,
+    // since only the *slot* -- not admission -- is released between them;
+    // that sequential nesting from this one caller is not the cross-instance
+    // race this test guards against, only ever `0` (fully released, the
+    // assertion below) would be.
+    try std.testing.expect(admission.active.load(.acquire) >= 1);
+    Gate.proceed.store(true, .release);
+    thread.join();
+    joined = true;
+    try worker.result;
+    try std.testing.expectEqual(@as(usize, 0), admission.active.load(.acquire));
 }
 
 fn queuedMutationCountForTest(store: *Store) usize {
