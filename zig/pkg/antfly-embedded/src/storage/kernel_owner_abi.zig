@@ -24,7 +24,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 90 also fences certified graph document-key descriptor domains.
 // Version 91 fences selected-role merge-readiness projection responses.
 // Version 92 adds ordered history control and its stable retention failures.
-pub const abi_version: u32 = 92;
+// Version 93 adds bounded binary retained-history pages at an ordered read cut.
+pub const abi_version: u32 = 93;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1977,6 +1978,14 @@ pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
 pub extern fn antfly_storage_owner_ordered_history_control_json(
     owner: ?*anyopaque,
     request: *const ReplicatedBatchAtRaftEntryRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Private read request JSON contains a history page request and required cut;
+/// the response is the bounded HPG1 binary page envelope, not JSON.
+pub extern fn antfly_storage_owner_ordered_history_page(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 

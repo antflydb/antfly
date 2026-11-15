@@ -881,6 +881,10 @@ pub const Status = enum(u32) {
     history_resynchronization_required = 921,
     conflicting_ordered_apply_receipt = 922,
     invalid_ordered_apply_receipt = 923,
+    invalid_history_admission = 924,
+    history_too_large = 925,
+    history_checkpoint_conflict = 926,
+    corrupt_ordered_apply_receipt = 927,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

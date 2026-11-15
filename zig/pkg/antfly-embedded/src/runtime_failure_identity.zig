@@ -31,6 +31,10 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_history_admission, .err = error.InvalidHistoryAdmission },
+    .{ .status = .history_too_large, .err = error.HistoryTooLarge },
+    .{ .status = .history_checkpoint_conflict, .err = error.HistoryCheckpointConflict },
+    .{ .status = .corrupt_ordered_apply_receipt, .err = error.CorruptOrderedApplyReceipt },
     .{ .status = .history_authority_required, .err = error.HistoryAuthorityRequired },
     .{ .status = .history_corrupt, .err = error.HistoryCorrupt },
     .{ .status = .history_resynchronization_required, .err = error.HistoryResynchronizationRequired },

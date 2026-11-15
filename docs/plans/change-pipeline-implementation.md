@@ -1213,8 +1213,36 @@ forged checksummed metadata and every allocation-failure point.
 Physical storage qualification checks lagging cuts, zero cuts, standalone/Raft
 authority separation, expired leases, historical data surviving close/reopen,
 and ACK visibility. Logs: `zig/ordered-history-read-cut-qualification.log`.
-The compiled-owner ABI read operation and production routing are still pending;
-this primitive alone cannot expose a linearizable public feed.
+At this storage primitive milestone the compiled-owner ABI operation was still
+pending; it is implemented in the next milestone below. Production routing
+remains pending, so this primitive alone cannot expose a linearizable public feed.
+
+## In progress: compiled-owner history page operation
+
+Private storage-owner ABI 93 adds `orderedHistoryPage`. Its bounded strict JSON
+request carries the original private page request and nonzero minimum applied
+index; its response is the HPG1 binary page envelope. The physical owner reads
+through `DB.orderedHistoryPage`, then encodes the result before releasing the
+storage page. The control client decodes into caller-owned page storage before
+releasing the ABI response. Old ABI headers and invalid/reserved request fields
+fail before storage dispatch.
+
+Four append-only failure identities preserve invalid history admission, page
+size limits, cursor conflicts and corrupt ordered markers. These errors must
+not collapse into an internal owner failure. The independently compiled error
+registry verifies unique status identities and exact round trips.
+
+The real compiled-owner qualification enrolls retention, writes an ordered row,
+reads its historical image, rejects a lagging cut/zero cut/insufficient byte
+budget/expired lease, then closes and reopens the physical owner and compares
+header, images and continuation. Original page bytes survive owner teardown.
+Logs: `zig/ordered-history-compiled-page-qualification.log` and
+`zig/ordered-history-page-error-registry-qualification.log`.
+
+The production source adapter must still establish leader ReadIndex, validate
+the live route/root identity and preserve those fences across owner borrowing.
+This ABI operation is private and does not register a public feed or permit
+stale fallback when a leader barrier fails.
 
 ## Working constraints
 
