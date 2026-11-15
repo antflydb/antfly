@@ -10387,11 +10387,30 @@ pub const NativeFile = struct {
     /// that a backlog never grows unbounded between maintenance turns.
     const foreground_retirement_cap_pages: usize = 16;
 
-    fn drainRetirement(self: *NativeFile, state: *allocator_v4.State, checkpoint: CheckpointSlot, budget: usize) !usize {
+    fn drainRetirement(self: *NativeFile, state: *allocator_v4.State, checkpoint: CheckpointSlot, budget: usize, fence_held: bool) !usize {
         // A registering reader may still hold its shared inode lock before
-        // publishing its epoch. Without the exclusive scan fence, even logical
-        // promotion would let a later writer consume that reader's old pages.
-        if (budget == 0 or self.epoch_window == null) return 0;
+        // publishing its epoch. Without the exclusive scan fence, even
+        // logical promotion would let a later writer consume that reader's
+        // old pages. `fence_held` (not `self.epoch_window != null`) is the
+        // right test for that: `epoch_window` only reflects *cross-process*
+        // readers (via a shared `regionForInode()`), so it stays null
+        // whenever no `reader_coordinator` is configured -- the common,
+        // single-process case -- even though the caller's own exclusive
+        // inode lock (`acquireEpochReuseLock`, unconditional whether or not
+        // a region exists) already fences every other writer, and
+        // in-process readers are tracked unconditionally by `reuseFrontier`/
+        // `metadataReuseFrontier` themselves (reader pins, `ReadView`s),
+        // not by `epoch_window`. Treating "no region" as "fence not held"
+        // made this a permanent no-op for any store without a configured
+        // `reader_coordinator`: `state.heap`/`metadata_heap`/`chains_heap`
+        // items were never completed/released on that path (confirmed live
+        // as "lite reclamation writable reopen services debt and read only
+        // reopen does not (redo)" never reaching a bounded steady state --
+        // this file's own ledger bookkeeping pages, retired every fold,
+        // never promoted back to reusable). Not redo-specific: this gate
+        // has no legacy/redo branch, so it was equally dead for legacy
+        // `page_reuse = true` stores with no reader_coordinator.
+        if (budget == 0 or !fence_held) return 0;
         const frontier = self.reuseFrontier();
         const metadata_frontier = self.metadataReuseFrontier();
         // Completed data/chain pages use the metadata fence too: recovery can
@@ -10958,7 +10977,15 @@ pub const NativeFile = struct {
             const advances = 2 *| allocator_v4.serviceJournalPages(self.maxPagePayloadBytes(), 1);
             while (work > 1 and allocator_v4.serviceJournalPages(self.maxPagePayloadBytes(), work) +| advances > available) work = work / 2 + work % 2;
         }
-        const count = try self.drainRetirement(pages.ledger.?, before, work);
+        // Same `fence_held` condition as `pageAllocatorFromFreeMapWithProof`'s
+        // own `drainRetirement` call (that function's own doc comment):
+        // `pages` was already built by this transaction's one call into
+        // it above, so its `data_lock_file`/`coordinated_reader_window`
+        // report whether this transaction actually holds the exclusive
+        // scan fence, independent of whether `self.epoch_window` ended up
+        // populated (cross-process readers only).
+        const fence_held = pages.data_lock_file != null or pages.coordinated_reader_window;
+        const count = try self.drainRetirement(pages.ledger.?, before, work, fence_held);
         const state = pages.ledger.?;
         if (state.checkpointDue()) {
             // Bound metadata construction independently of the physical ledger
@@ -15244,6 +15271,36 @@ pub const NativeFile = struct {
     pub fn finishPublicationSequence(self: *NativeFile, sequence: u64, selected: CheckpointSlot) !void {
         var checkpoint = selected;
         checkpoint.commit_sequence = sequence;
+        // perf/lwa-read-audit: `redo_folded_through` must advance to this
+        // same final `sequence`, not stay at whatever `selected` already
+        // carried. `selected` (`image.prepared.activeCheckpoint()`) was
+        // last stamped by `prepareVacuum`'s own construction
+        // (`redo_folded_through = previous.commit_sequence + 1`, taken
+        // from the *initial* snapshot `Store.performVacuum` captured
+        // before any catch-up round ran) -- correct only when `sequence`
+        // here still equals that same initial value, i.e. no concurrent
+        // commit landed on the live store during the whole copy. Every
+        // catch-up round in between (`applyCapturedChanges`) writes
+        // directly into this generation's real tree -- `image.prepared`
+        // has no redo attached at all until `replaceWithPreparedGeneration`
+        // runs, well after this call, so there is nowhere for those
+        // writes to divert to -- so by the time this function runs,
+        // `sequence` (whatever catch-up advanced `commit_sequence` to,
+        // residual included) is exactly as truthfully folded as
+        // `prepareVacuum`'s own original stamp was for its own, earlier
+        // value. Leaving the stale, too-low value here durably published
+        // the wrong fold boundary to both slots: confirmed live as
+        // `error.NativeRedoLogCorrupt` on the next reopen under
+        // concurrent group-commit load during "lite online vacuum
+        // publishes while group-commit mutations keep landing" -- the
+        // live generation kept committing correctly past the stale
+        // boundary (ordinary diverted commits never touch this field,
+        // by design), but a fresh recovery's own `redo_log.replay`,
+        // pinned to the stale, far-too-low boundary from the slot it
+        // actually read, found the log's first *genuinely new* record
+        // nowhere near `stale + 1` and refused it as corrupt, even
+        // though nothing was actually malformed on disk.
+        checkpoint.redo_folded_through = sequence;
         // Catch-up can replay keys from failed/no-op foreground mutations, so
         // its private sequence may exceed the live store's publication sequence.
         // Both recovery slots must identify the final image; a newer private
@@ -16681,8 +16738,25 @@ pub const NativeFile = struct {
             // bounding the normal (128-budget) case to a few pages per
             // commit; drainRetirement's own heaps already carry the cursor
             // forward between calls; nothing here re-scans from the start.
-            _ = try self.drainRetirement(state, checkpoint, @min(self.retirement_work_pages, foreground_retirement_cap_pages));
-            const can_reuse = self.free_pages_verified and (lock != null or (coordinated and self.reader_window_lock != null));
+            // perf/lwa-lease-fold: "fence held" -- the exclusive scan fence
+            // this drain's own comment (above `has_retirement_backlog`)
+            // requires before touching retirement data structures -- is
+            // `lock != null or coordinated`, the same condition `can_reuse`
+            // below already uses for the identical reason. It is not the
+            // same thing as `self.epoch_window != null`: a direct
+            // `acquireEpochReuseLock` (the `lock` branch) always takes the
+            // exclusive inode lock first, regardless of whether
+            // `regionForInode()` finds a shared region to populate
+            // `epoch_window` from -- no `reader_coordinator` configured
+            // (the common, single-process case) means no cross-process
+            // readers to fence, not "fence not held" or "readers unknown":
+            // in-process readers stay tracked unconditionally (`reuseFrontier`/
+            // `metadataReuseFrontier`'s own reader-pin terms, unrelated to
+            // `epoch_window`), so the frontier `drainRetirement` compares
+            // against is already correct either way.
+            const fence_held = lock != null or (coordinated and self.reader_window_lock != null);
+            _ = try self.drainRetirement(state, checkpoint, @min(self.retirement_work_pages, foreground_retirement_cap_pages), fence_held);
+            const can_reuse = self.free_pages_verified and fence_held;
             return .{ .file = self, .free_pages = &.{}, .next_page_id = self.manifestSafeNextPageId(checkpoint.page_count), .ledger = state, .can_reuse = can_reuse, .reuse_retry_enabled = self.free_pages_verified and !can_reuse, .coordinated_reader_window = coordinated, .data_lock_file = lock };
         }
         var free_pages = try self.readFreePagesAlloc(checkpoint);
@@ -18654,7 +18728,38 @@ pub const NativeFile = struct {
         // where they get it instead. Harmless to reapply when that
         // branch already ran (same value, `next.commit_sequence` is
         // unchanged by this line too in that case).
-        if (changed and (self.redo == null or self.redo.?.checkpointing)) next.redo_folded_through = next.commit_sequence;
+        //
+        // perf/lwa-read-audit: `!deferred_publication` added -- missing
+        // here (unlike the certify-on-commit branch above, which already
+        // requires it). `redo.checkpointing` means "this commit certifies
+        // no unfolded logical work remains" (`reclaimPagesImpl`'s own
+        // ledger-only commit, gated on exactly that), which makes the
+        // stamp semantically correct even then -- but a *deferred*
+        // publish (`durable=false`'s ride-along path, a few lines below)
+        // never reaches `publishCheckpoint`'s real slot-write tail at
+        // all: it only appends a redo-log record (`CompactCheckpoint`,
+        // which carries no `redo_folded_through` of its own by design)
+        // and stages `next` into `self.header` directly. Stamping here
+        // regardless left `self.header`'s in-memory active checkpoint
+        // slot permanently ahead of what the physical slot page (last
+        // written by the previous real fold) actually holds, with
+        // nothing short of the *next* real fold ever reconciling the
+        // two -- confirmed live: `captureFullReadSnapshot`'s fresh,
+        // by-path reopen recovered a `redo_folded_through` two behind
+        // the live `self.header`'s, with every other field of the same
+        // active slot byte-identical. Same shape as 6c82ab8a0e
+        // (`stageAllocatorCertificate` stamping a value never reaching
+        // the publish it was sealed against) -- a stamp applied somewhere
+        // that does not control (or, here, does not even reach) the
+        // actual serialized bytes. Skipping the stamp on the deferred
+        // path is always safe (`redo_folded_through` simply carries
+        // forward unchanged, same as any ordinary diverted commit),
+        // and keeps `self.header` from ever running ahead of the
+        // physical slot for this field: the next commit that actually
+        // reaches this same site with `deferred_publication == false`
+        // (or a real fold) applies it for real, serialized together
+        // with everything else in that commit's own slot write.
+        if (changed and !deferred_publication and (self.redo == null or self.redo.?.checkpointing)) next.redo_folded_through = next.commit_sequence;
         if (deferred_publication) {
             defer self.notifyPublication();
             // Keep the last durable checkpoint slots intact until an explicit
@@ -19685,6 +19790,26 @@ pub const NativeFile = struct {
 
         self.header.checkpoints[next_slot] = checkpoint;
         self.header.active_checkpoint = next_slot;
+        // perf/lwa-read-audit: a durable publish must leave the active
+        // slot's on-disk bytes and `self.header`'s own in-memory copy
+        // byte-identical, `redo_folded_through` included -- the whole
+        // point of this slot write being one atomic page, not a
+        // separately-tracked field. Decoding what was *actually* just
+        // written (not re-deriving it from `checkpoint`, which would only
+        // catch an encode bug, not a mismatched assignment) and comparing
+        // against `self.header.checkpoints[next_slot]` catches a stamp
+        // applied somewhere that does not control these exact bytes --
+        // the same shape of bug as 6c82ab8a0e (`stageAllocatorCertificate`
+        // fingerprinting a value the real publish never actually wrote)
+        // and the `!deferred_publication` gap this branch's own caller,
+        // `commitTransactionWithDurability`, just closed for the general
+        // `redo_folded_through` stamp. Debug-only: a real decode plus a
+        // full-struct comparison on every durable publish is not free.
+        if (builtin.mode == .debug) {
+            const written = decodeCheckpointSlotPage(slot_page) catch |err|
+                std.debug.panic("lite: durable publish wrote an undecodable checkpoint slot: {s}", .{@errorName(err)});
+            std.debug.assert(std.meta.eql(written, self.header.checkpoints[next_slot]));
+        }
         self.checkpoint_publication_uncertain = false;
         self.uncertain_checkpoint = null;
         self.uncertain_slot = null;
@@ -26369,6 +26494,84 @@ test "lite compaction catches final mutations across all roots and streams large
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(report.live_file_count, image.report.live_file_count);
     try std.testing.expectEqual(report.live_bytes, image.report.live_bytes);
+}
+
+// perf/lwa-read-audit: `Store.performVacuum` (docstore.zig) calls
+// `preparePublicationSequence` *early* -- right after `prepareVacuum`,
+// before any catch-up round has run -- then, after however many rounds
+// of `applyCapturedChanges` have folded in concurrent commits, calls
+// `finishPublicationSequence` with the *final*, caught-up sequence.
+// `finishPublicationSequence` used to leave `redo_folded_through` at
+// whatever `selected` (the image's own checkpoint) already carried --
+// `preparePublicationSequence`'s own early stamp, or further back,
+// `prepareVacuum`'s own `previous.commit_sequence + 1` -- never advancing
+// it to match the later, caught-up `sequence` it was just handed. Every
+// mutation up through that final sequence was, by construction, written
+// directly into this generation's real tree (catch-up copies have no
+// redo attached to divert into until `replaceWithPreparedGeneration` runs,
+// well after this call), so the stale value was always too low, not
+// merely imprecise -- and, published durably to both slots here, it
+// stayed wrong until the next real fold. A fresh, by-path reopen after
+// such a publish (or, as this bug surfaced live under contention,
+// `Store.checkWithCancel`'s own fresh snapshot open) then replays the
+// redo log pinned to that stale boundary and refuses the first
+// genuinely-new record as `error.NativeRedoLogCorrupt`, even though
+// nothing on disk was actually malformed -- see "lite online vacuum
+// publishes while group-commit mutations keep landing" (docstore.zig),
+// which reproduces this under real concurrency; this test reproduces the
+// same root cause deterministically, with no threads at all, by calling
+// `Store.performVacuum`'s own two-call sequence directly.
+test "lite vacuum's late finishPublicationSequence call advances redo_folded_through past an earlier catch-up round" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "vacuum-finish-publication-fold-boundary.aflite");
+    defer alloc.free(path);
+    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    try file.putDocument("seed", "value");
+
+    var source = try NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true, .no_sync = true });
+    defer source.close();
+    var capture = ChangeCapture{};
+    defer capture.deinit(alloc);
+    file.change_capture = &capture;
+    defer file.change_capture = null;
+    var image = try source.prepareVacuum(null);
+    defer image.deinit();
+
+    // Mirrors `Store.performVacuum`'s own early call, right after
+    // `prepareVacuum`, before any catch-up round: at this point
+    // `image.prepared`'s checkpoint is correctly fully folded (nothing
+    // has diverged yet), so `redo_folded_through` already equals
+    // `commit_sequence` here -- this call must be a no-op for that
+    // reason, not because it skips the field.
+    const initial_sequence = file.activeCheckpoint().commit_sequence + 1;
+    try image.prepared.preparePublicationSequence(initial_sequence);
+    try std.testing.expectEqual(image.prepared.activeCheckpoint().commit_sequence, image.prepared.activeCheckpoint().redo_folded_through);
+
+    // Concurrent commits landing on the live file during the copy --
+    // exactly what a hammering foreground writer does during a real
+    // online vacuum's own catch-up window.
+    var round: usize = 0;
+    while (round < 10) : (round += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "oob:{d}", .{round});
+        try file.putDocument(key, "landed");
+    }
+    try file.applyCapturedChanges(&image.prepared, &capture, &image.report, null);
+
+    // The final round's own publish: a strictly higher sequence than
+    // `initial_sequence`, same as `Store.performVacuum`'s own
+    // `self.file.activeCheckpoint().commit_sequence + 1` at this later
+    // point.
+    const final_sequence = file.activeCheckpoint().commit_sequence + 1;
+    try std.testing.expect(final_sequence > initial_sequence);
+    try image.prepared.finishPublicationSequence(final_sequence, image.prepared.activeCheckpoint());
+
+    const published = image.prepared.activeCheckpoint();
+    try std.testing.expectEqual(final_sequence, published.commit_sequence);
+    try std.testing.expectEqual(final_sequence, published.redo_folded_through);
 }
 
 test "lite unpacked v3 remains readable and vacuum explicitly adopts packed signature" {
