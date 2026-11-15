@@ -507,6 +507,27 @@ HTTP/SQL/pgwire exposure, distributed outcome proofs and bootstrap remain requir
    inbound PostgreSQL -> destination commit -> outbound feed with independently
    advancing indexes; record actual versions and unsupported capabilities.
 
+## In progress: PostgreSQL logical wire codec
+
+`pgwire/pgoutput.zig` implements bounded protocol-v1 message encoding for begin,
+commit, relation/type, insert/update/delete/truncate, origin and logical messages.
+It preserves SQL NULL, empty text, binary and unchanged-TOAST distinctions,
+including old tuples. CopyData WAL envelopes and keepalives use network byte
+order; strict standby-status decoding treats positions as untrusted claims.
+UTF8 text and C-string fields reject embedded NUL or invalid encoding. PostgreSQL
+epoch conversion handles negative times and overflow.
+
+The codec uses an explicit LSN type. It neither assigns LSNs nor acknowledges
+history. Durable slot mappings must establish which issued, complete transaction
+a reported flush position covers before it can affect feed retention. The codec
+has no authentication, slots, exported snapshots, replication commands or socket
+activation. Protocol negotiation and full existing-client qualification remain
+required; this codec alone does not satisfy the pgoutput requirement.
+
+`zig build pgoutput-test -j2` exercises independently written wire fixtures for
+all v1 message variants, framing, malformed feedback, bounds and allocation
+failure cleanup. This target also runs in the regular unit suite.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
