@@ -1080,7 +1080,7 @@ not a decision explanation.
 | Embedded single DB | own-table document, query (all live predicates, top-N), graph, and snapshot sources |
 | Embedded Lite (multi-table) | cross-table sources, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
 | Ordered (Raft) publication | dependency state commits with the artifact through replicated publish intents |
-| Distributed server tables | document, query (all live predicates, top-N), and snapshot `search.request` sources, own table and across tables; graph sources, `_artifacts` fields, and the search shorthands are rejected at admission (they need shard-local indexes) |
+| Distributed server tables | every source kind (document, query with all live predicates and top-N, graph, `_artifacts` fields, snapshot search), own table and across tables; declared through the enrichment endpoint |
 
 ### Distributed tables
 
@@ -1116,15 +1116,28 @@ dependency state, and only a group's leader plans changes to it.
   run on the apply path); the data server runs one bounded, leader-only
   maintenance job per control round instead.
 - Resolution reads every table, the own one included, through the routed
-  read path: point lookups, filtered scans (with the storage filter pushed
-  down), and full `QueryRequest` execution for snapshot sources.
+  read path: point lookups; key-cursor scans with the storage filter
+  evaluated by every group and documents hydrated in exact-ID batches of 64
+  (a continuation resumes after the previous page's last key, never
+  re-scanning); graph adjacency and generated-artifact values from the
+  group owning the key (a group-local `context_read`); and ranked retrieval
+  as a `QueryRequest` (the `text` and `vector` shorthands become a
+  `full_text_search` match and a precomputed `embeddings` entry).
+- Leader maintenance plans inside the owner call but never proposes there:
+  the owner returns its plans and pending deliveries, and the data server
+  proposes them, delivers, and acknowledges by content outside any owner
+  call (plans that went stale meanwhile are no-ops and are re-planned).
+- Splits carry the replicated topology, the shadow-completion marker,
+  generated-record crash intents, the delivered-notice inbox (each group
+  applies a notice to the dependents in its own range), and publish
+  intents for the moved documents; the source keeps and delivers its own
+  outbox.
 
 ### Remaining work
 
-- Distributed tables: graph sources and generated-artifact (`_artifacts`)
-  values need a routed, cross-shard read of graph adjacency and artifacts;
-  until then they are rejected at admission. Context sources are declared
-  through the enrichment endpoint, not inline at table creation.
+- Distributed tables: context sources are declared through the enrichment
+  endpoint, not inline at table creation (resolution needs the table's
+  catalog identity).
 - HTTP surface: artifact `freshness`, the per-artifact dependency manifest,
   `POST /dependencies/impact`, and `freshness=require_current&wait_timeout=`
   reads (the storage and C ABI primitives exist).

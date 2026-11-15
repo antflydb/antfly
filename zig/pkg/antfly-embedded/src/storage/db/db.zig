@@ -211,6 +211,36 @@ fn copyContextDependencyHints(alloc: Allocator, source: *docstore_mod.DocStore, 
     try dest.putBatch(writes, &.{});
 }
 
+/// Context state a split destination keeps across the system-metadata wipe:
+/// the replicated topology (identity and inbound dependents, so rows in the
+/// destination keep staging notices for foreign dependents from the first
+/// write), the shadow-completion marker (shadows move with their rows), and
+/// crash intents of generated records (reconciled by the new group). The
+/// source keeps and delivers its own outbox, so a physically copied outbox
+/// is dropped here rather than delivered twice.
+fn copyContextSplitState(alloc: Allocator, source: *docstore_mod.DocStore, dest: *docstore_mod.DocStore) !void {
+    const prefixes = [_][]const u8{
+        "\x00\x00__metadata__:context_dependency:host",
+        context_dependency_db.shadows_complete_key,
+        context_dependency_db.pending_prefix,
+    };
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned = std.ArrayListUnmanaged([]docstore_mod.OwnedKVPair).empty;
+    defer {
+        for (owned.items) |rows| docstore_mod.DocStore.freeResults(alloc, rows);
+        owned.deinit(alloc);
+    }
+    for (prefixes) |prefix| {
+        const rows = try source.scanPrefix(alloc, prefix);
+        try owned.append(alloc, rows);
+        for (rows) |row| try writes.append(alloc, .{ .key = row.key, .value = row.value });
+    }
+    if (writes.items.len != 0) try dest.putBatch(writes.items, &.{});
+    const outbox = context_dependency_store.familyPrefix(@import("enrichment/context_notices.zig").outbox_family);
+    try deleteKeysWithPrefixFromStore(alloc, dest, &outbox);
+}
+
 fn contextNowMs() u64 {
     return @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
 }
@@ -5261,7 +5291,10 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("close", .{self}) catch unreachable;
         if (self.closed) return;
         self.closed = true;
-        if (self.context_remote_reader) |remote| self.alloc.destroy(remote);
+        if (self.context_remote_reader) |remote| {
+            remote.deinit();
+            self.alloc.destroy(remote);
+        }
         self.context_remote_reader = null;
         if (self.context_remote_table_id) |id| self.alloc.free(id);
         self.context_remote_table_id = null;
@@ -10372,14 +10405,17 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("installContextHost", .{ self, config });
         var reader: ?@import("enrichment/context_resolution.zig").Reader = null;
         if (config.read_source) |source| {
-            const remote = if (self.context_remote_reader) |existing| existing else blk: {
+            const remote = if (self.context_remote_reader) |existing| blk: {
+                existing.deinit();
+                break :blk existing;
+            } else blk: {
                 const created = try self.alloc.create(@import("context_source_db_reader.zig").RemoteReader);
                 self.context_remote_reader = created;
                 break :blk created;
             };
             if (self.context_remote_table_id) |old| self.alloc.free(old);
             self.context_remote_table_id = try self.alloc.dupe(u8, config.table_id);
-            remote.* = .{ .source = source, .own_table_id = self.context_remote_table_id.? };
+            remote.* = .{ .source = source, .own_table_id = self.context_remote_table_id.?, .cursor_alloc = self.alloc };
             reader = remote.reader();
         }
         if (config.replication != null) {
@@ -10635,6 +10671,12 @@ pub const DB = struct {
             };
             const dependent = try context_dependency_db.dependentOf(self.alloc, entry.value);
             defer self.alloc.free(dependent);
+            if (context_dependency_db.active_collector) |collector| {
+                // Deferred: the host delivers, then acknowledges by content.
+                try collector.addDelivery(dependent, entry.value);
+                result.delivered += 1;
+                continue;
+            }
             dispatcher.deliverNotice(self.alloc, dependent, entry.value) catch |err| {
                 std.log.warn("context notice delivery deferred dependent={s} err={s}", .{ dependent, @errorName(err) });
                 result.remaining = true;
@@ -27405,8 +27447,11 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, context_maintenance, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
+            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, context_maintenance, context_read, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
+            /// `context_read`: a routed read of this group's own rows for a
+            /// distributed context-source host (graph adjacency, artifacts).
+            context: ?@import("context_host_wire.zig").ReadRequest = null,
         }, alloc, request_json, .{});
         defer request.deinit();
         if ((request.value.mode == .online_source_status) != (request.value.scope != null)) return error.InvalidOnlineSourceCommand;
@@ -27542,12 +27587,40 @@ pub const DB = struct {
                 }
                 try stream.write(types.LeannPlanStatus{ .proposals = out });
             },
+            .context_read => {
+                const read = request.value.context orelse return error.InvalidArgument;
+                const reader = @import("context_source_db_reader.zig").Adapter(DB);
+                switch (read.op) {
+                    .edges => {
+                        const edges = try reader.edges(self, alloc, read.graph_index, read.key, read.edge_types, read.direction, .{ .limit = read.limit, .include_generated = read.include_generated });
+                        defer @import("enrichment/context_resolution.zig").freeEdges(alloc, edges);
+                        try stream.write(edges);
+                    },
+                    .artifacts => {
+                        const values = try reader.artifacts(self, alloc, read.key, read.names);
+                        defer alloc.free(values);
+                        try stream.beginWriteRaw();
+                        try stream.writer.writeAll(values);
+                        stream.endWriteRaw();
+                    },
+                }
+            },
             .context_maintenance => {
-                // Leader-local context-dependency work (reconcile, backfill,
-                // inbox, outbox delivery); mutations are proposed by the
-                // installed replication hook and validated by every replica.
+                // Leader-local context-dependency planning (reconcile,
+                // backfill, topology, inbox, outbox). Nothing is proposed
+                // inside this owner call: plans and deliveries are returned
+                // for the host to propose, deliver, and acknowledge.
+                var collector = context_dependency_db.Collector{ .alloc = alloc };
+                defer collector.deinit();
+                context_dependency_db.active_collector = &collector;
+                defer context_dependency_db.active_collector = null;
                 const more = try self.runContextMaintenance();
-                try stream.write(.{ .more = more });
+                const Wire = struct {
+                    more: bool,
+                    proposals: []const []const u8,
+                    deliveries: []const context_dependency_db.Collector.Delivery,
+                };
+                try stream.write(Wire{ .more = more or !collector.isEmpty(), .proposals = collector.commands.items, .deliveries = collector.deliveries.items });
             },
             .graph_endpoint_cleanup => {
                 if (try self.prepareGraphEndpointCleanupBatch(alloc)) |owned| {
@@ -61203,6 +61276,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     // its global subscription/impact/debounce hints are copied for the moved
     // range so invalidation never misses a dependent after the split.
     try copyContextDependencyHints(self.alloc, self.core.store, dest_store, byte_range.start, byte_range.end);
+    try copyContextSplitState(self.alloc, self.core.store, dest_store);
     try @import("relational_integrity_range.zig").copyToUnpublished(self.alloc, self.backend_runtime.io(), self.core.store, dest_store, byte_range.start, byte_range.end);
     // Replicated apply reopens prepared shards from their local manifest;
     // it cannot consult metadata while metadata is waiting for that apply.
@@ -155532,6 +155606,39 @@ test "db replicated context dependencies apply leader plans identically on every
     try std.testing.expect(!try leader.runContextMaintenance());
 }
 
+/// Host-side deferred maintenance, as the data server runs it: the owner
+/// plans inside the call; the host proposes, delivers, and acknowledges.
+fn contextTestDeferredMaintenance(db: *DB, alloc: Allocator, pair: *ContextReplicaPair, deliver: context_dependency_db.Dispatcher) !void {
+    const command_mod = @import("enrichment/context_dependency_command.zig");
+    for (0..32) |_| {
+        var collector = context_dependency_db.Collector{ .alloc = alloc };
+        defer collector.deinit();
+        context_dependency_db.active_collector = &collector;
+        const more = db.runContextMaintenance() catch |err| {
+            context_dependency_db.active_collector = null;
+            return err;
+        };
+        context_dependency_db.active_collector = null;
+        for (collector.commands.items) |encoded| {
+            var parsed = try std.json.parseFromSlice(command_mod.Command, alloc, encoded, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            try pair.apply(.{ .context_dependency = parsed.value });
+        }
+        var acks = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (acks.items) |d| alloc.free(d);
+            acks.deinit(alloc);
+        }
+        for (collector.deliveries.items) |d| {
+            try deliver.deliverNotice(alloc, d.dependent, d.notice);
+            try acks.append(alloc, try command_mod.ackDigestHexAlloc(alloc, d.notice));
+        }
+        if (acks.items.len != 0) try pair.apply(.{ .context_dependency = .{ .acks = acks.items } });
+        if (!more and collector.isEmpty()) return;
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "db replicated context topology installs on every replica and catches up new inbound dependents" {
     const alloc = std.testing.allocator;
     var leader_dir = try TestDirectory.init("context-topology-leader");
@@ -155592,7 +155699,9 @@ test "db replicated context topology installs on every replica and catches up ne
     try leader.installContextHost(.{ .table_id = "", .dispatcher = .{ .ptr = &host, .deliver = Host.deliver }, .replication = .{ .ptr = &host, .propose_fn = Host.propose, .is_owner_fn = Host.isLeader }, .topology = .{ .ptr = &host, .fetch_fn = Host.fetch } });
     try follower.installContextHost(.{ .table_id = "", .dispatcher = .{ .ptr = &host, .deliver = Host.deliver }, .replication = .{ .ptr = &host, .propose_fn = Host.propose, .is_owner_fn = Host.notLeader }, .topology = .{ .ptr = &host, .fetch_fn = Host.fetch } });
 
-    while (try leader.runContextMaintenance()) {}
+    // Deferred, as the data server runs it (no proposal inside the owner call).
+    const deliver_to_host: context_dependency_db.Dispatcher = .{ .ptr = &host, .deliver = Host.deliver };
+    try contextTestDeferredMaintenance(&leader, alloc, &host.pair, deliver_to_host);
     try std.testing.expect(!try follower.runContextMaintenance());
     // Both replicas switched topology at the same log position.
     try std.testing.expectEqualStrings("srv:1", leader.contextSourceTableId());
@@ -155605,7 +155714,7 @@ test "db replicated context topology installs on every replica and catches up ne
     // Row changes stage notices on every replica; only the leader delivers,
     // and acknowledgements clear every replica's outbox.
     try host.pair.apply(.{ .writes = &.{.{ .key = "o:1", .value = "{\"org\":\"o1\",\"title\":\"t\"}" }} });
-    while (try leader.runContextMaintenance()) {}
+    try contextTestDeferredMaintenance(&leader, alloc, &host.pair, deliver_to_host);
     try std.testing.expect(host.delivered.items.len >= 2);
     const l = try contextTestDependencyFamiliesAlloc(&leader, alloc);
     defer alloc.free(l);

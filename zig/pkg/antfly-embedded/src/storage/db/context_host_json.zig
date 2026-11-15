@@ -58,7 +58,7 @@ pub const Host = struct {
     }
 
     pub fn readSource(self: *Host) reader_mod.ReadSource {
-        return .{ .ptr = self, .lookup_fn = lookup, .query_fn = query, .request_fn = request };
+        return .{ .ptr = self, .lookup_fn = lookup, .query_fn = query, .request_fn = request, .scan_fn = scan, .edges_fn = edges, .artifacts_fn = artifacts };
     }
 
     pub fn topology(self: *Host) Topology {
@@ -109,6 +109,42 @@ pub const Host = struct {
         const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .table = table_id, .request = request_json, .k = k }, .{});
         defer alloc.free(encoded);
         return pageFrom(alloc, try self.call.call(alloc, .request, encoded));
+    }
+
+    fn scan(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, envelope: []const u8, after: []const u8, limit: u32) anyerror!resolution.Page {
+        const self: *Host = @ptrCast(@alignCast(ptr));
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .table = table_id, .envelope = envelope, .after = after, .limit = limit }, .{});
+        defer alloc.free(encoded);
+        return pageFrom(alloc, try self.call.call(alloc, .scan, encoded));
+    }
+
+    fn edges(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: @import("enrichment/context_sources.zig").GraphSpec.Direction, options: resolution.EdgeOptions) anyerror![]resolution.Edge {
+        const self: *Host = @ptrCast(@alignCast(ptr));
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .table = table_id, .graph_index = graph_index, .node = node, .edge_types = types, .direction = direction, .limit = options.limit, .include_generated = options.include_generated }, .{});
+        defer alloc.free(encoded);
+        const out = try self.call.call(alloc, .edges, encoded);
+        defer alloc.free(out);
+        const parsed = try std.json.parseFromSlice([]const struct { edge_type: []const u8, neighbor: []const u8, outgoing: bool }, alloc, out, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const list = try alloc.alloc(resolution.Edge, parsed.value.len);
+        var filled: usize = 0;
+        errdefer {
+            resolution.freeEdges(alloc, list[0..filled]);
+        }
+        for (parsed.value, list) |src, *dst| {
+            const t = try alloc.dupe(u8, src.edge_type);
+            errdefer alloc.free(t);
+            dst.* = .{ .edge_type = t, .neighbor = try alloc.dupe(u8, src.neighbor), .outgoing = src.outgoing };
+            filled += 1;
+        }
+        return list;
+    }
+
+    fn artifacts(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8, names: []const []const u8) anyerror![]u8 {
+        const self: *Host = @ptrCast(@alignCast(ptr));
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .table = table_id, .key = key, .names = names }, .{});
+        defer alloc.free(encoded);
+        return self.call.call(alloc, .artifacts, encoded);
     }
 
     fn fetchTopology(ptr: *anyopaque, alloc: Allocator) anyerror![]u8 {

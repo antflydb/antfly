@@ -35,6 +35,27 @@ pub const Op = enum(u32) {
     request = 6,
     /// Response: `{"table_id","inbound":[DeclaredConfig]}`.
     topology = 7,
+    /// Request: `{"table","graph_index","node","edge_types","direction","limit","include_generated"}`.
+    /// Response: `[{"edge_type","neighbor","outgoing"}]`.
+    edges = 8,
+    /// Request: `{"table","key","names"}`. Response: `{"<artifact>":value|null}`.
+    artifacts = 9,
+    /// Request: `{"table","envelope","after","limit"}`: the page after key
+    /// `after` (exclusive; "" from the start). Response: page.
+    scan = 10,
+};
+
+/// A group-local context read (lookup mode `context_read`), routed by key
+/// to the group owning it.
+pub const ReadRequest = struct {
+    op: enum { edges, artifacts },
+    key: []const u8,
+    graph_index: []const u8 = "",
+    edge_types: []const []const u8 = &.{},
+    direction: @import("enrichment/context_sources.zig").GraphSpec.Direction = .out,
+    limit: u32 = 0,
+    include_generated: bool = false,
+    names: []const []const u8 = &.{},
 };
 
 /// Page response: `{"rows":[{"key","value"}],"exhausted":bool}`.

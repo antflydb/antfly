@@ -1060,6 +1060,19 @@ fn putSubscriptionValue(alloc: Allocator, reader: Reader, plan: *Plan, t: ctx.Su
 /// state (freshness, subscriptions, lineage) commit together everywhere.
 pub const intent_family: u8 = 0x09;
 
+/// Document key of a publish intent key (null when malformed).
+pub fn intentDocKey(key: []const u8) ?[]const u8 {
+    if (key.len < 8) return null;
+    var pos: usize = 4;
+    const artifact_len = std.mem.readInt(u32, key[pos..][0..4], .big);
+    pos += 4 + artifact_len;
+    if (pos + 4 > key.len) return null;
+    const doc_len = std.mem.readInt(u32, key[pos..][0..4], .big);
+    pos += 4;
+    if (pos + doc_len != key.len) return null;
+    return key[pos..];
+}
+
 pub fn intentKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     errdefer list.deinit(alloc);
@@ -1712,8 +1725,16 @@ pub fn copyHintsForRange(alloc: Allocator, source: Reader, plan: *Plan, lower: [
                     const entry = (try parseDebounceKeyAlloc(self.alloc, key)) orelse return true;
                     self.alloc.free(entry.artifact);
                     break :blk entry.doc_key;
-                } else if (key.len >= 4 and key[3] == pivot_family) {
-                    // Spec-wide: every destination needs the same pivots.
+                } else if (key.len >= 4 and (key[3] == pivot_family or key[3] == 0x07)) {
+                    // Spec-wide pivots, and delivered notices not yet applied
+                    // (inbox): every group applies a notice to the dependents
+                    // in its own range, so each destination needs them all.
+                    try self.plan.put(key, value);
+                    self.copied += 1;
+                    return true;
+                } else if (key.len >= 4 and key[3] == intent_family) {
+                    const doc = intentDocKey(key) orelse return true;
+                    if (!inRange(doc, self.lower, self.upper)) return true;
                     try self.plan.put(key, value);
                     self.copied += 1;
                     return true;
@@ -2287,4 +2308,33 @@ test "publish intents promote only for the recorded output and generation" {
     try testing.expect(!try planPromoteIntent(alloc, s.reader(), &plan, "doc", "summary", @splat(0xcc)));
     try commit(&s, &plan);
     try testing.expectEqual(@as(usize, 0), s.countPrefix(&familyPrefix(intent_family)));
+}
+
+test "split copies delivered inbox notices and publish intents for the moved range" {
+    const alloc = testing.allocator;
+    var src = MemoryStore{ .alloc = alloc };
+    defer src.deinit();
+    var plan = Plan.init(alloc);
+    defer plan.deinit();
+    // An inbox notice (every group applies it to its own range) and intents
+    // for documents inside and outside the moved range.
+    var inbox_key: [36]u8 = undefined;
+    @memcpy(inbox_key[0..4], &familyPrefix(0x07));
+    @memset(inbox_key[4..], 0xab);
+    try plan.put(&inbox_key, "notice");
+    const capture = Capture{ .generation = 0, .config_digest = @splat(1) };
+    try planPublishIntent(alloc, src.reader(), &plan, "m:1", "summary", @splat(1), .{ .capture = capture, .tuples = &.{}, .input_fingerprint = @splat(2) });
+    try planPublishIntent(alloc, src.reader(), &plan, "z:9", "summary", @splat(1), .{ .capture = capture, .tuples = &.{}, .input_fingerprint = @splat(2) });
+    try commit(&src, &plan);
+    const key = try intentKeyAlloc(alloc, "m:1", "summary");
+    defer alloc.free(key);
+    try testing.expectEqualStrings("m:1", intentDocKey(key).?);
+    var dest_plan = Plan.init(alloc);
+    defer dest_plan.deinit();
+    _ = try copyHintsForRange(alloc, src.reader(), &dest_plan, "m", "n");
+    var dest = MemoryStore{ .alloc = alloc };
+    defer dest.deinit();
+    try dest.apply(&dest_plan);
+    try testing.expectEqual(@as(usize, 1), dest.countPrefix(&familyPrefix(0x07)));
+    try testing.expectEqual(@as(usize, 1), dest.countPrefix(&familyPrefix(intent_family)));
 }

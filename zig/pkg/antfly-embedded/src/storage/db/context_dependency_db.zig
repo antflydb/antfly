@@ -727,6 +727,8 @@ pub fn ackOutbox(alloc: Allocator, primary: *docstore_mod.DocStore, manager: any
     if (keys.len == 0) return;
     const replication = manager.context_replication orelse return deleteOutboxKeys(primary, keys);
     if (!replication.isOwner()) return error.ContextDependencyNotOwner;
+    // Deferred: the host acknowledges after it delivered.
+    if (active_collector != null) return;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -778,6 +780,53 @@ pub const Committer = struct {
 
 pub const max_plan_attempts: usize = 4;
 
+/// Deferred proposals for leader maintenance run inside a host owner call.
+/// Proposing (and waiting for the entry to apply) from inside the call
+/// could wait on the owner it is holding, so planning collects commands and
+/// deliveries here and the host proposes, delivers, and acknowledges them
+/// after the call returns. Collected plans are validated at apply like any
+/// other: a plan that went stale meanwhile is a deterministic no-op and is
+/// re-planned on the next pass. Thread-local, so enrichment workers on other
+/// threads keep proposing synchronously.
+pub const Collector = struct {
+    alloc: Allocator,
+    /// JSON-encoded commands for this group, in plan order.
+    commands: std.ArrayListUnmanaged([]u8) = .empty,
+    deliveries: std.ArrayListUnmanaged(Delivery) = .empty,
+
+    pub const Delivery = struct { dependent: []u8, notice: []u8 };
+
+    pub fn deinit(self: *Collector) void {
+        for (self.commands.items) |c| self.alloc.free(c);
+        self.commands.deinit(self.alloc);
+        for (self.deliveries.items) |d| {
+            self.alloc.free(d.dependent);
+            self.alloc.free(d.notice);
+        }
+        self.deliveries.deinit(self.alloc);
+    }
+
+    pub fn addCommand(self: *Collector, command: command_mod.Command) !void {
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, command, .{});
+        errdefer self.alloc.free(encoded);
+        try self.commands.append(self.alloc, encoded);
+    }
+
+    pub fn addDelivery(self: *Collector, dependent: []const u8, notice: []const u8) !void {
+        const d = try self.alloc.dupe(u8, dependent);
+        errdefer self.alloc.free(d);
+        const n = try self.alloc.dupe(u8, notice);
+        errdefer self.alloc.free(n);
+        try self.deliveries.append(self.alloc, .{ .dependent = d, .notice = n });
+    }
+
+    pub fn isEmpty(self: *const Collector) bool {
+        return self.commands.items.len == 0 and self.deliveries.items.len == 0;
+    }
+};
+
+pub threadlocal var active_collector: ?*Collector = null;
+
 /// Plan and commit one context-dependency change. Locally: under the
 /// dependency lock, as one atomic batch. Replicated: only on the leader, as
 /// a proposal carrying the exact effects and the recorded read set, which
@@ -786,6 +835,19 @@ pub const max_plan_attempts: usize = 4;
 pub fn planAndCommit(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, planner: Planner) !void {
     if (manager.context_replication) |replication| {
         if (!replication.isOwner()) return error.ContextDependencyNotOwner;
+        if (active_collector) |collector| {
+            // Deferred: one plan, proposed by the host after the owner call.
+            var state = try StoreReader.init(primary);
+            defer state.deinit();
+            var recorder = command_mod.Recorder.init(alloc, state.reader());
+            defer recorder.deinit();
+            var plan = store.Plan.init(alloc);
+            defer plan.deinit();
+            try planner.plan_fn(planner.ptr, alloc, recorder.reader(), &plan);
+            if (plan.puts.items.len == 0 and plan.deletes.items.len == 0) return;
+            try collector.addCommand(try recorder.commandAlloc(&plan));
+            return;
+        }
         manager.lockContextProposals();
         defer manager.unlockContextProposals();
         var attempt: usize = 0;

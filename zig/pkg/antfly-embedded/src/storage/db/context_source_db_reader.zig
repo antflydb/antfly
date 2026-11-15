@@ -335,6 +335,9 @@ pub const ReadSource = struct {
         lookup: *const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8) anyerror!?[]u8,
         query: *const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, envelope: []const u8, offset: u32, limit: u32) anyerror!context_resolution.Page,
         request: *const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, request_json: []const u8, k: u32) anyerror!context_resolution.Page,
+        scan: *const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, envelope: []const u8, after: []const u8, limit: u32) anyerror!context_resolution.Page,
+        edges: *const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, options: context_resolution.EdgeOptions) anyerror![]context_resolution.Edge,
+        artifacts: *const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8, names: []const []const u8) anyerror![]u8,
     };
     const NativeBoundary = @import("../named_callback.zig").Boundary(Methods);
     callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
@@ -342,6 +345,9 @@ pub const ReadSource = struct {
     lookup_fn: @FieldType(Methods, "lookup"),
     query_fn: @FieldType(Methods, "query"),
     request_fn: @FieldType(Methods, "request"),
+    scan_fn: @FieldType(Methods, "scan"),
+    edges_fn: @FieldType(Methods, "edges"),
+    artifacts_fn: @FieldType(Methods, "artifacts"),
 
     fn lookup(self: ReadSource, alloc: Allocator, table_id: []const u8, key: []const u8) !?[]u8 {
         return NativeBoundary.call("lookup", self.callback_dispatch, self.lookup_fn, .{ self.ptr, alloc, table_id, key });
@@ -352,22 +358,56 @@ pub const ReadSource = struct {
     fn request(self: ReadSource, alloc: Allocator, table_id: []const u8, request_json: []const u8, k: u32) !context_resolution.Page {
         return NativeBoundary.call("request", self.callback_dispatch, self.request_fn, .{ self.ptr, alloc, table_id, request_json, k });
     }
+    fn scan(self: ReadSource, alloc: Allocator, table_id: []const u8, envelope: []const u8, after: []const u8, limit: u32) !context_resolution.Page {
+        return NativeBoundary.call("scan", self.callback_dispatch, self.scan_fn, .{ self.ptr, alloc, table_id, envelope, after, limit });
+    }
+    fn edges(self: ReadSource, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, options: context_resolution.EdgeOptions) ![]context_resolution.Edge {
+        return NativeBoundary.call("edges", self.callback_dispatch, self.edges_fn, .{ self.ptr, alloc, table_id, graph_index, node, types, direction, options });
+    }
+    fn artifacts(self: ReadSource, alloc: Allocator, table_id: []const u8, key: []const u8, names: []const []const u8) ![]u8 {
+        return NativeBoundary.call("artifacts", self.callback_dispatch, self.artifacts_fn, .{ self.ptr, alloc, table_id, key, names });
+    }
 };
 
 /// Resolution reader over a `ReadSource`. Every table, the own one included,
-/// is read through the host (a shard holds only part of its table). Graph
-/// adjacency, generated-artifact values, and the search shorthands need
-/// shard-local indexes and fail explicitly; declare `search.request` instead.
+/// is read through the host (a shard holds only part of its table): point
+/// lookups, key-cursor scans with the storage filter pushed down, graph
+/// adjacency and artifact values from the group owning the key, and ranked
+/// retrieval as a QueryRequest (the search shorthands are expressed as one).
 pub const RemoteReader = struct {
     source: ReadSource,
     own_table_id: []const u8,
+    /// Scan continuations: resolution pages by offset; a continuation that
+    /// follows a known page resumes after its last key instead of
+    /// re-scanning (resolutions run concurrently, so keyed and locked).
+    cursor_mutex: std.atomic.Mutex = .unlocked,
+    cursors: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    cursor_alloc: Allocator = std.heap.page_allocator,
 
     pub fn reader(self: *RemoteReader) context_resolution.Reader {
-        return .{ .ptr = self, .own_table_id = self.own_table_id, .lookup_fn = lookupImpl, .query_fn = queryImpl, .request_fn = requestImpl, .row_filter = row_filter };
+        return .{ .ptr = self, .own_table_id = self.own_table_id, .lookup_fn = lookupImpl, .query_fn = queryImpl, .request_fn = requestImpl, .search_fn = searchImpl, .edges_fn = edgesImpl, .artifacts_fn = artifactsImpl, .row_filter = row_filter };
+    }
+
+    pub fn deinit(self: *RemoteReader) void {
+        var it = self.cursors.valueIterator();
+        while (it.next()) |v| self.cursor_alloc.free(v.*);
+        self.cursors.deinit(self.cursor_alloc);
     }
 
     fn target(self: *RemoteReader, table_id: []const u8) []const u8 {
         return if (table_id.len == 0) self.own_table_id else table_id;
+    }
+
+    fn cursorKey(table_id: []const u8, envelope: []const u8, offset: u32) u64 {
+        var h = std.hash.Wyhash.init(offset);
+        h.update(table_id);
+        h.update(&.{0});
+        h.update(envelope);
+        return h.final();
+    }
+
+    fn lockCursors(self: *RemoteReader) void {
+        while (!self.cursor_mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
     fn lookupImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8) anyerror!?[]u8 {
@@ -377,11 +417,68 @@ pub const RemoteReader = struct {
 
     fn queryImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, envelope: []const u8, offset: u32, limit: u32) anyerror!context_resolution.Page {
         const self: *RemoteReader = @ptrCast(@alignCast(ptr));
-        return self.source.query(alloc, self.target(table_id), envelope, offset, limit);
+        const table = self.target(table_id);
+        var after: ?[]u8 = null;
+        defer if (after) |a| self.cursor_alloc.free(a);
+        if (offset != 0) {
+            self.lockCursors();
+            defer self.cursor_mutex.unlock();
+            if (self.cursors.fetchRemove(cursorKey(table, envelope, offset))) |entry| after = entry.value;
+        }
+        // An unknown continuation (no page before it here) pages by offset.
+        if (offset != 0 and after == null) return self.source.query(alloc, table, envelope, offset, limit);
+        const page = try self.source.scan(alloc, table, envelope, after orelse "", limit);
+        if (!page.exhausted and page.rows.len != 0) {
+            const last = try self.cursor_alloc.dupe(u8, page.rows[page.rows.len - 1].key);
+            self.lockCursors();
+            defer self.cursor_mutex.unlock();
+            const gop = self.cursors.getOrPut(self.cursor_alloc, cursorKey(table, envelope, offset + @as(u32, @intCast(page.rows.len)))) catch {
+                self.cursor_alloc.free(last);
+                return page;
+            };
+            if (gop.found_existing) self.cursor_alloc.free(gop.value_ptr.*);
+            gop.value_ptr.* = last;
+        }
+        return page;
     }
 
     fn requestImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, request_json: []const u8, k: u32) anyerror!context_resolution.Page {
         const self: *RemoteReader = @ptrCast(@alignCast(ptr));
         return self.source.request(alloc, self.target(table_id), request_json, k);
+    }
+
+    /// Search shorthands as QueryRequests: full-text relevance as a `match`
+    /// in `full_text_search`, dense k-NN as a precomputed `embeddings` entry.
+    fn searchImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, q: context_resolution.SearchQuery) anyerror!context_resolution.Page {
+        const self: *RemoteReader = @ptrCast(@alignCast(ptr));
+        const request_json = if (q.vector.len != 0) blk: {
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            errdefer out.deinit();
+            var stream: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+            try stream.beginObject();
+            try stream.objectField("embeddings");
+            try stream.beginObject();
+            try stream.objectField(q.vector_index);
+            try stream.write(q.vector);
+            try stream.endObject();
+            try stream.objectField("indexes");
+            try stream.write(&[_][]const u8{q.vector_index});
+            try stream.objectField("limit");
+            try stream.write(q.k);
+            try stream.endObject();
+            break :blk try out.toOwnedSlice();
+        } else try std.json.Stringify.valueAlloc(alloc, .{ .full_text_search = .{ .match = q.text, .field = q.text_field }, .limit = q.k }, .{});
+        defer alloc.free(request_json);
+        return self.source.request(alloc, self.target(table_id), request_json, q.k);
+    }
+
+    fn edgesImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, options: context_resolution.EdgeOptions) anyerror![]context_resolution.Edge {
+        const self: *RemoteReader = @ptrCast(@alignCast(ptr));
+        return self.source.edges(alloc, self.target(table_id), graph_index, node, types, direction, options);
+    }
+
+    fn artifactsImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8, names: []const []const u8) anyerror![]u8 {
+        const self: *RemoteReader = @ptrCast(@alignCast(ptr));
+        return self.source.artifacts(alloc, self.target(table_id), key, names);
     }
 };

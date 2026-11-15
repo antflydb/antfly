@@ -6767,6 +6767,14 @@ pub const DataServer = struct {
         return a.dupe(u64, routes.group_ids);
     }
 
+    fn contextGroupForKey(ptr: *anyopaque, a: std.mem.Allocator, table_name: []const u8, key: []const u8) anyerror!u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const catalog = antfly.public_api.table_catalog;
+        const route = try catalog.routedGroupSnapshotUntil(a, self.write_source.catalog, table_name, key, self.write_source.catalog.deadlineFrom(.{ .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s }));
+        const selected = route.route orelse return error.TopologyChanged;
+        return selected.group_id;
+    }
+
     fn contextTables(ptr: *anyopaque, a: std.mem.Allocator) anyerror![]const antfly.public_api.context_host.TableInfo {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         var snapshot = try self.write_source.catalog.adminSnapshot();
@@ -6840,15 +6848,44 @@ pub const DataServer = struct {
         const job: *ContextMaintenanceJob = @ptrCast(@alignCast(ptr));
         const server = job.server;
         const budget_end = platform_time.monotonicNs() +| 2 * std.time.ns_per_s;
+        const command_mod = @import("antfly_local_sources").storage_db_enrichment_context_dependency_command;
         for (0..64) |_| {
             if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
             if (server.hotStandbyWriteGate()) |gate| try gate.check();
             if (server.group_leadership_source) |leadership| if (!leadership.isLocalLeader(job.group_id)) return error.NotLeader;
+            var arena = std.heap.ArenaAllocator.init(server.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            // The owner only plans; every proposal and delivery happens here,
+            // outside the owner call, so no proposal ever waits on an owner
+            // the caller holds.
             var response = (try server.read_source.source().lookupGroupLocal(server.alloc, job.group_id, job.table, "", .{ .relational_topology_json = "{\"mode\":\"context_maintenance\"}", .execution_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&server.background_jobs_shutdown) }, .leader_lease)) orelse return;
             defer response.deinit(server.alloc);
-            const status = std.json.parseFromSlice(struct { more: bool = false }, server.alloc, response.json, .{ .ignore_unknown_fields = true }) catch return;
-            defer status.deinit();
-            if (!status.value.more) return;
+            const status = try std.json.parseFromSliceLeaky(struct {
+                more: bool = false,
+                proposals: []const []const u8 = &.{},
+                deliveries: []const struct { dependent: []const u8, notice: []const u8 } = &.{},
+            }, a, response.json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+            for (status.proposals) |encoded| {
+                const command = try std.json.parseFromSliceLeaky(command_mod.Command, a, encoded, .{ .allocate = .alloc_always });
+                try contextPropose(server, a, job.group_id, job.table, command, false);
+            }
+            if (status.deliveries.len != 0) {
+                const host = &(server.context_host orelse return);
+                var acks = std.ArrayListUnmanaged([]const u8).empty;
+                for (status.deliveries) |d| {
+                    const request = try std.json.Stringify.valueAlloc(a, .{ .dependent = d.dependent, .notice = d.notice }, .{});
+                    const out = host.call(a, @backingInt(@import("antfly_local_sources").storage_db_context_host_wire.Op.deliver), job.group_id, job.table, request) catch |err| {
+                        // Undelivered entries stay in the outbox for the next pass.
+                        std.log.warn("context notice delivery deferred table={s} group_id={d} err={s}", .{ job.table, job.group_id, @errorName(err) });
+                        continue;
+                    };
+                    _ = out;
+                    try acks.append(a, try command_mod.ackDigestHexAlloc(a, d.notice));
+                }
+                if (acks.items.len != 0) try contextPropose(server, a, job.group_id, job.table, .{ .acks = acks.items }, false);
+            }
+            if (!status.more) return;
             if (platform_time.monotonicNs() >= budget_end) return;
         }
     }
@@ -7290,6 +7327,7 @@ pub const DataServer = struct {
             .propose_fn = contextPropose,
             .is_leader_fn = contextIsLeader,
             .groups_fn = contextGroups,
+            .group_for_key_fn = contextGroupForKey,
             .tables_fn = contextTables,
             .reads_fn = contextReads,
             .collect = .{ .collect_fn = contextCollect },

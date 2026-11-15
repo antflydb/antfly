@@ -22,9 +22,9 @@
 //! can never retarget a dependency.
 //!
 //! Admission helpers canonicalize a public `context_sources` declaration
-//! against the catalog, reject cross-table generated-input cycles, and reject
-//! source kinds that need shard-local indexes (graph traversal, generated
-//! artifact values, and the search shorthands) on distributed tables.
+//! against the catalog and reject cross-table generated-input cycles. Graph
+//! adjacency and generated-artifact values are read from the group owning
+//! the key; the search shorthands run as QueryRequests.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -123,9 +123,8 @@ fn resolveName(ptr: *anyopaque, alloc: Allocator, name: []const u8) anyerror!?[]
 }
 
 /// Admission for a distributed table: canonicalize the public declaration
-/// (table names to identities, row filters lowered by `lowering`), reject
-/// kinds that need shard-local indexes, and reject generated-input cycles
-/// across tables. Returns the canonical stored JSON.
+/// (table names to identities, row filters lowered by `lowering`) and reject
+/// generated-input cycles across tables. Returns the canonical stored JSON.
 pub fn admitAlloc(
     alloc: Allocator,
     tables: []const TableInfo,
@@ -144,11 +143,6 @@ pub fn admitAlloc(
     const stored = try ctx.canonicalFromPublicAlloc(a, sources_value, refresh_value, resolver(&table_list), lowering);
     var config = try ctx.parseStoredJson(a, stored);
     defer config.deinit();
-    for (config.sources) |source| {
-        if (source.kind == .graph) return error.UnsupportedContextPredicate;
-        if (source.artifact_names.len != 0) return error.UnsupportedContextPredicate;
-        if (source.kind == .search and source.search.request.len == 0) return error.UnsupportedContextPredicate;
-    }
     const owner_identity = try identityAlloc(a, owner.table_id);
     const declared = try declarationsAlloc(a, tables, collect);
     // The candidate replaces any previous declaration of the same name.
@@ -171,6 +165,8 @@ pub const Primitives = struct {
     is_leader_fn: *const fn (ptr: *anyopaque, group_id: u64) bool,
     /// Every group of a table.
     groups_fn: *const fn (ptr: *anyopaque, alloc: Allocator, table_name: []const u8) anyerror![]const u64,
+    /// The group owning `key` in `table_name`.
+    group_for_key_fn: *const fn (ptr: *anyopaque, alloc: Allocator, table_name: []const u8, key: []const u8) anyerror!u64,
     /// The catalog (allocated in `a`).
     tables_fn: *const fn (ptr: *anyopaque, a: Allocator) anyerror![]const TableInfo,
     reads_fn: *const fn (ptr: *anyopaque) table_reads.TableReadSource,
@@ -219,30 +215,37 @@ pub const Host = struct {
                 return std.json.Stringify.valueAlloc(alloc, .{ .value = @as(?[]const u8, response.json) }, .{});
             },
             .query => {
+                // Offset continuation without a cursor (rare: resolution pages
+                // sequentially and the storage reader resumes by key).
                 const body = try std.json.parseFromSliceLeaky(struct { table: []const u8, envelope: []const u8, offset: u32, limit: u32 }, a, request, .{ .allocate = .alloc_always });
                 const name = try self.tableName(a, body.table, table_name);
-                const envelope = try std.json.parseFromSliceLeaky(std.json.Value, a, body.envelope, .{});
-                const scan_filter: []const u8 = if (envelope == .object) if (envelope.object.get("scan")) |v| (if (v == .null) "" else try std.json.Stringify.valueAlloc(a, v, .{})) else "" else "";
                 const want = @min(@as(u64, body.offset) + body.limit + 1, max_scan_rows);
-                var response = (try p.reads_fn(p.ptr).scan(alloc, name, "", "", .{ .include_documents = false, .filter_query_json = scan_filter, .limit = @intCast(want) }, .read_index)) orelse
-                    return host_json.encodePageAlloc(alloc, &.{}, true);
-                defer response.deinit(alloc);
-                var keys = std.ArrayListUnmanaged([]const u8).empty;
-                var lines = std.mem.splitScalar(u8, response.ndjson, '\n');
-                while (lines.next()) |line| {
-                    if (line.len == 0) continue;
-                    const wire = try std.json.parseFromSliceLeaky(struct { _id: []const u8 }, a, line, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
-                    try keys.append(a, wire._id);
-                }
-                const start = @min(keys.items.len, body.offset);
-                const end = @min(keys.items.len, @as(usize, body.offset) + body.limit);
-                var rows = std.ArrayListUnmanaged(local.storage_db_enrichment_context_resolution.Row).empty;
-                for (keys.items[start..end]) |key| {
-                    var doc = (try p.reads_fn(p.ptr).lookup(alloc, name, key, .{}, .read_index)) orelse continue;
-                    defer doc.deinit(alloc);
-                    try rows.append(a, .{ .key = try a.dupe(u8, key), .value = try a.dupe(u8, doc.json) });
-                }
-                return host_json.encodePageAlloc(alloc, rows.items, keys.items.len <= end);
+                const keys = try scanKeys(p, alloc, a, name, try scanFilter(a, body.envelope), "", @intCast(want));
+                const start = @min(keys.len, body.offset);
+                const end = @min(keys.len, @as(usize, body.offset) + body.limit);
+                const rows = try hydrateRows(p, alloc, a, name, keys[start..end]);
+                return host_json.encodePageAlloc(alloc, rows, keys.len <= end);
+            },
+            .scan => {
+                const body = try std.json.parseFromSliceLeaky(struct { table: []const u8, envelope: []const u8, after: []const u8, limit: u32 }, a, request, .{ .allocate = .alloc_always });
+                const name = try self.tableName(a, body.table, table_name);
+                const limit = @min(body.limit, max_scan_rows);
+                const keys = try scanKeys(p, alloc, a, name, try scanFilter(a, body.envelope), body.after, limit + 1);
+                const page = keys[0..@min(keys.len, limit)];
+                const rows = try hydrateRows(p, alloc, a, name, page);
+                return host_json.encodePageAlloc(alloc, rows, keys.len <= limit);
+            },
+            .edges => {
+                const body = try std.json.parseFromSliceLeaky(struct { table: []const u8, graph_index: []const u8, node: []const u8, edge_types: []const []const u8 = &.{}, direction: []const u8 = "out", limit: u32 = 0, include_generated: bool = false }, a, request, .{ .allocate = .alloc_always });
+                const name = try self.tableName(a, body.table, table_name);
+                const read = try std.json.Stringify.valueAlloc(a, .{ .mode = "context_read", .context = .{ .op = "edges", .key = body.node, .graph_index = body.graph_index, .edge_types = body.edge_types, .direction = body.direction, .limit = body.limit, .include_generated = body.include_generated } }, .{});
+                return self.groupRead(alloc, a, name, body.node, read);
+            },
+            .artifacts => {
+                const body = try std.json.parseFromSliceLeaky(struct { table: []const u8, key: []const u8, names: []const []const u8 }, a, request, .{ .allocate = .alloc_always });
+                const name = try self.tableName(a, body.table, table_name);
+                const read = try std.json.Stringify.valueAlloc(a, .{ .mode = "context_read", .context = .{ .op = "artifacts", .key = body.key, .names = body.names } }, .{});
+                return self.groupRead(alloc, a, name, body.key, read);
             },
             .request => {
                 const body = try std.json.parseFromSliceLeaky(struct { table: []const u8, request: []const u8, k: u32 }, a, request, .{ .allocate = .alloc_always });
@@ -262,6 +265,15 @@ pub const Host = struct {
         }
     }
 
+    /// A group-local context read on the group owning `key`.
+    fn groupRead(self: *Host, alloc: Allocator, a: Allocator, table: []const u8, key: []const u8, read_json: []const u8) ![]u8 {
+        const p = self.primitives;
+        const group = try p.group_for_key_fn(p.ptr, a, table, key);
+        var response = (try p.reads_fn(p.ptr).lookupGroupLocal(alloc, group, table, "", .{ .relational_topology_json = read_json }, .read_index)) orelse return error.ContextSourceTableUnavailable;
+        defer response.deinit(alloc);
+        return alloc.dupe(u8, response.json);
+    }
+
     fn tableName(self: *Host, a: Allocator, identity: []const u8, own: []const u8) ![]const u8 {
         if (identity.len == 0) return own;
         const p = self.primitives;
@@ -269,6 +281,55 @@ pub const Host = struct {
         return (findByIdentity(tables, identity) orelse return error.ContextSourceTableUnavailable).name;
     }
 };
+
+fn scanFilter(a: Allocator, envelope_json: []const u8) ![]const u8 {
+    const envelope = try std.json.parseFromSliceLeaky(std.json.Value, a, envelope_json, .{});
+    if (envelope != .object) return "";
+    const v = envelope.object.get("scan") orelse return "";
+    if (v == .null) return "";
+    return std.json.Stringify.valueAlloc(a, v, .{});
+}
+
+/// Keys of the rows matching the storage filter (evaluated by every group),
+/// in key order, after `after` (exclusive; "" from the start).
+fn scanKeys(p: Primitives, alloc: Allocator, a: Allocator, table: []const u8, filter: []const u8, after: []const u8, limit: u32) ![]const []const u8 {
+    var response = (try p.reads_fn(p.ptr).scan(alloc, table, after, "", .{ .include_documents = false, .inclusive_from = after.len == 0, .filter_query_json = filter, .limit = limit }, .read_index)) orelse return &.{};
+    defer response.deinit(alloc);
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    var lines = std.mem.splitScalar(u8, response.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const wire = try std.json.parseFromSliceLeaky(struct { _id: []const u8 }, a, line, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        if (after.len != 0 and std.mem.eql(u8, wire._id, after)) continue;
+        try keys.append(a, wire._id);
+    }
+    return keys.items;
+}
+
+/// Logical documents for `keys`, hydrated in bounded exact-ID batches
+/// through the routed read fence (one round trip per 64 keys, not per key).
+fn hydrateRows(p: Primitives, alloc: Allocator, a: Allocator, table: []const u8, keys: []const []const u8) ![]local.storage_db_enrichment_context_resolution.Row {
+    var rows = std.ArrayListUnmanaged(local.storage_db_enrichment_context_resolution.Row).empty;
+    var start: usize = 0;
+    while (start < keys.len) {
+        const batch = keys[start..@min(keys.len, start + 64)];
+        start += batch.len;
+        var hydrated = (try p.reads_fn(p.ptr).hydrateDocuments(alloc, table, .{
+            .document_authority_mode = .lookup,
+            .query = .match_all,
+            .filter_doc_ids_positive = true,
+            .filter_doc_ids = batch,
+            .include_stored = true,
+            .limit = @intCast(batch.len),
+        }, .read_index)) orelse continue;
+        defer hydrated.deinit();
+        for (batch, hydrated.rows) |key, doc| {
+            const value = doc orelse continue;
+            try rows.append(a, .{ .key = try a.dupe(u8, key), .value = try a.dupe(u8, value) });
+        }
+    }
+    return rows.items;
+}
 
 /// `{"responses":[{"hits":{"hits":[{"_id","_source"}]}}]}` to a page.
 fn hitsPageAlloc(alloc: Allocator, a: Allocator, body: []const u8) ![]u8 {
@@ -306,7 +367,7 @@ fn testCollect(a: Allocator, indexes_json: []const u8) anyerror![]const db_types
     return out;
 }
 
-test "context host admission resolves names, rejects shard-local kinds, and computes inbound topology" {
+test "context host admission resolves names, rejects cycles, and computes inbound topology" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -329,10 +390,28 @@ test "context host admission resolves names, rejects shard-local kinds, and comp
     try std.testing.expectError(error.UnknownContextSourceTable, admitAlloc(alloc, &tables, collect, "docs", "s", try parse.of(a,
         \\{"x":{"document":{"table":"missing","key_from":"/k"},"fields":["a"]}}
     ), null, null));
-    try std.testing.expectError(error.UnsupportedContextPredicate, admitAlloc(alloc, &tables, collect, "docs", "s", try parse.of(a,
+    // Graph sources and generated-artifact fields are admitted (read from the
+    // owning group); a cross-table artifact cycle is not.
+    const graph = try admitAlloc(alloc, &tables, collect, "docs", "s", try parse.of(a,
         \\{"g":{"graph":{"graph_index":"refs"},"fields":["a"]}}
-    ), null, null));
-    try std.testing.expectError(error.UnsupportedContextPredicate, admitAlloc(alloc, &tables, collect, "docs", "s", try parse.of(a,
+    ), null, null);
+    alloc.free(graph);
+    const artifacts = try admitAlloc(alloc, &tables, collect, "docs", "s", try parse.of(a,
+        \\{"x":{"query":{"table":"orgs","filter_query":{"field":"k","term":"v"}},"fields":["_artifacts.tag"]}}
+    ), null, null);
+    alloc.free(artifacts);
+
+    // `orgs.tag` reading `docs.summary` while `docs.summary` reads
+    // `orgs._artifacts.tag` closes a cycle across tables.
+    const reads_tag = try admitAlloc(alloc, &tables, collect, "docs", "summary", try parse.of(a,
+        \\{"x":{"query":{"table":"orgs","filter_query":{"field":"k","term":"v"}},"fields":["_artifacts.tag"]}}
+    ), null, null);
+    defer alloc.free(reads_tag);
+    var cyclic = tables;
+    cyclic[0].indexes_json = try std.fmt.allocPrint(a, "{{\"enrichments\":[{{\"name\":\"tag\",\"context_sources_json\":{f}}}]}}", .{std.json.fmt(try admitAlloc(a, &tables, collect, "orgs", "tag", try parse.of(a,
+        \\{"y":{"query":{"table":"docs","filter_query":{"field":"k","term":"v"}},"fields":["_artifacts.summary"]}}
+    ), null, null), .{})});
+    try std.testing.expectError(error.ContextSourceFeedbackCycle, admitAlloc(alloc, &cyclic, collect, "docs", "summary", try parse.of(a,
         \\{"x":{"query":{"table":"orgs","filter_query":{"field":"k","term":"v"}},"fields":["_artifacts.tag"]}}
     ), null, null));
 
@@ -363,6 +442,9 @@ test "context host delivers notices to every group of the dependent table" {
             for (out, 0..) |*g, i| g.* = 10 + i;
             return out;
         }
+        fn groupForKey(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!u64 {
+            return 10;
+        }
         fn tables(_: *anyopaque, a: Allocator) anyerror![]const TableInfo {
             const out = try a.alloc(TableInfo, 2);
             out[0] = .{ .table_id = 7, .name = "orgs", .indexes_json = "{}" };
@@ -378,7 +460,7 @@ test "context host delivers notices to every group of the dependent table" {
     };
     var fake = Fake{};
     defer fake.proposals.deinit(alloc);
-    var host = Host{ .primitives = .{ .ptr = &fake, .propose_fn = Fake.propose, .is_leader_fn = Fake.isLeader, .groups_fn = Fake.groups, .tables_fn = Fake.tables, .reads_fn = Fake.reads, .collect = .{ .collect_fn = testCollect }, .parse_query_fn = Fake.parseQuery } };
+    var host = Host{ .primitives = .{ .ptr = &fake, .propose_fn = Fake.propose, .is_leader_fn = Fake.isLeader, .groups_fn = Fake.groups, .group_for_key_fn = Fake.groupForKey, .tables_fn = Fake.tables, .reads_fn = Fake.reads, .collect = .{ .collect_fn = testCollect }, .parse_query_fn = Fake.parseQuery } };
     const out = try host.call(alloc, @backingInt(host_json.Op.deliver), 10, "orgs", "{\"dependent\":\"srv:9\",\"notice\":\"n\"}");
     alloc.free(out);
     try std.testing.expectEqual(@as(usize, 3), fake.proposals.items.len);
