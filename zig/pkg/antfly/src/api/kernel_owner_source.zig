@@ -1706,6 +1706,39 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer response.deinit();
     }
 
+    /// Apply retention through the same descriptor-pinned owner as row replay.
+    /// This never resolves live metadata on the Raft progress thread.
+    pub fn applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        command: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command,
+        raft_term: u64,
+        raft_index: u64,
+    ) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome {
+        var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
+            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false)
+        else blk: {
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :blk self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_graph_indexes = false }) catch |err| switch (err) {
+                error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+                else => return err,
+            };
+        };
+        defer lease.deinit();
+        const json = try std.json.Stringify.valueAlloc(alloc, command, .{});
+        defer alloc.free(json);
+        var response = try lease.owner().orderedHistoryControlJson(table_name, json, raft_term, raft_index);
+        defer response.deinit();
+        if (response.bytes().len > 4096) return error.InvalidArgument;
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome, alloc, response.bytes(), .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub fn waitForCurrentSyncGroupLocal(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,

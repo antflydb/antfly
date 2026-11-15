@@ -31,6 +31,11 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .history_authority_required, .err = error.HistoryAuthorityRequired },
+    .{ .status = .history_corrupt, .err = error.HistoryCorrupt },
+    .{ .status = .history_resynchronization_required, .err = error.HistoryResynchronizationRequired },
+    .{ .status = .conflicting_ordered_apply_receipt, .err = error.ConflictingOrderedApplyReceipt },
+    .{ .status = .invalid_ordered_apply_receipt, .err = error.InvalidOrderedApplyReceipt },
     .{ .status = .storage_descriptor_pressure, .err = error.StorageDescriptorPressure },
     .{ .status = .process_fd_quota_exceeded, .err = error.ProcessFdQuotaExceeded },
     .{ .status = .system_fd_quota_exceeded, .err = error.SystemFdQuotaExceeded },

@@ -23,7 +23,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Older owners must reject their operation identifiers before dispatch.
 // Version 90 also fences certified graph document-key descriptor domains.
 // Version 91 fences selected-role merge-readiness projection responses.
-pub const abi_version: u32 = 91;
+// Version 92 adds ordered history control and its stable retention failures.
+pub const abi_version: u32 = 92;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1966,6 +1967,14 @@ pub extern fn antfly_storage_owner_replicated_batch_json(
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
+    owner: ?*anyopaque,
+    request: *const ReplicatedBatchAtRaftEntryRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Private committed retention command. Uses the same immutable entry identity
+/// header; its request/response JSON are typed history command/outcome values.
+pub extern fn antfly_storage_owner_ordered_history_control_json(
     owner: ?*anyopaque,
     request: *const ReplicatedBatchAtRaftEntryRequest,
     out_response: *OwnedBytes,

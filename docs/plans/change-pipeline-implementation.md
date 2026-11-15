@@ -1088,6 +1088,46 @@ owner-routed submission and linearizable inspection/pages remain the next
 integration boundary. No public feed or replication capability is advertised by
 this codec milestone.
 
+## In progress: compiled owner retention dispatch
+
+Private owner ABI 92 adds `orderedHistoryControlJson`, with bounded typed
+command/outcome JSON and the existing immutable term/index request header.
+The native provider invokes the atomic ordered control primitive; reducer
+rejections remain typed results, while corruption and entry conflicts retain
+their exact stable error identities. The new statuses append to the existing
+registry without renumbering published values. Older owner headers are rejected
+before dispatch. Writer contention uses the existing committed-entry retry
+normalization. Response allocation may fail after commit, so recovery continues
+to use the durable command/result receipt rather than inventing a new command.
+
+`ProvisionedKernelOwnerSource.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry`
+uses the same descriptor-pinned owner admission as row replay, without resolving
+live catalog state. Production admission is nonblocking on the Raft progress
+thread and uses the prepared control lane; direct fixture admission exercises
+the same compiled physical owner. Its result type belongs to the shared table
+write contract, independently of the intentionally opaque control-side DB type.
+No borrowed native result bytes escape the owner lease.
+
+The compiled source qualification applies enrollment and a rejected future ACK,
+reopens the physical owner, recovers the exact rejection, rejects a different
+command at the same entry, reports supersession explicitly and verifies that
+ACK progress stayed unchanged. A catalog which fails any admin or routing read
+records zero calls throughout. The test also checks old-header rejection before
+handle dispatch. The 15 error-registry tests and two frozen status-number tests
+pass. Logs: `zig/ordered-history-owner-final-qualification.log`,
+`zig/ordered-history-error-registry-qualification.log`, and
+`zig/ordered-history-error-abi-qualification.log`. The existing broad owner
+operation/replay regression is tracked in
+`zig/ordered-history-owner-regression-qualification.log`.
+That existing owner regression passes under ABI 92, including ordinary
+operations and non-idempotent row-transform replay at an exact Raft entry.
+
+This completes the compiled owner call, not data-Raft state-machine submission.
+Projection gating, dedicated entry dispatch, protocol activation, owner-routed
+submission and linearizable history inspection/pages are still outstanding.
+The advertised data-Raft maximum remains 29 and ordinary entry decode continues
+to reject retention envelopes until that integration is complete.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

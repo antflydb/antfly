@@ -876,6 +876,11 @@ pub const Status = enum(u32) {
     system_fd_quota_exceeded = 916,
     persistent_descriptor_admission_exhausted = 917,
     storage_descriptor_pressure = 918,
+    history_authority_required = 919,
+    history_corrupt = 920,
+    history_resynchronization_required = 921,
+    conflicting_ordered_apply_receipt = 922,
+    invalid_ordered_apply_receipt = 923,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

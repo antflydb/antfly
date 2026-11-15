@@ -4546,6 +4546,27 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
     return .ok;
 }
 
+pub fn storageOwnerOrderedHistoryControlJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.raft_term == 0 or request.raft_index == 0 or request.request_json.len > 4096 or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const Command = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command;
+    var parsed = std.json.parseFromSlice(Command, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    defer parsed.deinit();
+    const outcome = handle.db.applyOrderedHistoryConsumerControl(parsed.value, .{ .term = request.raft_term, .index = request.raft_index }, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    // Response allocation can fail after commit. The durable entry/result
+    // receipt makes a retry of this exact command recover its original result.
+    const response = std.json.Stringify.valueAlloc(std.heap.c_allocator, outcome, .{}) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = response.ptr, .len = response.len };
+    return .ok;
+}
+
 pub fn storageOwnerNativeFkGenerationControlJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.NativeFkGenerationControlRequest,
