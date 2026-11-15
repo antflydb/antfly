@@ -9518,11 +9518,31 @@ pub const NativeFile = struct {
 
     /// Capture only the immutable header/inode fence. The caller can release
     /// its foreground gate before walking the protected page graphs.
+    ///
+    /// `pin_read_checkpoint = true`: this reader's whole reason to exist is
+    /// a long, unprotected walk (`completeAllocatorVerification`'s
+    /// `validateIndexedAllocator`/`validateIndexedOwnership`, reading many
+    /// data pages) that the caller deliberately runs *after* releasing the
+    /// admission gate (`verifyAllocatorAssumeLocked`'s own comment: "Keep
+    /// it outside both publication locks"), so a concurrent writer is free
+    /// to keep committing and folding while this walk is in flight. Before
+    /// this pin, nothing protected that walk's pages from exactly that
+    /// fold -- the header-equality check below only catches a change that
+    /// already happened by the time this function returns, not one that
+    /// happens during the walk this reader exists to run (confirmed: the
+    /// `benchcrash` sequential-batch repro's `UnexpectedNativePageKind`
+    /// traced here, through `validateIndexedOwnership`'s own
+    /// `decodePagePayload(raw, .data)`). Safe to hold for this reader's
+    /// whole lifetime, unlike a cached, open-ended one
+    /// (`initializeReadGenerationAssumeLocked`'s own): every caller closes
+    /// this reader itself once its one walk finishes (`allocatorVerificationSnapshot`/
+    /// `prepareAllocatorVerification`'s own `defer`), never retains or
+    /// reuses it across turns.
     pub fn captureAllocatorVerificationSnapshot(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !*NativeFile {
         if (cancel) |token| try token.check();
         const reader = try self.allocator.create(NativeFile);
         errdefer self.allocator.destroy(reader);
-        reader.* = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{ .read_only = true, .resource_manager = self.page_cache.resource_manager });
+        reader.* = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{ .read_only = true, .pin_read_checkpoint = true, .resource_manager = self.page_cache.resource_manager });
         errdefer reader.close();
         reader.page_cache_policy = .metadata_only;
         reader.allocator_cancel_token = cancel;
