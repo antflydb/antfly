@@ -44,6 +44,7 @@ pub const createPjrtSession = implementation.createPjrtSession;
 pub const createPjrtSessionWithTaskOverride = implementation.createPjrtSessionWithTaskOverride;
 pub const createPjrtSessionWithOptions = implementation.createPjrtSessionWithOptions;
 pub const PjrtSessionOptions = implementation.PjrtSessionOptions;
+pub const createPjrtSessionFromManifestWithOptions = implementation.createPjrtSessionFromManifestWithOptions;
 pub const getPjrtClientPtr = implementation.getPjrtClientPtr;
 pub const createMetalSession = implementation.createMetalSession;
 pub const createMetalSessionWithTaskOverride = implementation.createMetalSessionWithTaskOverride;

@@ -42,6 +42,11 @@ fn vmCounters() ![3]u64 {
     return result;
 }
 
+fn positivePolicyBytes(value: []const u8) !usize {
+    const bytes = try std.fmt.parseInt(usize, value, 10);
+    return if (bytes == 0) error.InvalidPjrtMemoryPolicy else bytes;
+}
+
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
@@ -62,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
         if (i + 1 >= args.len) return error.MissingArgument;
         const key = args[i];
         const value = args[i + 1];
-        if (std.mem.eql(u8, key, "--pjrt-capacity-bytes")) pjrt_capacity = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--pjrt-device-bytes")) pjrt_device_bytes = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--model")) model = value else if (std.mem.eql(u8, key, "--suite")) suite_path = value else if (std.mem.eql(u8, key, "--output")) output = value else if (std.mem.eql(u8, key, "--case")) try selected.append(a, value) else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--iterations")) iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--long-iterations")) long_iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--backend")) {
+        if (std.mem.eql(u8, key, "--pjrt-capacity-bytes")) pjrt_capacity = try positivePolicyBytes(value) else if (std.mem.eql(u8, key, "--pjrt-device-bytes")) pjrt_device_bytes = try positivePolicyBytes(value) else if (std.mem.eql(u8, key, "--model")) model = value else if (std.mem.eql(u8, key, "--suite")) suite_path = value else if (std.mem.eql(u8, key, "--output")) output = value else if (std.mem.eql(u8, key, "--case")) try selected.append(a, value) else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--iterations")) iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--long-iterations")) long_iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--backend")) {
             backend = std.meta.stringToEnum(Backend, value) orelse return error.InvalidBackend;
         } else return error.UnknownArgument;
     }

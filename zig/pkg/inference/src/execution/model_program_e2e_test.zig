@@ -33,6 +33,7 @@ test "model program real EG2 PJRT public embedding outputs match native across c
     }
     var manager = @import("../backends/backends.zig").SessionManager.init(a);
     manager.required_backend = .pjrt;
+    manager.pjrt_memory_policy = .cpu;
     manager.required_backend_invalid = false;
     manager.native_call_policy = .in_process;
     manager.preferred_backends = &.{.pjrt};
@@ -84,7 +85,7 @@ test "model program real GLiNER25 Deberta backbone PJRT outputs match native" {
             initialized += 1;
         }
     }
-    const session = try factory.createPjrtSessionWithTaskOverride(a, model, .generic);
+    const session = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
     defer session.close();
     for (requests, expected, 0..) |values, want, index| {
         var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 3 }, &values);
@@ -146,9 +147,14 @@ test "model program real Whisper PJRT encoder and decoder stages match native" {
     }
     var manager = @import("../backends/backends.zig").SessionManager.init(a);
     manager.required_backend = .pjrt;
+    manager.pjrt_memory_policy = .cpu;
     manager.required_backend_invalid = false;
     manager.native_call_policy = .in_process;
-    const session = try manager.loadModel(model);
+    const session = loaded: {
+        var source = try @import("../architectures/model_definition.zig").LoadedModel.open(a, model);
+        defer source.deinit();
+        break :loaded try manager.loadModelSource(.{ .path = model, .kind = .directory, .manifest = &source.manifest }, null);
+    };
     defer session.close();
     const outputs = try session.runWithControl(&.{features}, a, .{ .native_call_policy = .in_process });
     defer a.free(outputs);

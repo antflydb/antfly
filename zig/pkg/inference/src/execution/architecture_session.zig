@@ -402,10 +402,10 @@ fn openHostSession(allocator: std.mem.Allocator, model_path: []const u8, overrid
     return prepareLoadedHostSession(allocator, loaded_model.manifest.source_root orelse model_path, &loaded_model, override, preparation);
 }
 
-fn openHostSessionFromManifest(allocator: std.mem.Allocator, model_path: []const u8, manifest: *const manifest_mod.ModelManifest, preparation: HostSessionOptions) !Session {
+fn openHostSessionFromManifest(allocator: std.mem.Allocator, model_path: []const u8, manifest: *const manifest_mod.ModelManifest, override: ?TaskOverride, preparation: HostSessionOptions) !Session {
     var loaded_model = try model_definition.LoadedModel.fromManifest(allocator, model_path, manifest);
     defer loaded_model.deinit();
-    return prepareLoadedHostSession(allocator, loaded_model.manifest.source_root orelse model_path, &loaded_model, null, preparation);
+    return prepareLoadedHostSession(allocator, loaded_model.manifest.source_root orelse model_path, &loaded_model, override, preparation);
 }
 
 /// Consumes the loaded source's weights, retaining its metadata until return.
@@ -503,6 +503,12 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 pub fn createPjrtSessionWithOptions(allocator: std.mem.Allocator, model_path: []const u8, options: PjrtSessionOptions) !Session {
     if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
     return openHostSession(allocator, model_path, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy });
+}
+
+/// Retains the caller's resolved source and policy through synchronous loading.
+pub fn createPjrtSessionFromManifestWithOptions(allocator: std.mem.Allocator, model_path: []const u8, manifest: *const manifest_mod.ModelManifest, options: PjrtSessionOptions) !Session {
+    if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
+    return openHostSessionFromManifest(allocator, model_path, manifest, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy });
 }
 
 test "host preparation shares execution and device-upload ownership and unwinds allocation failures" {
@@ -21221,8 +21227,8 @@ pub fn createSessionFromManifest(
     allow_unqualified_precision: bool,
 ) !Session {
     return switch (backend) {
-        .native => openHostSessionFromManifest(allocator, model_path, manifest, .{}),
-        .pjrt => if (comptime build_options.enable_pjrt) openHostSessionFromManifest(allocator, model_path, manifest, .{ .backend = .pjrt }) else error.PjrtNotEnabled,
+        .native => openHostSessionFromManifest(allocator, model_path, manifest, null, .{}),
+        .pjrt => createPjrtSessionFromManifestWithOptions(allocator, model_path, manifest, .{}),
         .metal => createGpuHostedSessionWithTaskOverride(allocator, model_path, null, .metal, jit, load_context, a4b, manifest),
         .cuda => blk: {
             if (precision) |value| {
@@ -21686,5 +21692,6 @@ test "host preparation rejects explicit PJRT when provider support is disabled" 
     const a = std.testing.allocator;
     try std.testing.expectError(error.PjrtNotEnabled, createPjrtSession(a, "/never-opened"));
     const manifest = manifest_mod.ModelManifest{ .allocator = a };
+    try std.testing.expectError(error.PjrtNotEnabled, createPjrtSessionFromManifestWithOptions(a, "/never-opened", &manifest, .{ .memory_policy = .cpu }));
     try std.testing.expectError(error.PjrtNotEnabled, createSessionFromManifest(a, "/never-opened", &manifest, .pjrt, .{}, .dynamic, null, null, false));
 }

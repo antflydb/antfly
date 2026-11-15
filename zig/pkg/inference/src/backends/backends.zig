@@ -262,6 +262,8 @@ pub const SessionManager = struct {
     required_backend: ?BackendType = null,
     required_backend_invalid: bool = false,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
+    /// Provider allocator quantities are fixed at load, independently of format.
+    pjrt_memory_policy: ?session_factory.PjrtSessionOptions.MemoryPolicy = null,
     kernel_jit: kernel_jit_mod.Config = .{},
     kernel_jit_load_context: kernel_jit_mod.LoadContext = .dynamic,
     /// Load-time A4B policy. It is copied into the created session and is
@@ -596,10 +598,16 @@ pub const SessionManager = struct {
     }
 
     fn createDirectSession(self: *SessionManager, source: ModelSource, backend: BackendType) !Session {
+        if (backend == .pjrt) {
+            const options = session_factory.PjrtSessionOptions{ .memory_policy = self.pjrt_memory_policy };
+            return if (source.manifest) |manifest|
+                session_factory.createPjrtSessionFromManifestWithOptions(self.allocator, source.path, manifest, options)
+            else
+                session_factory.createPjrtSessionWithOptions(self.allocator, source.path, options);
+        }
         if (source.manifest) |manifest| return session_factory.createSessionFromManifest(self.allocator, source.path, manifest, backend, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request, self.gliner_cuda_precision, if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false);
         return switch (backend) {
             .native => session_factory.createNativeSession(self.allocator, source.path),
-            .pjrt => session_factory.createPjrtSession(self.allocator, source.path),
             .metal => session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request),
             .cuda => if (self.gliner_cuda_precision) |precision|
                 if (if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false)
