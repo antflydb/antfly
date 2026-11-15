@@ -123,8 +123,8 @@ const std = @import("std");
 /// Version 90 admits table-scoped index aliases and durable retry receipts.
 pub const current_version: u16 = 90;
 pub const index_aliases_version: u16 = 90;
-pub fn usesIndexAliases(indexes_json: []const u8) bool {
-    return @import("antfly_local_sources").api_index_metadata.aliases.uses(indexes_json);
+pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
+    return @import("antfly_local_sources").api_index_metadata.aliases.uses(a, indexes_json);
 }
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;

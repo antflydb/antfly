@@ -26,34 +26,40 @@ pub const max_aliases_per_table = 64;
 pub const max_control_bytes = 512 * 1024;
 
 /// Structural detection, including escaped JSON member names. Invalid input
-/// fails closed at protocol admission; configuration validation reports it.
-pub fn uses(bytes: []const u8) bool {
+/// fails closed at protocol admission; allocation failures always propagate.
+pub fn uses(a: A, bytes: []const u8) A.Error!bool {
     if (std.mem.indexOfScalar(u8, bytes, '\\') == null and std.mem.indexOf(u8, bytes, "_index_alias") == null) return false;
-    var parsed = std.json.parseFromSlice(V, std.heap.page_allocator, bytes, .{}) catch return true;
+    var parsed = std.json.parseFromSlice(V, a, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    };
     defer parsed.deinit();
     return parsed.value == .object and (parsed.value.object.contains(key) or parsed.value.object.contains(receipts_key));
 }
 
 /// Transition envelopes contain TableRecord.indexes_json as an escaped string.
 /// Inspect that structural field, never arbitrary prompt/document strings.
-pub fn usesEnvelope(bytes: []const u8) bool {
-    var parsed = std.json.parseFromSlice(V, std.heap.page_allocator, bytes, .{}) catch return true;
+pub fn usesEnvelope(a: A, bytes: []const u8) A.Error!bool {
+    var parsed = std.json.parseFromSlice(V, a, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    };
     defer parsed.deinit();
-    return envelopeValue(parsed.value);
+    return envelopeValue(a, parsed.value);
 }
-fn envelopeValue(value: V) bool {
+fn envelopeValue(a: A, value: V) A.Error!bool {
     switch (value) {
         .object => |object| {
             if (object.contains(key) or object.contains(receipts_key)) return true;
             var entries = object.iterator();
             while (entries.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "indexes_json") and entry.value_ptr.* == .string) {
-                    if (uses(entry.value_ptr.string)) return true;
-                } else if (envelopeValue(entry.value_ptr.*)) return true;
+                    if (try uses(a, entry.value_ptr.string)) return true;
+                } else if (try envelopeValue(a, entry.value_ptr.*)) return true;
             }
         },
         .array => |array| for (array.items) |item| {
-            if (envelopeValue(item)) return true;
+            if (try envelopeValue(a, item)) return true;
         },
         else => {},
     }
@@ -78,13 +84,14 @@ pub fn physicalProjection(out: A, bytes: []const u8) ![]u8 {
 }
 
 /// Materialize at catalog publication, never on the query hot path.
-pub fn queryProjection(out: A, bytes: []const u8) ![]u8 {
-    if (!uses(bytes)) return out.dupe(u8, bytes);
+pub fn queryProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
+    if (std.mem.indexOfScalar(u8, bytes, '\\') == null and std.mem.indexOf(u8, bytes, "_index_alias") == null) return null;
     var arena = std.heap.ArenaAllocator.init(out);
     defer arena.deinit();
     const a = arena.allocator();
     var root = try std.json.parseFromSliceLeaky(V, a, bytes, .{});
     if (root != .object) return error.InvalidTableIndexMetadata;
+    if (!root.object.contains(key) and !root.object.contains(receipts_key)) return null;
     _ = root.object.orderedRemove(receipts_key);
     if (root.object.getPtr(key)) |declarations| {
         if (declarations.* != .object) return error.InvalidTableIndexMetadata;
@@ -95,7 +102,11 @@ pub fn queryProjection(out: A, bytes: []const u8) ![]u8 {
             try resource.object.put(a, "index", target);
         }
     }
-    return std.json.Stringify.valueAlloc(out, root, .{});
+    return try std.json.Stringify.valueAlloc(out, root, .{});
+}
+
+pub fn queryProjection(out: A, bytes: []const u8) ![]u8 {
+    return (try queryProjectionIfNeeded(out, bytes)) orelse try out.dupe(u8, bytes);
 }
 
 pub const Requirement = enum { queryable, complete };
@@ -634,10 +645,10 @@ test "full text aliases and nullable optional query fields preserve public seman
 }
 
 test "index alias structural detection handles escaped keys and ignores user values" {
-    try std.testing.expect(uses("{\"\\u005findex_aliases\":{}}"));
-    try std.testing.expect(uses("{\"\\u005findex_alias_receipts\":{}}"));
-    try std.testing.expect(!uses("{\"description\":\"_index_aliases\"}"));
     const a = std.testing.allocator;
+    try std.testing.expect(try uses(a, "{\"\\u005findex_aliases\":{}}"));
+    try std.testing.expect(try uses(a, "{\"\\u005findex_alias_receipts\":{}}"));
+    try std.testing.expect(!try uses(a, "{\"description\":\"_index_aliases\"}"));
     const compact = try queryProjection(a, "{\"a\":{\"type\":\"graph\"},\"_index_aliases\":{\"live\":{\"index\":\"a\",\"readiness\":{\"complete\":true}}},\"_index_alias_receipts\":{\"live\":[]}}");
     defer a.free(compact);
     try std.testing.expect(std.mem.indexOf(u8, compact, "readiness") == null);
@@ -707,4 +718,27 @@ test "index alias dependency recipes resolve inline-only executable owners" {
         \\{"P":{"type":"embeddings","_index_incarnation":3,"embedder":{"model":"B"},"enrichments":[{"name":"X","kind":"embedding","field":"body"}]},"C":{"type":"embeddings","_index_incarnation":2,"sources":[{"artifact":"X"}]}}
     ;
     try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(std.testing.allocator, before, after));
+}
+
+test "index alias classification propagates allocation failures without changing membership" {
+    const Check = struct {
+        fn run(a: A, bytes: []const u8, present: bool) !void {
+            try std.testing.expectEqual(present, try uses(a, bytes));
+        }
+        fn envelope(a: A, bytes: []const u8, present: bool) !void {
+            try std.testing.expectEqual(present, try usesEnvelope(a, bytes));
+        }
+    };
+    const plain = "{\"a\":{\"type\":\"full_text\",\"description\":\"line\\nnext\"}}";
+    const aliased = "{\"a\":{\"type\":\"full_text\"},\"\\u005findex_aliases\":{}}";
+    inline for (.{ .{ plain, false }, .{ aliased, true } }) |case| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ case[0], case[1] });
+    }
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .table = .{ .indexes_json = plain } }, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.envelope, .{ encoded, false });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expect(!try uses(failing.allocator(), "{\"a\":{\"type\":\"full_text\"}}"));
+    try std.testing.expectError(error.OutOfMemory, uses(failing.allocator(), plain));
+    try std.testing.expectError(error.OutOfMemory, usesEnvelope(failing.allocator(), encoded));
 }

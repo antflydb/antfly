@@ -1473,7 +1473,7 @@ pub const TableManager = struct {
     }
 
     pub fn upsertTable(self: *TableManager, record: TableRecord) !void {
-        if (@import("antfly_local_sources").api_index_metadata.aliases.uses(record.indexes_json)) {
+        if (try @import("antfly_local_sources").api_index_metadata.aliases.uses(self.alloc, record.indexes_json)) {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, record.indexes_json, .{});
             defer parsed.deinit();
             try @import("antfly_local_sources").api_index_metadata.aliases.validateReferences(parsed.value);
@@ -1515,7 +1515,7 @@ pub const TableManager = struct {
 
     fn upsertTableUnchecked(self: *TableManager, record: TableRecord) !void {
         if (self.table_names.get(record.name)) |id| if (id != record.table_id) return error.TableAlreadyExists;
-        const owned = try cloneTable(self.alloc, record);
+        const owned = try @import("antfly_local_sources").metadata_local_catalog.cloneTableForPublication(self.alloc, record);
         errdefer freeTable(self.alloc, owned);
         // Complete every allocation before changing either index or freeing a
         // borrowed name. Replacement/rollback cannot publish half an index.

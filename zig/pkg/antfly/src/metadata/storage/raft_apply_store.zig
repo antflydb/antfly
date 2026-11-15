@@ -17911,7 +17911,7 @@ pub const RaftApplyStore = struct {
             const privacy_raw = try txn.get(try tableKeyForGroup(&privacy_table_buf, group_id, table.id));
             const decoded_table = try decodeTableRecord(privacy_alloc, privacy_raw);
             try putPrivacyWork(privacy_alloc, txn, group_id, decoded_table);
-            try synchronizeIndexAliasTableTxn(txn, group_id, table.id, topology_protocol.usesIndexAliases(decoded_table.indexes_json));
+            try synchronizeIndexAliasTableTxn(txn, group_id, table.id, try topology_protocol.usesIndexAliases(self.alloc, decoded_table.indexes_json));
 
             var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table.id);
             fence.range_membership = .{};
@@ -26172,7 +26172,7 @@ pub const RaftApplyStore = struct {
         }
         try putPrivacyWork(self.alloc, txn, group_id, record);
         try txn.put(key, value);
-        try synchronizeIndexAliasTableTxn(txn, group_id, record.table_id, topology_protocol.usesIndexAliases(record.indexes_json));
+        try synchronizeIndexAliasTableTxn(txn, group_id, record.table_id, try topology_protocol.usesIndexAliases(self.alloc, record.indexes_json));
         const fingerprint = policyTableSchemaRecordDigest(record);
         var fingerprint_key_buf: [192]u8 = undefined;
         try txn.put(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, record.table_id), &fingerprint);
@@ -28067,7 +28067,7 @@ fn hasIndexAliasesTxn(txn: *docstore.DocStore.Txn, group_id: u64) !bool {
 }
 
 fn admitIndexAliasTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !bool {
-    if (!topology_protocol.usesIndexAliases(table.indexes_json)) return true;
+    if (!try topology_protocol.usesIndexAliases(self.alloc, table.indexes_json)) return true;
     var buf: [160]u8 = undefined;
     const prefix = try storePrefixForGroup(&buf, group_id);
     var cursor = try txn.openCursor();
@@ -28108,6 +28108,27 @@ test "index alias Raft admission permits rollout and fences returning legacy sto
     defer a.free(old_store);
     try txn.put(try storeKeyForGroup(&buf, group, legacy.store_id), old_store);
     try std.testing.expect(!try admitIndexAliasTableTxn(&store, &txn, group, table));
+    const plain: metadata.TableRecord = .{ .table_id = 84, .name = "plain", .indexes_json = "{\"text\":{\"type\":\"full_text\",\"description\":\"line\\nnext\"}}" };
+    {
+        const Admission = struct {
+            fn check(allocator: std.mem.Allocator, owner: *RaftApplyStore, transaction: *docstore.DocStore.Txn, table_: metadata.TableRecord, expected: bool) !void {
+                const previous = owner.alloc;
+                owner.alloc = allocator;
+                defer owner.alloc = previous;
+                try std.testing.expectEqual(expected, try admitIndexAliasTableTxn(owner, transaction, group, table_));
+            }
+        };
+        try std.testing.checkAllAllocationFailures(a, Admission.check, .{ &store, &txn, plain, true });
+        try std.testing.checkAllAllocationFailures(a, Admission.check, .{ &store, &txn, table, false });
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        const previous = store.alloc;
+        store.alloc = failing.allocator();
+        defer store.alloc = previous;
+        const plain_key = try tableKeyForGroup(&buf, group, plain.table_id);
+        try std.testing.expectError(error.OutOfMemory, store.putTableRecordTxnModeRaw(&txn, group, plain_key, plain, false));
+        try std.testing.expect((try RaftApplyStore.stagingGet(&txn, plain_key)) == null);
+        try std.testing.expect(!try hasIndexAliasesTxn(&txn, group));
+    }
     var modern = legacy;
     modern.artifact_sources_protocol_version = 3;
     const new_store = try encodeStoreRecord(a, modern);
@@ -31365,11 +31386,12 @@ fn appendTableRecord(
             try appendInt(alloc, out, u64, migration.request.budget.disk_reserve_bytes);
         }
     }
-    if (materialize_query_projection and topology_protocol.usesIndexAliases(record.indexes_json)) {
-        const projection = try @import("antfly_local_sources").api_index_metadata.aliases.queryProjection(alloc, record.indexes_json);
-        defer alloc.free(projection);
-        try appendInt(alloc, out, u32, 0x31514149); // IAQ1
-        try appendRequiredString(alloc, out, projection);
+    if (materialize_query_projection) {
+        if (try @import("antfly_local_sources").api_index_metadata.aliases.queryProjectionIfNeeded(alloc, record.indexes_json)) |projection| {
+            defer alloc.free(projection);
+            try appendInt(alloc, out, u32, 0x31514149); // IAQ1
+            try appendRequiredString(alloc, out, projection);
+        }
     }
 }
 

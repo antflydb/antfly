@@ -53,7 +53,18 @@ pub fn validateCompleteKeyspaceRanges(ranges: anytype) !void {
     }
 }
 
+/// Read-only copies preserve the already materialized query catalog.
 pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    return cloneTableMode(alloc, record, false);
+}
+
+/// Canonicalize derived state only when publishing an authoritative definition.
+/// Callers may have changed indexes_json while retaining an older projection.
+pub fn cloneTableForPublication(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    return cloneTableMode(alloc, record, true);
+}
+
+fn cloneTableMode(alloc: std.mem.Allocator, record: TableRecord, publication: bool) !TableRecord {
     const lake_index_catalog_json = try alloc.dupe(u8, record.lake_index_catalog_json);
     errdefer alloc.free(lake_index_catalog_json);
     const relational_retirement_json = try alloc.dupe(u8, record.relational_retirement_json);
@@ -71,7 +82,10 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     errdefer alloc.free(read_schema_json);
     const indexes_json = try alloc.dupe(u8, record.indexes_json);
     errdefer alloc.free(indexes_json);
-    const query_indexes_json = if (@import("../api/index_aliases.zig").uses(record.indexes_json)) try @import("../api/index_aliases.zig").queryProjection(alloc, record.indexes_json) else try alloc.dupe(u8, "");
+    const query_indexes_json = if (publication)
+        (try @import("../api/index_aliases.zig").queryProjectionIfNeeded(alloc, record.indexes_json)) orelse try alloc.dupe(u8, "")
+    else
+        try alloc.dupe(u8, record.query_indexes_json);
     errdefer alloc.free(query_indexes_json);
     const replication_sources_json = try alloc.dupe(u8, record.replication_sources_json);
     errdefer alloc.free(replication_sources_json);
@@ -106,4 +120,42 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
 
 pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
     @import("record_memory.zig").freeTable(alloc, record);
+}
+
+test "index alias read clones copy the materialized projection without parsing receipt history" {
+    const a = std.testing.allocator;
+    // A read copy must be independent of parsing the authoritative catalog.
+    // Publication, unlike copying, still rejects invalid input.
+    const record: TableRecord = .{ .table_id = 7, .name = "docs", .indexes_json = "{invalid _index_aliases", .query_indexes_json = "{\"a\":{\"type\":\"full_text\"},\"_index_aliases\":{\"live\":{\"index\":\"a\"}}}" };
+    const copy = try cloneTable(a, record);
+    defer freeTable(a, copy);
+    try std.testing.expectEqualStrings(record.query_indexes_json, copy.query_indexes_json);
+    try std.testing.expect(copy.query_indexes_json.ptr != record.query_indexes_json.ptr);
+    try std.testing.expectError(error.SyntaxError, cloneTableForPublication(a, record));
+}
+
+test "index alias publication replaces stale projections and removes retired controls" {
+    const a = std.testing.allocator;
+    var before: TableRecord = .{ .table_id = 7, .name = "docs", .indexes_json = "{\"a\":{\"type\":\"full_text\"},\"b\":{\"type\":\"full_text\"},\"_index_aliases\":{\"live\":{\"index\":\"b\",\"readiness\":{\"complete\":true}}},\"_index_alias_receipts\":{}}", .query_indexes_json = "stale" };
+    const Check = struct {
+        fn publish(allocator: std.mem.Allocator, record: TableRecord) !void {
+            const owned = try cloneTableForPublication(allocator, record);
+            defer freeTable(allocator, owned);
+            try std.testing.expect(owned.query_indexes_json.len != 0);
+            try std.testing.expect(!std.mem.eql(u8, record.query_indexes_json, owned.query_indexes_json));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Check.publish, .{before});
+    const published = try cloneTableForPublication(a, before);
+    defer freeTable(a, published);
+    try std.testing.expect(std.mem.indexOf(u8, published.query_indexes_json, "readiness") == null);
+    try std.testing.expect(std.mem.indexOf(u8, published.query_indexes_json, "_index_alias_receipts") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, published.query_indexes_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("b", try @import("../api/index_aliases.zig").resolve(parsed.value, "live"));
+    before.indexes_json = "{}";
+    before.query_indexes_json = published.query_indexes_json;
+    const removed = try cloneTableForPublication(a, before);
+    defer freeTable(a, removed);
+    try std.testing.expectEqualStrings("", removed.query_indexes_json);
 }
