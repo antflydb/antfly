@@ -1552,27 +1552,28 @@ fn workerIsStopping(runtime: *DerivedRuntime, worker: *const Worker, io: Io) boo
 }
 
 fn scheduleRecoverableCatchUpRetry(worker: *Worker, err: anyerror) void {
-    if (err == error.ReplayDocumentNotVisible) {
-        _ = catch_up_policy.recordRecoverableRetry(&worker.runtime.recoverable_retry_counters, worker.runtime.backlog.resource_manager, &worker.recoverable_retry_backoff, err);
-        // The unadvanced durable checkpoint is the repair debt. Retry after a
-        // source/producer commit (including explicit same-sequence repair), or
-        // once on reopen. Capture the pre-read epoch to avoid losing a commit
-        // that races the failed replay read. No periodic full-window polling.
-        const runtime = worker.runtime;
-        const io = runtime.ioContext();
-        runtime.mutex.lockUncancelable(io);
-        defer runtime.mutex.unlock(io);
-        worker.dependency_wait_epoch = worker.dispatch_notification_epoch;
-        worker.retry_not_before_ns = 0;
-        worker.next_delay_ms = if (worker.notification_epoch == worker.dispatch_notification_epoch) null else 0;
-        return;
-    }
     const delay_ns = catch_up_policy.recordRecoverableRetry(
         &worker.runtime.recoverable_retry_counters,
         worker.runtime.backlog.resource_manager,
         &worker.recoverable_retry_backoff,
         err,
     );
+    if (err == error.ReplayDocumentNotVisible) {
+        // The unadvanced durable checkpoint is the repair debt. Retry after a
+        // source/producer commit (including explicit same-sequence repair), or
+        // once on reopen. Capture the pre-read epoch to avoid losing a commit
+        // that races the failed replay read. Keep the retry deadline as well:
+        // unrelated commits must not repeatedly decode this blocked window.
+        // No event means no timer, even after the deadline has elapsed.
+        const runtime = worker.runtime;
+        const io = runtime.ioContext();
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        worker.dependency_wait_epoch = worker.dispatch_notification_epoch;
+        worker.retry_not_before_ns = platform_time.monotonicNs() +| delay_ns;
+        worker.next_delay_ms = if (worker.notification_epoch == worker.dispatch_notification_epoch) null else delayMilliseconds(delay_ns);
+        return;
+    }
     if (worker.recoverable_retry_backoff.shouldLog()) std.log.warn(
         "derived worker retrying recoverable failure worker={s} error={s} failures={} retry_ms={}",
         .{ worker.name, @errorName(err), worker.recoverable_retry_backoff.failures, delay_ns / std.time.ns_per_ms },
@@ -1685,6 +1686,7 @@ fn stopAndJoinWorker(runtime: *DerivedRuntime, worker: *Worker, io: Io) void {
 const TestThreadedRuntimeCapture = struct {
     require_capture_worker: ?*Worker = null,
     fail_next_begin: bool = false,
+    missing_replay_input: bool = false,
     empty_coverage_checks: @import("antfly_platform").atomic.Value(u64) = .init(0),
     runtime: ?*DerivedRuntime = null,
     apply_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
@@ -1728,6 +1730,7 @@ fn testThreadedRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, 
         try std.testing.expect(worker.replay_cursor != null);
     }
     _ = capture.apply_calls.fetchAdd(1, .monotonic);
+    if (capture.missing_replay_input) return error.ReplayDocumentNotVisible;
     if (capture.fail_next_apply_would_block.swap(false, .monotonic)) {
         _ = capture.would_block_failures.fetchAdd(1, .monotonic);
         return error.WouldBlock;
@@ -3102,9 +3105,81 @@ test "db pending producer replay parks missing input and wakes on same sequence 
     try runtime.waitForIndexesWithVisibilityWait(1, &.{"text"}, .{ .deadline_ns = deadline });
     try std.testing.expectEqual(@as(?u64, 1), runtime.appliedSequence("text"));
 
-    // A commit arriving during the failed read must schedule an immediate retry.
+    // A commit racing the failed read retains a scheduled retry and backoff.
     var probe_name = "probe".*;
     var probe: Worker = .{ .runtime = &runtime, .name = &probe_name, .kind = .{ .name = &probe_name, .kind = .full_text }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 1, .notification_epoch = 1 };
     scheduleRecoverableCatchUpRetry(&probe, error.ReplayDocumentNotVisible);
-    try std.testing.expectEqual(@as(?u64, 0), probe.next_delay_ms);
+    try std.testing.expect(probe.next_delay_ms != null and probe.next_delay_ms.? > 0);
+    try std.testing.expect(probe.retry_not_before_ns > 0);
+}
+
+test "db pending producer replay bounds retries under unrelated commits without idle polling" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/busy-missing-input", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{ .sequence = 1, .changed_doc_keys = &.{"missing"}, .target_hints = &.{.full_text} });
+    var capture = TestThreadedRuntimeCapture{ .missing_replay_input = true };
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, null);
+    defer runtime.deinit();
+    // Dispatch manually so deadline boundaries are deterministic. The worker
+    // remains in the real notification/retention sets, without a timer thread.
+    const worker = owned: {
+        const value = try alloc.create(Worker);
+        errdefer alloc.destroy(value);
+        const name = try alloc.dupe(u8, "text");
+        errdefer alloc.free(name);
+        value.* = .{ .runtime = &runtime, .name = name, .kind = .{ .name = name, .kind = .full_text }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 1 };
+        try runtime.workers.append(alloc, value);
+        break :owned value;
+    };
+    runtime.notifySequence(1);
+    workerMain(worker);
+    try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+    try std.testing.expect(worker.retry_not_before_ns > 0);
+    try std.testing.expectEqual(@as(?u64, null), worker.next_delay_ms);
+
+    // Model a not-yet-expired deadline without depending on host speed. Real
+    // unrelated journal commits must not bypass it or advance the checkpoint.
+    const deadline = platform_time.monotonicNs() + 60 * std.time.ns_per_s;
+    worker.retry_not_before_ns = deadline;
+    for (2..34) |sequence| {
+        try appendTestThreadedRuntimeRecord(&journal, alloc, .{ .sequence = sequence, .changed_doc_keys = &.{"unrelated"}, .target_hints = &.{.full_text} });
+        switch (sequence % 4) {
+            0 => runtime.notifySequence(sequence),
+            1 => runtime.notifyIndexes(sequence, &.{"text"}),
+            2 => runtime.notifyExceptKind(sequence, .dense_vector),
+            else => runtime.forceSequence(sequence),
+        }
+        workerMain(worker);
+        try std.testing.expectEqual(deadline, worker.retry_not_before_ns);
+        try std.testing.expect(worker.next_delay_ms != null and worker.next_delay_ms.? > 0);
+        try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), worker.applied_sequence);
+    }
+    // An expired deadline with pending notifications permits one retry.
+    worker.retry_not_before_ns = 0;
+    workerMain(worker);
+    try std.testing.expectEqual(@as(u64, 2), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 2), worker.recoverable_retry_backoff.failures);
+    try std.testing.expect(worker.retry_not_before_ns > 0);
+    try std.testing.expectEqual(@as(?u64, null), worker.next_delay_ms);
+    try std.testing.expectEqual(@as(u64, 0), capture.truncated_sequence.load(.monotonic));
+
+    // The clock alone cannot make the worker poll an unchanged dependency.
+    worker.retry_not_before_ns = 0;
+    for (0..32) |_| workerMain(worker);
+    try std.testing.expectEqual(@as(u64, 2), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(?u64, null), worker.next_delay_ms);
+    capture.missing_replay_input = false;
+    runtime.notifyIndexes(33, &.{"text"});
+    workerMain(worker);
+    try std.testing.expectEqual(@as(u64, 3), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 33), worker.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 33), capture.persisted_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 0), worker.recoverable_retry_backoff.failures);
+    try std.testing.expect(worker.dependency_wait_epoch == null);
 }
