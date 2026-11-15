@@ -40,7 +40,11 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 30;
+pub const batch_protocol_version: u16 = 31;
+/// Version 31 carries leader-planned context-dependency effects, delivered
+/// change notices, and content outbox acknowledgements
+/// (`_context_dependency`). Older peers cannot apply them as empty batches.
+pub const batch_context_dependency_protocol_version: u16 = 31;
 /// Version 30 applies immutable direct producer effects atomically with their
 /// source. Older members must reject the envelope before admitting the source.
 pub const batch_prepared_enrichments_protocol_version: u16 = 30;

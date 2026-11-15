@@ -325,3 +325,63 @@ pub fn Registry(comptime DB: type) type {
         }
     };
 }
+
+/// Host read capability for distributed tables: rows of other tables, and
+/// of other shards of this table, served by the host's routed read path
+/// (scatter-gather across every group). Crosses the storage boundary, so
+/// errors travel by name.
+pub const ReadSource = struct {
+    const Methods = struct {
+        lookup: *const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8) anyerror!?[]u8,
+        query: *const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, envelope: []const u8, offset: u32, limit: u32) anyerror!context_resolution.Page,
+        request: *const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, request_json: []const u8, k: u32) anyerror!context_resolution.Page,
+    };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(Methods);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+    ptr: *anyopaque,
+    lookup_fn: @FieldType(Methods, "lookup"),
+    query_fn: @FieldType(Methods, "query"),
+    request_fn: @FieldType(Methods, "request"),
+
+    fn lookup(self: ReadSource, alloc: Allocator, table_id: []const u8, key: []const u8) !?[]u8 {
+        return NativeBoundary.call("lookup", self.callback_dispatch, self.lookup_fn, .{ self.ptr, alloc, table_id, key });
+    }
+    fn query(self: ReadSource, alloc: Allocator, table_id: []const u8, envelope: []const u8, offset: u32, limit: u32) !context_resolution.Page {
+        return NativeBoundary.call("query", self.callback_dispatch, self.query_fn, .{ self.ptr, alloc, table_id, envelope, offset, limit });
+    }
+    fn request(self: ReadSource, alloc: Allocator, table_id: []const u8, request_json: []const u8, k: u32) !context_resolution.Page {
+        return NativeBoundary.call("request", self.callback_dispatch, self.request_fn, .{ self.ptr, alloc, table_id, request_json, k });
+    }
+};
+
+/// Resolution reader over a `ReadSource`. Every table, the own one included,
+/// is read through the host (a shard holds only part of its table). Graph
+/// adjacency, generated-artifact values, and the search shorthands need
+/// shard-local indexes and fail explicitly; declare `search.request` instead.
+pub const RemoteReader = struct {
+    source: ReadSource,
+    own_table_id: []const u8,
+
+    pub fn reader(self: *RemoteReader) context_resolution.Reader {
+        return .{ .ptr = self, .own_table_id = self.own_table_id, .lookup_fn = lookupImpl, .query_fn = queryImpl, .request_fn = requestImpl, .row_filter = row_filter };
+    }
+
+    fn target(self: *RemoteReader, table_id: []const u8) []const u8 {
+        return if (table_id.len == 0) self.own_table_id else table_id;
+    }
+
+    fn lookupImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8) anyerror!?[]u8 {
+        const self: *RemoteReader = @ptrCast(@alignCast(ptr));
+        return self.source.lookup(alloc, self.target(table_id), key);
+    }
+
+    fn queryImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, envelope: []const u8, offset: u32, limit: u32) anyerror!context_resolution.Page {
+        const self: *RemoteReader = @ptrCast(@alignCast(ptr));
+        return self.source.query(alloc, self.target(table_id), envelope, offset, limit);
+    }
+
+    fn requestImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, request_json: []const u8, k: u32) anyerror!context_resolution.Page {
+        const self: *RemoteReader = @ptrCast(@alignCast(ptr));
+        return self.source.request(alloc, self.target(table_id), request_json, k);
+    }
+};

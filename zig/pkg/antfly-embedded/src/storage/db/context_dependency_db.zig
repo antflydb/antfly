@@ -36,6 +36,8 @@ const notices = @import("enrichment/context_notices.zig");
 const internal_keys = @import("../internal_keys.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const artifact_codec = @import("enrichment/artifact_codec.zig");
+const command_mod = @import("enrichment/context_dependency_command.zig");
+const named = @import("../named_callback.zig");
 
 pub const shadows_complete_key = "\x00\x00__metadata__:context_dependency:shadows_complete";
 
@@ -43,8 +45,17 @@ pub const shadows_complete_key = "\x00\x00__metadata__:context_dependency:shadow
 /// `deliver` must apply the notice durably (idempotently) on every shard of
 /// the dependent table before returning success.
 pub const Dispatcher = struct {
+    const Methods = struct { deliver: *const fn (ptr: *anyopaque, alloc: Allocator, dependent_table_id: []const u8, encoded_notice: []const u8) anyerror!void };
+    const NativeBoundary = named.Boundary(Methods);
+    /// Translates errors by name when the host lives in another compiled
+    /// unit (the server over the storage engine boundary).
+    callback_dispatch: named.Dispatch = NativeBoundary.local_dispatch,
     ptr: *anyopaque,
-    deliver: *const fn (ptr: *anyopaque, alloc: Allocator, dependent_table_id: []const u8, encoded_notice: []const u8) anyerror!void,
+    deliver: @FieldType(Methods, "deliver"),
+
+    pub fn deliverNotice(self: Dispatcher, alloc: Allocator, dependent_table_id: []const u8, encoded_notice: []const u8) !void {
+        return NativeBoundary.call("deliver", self.callback_dispatch, self.deliver, .{ self.ptr, alloc, dependent_table_id, encoded_notice });
+    }
 };
 
 /// Store `Reader` that serves point reads from a probe transaction and
@@ -401,35 +412,52 @@ pub fn reconcilePage(alloc: Allocator, primary: *docstore_mod.DocStore, manager:
     defer alloc.free(declared);
     var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
     defer specs.deinit();
+    const Pass = struct {
+        manager: @TypeOf(manager),
+        specs: *const notices.SourceSpecs,
+        rows: []const notices.RowChange,
+        sequence: u64,
+        done: bool,
+        fn run(p: *anyopaque, a: Allocator, reader: store.Reader, plan: *store.Plan) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var changes = std.ArrayListUnmanaged(notices.RowChange).empty;
+            for (self.rows) |row| {
+                const raw = row.next orelse continue;
+                try changes.append(arena.allocator(), .{ .key = row.key, .next = if (self.specs.artifact_names.len == 0) raw else try logicalRowAlloc(arena.allocator(), reader, self.manager, row.key, raw, self.specs.artifact_names) });
+            }
+            if (!self.specs.isEmpty()) _ = try notices.planStageNotices(a, reader, plan, self.specs, self.manager.context_table_id, self.sequence, 0x6000_0000, changes.items, true);
+            if (self.done) {
+                try plan.delete(reconcile_cursor_key);
+            } else if (self.rows.len != 0) {
+                try plan.put(reconcile_cursor_key, self.rows[self.rows.len - 1].key);
+            }
+        }
+    };
+    var pass = Pass{ .manager = manager, .specs = &specs, .rows = rows, .sequence = sequence, .done = done };
+    try planAndCommit(alloc, primary, manager, .{ .ptr = &pass, .plan_fn = Pass.run });
+    if (!done) return;
+    // Pending markers are replica-local crash intents (never replicated, so
+    // never part of a replicated read set): clear them locally.
     var reader_state = try StoreReader.init(primary);
     defer reader_state.deinit();
-    const reader = reader_state.reader();
-    var plan = store.Plan.init(alloc);
-    defer plan.deinit();
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    var changes = std.ArrayListUnmanaged(notices.RowChange).empty;
-    for (rows) |row| {
-        const raw = row.next orelse continue;
-        try changes.append(arena.allocator(), .{ .key = row.key, .next = if (specs.artifact_names.len == 0) raw else try logicalRowAlloc(arena.allocator(), reader, manager, row.key, raw, specs.artifact_names) });
+    const Collect = struct {
+        alloc: Allocator,
+        keys: std.ArrayListUnmanaged([]u8) = .empty,
+        fn visit(p: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            try self.keys.append(self.alloc, try self.alloc.dupe(u8, key));
+            return true;
+        }
+    };
+    var collect = Collect{ .alloc = alloc };
+    defer {
+        for (collect.keys.items) |k| alloc.free(k);
+        collect.keys.deinit(alloc);
     }
-    if (!specs.isEmpty()) _ = try notices.planStageNotices(alloc, reader, &plan, &specs, manager.context_table_id, sequence, 0x6000_0000, changes.items, true);
-    if (done) {
-        const Collect = struct {
-            plan: *store.Plan,
-            fn visit(p: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
-                const self: *@This() = @ptrCast(@alignCast(p));
-                try self.plan.delete(key);
-                return true;
-            }
-        };
-        var collect = Collect{ .plan = &plan };
-        try reader.scanPrefix(alloc, pending_prefix, .{ .ptr = &collect, .visit_fn = Collect.visit });
-        try plan.delete(reconcile_cursor_key);
-    } else if (rows.len != 0) {
-        try plan.put(reconcile_cursor_key, rows[rows.len - 1].key);
-    }
-    try commitPlan(alloc, primary, &plan);
+    try reader_state.reader().scanPrefix(alloc, pending_prefix, .{ .ptr = &collect, .visit_fn = Collect.visit });
+    if (collect.keys.items.len != 0) try primary.putBatch(&.{}, @ptrCast(collect.keys.items));
 }
 
 pub fn reconcileCursorAlloc(alloc: Allocator, primary: *docstore_mod.DocStore) !?[]u8 {
@@ -459,30 +487,56 @@ pub fn markShadowsComplete(alloc: Allocator, primary: *docstore_mod.DocStore, ma
     defer alloc.free(declared);
     var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
     defer specs.deinit();
-    try primary.put(shadows_complete_key, &specs.fields_digest);
+    if (manager.context_replication == null) return primary.put(shadows_complete_key, &specs.fields_digest);
+    const Pass = struct {
+        digest: ctx.Digest,
+        fn run(p: *anyopaque, _: Allocator, _: store.Reader, plan: *store.Plan) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            try plan.put(shadows_complete_key, &self.digest);
+        }
+    };
+    var pass = Pass{ .digest = specs.fields_digest };
+    try planAndCommit(alloc, primary, manager, .{ .ptr = &pass, .plan_fn = Pass.run });
 }
 
 /// Backfill covering shadows for one page of existing rows.
 pub fn backfillShadowPage(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, rows: []const notices.RowChange) !usize {
+    return backfillShadowPageWithCursor(alloc, primary, manager, rows, null, null);
+}
+
+/// One backfill page; `cursor_key`/`cursor` (when given) are written in the
+/// same commit, so a replicated owner advances shadows and cursor together.
+pub fn backfillShadowPageWithCursor(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, rows: []const notices.RowChange, cursor_key: ?[]const u8, cursor: ?[]const u8) !usize {
     const declared = try manager.contextDeclarationsAlloc(alloc);
     defer alloc.free(declared);
     var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
     defer specs.deinit();
     if (specs.isEmpty()) return 0;
-    var txn_reader = try StoreReader.init(primary);
-    defer txn_reader.deinit();
-    var plan = store.Plan.init(alloc);
-    defer plan.deinit();
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    var logical = std.ArrayListUnmanaged(notices.RowChange).empty;
-    for (rows) |row| {
-        const raw = row.next orelse continue;
-        try logical.append(arena.allocator(), .{ .key = row.key, .next = if (specs.artifact_names.len == 0) raw else try logicalRowAlloc(arena.allocator(), txn_reader.reader(), manager, row.key, raw, specs.artifact_names) });
-    }
-    const written = try notices.planBackfillShadows(alloc, txn_reader.reader(), &plan, &specs, logical.items);
-    try commitPlan(alloc, primary, &plan);
-    return written;
+    const Pass = struct {
+        manager: @TypeOf(manager),
+        specs: *const notices.SourceSpecs,
+        rows: []const notices.RowChange,
+        cursor_key: ?[]const u8,
+        cursor: ?[]const u8,
+        written: usize = 0,
+        fn run(p: *anyopaque, a: Allocator, reader: store.Reader, plan: *store.Plan) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var logical = std.ArrayListUnmanaged(notices.RowChange).empty;
+            for (self.rows) |row| {
+                const raw = row.next orelse continue;
+                try logical.append(arena.allocator(), .{ .key = row.key, .next = if (self.specs.artifact_names.len == 0) raw else try logicalRowAlloc(arena.allocator(), reader, self.manager, row.key, raw, self.specs.artifact_names) });
+            }
+            self.written = try notices.planBackfillShadows(a, reader, plan, self.specs, logical.items);
+            if (self.cursor_key) |key| {
+                if (self.cursor) |value| try plan.put(key, value) else try plan.delete(key);
+            }
+        }
+    };
+    var pass = Pass{ .manager = manager, .specs = &specs, .rows = rows, .cursor_key = cursor_key, .cursor = cursor };
+    try planAndCommit(alloc, primary, manager, .{ .ptr = &pass, .plan_fn = Pass.run });
+    return pass.written;
 }
 
 pub const ApplySummary = struct {
@@ -551,46 +605,79 @@ pub fn applyNotices(
     range_lower: []const u8,
     range_upper: []const u8,
 ) !ApplySummary {
-    // All read-modify-write of dependency state holds this lock, so planning
-    // from a probe snapshot and committing one atomic batch is linearizable.
-    manager.lockContextDependencies();
-    defer manager.unlockContextDependencies();
-    var txn_reader = try StoreReader.init(primary);
-    defer txn_reader.deinit();
-    const reader = txn_reader.reader();
-    var plan = store.Plan.init(alloc);
-    defer plan.deinit();
-    var refs = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
-    errdefer {
-        for (refs.items) |ref| enrichment_types.freeGeneratedRef(alloc, ref);
-        refs.deinit(alloc);
-    }
-    var summary = ApplySummary{};
-    var lookup = SourceCache(@TypeOf(manager)){ .alloc = alloc, .manager = manager };
-    defer lookup.deinit();
-    for (encoded, 0..) |raw, i| {
-        var decoded = try notices.decodeNoticeAlloc(alloc, raw);
-        defer decoded.deinit();
-        var applied = try notices.planApplyNoticeWithSources(alloc, reader, &plan, decoded.notice, now_ms, range_lower, range_upper, notices.default_fanout_page, lookup.sources());
-        defer applied.deinit(alloc);
-        summary.invalidated += applied.rebuild.items.len + applied.debounced + applied.stale_only;
-        summary.debounced += applied.debounced;
-        summary.stale_only += applied.stale_only;
-        for (applied.rebuild.items) |t| try appendRef(alloc, &refs, t.artifact, t.doc_key);
-        if (applied.continuation) |cont| {
-            // Same sequence keeps the continuation ordered before later notices.
-            var h = std.hash.Wyhash.init(i);
-            h.update(cont);
-            const key = notices.outboxKey(decoded.notice.sequence, @truncate(h.final() | 0x8000_0000));
-            try plan.put(&key, cont);
+    return applyNoticesConsuming(alloc, primary, manager, encoded, &.{}, now_ms, range_lower, range_upper);
+}
+
+/// Apply notices and, in the same commit, delete the store keys they were
+/// read from (a replicated dependent's inbox).
+pub fn applyNoticesConsuming(
+    alloc: Allocator,
+    primary: *docstore_mod.DocStore,
+    manager: anytype,
+    encoded: []const []const u8,
+    consumed_keys: []const []const u8,
+    now_ms: u64,
+    range_lower: []const u8,
+    range_upper: []const u8,
+) !ApplySummary {
+    const Pass = struct {
+        manager: @TypeOf(manager),
+        encoded: []const []const u8,
+        consumed: []const []const u8,
+        now_ms: u64,
+        lower: []const u8,
+        upper: []const u8,
+        refs: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
+        summary: ApplySummary = .{},
+
+        fn reset(p: *anyopaque, a: Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            for (self.refs.items) |ref| enrichment_types.freeGeneratedRef(a, ref);
+            self.refs.clearRetainingCapacity();
+            self.summary = .{};
         }
+
+        fn run(p: *anyopaque, a: Allocator, reader: store.Reader, plan: *store.Plan) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            var lookup = SourceCache(@TypeOf(self.manager)){ .alloc = a, .manager = self.manager };
+            defer lookup.deinit();
+            for (self.encoded, 0..) |raw, i| {
+                var decoded = try notices.decodeNoticeAlloc(a, raw);
+                defer decoded.deinit();
+                var applied = try notices.planApplyNoticeWithSources(a, reader, plan, decoded.notice, self.now_ms, self.lower, self.upper, notices.default_fanout_page, lookup.sources());
+                defer applied.deinit(a);
+                self.summary.invalidated += applied.rebuild.items.len + applied.debounced + applied.stale_only;
+                self.summary.debounced += applied.debounced;
+                self.summary.stale_only += applied.stale_only;
+                for (applied.rebuild.items) |t| try appendRef(a, &self.refs, t.artifact, t.doc_key);
+                if (applied.continuation) |cont| {
+                    // Same sequence keeps the continuation ordered before later
+                    // notices. Replicated owners re-deliver to their own inbox.
+                    if (self.manager.context_replication != null) {
+                        try plan.putOwned(try command_mod.inboxKeyAlloc(a, cont), try a.dupe(u8, cont));
+                    } else {
+                        var h = std.hash.Wyhash.init(i);
+                        h.update(cont);
+                        const key = notices.outboxKey(decoded.notice.sequence, @truncate(h.final() | 0x8000_0000));
+                        try plan.put(&key, cont);
+                    }
+                }
+            }
+            for (self.consumed) |key| try plan.delete(key);
+            // Debounced rebuilds that are due join this journal record.
+            const due = try store.planDrainDebounced(a, reader, plan, self.now_ms, notices.default_fanout_page);
+            defer store.freeTargets(a, due);
+            for (due) |t| try appendRef(a, &self.refs, t.artifact, t.doc_key);
+        }
+    };
+    var pass = Pass{ .manager = manager, .encoded = encoded, .consumed = consumed_keys, .now_ms = now_ms, .lower = range_lower, .upper = range_upper };
+    errdefer {
+        Pass.reset(&pass, alloc);
+        pass.refs.deinit(alloc);
     }
-    // Debounced rebuilds that are due join this journal record.
-    const due = try store.planDrainDebounced(alloc, reader, &plan, now_ms, notices.default_fanout_page);
-    defer store.freeTargets(alloc, due);
-    for (due) |t| try appendRef(alloc, &refs, t.artifact, t.doc_key);
-    try commitPlan(alloc, primary, &plan);
-    summary.rebuild_refs = try refs.toOwnedSlice(alloc);
+    try planAndCommit(alloc, primary, manager, .{ .ptr = &pass, .plan_fn = Pass.run, .reset_fn = Pass.reset });
+    var summary = pass.summary;
+    summary.rebuild_refs = try pass.refs.toOwnedSlice(alloc);
     return summary;
 }
 
@@ -631,6 +718,103 @@ pub fn dependentOf(alloc: Allocator, raw: []const u8) ![]u8 {
 pub fn deleteOutboxKeys(primary: *docstore_mod.DocStore, keys: []const []const u8) !void {
     if (keys.len == 0) return;
     try primary.putBatch(&.{}, keys);
+}
+
+/// Acknowledge delivered outbox entries. Replicated owners propose content
+/// acknowledgements (every replica deletes its identical entries, whatever
+/// their local keys); `values` are the delivered notice bytes.
+pub fn ackOutbox(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, keys: []const []const u8, values: []const []const u8) !void {
+    if (keys.len == 0) return;
+    const replication = manager.context_replication orelse return deleteOutboxKeys(primary, keys);
+    if (!replication.isOwner()) return error.ContextDependencyNotOwner;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const acks = try a.alloc([]const u8, values.len);
+    for (values, acks) |v, *d| d.* = try command_mod.ackDigestHexAlloc(a, v);
+    manager.lockContextProposals();
+    defer manager.unlockContextProposals();
+    try replication.propose(alloc, .{ .acks = acks });
+}
+
+/// Replicated (Raft) owner hooks.
+pub const Replication = struct {
+    const Methods = struct { propose: *const fn (ptr: *anyopaque, alloc: Allocator, command: command_mod.Command) anyerror!void };
+    const NativeBoundary = named.Boundary(Methods);
+    callback_dispatch: named.Dispatch = NativeBoundary.local_dispatch,
+    ptr: *anyopaque,
+    /// Propose `command` to this table's group and return once it is applied
+    /// on this replica (the leader).
+    propose_fn: *const fn (ptr: *anyopaque, alloc: Allocator, command: command_mod.Command) anyerror!void,
+    /// Whether this replica currently leads the group.
+    is_owner_fn: *const fn (ptr: *anyopaque) bool,
+
+    pub fn propose(self: Replication, alloc: Allocator, command: command_mod.Command) !void {
+        return NativeBoundary.call("propose", self.callback_dispatch, self.propose_fn, .{ self.ptr, alloc, command });
+    }
+
+    pub fn isOwner(self: Replication) bool {
+        return self.is_owner_fn(self.ptr);
+    }
+};
+
+/// One planning pass against a reader. On a replicated owner the pass may
+/// run more than once (a stale read set re-plans); `reset_fn` discards the
+/// outputs of a superseded pass.
+pub const Planner = struct {
+    ptr: *anyopaque,
+    plan_fn: *const fn (ptr: *anyopaque, alloc: Allocator, reader: store.Reader, plan: *store.Plan) anyerror!void,
+    reset_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
+};
+
+pub const Committer = struct {
+    ptr: *anyopaque,
+    commit_fn: *const fn (ptr: *anyopaque, alloc: Allocator, planner: Planner) anyerror!void,
+
+    pub fn commit(self: Committer, alloc: Allocator, planner: Planner) !void {
+        return self.commit_fn(self.ptr, alloc, planner);
+    }
+};
+
+pub const max_plan_attempts: usize = 4;
+
+/// Plan and commit one context-dependency change. Locally: under the
+/// dependency lock, as one atomic batch. Replicated: only on the leader, as
+/// a proposal carrying the exact effects and the recorded read set, which
+/// every replica validates at the same log position; a stale read set
+/// re-plans. Followers never mutate dependency state.
+pub fn planAndCommit(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, planner: Planner) !void {
+    if (manager.context_replication) |replication| {
+        if (!replication.isOwner()) return error.ContextDependencyNotOwner;
+        manager.lockContextProposals();
+        defer manager.unlockContextProposals();
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            if (attempt != 0) if (planner.reset_fn) |reset| reset(planner.ptr, alloc);
+            var state = try StoreReader.init(primary);
+            defer state.deinit();
+            var recorder = command_mod.Recorder.init(alloc, state.reader());
+            defer recorder.deinit();
+            var plan = store.Plan.init(alloc);
+            defer plan.deinit();
+            try planner.plan_fn(planner.ptr, alloc, recorder.reader(), &plan);
+            if (plan.puts.items.len == 0 and plan.deletes.items.len == 0) return;
+            const command = try recorder.commandAlloc(&plan);
+            try replication.propose(alloc, command);
+            var check = try StoreReader.init(primary);
+            defer check.deinit();
+            if (try command_mod.wasApplied(alloc, check.reader(), command)) return;
+            if (attempt + 1 >= max_plan_attempts) return error.ContextDependencyConflict;
+        }
+    }
+    manager.lockContextDependencies();
+    defer manager.unlockContextDependencies();
+    var state = try StoreReader.init(primary);
+    defer state.deinit();
+    var plan = store.Plan.init(alloc);
+    defer plan.deinit();
+    try planner.plan_fn(planner.ptr, alloc, state.reader(), &plan);
+    try commitPlan(alloc, primary, &plan);
 }
 
 fn commitPlan(alloc: Allocator, primary: *docstore_mod.DocStore, plan: *const store.Plan) !void {

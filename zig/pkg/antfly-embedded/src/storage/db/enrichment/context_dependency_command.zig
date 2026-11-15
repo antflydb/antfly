@@ -39,6 +39,8 @@ const store = @import("context_dependency_store.zig");
 
 pub const Digest = [Sha256.digest_length]u8;
 
+/// Source-side notice outbox (see context_notices.zig).
+const outbox_family: u8 = 0x04;
 /// Inbox of delivered notices (dependent side), keyed by notice digest.
 pub const inbox_family: u8 = 0x07;
 /// Digest of the last applied plan command (identical on every replica).
@@ -56,6 +58,10 @@ pub const Command = struct {
     scans: []const Scan = &.{},
     /// Delivered notices to append to this group's inbox.
     inbox: []const []const u8 = &.{},
+    /// Outbox entries delivered by the leader, as hex SHA-256 of the notice
+    /// bytes. Outbox keys embed each replica's local sequence, so replicas
+    /// delete matching entries by content, not by key.
+    acks: []const []const u8 = &.{},
 
     pub const Put = struct { key: []const u8, value: []const u8 };
     /// `digest` is empty when the key was absent.
@@ -68,7 +74,7 @@ pub const Command = struct {
     }
 
     pub fn validate(self: Command) !void {
-        const plan = self.puts.len != 0 or self.deletes.len != 0 or self.reads.len != 0 or self.scans.len != 0;
+        const plan = self.puts.len != 0 or self.deletes.len != 0 or self.reads.len != 0 or self.scans.len != 0 or self.acks.len != 0;
         if (plan == self.isInbox()) return error.InvalidContextDependencyCommand;
         if (self.puts.len + self.deletes.len > max_effects or self.reads.len + self.scans.len > max_reads or self.inbox.len > max_inbox_notices)
             return error.InvalidContextDependencyCommand;
@@ -76,6 +82,8 @@ pub const Command = struct {
         for (self.deletes) |k| if (!isHex(k) or k.len == 0) return error.InvalidContextDependencyCommand;
         for (self.reads) |r| if (!isHex(r.key) or (r.digest.len != 0 and r.digest.len != 64) or !isHex(r.digest)) return error.InvalidContextDependencyCommand;
         for (self.scans) |s| if (!isHex(s.lower) or !isHex(s.upper) or s.digest.len != 64 or !isHex(s.digest)) return error.InvalidContextDependencyCommand;
+        if (self.acks.len > max_effects) return error.InvalidContextDependencyCommand;
+        for (self.acks) |d| if (d.len != 64 or !isHex(d)) return error.InvalidContextDependencyCommand;
     }
 
     /// Identity recorded after a successful apply.
@@ -101,6 +109,8 @@ pub const Command = struct {
         }
         field(&h, "|");
         for (self.inbox) |n| field(&h, n);
+        field(&h, "|");
+        for (self.acks) |d| field(&h, d);
         var out: Digest = undefined;
         h.final(&out);
         return out;
@@ -128,6 +138,10 @@ fn unhexAlloc(a: Allocator, hex: []const u8) ![]u8 {
     const out = try a.alloc(u8, hex.len / 2);
     _ = std.fmt.hexToBytes(out, hex) catch return error.InvalidContextDependencyCommand;
     return out;
+}
+
+pub fn ackDigestHexAlloc(a: Allocator, notice: []const u8) ![]u8 {
+    return hexAlloc(a, &valueDigest(notice));
 }
 
 fn valueDigest(value: []const u8) Digest {
@@ -274,6 +288,27 @@ pub fn applyTxn(alloc: Allocator, txn: anytype, command: Command) !Outcome {
         };
     }
     for (command.puts) |p| try txn.put(try unhexAlloc(a, p.key), try unhexAlloc(a, p.value));
+    if (command.acks.len != 0) {
+        const prefix = store.familyPrefix(outbox_family);
+        var doomed = std.ArrayListUnmanaged([]u8).empty;
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry = try cursor.seekAtOrAfter(&prefix);
+            while (entry) |e| {
+                if (!std.mem.startsWith(u8, e.key, &prefix)) break;
+                const hex = try hexAlloc(a, &valueDigest(e.value));
+                for (command.acks) |ack| if (std.mem.eql(u8, ack, hex)) {
+                    try doomed.append(a, try a.dupe(u8, e.key));
+                    break;
+                };
+                entry = try cursor.next();
+            }
+        }
+        for (doomed.items) |key| txn.delete(key) catch |err| {
+            if (@as(anyerror, err) != error.NotFound) return err;
+        };
+    }
     const d = command.digest();
     try txn.put(&last_applied_key, &d);
     return .applied;

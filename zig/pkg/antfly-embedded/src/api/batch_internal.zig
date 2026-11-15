@@ -529,6 +529,7 @@ pub const OwnedBatchRequest = struct {
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
     group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
+    context_dependency: ?std.json.Parsed(@import("../storage/db/enrichment/context_dependency_command.zig").Command) = null,
     resolver_review: ?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command) = null,
     artifact_catalog: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command) = null,
     artifact_publication: ?std.json.Parsed(@import("../storage/db/artifact_publication.zig").Command) = null,
@@ -567,6 +568,7 @@ pub const OwnedBatchRequest = struct {
         if (self.restore_staging) |*control| control.deinit();
         if (self.online_source) |*control| control.deinit();
         if (self.group_source) |*control| control.deinit();
+        if (self.context_dependency) |*control| control.deinit();
         if (self.resolver_review) |*control| control.deinit();
         if (self.artifact_catalog) |*control| control.deinit();
         if (self.artifact_publication) |*control| control.deinit();
@@ -955,6 +957,18 @@ fn parseBatchRequestWithOptions(
         break :control @as(?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command), parsed_control);
     } else null;
     errdefer if (group_source) |*control| control.deinit();
+    var context_dependency = if (root.get("_context_dependency")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "context_dependency_v1")) return error.InvalidBatchRequest;
+        const parsed_control = try std.json.parseFromValue(@import("../storage/db/enrichment/context_dependency_command.zig").Command, alloc, value, .{ .allocate = .alloc_always });
+        errdefer parsed_control.deinit();
+        parsed_control.value.validate() catch return error.InvalidBatchRequest;
+        break :control @as(?std.json.Parsed(@import("../storage/db/enrichment/context_dependency_command.zig").Command), parsed_control);
+    } else null;
+    errdefer if (context_dependency) |*control| control.deinit();
     var resolver_review = if (root.get("_resolver_review")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
@@ -1147,7 +1161,7 @@ fn parseBatchRequestWithOptions(
         // single-purpose validators correctly reject. Ordinary unmarked row
         // replay retains its historical legacy interpretation.
         const isolated_control = graph_endpoint_cleanup or activate_range_tracking or relational_topology != null or relational_generation_gc != null or
-            row_policy_publication != null or artifact_catalog != null or group_source != null or
+            row_policy_publication != null or artifact_catalog != null or group_source != null or context_dependency != null or
             resolver_review != null or artifact_publication != null or artifact_publication_transport != null or
             leann_record_index != null or merge_proof_adoption != null;
         const value = root.get("_document_version_scheme") orelse break :scheme if (!allow_internal or local_owner or isolated_control) .admit_current else .legacy;
@@ -1409,6 +1423,10 @@ fn parseBatchRequestWithOptions(
         }
         if (std.mem.eql(u8, kind_value.string, "group_source_v1")) {
             if (group_source == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
+        if (std.mem.eql(u8, kind_value.string, "context_dependency_v1")) {
+            if (context_dependency == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
         if (std.mem.eql(u8, kind_value.string, "resolver_review_v1")) {
@@ -1700,6 +1718,7 @@ fn parseBatchRequestWithOptions(
         .restore_staging = restore_staging,
         .online_source = online_source,
         .group_source = group_source,
+        .context_dependency = context_dependency,
         .resolver_review = resolver_review,
         .artifact_catalog = artifact_catalog,
         .artifact_publication = artifact_publication,
@@ -1737,6 +1756,7 @@ fn parseBatchRequestWithOptions(
             .restore_staging = if (restore_staging) |control| control.value else null,
             .online_source = if (online_source) |control| control.value else null,
             .group_source = if (group_source) |control| control.value else null,
+            .context_dependency = if (context_dependency) |control| control.value else null,
             .resolver_review = if (resolver_review) |control| control.value else null,
             .artifact_catalog = if (artifact_catalog) |control| control.value else null,
             .artifact_publication = if (artifact_publication) |control| control.value else null,
@@ -2122,6 +2142,12 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     }
     if (req.group_source) |control| {
         try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"group_source_v1\"},\"_group_source\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
+    if (req.context_dependency) |control| {
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"context_dependency_v1\"},\"_context_dependency\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
         defer alloc.free(encoded);
         try writer.writeAll(encoded);

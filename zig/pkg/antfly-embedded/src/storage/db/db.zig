@@ -3204,6 +3204,11 @@ pub const DB = struct {
     context_source_host_reader: ?@import("enrichment/context_resolution.zig").Reader = null,
     /// Host delivery of change notices to foreign dependent tables.
     context_notice_dispatcher: ?context_dependency_db.Dispatcher = null,
+    /// Set when a replicated inbox append applied; cleared once drained.
+    context_inbox_pending: std.atomic.Value(bool) = .init(false),
+    /// Distributed hosts: reader over the host's routed read source.
+    context_remote_reader: ?*@import("context_source_db_reader.zig").RemoteReader = null,
+    context_remote_table_id: ?[]u8 = null,
     enrichment_owner: EnrichmentOwner = .{},
     query_recovery_owner: DetachedEnrichmentRuntime = .{},
     // Keep one reconstruction service owner when live producers are removed.
@@ -5255,6 +5260,10 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("close", .{self}) catch unreachable;
         if (self.closed) return;
         self.closed = true;
+        if (self.context_remote_reader) |remote| self.alloc.destroy(remote);
+        self.context_remote_reader = null;
+        if (self.context_remote_table_id) |id| self.alloc.free(id);
+        self.context_remote_table_id = null;
         self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
         self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
         self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
@@ -9232,6 +9241,7 @@ pub const DB = struct {
             return self.batchInternal(.{ .sync_level = .write }, profile, control_opts);
         }
         if (req.leann_record != null) return self.applyLeannRecordBatch(req, opts);
+        if (req.context_dependency != null) return self.applyContextDependencyBatch(req, opts);
         if (req.merge_proof_adoption != null) return self.applyMergeProofAdoptionBatch(req, opts);
         if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
         if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
@@ -10341,6 +10351,118 @@ pub const DB = struct {
 
     const context_dependency_host_key = "\x00\x00__metadata__:context_dependency:host";
 
+    /// Distributed (Raft) host configuration for one group's DB: the table's
+    /// immutable identity, inbound dependents from other tables, the routed
+    /// read source, the notice dispatcher (to every group of a dependent
+    /// table), and the group's replication hooks.
+    pub const ContextHostConfig = struct {
+        table_id: []const u8,
+        inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig = &.{},
+        read_source: ?@import("context_source_db_reader.zig").ReadSource = null,
+        dispatcher: ?context_dependency_db.Dispatcher = null,
+        replication: ?context_dependency_db.Replication = null,
+    };
+
+    pub fn installContextHost(self: *DB, config: ContextHostConfig) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("installContextHost", .{ self, config });
+        var reader: ?@import("enrichment/context_resolution.zig").Reader = null;
+        if (config.read_source) |source| {
+            const remote = if (self.context_remote_reader) |existing| existing else blk: {
+                const created = try self.alloc.create(@import("context_source_db_reader.zig").RemoteReader);
+                self.context_remote_reader = created;
+                break :blk created;
+            };
+            if (self.context_remote_table_id) |old| self.alloc.free(old);
+            self.context_remote_table_id = try self.alloc.dupe(u8, config.table_id);
+            remote.* = .{ .source = source, .own_table_id = self.context_remote_table_id.? };
+            reader = remote.reader();
+        }
+        try self.setContextDependencyHost(config.table_id, config.inbound, reader, config.dispatcher);
+        self.setContextReplication(config.replication);
+    }
+
+    /// Replicated owners: route every context-dependency mutation through
+    /// leader proposals (see enrichment/context_dependency_command.zig) and
+    /// stop the automatic post-commit drains, which would run on the apply
+    /// path. The host then calls `runContextMaintenance` on the leader.
+    pub fn setContextReplication(self: *DB, replication: ?context_dependency_db.Replication) void {
+        self.core.lockApply();
+        defer self.core.unlockApply();
+        self.core.index_manager.context_replication = replication;
+        self.core.index_manager.context_committer = if (replication != null) .{ .ptr = self, .commit_fn = commitContextPlanHook } else null;
+    }
+
+    fn commitContextPlanHook(ptr: *anyopaque, alloc: Allocator, planner: context_dependency_db.Planner) anyerror!void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return context_dependency_db.planAndCommit(alloc, self.core.store, self.core.index_manager, planner);
+    }
+
+    fn signalContextInbox(self: *DB) void {
+        self.context_inbox_pending.store(true, .release);
+    }
+
+    /// Whether delivered notices are waiting in this replica's inbox.
+    pub fn contextInboxPending(self: *DB) bool {
+        return self.context_inbox_pending.load(.acquire);
+    }
+
+    /// Apply notices delivered to this group's inbox (replicated owners), in
+    /// bounded pages, deleting them in the same commit.
+    pub fn applyContextInbox(self: *DB, limit: usize) !usize {
+        const command_mod = @import("enrichment/context_dependency_command.zig");
+        const Collect = struct {
+            alloc: Allocator,
+            keys: std.ArrayListUnmanaged([]u8) = .empty,
+            values: std.ArrayListUnmanaged([]u8) = .empty,
+            limit: usize,
+            fn visit(p: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
+                const c: *@This() = @ptrCast(@alignCast(p));
+                try c.keys.append(c.alloc, try c.alloc.dupe(u8, key));
+                try c.values.append(c.alloc, try c.alloc.dupe(u8, value));
+                return c.keys.items.len < c.limit;
+            }
+        };
+        var collect = Collect{ .alloc = self.alloc, .limit = if (limit == 0) 128 else limit };
+        defer {
+            for (collect.keys.items) |k| self.alloc.free(k);
+            for (collect.values.items) |v| self.alloc.free(v);
+            collect.keys.deinit(self.alloc);
+            collect.values.deinit(self.alloc);
+        }
+        {
+            var reader = try context_dependency_db.StoreReader.init(self.core.store);
+            defer reader.deinit();
+            const prefix = context_dependency_store.familyPrefix(command_mod.inbox_family);
+            try reader.reader().scanPrefix(self.alloc, &prefix, .{ .ptr = &collect, .visit_fn = Collect.visit });
+        }
+        if (collect.keys.items.len < collect.limit) self.context_inbox_pending.store(false, .release);
+        if (collect.keys.items.len == 0) return 0;
+        const range = self.core.byteRange();
+        var summary = try context_dependency_db.applyNoticesConsuming(self.alloc, self.core.store, self.core.index_manager, @ptrCast(collect.values.items), @ptrCast(collect.keys.items), contextNowMs(), range.start, range.end);
+        defer summary.deinit(self.alloc);
+        try self.journalContextRebuilds(&summary);
+        return collect.keys.items.len;
+    }
+
+    /// One maintenance pass for replicated owners, run by the host on the
+    /// group leader outside the apply path: reconcile, shadow backfill, inbox
+    /// application, debounced rebuilds, and outbox delivery. A no-op on
+    /// followers. Returns whether more work remains.
+    pub fn runContextMaintenance(self: *DB) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runContextMaintenance", .{self});
+        if (self.core.index_manager.contextFollower()) return false;
+        if (!self.core.index_manager.hasContextDependents() and !self.contextInboxPending()) return false;
+        var more = false;
+        if (!try self.advanceContextReconcile(256)) more = true;
+        if (!try self.advanceContextShadowBackfill(256)) more = true;
+        if (try self.applyContextInbox(128) == 128) more = true;
+        const result = try self.drainContextNoticeOutbox(256);
+        if (result.remaining) more = true;
+        // Delivery may have filled this group's own inbox.
+        if (self.contextInboxPending()) more = true;
+        return more;
+    }
+
     /// Re-install the persisted topology (identity and inbound dependents)
     /// with fresh host callbacks. Returns false when none was persisted.
     pub fn restoreContextDependencyHost(
@@ -10394,8 +10516,12 @@ pub const DB = struct {
         defer local.deinit(self.alloc);
         var done = std.ArrayListUnmanaged([]const u8).empty;
         defer done.deinit(self.alloc);
+        // Replicated tables span groups: even own-table dependents may live in
+        // another group, so every notice goes through the dispatcher (which
+        // delivers to every group of the dependent table, this one included).
+        const replicated = self.core.index_manager.context_replication != null;
         for (entries) |entry| {
-            if (try context_dependency_db.isLocalNotice(self.alloc, entry.value, self.context_source_table_id)) {
+            if (!replicated and try context_dependency_db.isLocalNotice(self.alloc, entry.value, self.context_source_table_id)) {
                 try local.append(self.alloc, entry.value);
                 continue;
             }
@@ -10405,7 +10531,7 @@ pub const DB = struct {
             };
             const dependent = try context_dependency_db.dependentOf(self.alloc, entry.value);
             defer self.alloc.free(dependent);
-            dispatcher.deliver(dispatcher.ptr, self.alloc, dependent, entry.value) catch |err| {
+            dispatcher.deliverNotice(self.alloc, dependent, entry.value) catch |err| {
                 std.log.warn("context notice delivery deferred dependent={s} err={s}", .{ dependent, @errorName(err) });
                 result.remaining = true;
                 continue;
@@ -10425,7 +10551,13 @@ pub const DB = struct {
             defer summary.deinit(self.alloc);
             try self.journalContextRebuilds(&summary);
         }
-        try context_dependency_db.deleteOutboxKeys(self.core.store, done.items);
+        var done_values = std.ArrayListUnmanaged([]const u8).empty;
+        defer done_values.deinit(self.alloc);
+        for (done.items) |key| for (entries) |entry| if (entry.key.ptr == key.ptr) {
+            try done_values.append(self.alloc, entry.value);
+            break;
+        };
+        try context_dependency_db.ackOutbox(self.alloc, self.core.store, self.core.index_manager, done.items, done_values.items);
         return result;
     }
 
@@ -10471,6 +10603,9 @@ pub const DB = struct {
     }
 
     fn drainContextNoticeOutboxBestEffort(self: *DB) void {
+        // Replicated owners drain from the host's leader maintenance pass,
+        // never from a commit (which may be the apply path).
+        if (self.core.index_manager.context_replication != null) return;
         if (!self.core.index_manager.hasContextDependents()) return;
         _ = self.advanceContextReconcile(256) catch |err| blk: {
             std.log.warn("context reconcile deferred: {s}", .{@errorName(err)});
@@ -10506,6 +10641,8 @@ pub const DB = struct {
         defer if (cursor) |value| self.alloc.free(value);
         const page = try self.backfillContextShadows(cursor orelse "", page_rows);
         defer if (page.next_key) |key| self.alloc.free(key);
+        // Replicated owners commit the cursor with the page.
+        if (self.core.index_manager.context_replication != null) return page.done;
         if (page.next_key) |key| {
             try self.core.store.put(context_shadow_cursor_key, key);
         } else {
@@ -10543,7 +10680,9 @@ pub const DB = struct {
             error.Canceled => {},
             else => return err,
         };
-        _ = try context_dependency_db.backfillShadowPage(self.alloc, self.core.store, self.core.index_manager, collect.rows.items);
+        const replicated = self.core.index_manager.context_replication != null;
+        const next_cursor: ?[]const u8 = if (collect.rows.items.len < collect.limit or collect.rows.items.len == 0) null else collect.rows.items[collect.rows.items.len - 1].key;
+        _ = try context_dependency_db.backfillShadowPageWithCursor(self.alloc, self.core.store, self.core.index_manager, collect.rows.items, if (replicated) context_shadow_cursor_key else null, if (replicated) next_cursor else null);
         if (collect.rows.items.len < collect.limit) {
             try context_dependency_db.markShadowsComplete(self.alloc, self.core.store, self.core.index_manager);
             return .{ .done = true, .next_key = null };
@@ -27162,7 +27301,7 @@ pub const DB = struct {
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         var request = try std.json.parseFromSlice(struct {
-            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
+            mode: enum { identity, status, completed, parent_activation, generation_publication, generation_handoff_summary, generation_handoff_seal, generation_handoff_install, generation_handoff_identity, graph_retirement, graph_endpoint_cleanup, leann_plan, context_maintenance, initial_child_preflight, initial_child_publication, public_schema, generation_gc, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
             scope: ?@import("online_source_contract.zig").Scope = null,
         }, alloc, request_json, .{});
         defer request.deinit();
@@ -27298,6 +27437,13 @@ pub const DB = struct {
                     o.* = .{ .index_name = p.index_name, .records_base64 = encoded };
                 }
                 try stream.write(types.LeannPlanStatus{ .proposals = out });
+            },
+            .context_maintenance => {
+                // Leader-local context-dependency work (reconcile, backfill,
+                // inbox, outbox delivery); mutations are proposed by the
+                // installed replication hook and validated by every replica.
+                const more = try self.runContextMaintenance();
+                try stream.write(.{ .more = more });
             },
             .graph_endpoint_cleanup => {
                 if (try self.prepareGraphEndpointCleanupBatch(alloc)) |owned| {
@@ -28068,6 +28214,60 @@ pub const DB = struct {
     /// manager apply persisted records in log order. A failure to apply
     /// (for example a generation whose chunks are still arriving) does not
     /// fail the Raft apply: the record is durable and the next drain resumes.
+    /// Replicated context-dependency command at its log position. Plans are
+    /// applied verbatim when their read set still matches (otherwise a
+    /// deterministic no-op the proposing leader observes and re-plans);
+    /// inbox appends always apply. Every replica writes the same bytes.
+    fn applyContextDependencyBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        try types.validateContextDependencyCommand(req);
+        const command = req.context_dependency orelse return error.InvalidBatchRequest;
+        // Unreplicated owners (servers without data Raft) accept delivered
+        // notices directly; plans always come from a replicated leader.
+        const entry = opts.ordered_apply_receipt orelse {
+            if (!command.isInbox() or self.core.index_manager.context_replication != null) return error.InvalidBatchRequest;
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try @import("enrichment/context_dependency_command.zig").applyTxn(self.alloc, &txn, command);
+            try txn.commit();
+            self.signalContextInbox();
+            return;
+        };
+        if (entry.term == 0 or entry.index == 0 or opts.artifact_upload_finalize != null or
+            opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0 or opts.outcome_marker_write != null) return error.InvalidBatchRequest;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
+        }
+        var outcome: @import("enrichment/context_dependency_command.zig").Outcome = .conflict;
+        {
+            var mutation = self.core.snapshot_admission.acquireMutation();
+            defer mutation.release();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            outcome = try @import("enrichment/context_dependency_command.zig").applyTxn(self.alloc, &txn, command);
+            var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_buf);
+            try txn.put(marker.key, marker.value);
+            var standby_buf: [replication_applied_lsn_value_len]u8 = undefined;
+            if (opts.replication_applied_lsn_marker) |lsn| {
+                const standby = replicationAppliedSequenceWrite(lsn, &standby_buf);
+                try txn.put(standby.key, standby.value);
+            }
+            try txn.commit();
+        }
+        // Delivered notices are processed by the group leader's drain.
+        if (outcome == .applied and command.isInbox()) self.signalContextInbox();
+    }
+
     fn applyLeannRecordBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
         try types.validateLeannRecordCommand(req);
         const command = req.leann_record orelse return error.InvalidBatchRequest;
@@ -28990,6 +29190,7 @@ pub const DB = struct {
                 try @import("artifact_producer_provenance.zig").stageIndexed(txn, guard.command, guard.proof, guard.position, guard.document_references);
                 try publication.stageArtifactRevisions(alloc, txn, guard.command, guard.position);
                 if (guard.command.producer_kind == .resolver) try @import("artifact_publication_resolution.zig").stageHandoff(alloc, txn, guard.command);
+                try guard.db.promoteContextIntentsTxn(alloc, txn, guard.command);
                 try DB.completeArtifactUpload(txn, guard.upload, .{ .term = guard.position.raft.term, .index = guard.position.raft.index });
                 try guard.db.stageRestoreStagingReplicationOutbox(txn, guard.replication_payload);
             }
@@ -29021,6 +29222,26 @@ pub const DB = struct {
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             try applyDerivedBatchInlineAssumeApply(&batch_ctx, prepared_value.batch);
+        }
+    }
+
+    /// Inside an ordered publication's commit, on every replica: promote the
+    /// context publish intent recorded for each published asset output (by
+    /// exact output digest), so dependency state lands with the artifact.
+    fn promoteContextIntentsTxn(self: *DB, alloc: Allocator, txn: anytype, command: anytype) !void {
+        if (!self.core.index_manager.hasAssetContextSources()) return;
+        for (command.mutations) |effect| {
+            const value = effect.value orelse continue;
+            var ref = (artifact_ids.decodeArtifactRefAlloc(alloc, effect.key) catch null) orelse continue;
+            defer ref.deinit(alloc);
+            if (ref.kind != .asset or ref.unit_id != null) continue;
+            var output_digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(value, &output_digest, .{});
+            var reader = context_dependency_store.TxnReader(@TypeOf(txn.*)){ .txn = txn };
+            var plan = context_dependency_store.Plan.init(alloc);
+            defer plan.deinit();
+            _ = try context_dependency_store.planPromoteIntent(alloc, reader.reader(), &plan, ref.document_id, ref.name, output_digest);
+            try context_dependency_store.applyPlanToTxn(txn, &plan);
         }
     }
 
@@ -155046,6 +155267,151 @@ test "db context sources evaluate antfly filter trees with storage row filters" 
     defer alloc.free(manifest);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "n:3") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "n:2") == null);
+}
+
+const ContextReplicaPair = struct {
+    leader: *DB,
+    follower: *DB,
+    index: u64 = 100,
+    leader_owner: bool = true,
+
+    fn apply(self: *ContextReplicaPair, req: types.BatchRequest) !void {
+        self.index += 1;
+        // Every replica applies the same entry at the same log position.
+        try graphTestApplyOrdered(self.leader, req, .{ .term = 1, .index = self.index });
+        try graphTestApplyOrdered(self.follower, req, .{ .term = 1, .index = self.index });
+    }
+
+    fn propose(ptr: *anyopaque, _: Allocator, command: @import("enrichment/context_dependency_command.zig").Command) anyerror!void {
+        const self: *ContextReplicaPair = @ptrCast(@alignCast(ptr));
+        try self.apply(.{ .context_dependency = command });
+    }
+
+    fn isLeader(ptr: *anyopaque) bool {
+        const self: *ContextReplicaPair = @ptrCast(@alignCast(ptr));
+        return self.leader_owner;
+    }
+
+    fn isFollowerOwner(_: *anyopaque) bool {
+        return false;
+    }
+
+    /// Delivery to "every group of the dependent table": here one group.
+    fn deliver(ptr: *anyopaque, _: Allocator, _: []const u8, notice: []const u8) anyerror!void {
+        const self: *ContextReplicaPair = @ptrCast(@alignCast(ptr));
+        try self.apply(.{ .context_dependency = .{ .inbox = &.{notice} } });
+    }
+};
+
+fn contextTestDependencyFamiliesAlloc(db: *DB, alloc: Allocator) ![]u8 {
+    // Replicated dependency families plus document-scoped state, as bytes.
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var reader = try context_dependency_db.StoreReader.init(db.core.store);
+    defer reader.deinit();
+    const Collect = struct {
+        alloc: Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        fn visit(p: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            try self.out.print(self.alloc, "{x}={x};", .{ key, value });
+            return true;
+        }
+    };
+    var collect = Collect{ .alloc = alloc, .out = &out };
+    for ([_]u8{ 0x01, 0x02, 0x03, 0x04, 0x06, 0x07, 0x08, 0x09 }) |family| {
+        const prefix = context_dependency_store.familyPrefix(family);
+        try reader.reader().scanPrefix(alloc, &prefix, .{ .ptr = &collect, .visit_fn = Collect.visit });
+    }
+    for ([_][]const u8{ "doc:a", "doc:b" }) |doc| {
+        var state = (try context_dependency_store.loadState(alloc, reader.reader(), null, doc, "summary")) orelse continue;
+        defer state.deinit(alloc);
+        try out.print(alloc, "{s}:{d}:{d}:{s};", .{ doc, state.generation, state.published_generation, @tagName(state.freshness) });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "db replicated context dependencies apply leader plans identically on every replica" {
+    const alloc = std.testing.allocator;
+    var leader_dir = try TestDirectory.init("context-replicated-leader");
+    defer leader_dir.cleanup();
+    var follower_dir = try TestDirectory.init("context-replicated-follower");
+    defer follower_dir.cleanup();
+    var leader = try DB.open(alloc, leader_dir.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer leader.close();
+    var follower = try DB.open(alloc, follower_dir.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer follower.close();
+    const declaration = try contextSourcesTestDeclarationAlloc(alloc,
+        \\{"peers":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}}},"fields":["title"],"max_documents":10}}
+    );
+    defer alloc.free(declaration);
+    for ([_]*DB{ &leader, &follower }) |db| {
+        try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .context_sources_json = declaration });
+    }
+    var pair = ContextReplicaPair{ .leader = &leader, .follower = &follower };
+    leader.setContextReplication(.{ .ptr = &pair, .propose_fn = ContextReplicaPair.propose, .is_owner_fn = ContextReplicaPair.isLeader });
+    follower.setContextReplication(.{ .ptr = &pair, .propose_fn = ContextReplicaPair.propose, .is_owner_fn = ContextReplicaPair.isFollowerOwner });
+    for ([_]*DB{ &leader, &follower }) |db| try db.setContextDependencyHost("t1", &.{}, null, .{ .ptr = &pair, .deliver = ContextReplicaPair.deliver });
+
+    // Shadows backfill through proposals on the leader only.
+    try pair.apply(.{ .writes = &.{
+        .{ .key = "n:1", .value = "{\"org\":\"o1\",\"title\":\"a\"}" },
+        .{ .key = "doc:a", .value = "{\"body\":\"x\",\"org\":\"o1\"}" },
+        .{ .key = "doc:b", .value = "{\"body\":\"y\",\"org\":\"o2\"}" },
+    } });
+    while (try leader.runContextMaintenance()) {}
+    try std.testing.expect(!try follower.runContextMaintenance());
+
+    // Register dependents through the leader's committer (the enrichment
+    // runtime's path), then publish through an intent promoted on apply.
+    const Register = struct {
+        doc: []const u8,
+        org: []const u8,
+        config: *const @import("enrichment/context_sources.zig").Config,
+        fn run(p: *anyopaque, a: Allocator, reader: context_dependency_store.Reader, plan: *context_dependency_store.Plan) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const doc = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try std.fmt.allocPrint(arena.allocator(), "{{\"org\":\"{s}\"}}", .{self.org}), .{});
+            var bindings = try @import("enrichment/context_sources.zig").bindForKeyAlloc(a, self.config, self.doc, doc);
+            defer bindings.deinit();
+            const tuples = try bindings.allTuplesAlloc(a);
+            defer a.free(tuples);
+            const capture = try context_dependency_store.planRegister(a, reader, plan, self.doc, "summary", tuples, self.config.digest());
+            _ = try context_dependency_store.planPublish(a, reader, plan, self.doc, "summary", .{ .capture = capture, .tuples = tuples, .input_fingerprint = @splat(1) });
+        }
+    };
+    var config = try @import("enrichment/context_sources.zig").parseStoredJson(alloc, declaration);
+    defer config.deinit();
+    const committer = leader.core.index_manager.context_committer.?;
+    for ([_][2][]const u8{ .{ "doc:a", "o1" }, .{ "doc:b", "o2" } }) |d| {
+        var register = Register{ .doc = d[0], .org = d[1], .config = &config };
+        try committer.commit(alloc, .{ .ptr = &register, .plan_fn = Register.run });
+    }
+    // Followers never plan.
+    try std.testing.expectError(error.ContextDependencyNotOwner, follower.core.index_manager.context_committer.?.commit(alloc, .{ .ptr = undefined, .plan_fn = Register.run }));
+
+    // A source change stages a notice on both replicas; only the leader
+    // delivers it (to the group inbox) and applies the inbox via a plan.
+    try pair.apply(.{ .writes = &.{.{ .key = "n:2", .value = "{\"org\":\"o1\",\"title\":\"b\"}" }} });
+    try std.testing.expect(!try follower.runContextMaintenance());
+    while (try leader.runContextMaintenance()) {}
+    try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&leader, alloc, "doc:a"));
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&leader, alloc, "doc:b"));
+    {
+        const l = try contextTestDependencyFamiliesAlloc(&leader, alloc);
+        defer alloc.free(l);
+        const f = try contextTestDependencyFamiliesAlloc(&follower, alloc);
+        defer alloc.free(f);
+        try std.testing.expectEqualStrings(l, f);
+        // Inbox drained everywhere.
+        try std.testing.expect(std.mem.indexOf(u8, l, "025eff07") == null);
+    }
+
+    // A leader change: the old leader stops planning, the new one drains.
+    pair.leader_owner = false;
+    try std.testing.expectError(error.ContextDependencyNotOwner, committer.commit(alloc, .{ .ptr = undefined, .plan_fn = Register.run }));
+    try std.testing.expect(!try leader.runContextMaintenance());
 }
 
 test "db context sources publish snapshot context as unverified with scheduled refresh" {

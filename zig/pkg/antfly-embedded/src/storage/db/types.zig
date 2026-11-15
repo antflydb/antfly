@@ -278,6 +278,10 @@ pub const BatchRequest = struct {
     online_source: ?@import("online_source_contract.zig").Command = null,
     /// Ordered complete artifact catalog; accepted only by private Raft ingress.
     artifact_catalog: ?@import("artifact_inventory.zig").Command = null,
+    /// Leader-planned context-dependency effects or delivered change notices
+    /// (see enrichment/context_dependency_command.zig). Private Raft ingress
+    /// only; replicas validate the read set and apply verbatim.
+    context_dependency: ?@import("enrichment/context_dependency_command.zig").Command = null,
     /// Private grouped-source control; public batch JSON cannot populate it.
     group_source: ?@import("group_source_contract.zig").Command = null,
     /// Exact producer result; only authenticated owner-leader Raft ingress.
@@ -5592,6 +5596,22 @@ pub const LeannPlanStatus = struct {
 
 /// Upper bound for one record: writes plus an inline generation.
 pub const leann_record_max_bytes: usize = 8 << 20;
+
+/// A context-dependency command is standalone, like a LEANN record.
+pub fn validateContextDependencyCommand(req: BatchRequest) !void {
+    const command = req.context_dependency orelse return;
+    command.validate() catch return error.InvalidBatchRequest;
+    const defaults = BatchRequest{};
+    inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "document_version_scheme")) continue;
+        if (comptime !std.mem.eql(u8, field_name, "context_dependency") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
+            const value = @field(req, field_name);
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+                if (value.len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(value, @field(defaults, field_name))) return error.InvalidBatchRequest;
+        }
+    }
+}
 
 /// A LEANN record is a standalone private command: it carries no other
 /// effect, so replicas never apply part of a batch.

@@ -1053,6 +1053,148 @@ fn putSubscriptionValue(alloc: Allocator, reader: Reader, plan: *Plan, t: ctx.Su
     try plan.putOwned(key, try alloc.dupe(u8, t.residual));
 }
 
+/// Publish intents (replicated owners): the leader records the dependency
+/// publication for one exact output before submitting it through ordered
+/// artifact publication; every replica promotes the intent inside the
+/// publication's apply transaction, so the artifact and its dependency
+/// state (freshness, subscriptions, lineage) commit together everywhere.
+pub const intent_family: u8 = 0x09;
+
+pub fn intentKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    errdefer list.deinit(alloc);
+    try list.appendSlice(alloc, &familyPrefix(intent_family));
+    try appendLenPrefixed(alloc, &list, artifact);
+    try appendLenPrefixed(alloc, &list, doc_key);
+    return list.toOwnedSlice(alloc);
+}
+
+fn appendLenPrefixed(alloc: Allocator, list: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, @intCast(bytes.len), .big);
+    try list.appendSlice(alloc, &len);
+    try list.appendSlice(alloc, bytes);
+}
+
+const WireInput = struct { source: []const u8, table_id: []const u8, key: []const u8, revision: []const u8 };
+const WireQuery = struct { source: []const u8, table_id: []const u8, query_identity: []const u8, member_count: u32, membership: []const u8, complete: bool };
+const WireTuple = struct { spec: []const u8, tuple: []const u8, residual: []const u8 };
+const WireIntent = struct {
+    output_digest: []const u8,
+    generation: u64,
+    config_digest: []const u8,
+    tuples: []const WireTuple,
+    input_fingerprint: []const u8,
+    frontier: []const u8,
+    producer_recipe: []const u8,
+    published_at_ms: i64,
+    inputs: []const WireInput,
+    queries: []const WireQuery,
+    absent: []const WireInput,
+    retain_versions: u32,
+    snapshot: bool,
+    refresh_due_ms: u64,
+};
+
+fn hexOf(a: Allocator, d: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{x}", .{d});
+}
+
+fn digestOf(hex: []const u8) !Digest {
+    var out: Digest = undefined;
+    if (hex.len != 64) return error.InvalidContextIntent;
+    _ = std.fmt.hexToBytes(&out, hex) catch return error.InvalidContextIntent;
+    return out;
+}
+
+/// Plan the intent for `output_digest` (pivot carriers expanded against the
+/// leader's pivots, so replicas promote plain tuples).
+pub fn planPublishIntent(alloc: Allocator, reader: Reader, plan: *Plan, doc_key: []const u8, artifact: []const u8, output_digest: Digest, input: PublishInput) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tuples = try expandPivotTuplesAlloc(a, reader, plan, input.tuples);
+    const wire_tuples = try a.alloc(WireTuple, tuples.len);
+    for (tuples, wire_tuples) |t, *w| w.* = .{ .spec = try hexOf(a, &t.spec), .tuple = try hexOf(a, &t.tuple), .residual = t.residual };
+    const Conv = struct {
+        fn inputs(ca: Allocator, list: []const ManifestInput) ![]WireInput {
+            const out = try ca.alloc(WireInput, list.len);
+            for (list, out) |m, *w| w.* = .{ .source = m.source, .table_id = m.table_id, .key = m.key, .revision = try hexOf(ca, &m.revision) };
+            return out;
+        }
+    };
+    const queries = try a.alloc(WireQuery, input.queries.len);
+    for (input.queries, queries) |q, *w| w.* = .{ .source = q.source, .table_id = q.table_id, .query_identity = try hexOf(a, &q.query_identity), .member_count = q.member_count, .membership = try hexOf(a, &q.membership), .complete = q.complete };
+    const intent = WireIntent{
+        .output_digest = try hexOf(a, &output_digest),
+        .generation = input.capture.generation,
+        .config_digest = try hexOf(a, &input.capture.config_digest),
+        .tuples = wire_tuples,
+        .input_fingerprint = try hexOf(a, &input.input_fingerprint),
+        .frontier = input.frontier,
+        .producer_recipe = input.producer_recipe,
+        .published_at_ms = input.published_at_ms,
+        .inputs = try Conv.inputs(a, input.inputs),
+        .queries = queries,
+        .absent = try Conv.inputs(a, input.absent),
+        .retain_versions = input.retain_versions,
+        .snapshot = input.snapshot,
+        .refresh_due_ms = input.refresh_due_ms,
+    };
+    const encoded = try std.json.Stringify.valueAlloc(plan.alloc, intent, .{});
+    errdefer plan.alloc.free(encoded);
+    try plan.putOwned(try intentKeyAlloc(plan.alloc, doc_key, artifact), encoded);
+}
+
+/// Promote the intent for `(doc_key, artifact)` when it was recorded for
+/// exactly `output_digest` (inside the publication's apply). A superseded
+/// generation drops the intent without publishing: the invalidation that
+/// superseded it already re-queued the document. Returns whether published.
+pub fn planPromoteIntent(alloc: Allocator, reader: Reader, plan: *Plan, doc_key: []const u8, artifact: []const u8, output_digest: Digest) !bool {
+    const key = try intentKeyAlloc(alloc, doc_key, artifact);
+    defer alloc.free(key);
+    const raw = (try reader.get(alloc, key)) orelse return false;
+    defer alloc.free(raw);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const intent = std.json.parseFromSliceLeaky(WireIntent, a, raw, .{}) catch {
+        try plan.delete(key);
+        return false;
+    };
+    if (!std.mem.eql(u8, &(try digestOf(intent.output_digest)), &output_digest)) return false;
+    try plan.delete(key);
+    const tuples = try a.alloc(ctx.SubscriptionTuple, intent.tuples.len);
+    for (intent.tuples, tuples) |w, *t| t.* = .{ .spec = try digestOf(w.spec), .tuple = try digestOf(w.tuple), .residual = w.residual };
+    const Conv = struct {
+        fn inputs(ca: Allocator, list: []const WireInput) ![]ManifestInput {
+            const out = try ca.alloc(ManifestInput, list.len);
+            for (list, out) |w, *m| m.* = .{ .source = w.source, .table_id = w.table_id, .key = w.key, .revision = try digestOf(w.revision) };
+            return out;
+        }
+    };
+    const queries = try a.alloc(ManifestQuery, intent.queries.len);
+    for (intent.queries, queries) |w, *q| q.* = .{ .source = w.source, .table_id = w.table_id, .query_identity = try digestOf(w.query_identity), .member_count = w.member_count, .membership = try digestOf(w.membership), .complete = w.complete };
+    _ = planPublish(alloc, reader, plan, doc_key, artifact, .{
+        .capture = .{ .generation = intent.generation, .config_digest = try digestOf(intent.config_digest) },
+        .tuples = tuples,
+        .input_fingerprint = try digestOf(intent.input_fingerprint),
+        .frontier = intent.frontier,
+        .producer_recipe = intent.producer_recipe,
+        .published_at_ms = intent.published_at_ms,
+        .inputs = try Conv.inputs(a, intent.inputs),
+        .queries = queries,
+        .absent = try Conv.inputs(a, intent.absent),
+        .retain_versions = intent.retain_versions,
+        .snapshot = intent.snapshot,
+        .refresh_due_ms = intent.refresh_due_ms,
+    }) catch |err| switch (err) {
+        error.DependencyGenerationSuperseded => return false,
+        else => return err,
+    };
+    return true;
+}
+
 pub const PublishResult = struct {
     version: u64,
 };
@@ -2113,4 +2255,36 @@ test "residual subscription values filter invalidation per subscriber and snapsh
     const due = try planDrainDebounced(alloc, store.reader(), &plan, 9000, 4);
     defer freeTargets(alloc, due);
     try testing.expectEqual(@as(usize, 1), due.len);
+}
+
+test "publish intents promote only for the recorded output and generation" {
+    const alloc = testing.allocator;
+    var s = MemoryStore{ .alloc = alloc };
+    defer s.deinit();
+    const t1 = ctx.SubscriptionTuple{ .spec = @splat(7), .tuple = @splat(8), .residual = "{}" };
+    var plan = Plan.init(alloc);
+    defer plan.deinit();
+    const capture = try planRegister(alloc, s.reader(), &plan, "doc", "summary", &.{t1}, @splat(1));
+    try commit(&s, &plan);
+    const inputs = [_]ManifestInput{.{ .source = "peers", .table_id = "t", .key = "p:1", .revision = @splat(3) }};
+    try planPublishIntent(alloc, s.reader(), &plan, "doc", "summary", @splat(0xaa), .{ .capture = capture, .tuples = &.{t1}, .input_fingerprint = @splat(9), .inputs = &inputs, .published_at_ms = 5 });
+    try commit(&s, &plan);
+    // Another output (or none) leaves the intent pending.
+    try testing.expect(!try planPromoteIntent(alloc, s.reader(), &plan, "doc", "summary", @splat(0xbb)));
+    try testing.expectEqual(@as(usize, 1), s.countPrefix(&familyPrefix(intent_family)));
+    try testing.expect(try planPromoteIntent(alloc, s.reader(), &plan, "doc", "summary", @splat(0xaa)));
+    try commit(&s, &plan);
+    try testing.expectEqual(@as(usize, 0), s.countPrefix(&familyPrefix(intent_family)));
+    var state = (try loadState(alloc, s.reader(), null, "doc", "summary")).?;
+    defer state.deinit(alloc);
+    try testing.expectEqual(Freshness.current, state.freshness);
+    try testing.expectEqual(@as(u64, 1), state.published_version);
+    // A superseded intent is dropped without publishing.
+    _ = try planRegister(alloc, s.reader(), &plan, "doc", "summary", &.{t1}, @splat(2));
+    try commit(&s, &plan);
+    try planPublishIntent(alloc, s.reader(), &plan, "doc", "summary", @splat(0xcc), .{ .capture = capture, .tuples = &.{t1}, .input_fingerprint = @splat(9), .published_at_ms = 6 });
+    try commit(&s, &plan);
+    try testing.expect(!try planPromoteIntent(alloc, s.reader(), &plan, "doc", "summary", @splat(0xcc)));
+    try commit(&s, &plan);
+    try testing.expectEqual(@as(usize, 0), s.countPrefix(&familyPrefix(intent_family)));
 }

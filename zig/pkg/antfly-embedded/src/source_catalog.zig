@@ -394,6 +394,7 @@ pub const storage_db_enrichment_enrichment_state = @import("storage/db/enrichmen
 pub const storage_db_enrichment_enrichment_types = @import("storage/db/enrichment/enrichment_types.zig");
 pub const storage_db_enrichment_enrichment_worker = @import("storage/db/enrichment/enrichment_worker.zig");
 pub const storage_db_enrichment_media_pass = @import("storage/db/enrichment/media_pass.zig");
+pub const storage_db_enrichment_context_dependency_command = @import("storage/db/enrichment/context_dependency_command.zig");
 pub const storage_db_enrichment_context_dependency_store = @import("storage/db/enrichment/context_dependency_store.zig");
 pub const storage_db_enrichment_context_notices = @import("storage/db/enrichment/context_notices.zig");
 pub const storage_db_enrichment_context_resolution = @import("storage/db/enrichment/context_resolution.zig");

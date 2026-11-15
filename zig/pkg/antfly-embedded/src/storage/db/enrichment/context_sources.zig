@@ -4204,3 +4204,104 @@ test "antfly filter_query shape: bool trees, ranges, phrases, and storage row fi
         \\{"q":{"query":{"filter_query":{"field":"t","match":"x","analyzer":"standard"}},"fields":["t"]}}
     , ""));
 }
+
+// ---------------------------------------------------------------------------
+// Cross-table cycle admission
+// ---------------------------------------------------------------------------
+
+/// One enrichment declaration of some table, for cross-table checks.
+pub const DeclaredEnrichment = struct {
+    table_id: []const u8,
+    name: []const u8,
+    /// Upstream artifact stream (`source_artifact_name`), "" when none.
+    source_artifact: []const u8 = "",
+    /// Canonical stored context sources, "" when none.
+    context_sources_json: []const u8 = "",
+};
+
+/// Reject a candidate whose generated inputs, followed across tables
+/// through context reads of `_artifacts.X` and upstream artifact streams,
+/// reach the candidate itself (a producer feedback loop).
+pub fn rejectCrossTableCycle(alloc: Allocator, declared: []const DeclaredEnrichment, owner_table_id: []const u8, candidate_name: []const u8, candidate_json: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Node = struct { table: []const u8, name: []const u8 };
+    var stack = std.ArrayListUnmanaged(Node).empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    const Push = struct {
+        fn reads(pa: Allocator, list: *std.ArrayListUnmanaged(Node), table: []const u8, stored: []const u8) !void {
+            if (stored.len == 0) return;
+            var config = parseStoredJson(pa, stored) catch return;
+            defer config.deinit();
+            for (config.sources) |source| {
+                const target = if (source.table_id.len == 0) table else source.table_id;
+                for (source.artifact_names) |name| try list.append(pa, .{ .table = try pa.dupe(u8, target), .name = try pa.dupe(u8, name) });
+            }
+        }
+    };
+    try Push.reads(a, &stack, owner_table_id, candidate_json);
+    var steps: usize = 0;
+    while (stack.pop()) |node| {
+        steps += 1;
+        if (steps > 10_000) return error.ContextSourceFeedbackCycle;
+        if (std.mem.eql(u8, node.table, owner_table_id) and std.mem.eql(u8, node.name, candidate_name)) return error.ContextSourceFeedbackCycle;
+        const id = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ node.table, node.name });
+        if ((try seen.getOrPut(a, id)).found_existing) continue;
+        for (declared) |d| {
+            if (!std.mem.eql(u8, d.table_id, node.table) or !std.mem.eql(u8, d.name, node.name)) continue;
+            if (d.source_artifact.len != 0) try stack.append(a, .{ .table = node.table, .name = d.source_artifact });
+            try Push.reads(a, &stack, node.table, d.context_sources_json);
+        }
+    }
+}
+
+/// Inbound declarations of `table_id`: other tables' enrichments whose live
+/// context sources read it (the source-side notice specs).
+pub fn inboundDeclarationsAlloc(alloc: Allocator, declared: []const DeclaredEnrichment, table_id: []const u8) ![]DeclaredEnrichment {
+    var out = std.ArrayListUnmanaged(DeclaredEnrichment).empty;
+    errdefer out.deinit(alloc);
+    for (declared) |d| {
+        if (d.context_sources_json.len == 0) continue;
+        var config = parseStoredJson(alloc, d.context_sources_json) catch continue;
+        defer config.deinit();
+        for (config.sources) |source| {
+            // Own-table sources (empty identity) of another table are not
+            // inbound here; a source naming this table explicitly is, even
+            // from the table itself (it is delivered like any other).
+            if (std.mem.eql(u8, source.table_id, table_id) and !std.mem.eql(u8, d.table_id, table_id)) {
+                try out.append(alloc, d);
+                break;
+            }
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "cross-table generated-input cycles are rejected" {
+    const alloc = testing.allocator;
+    const reads = struct {
+        fn of(a: Allocator, table: []const u8, artifact: []const u8) ![]u8 {
+            const raw = try std.fmt.allocPrint(a, "{{\"x\":{{\"query\":{{\"table\":\"t\",\"filter_query\":{{\"field\":\"k\",\"term\":\"v\"}}}},\"fields\":[\"_artifacts.{s}\"]}}}}", .{artifact});
+            defer a.free(raw);
+            var value = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+            defer value.deinit();
+            var config = try parsePublicValue(a, value.value, null, false);
+            defer config.deinit();
+            @constCast(&config.sources[0]).table_id = table;
+            return config.canonicalJsonAlloc(a);
+        }
+    };
+    const a_reads_b = try reads.of(alloc, "srv:2", "beta");
+    defer alloc.free(a_reads_b);
+    const b_reads_a = try reads.of(alloc, "srv:1", "alpha");
+    defer alloc.free(b_reads_a);
+    const declared = [_]DeclaredEnrichment{.{ .table_id = "srv:2", .name = "beta", .context_sources_json = b_reads_a }};
+    // alpha (table 1) reads beta (table 2), which reads alpha: rejected.
+    try testing.expectError(error.ContextSourceFeedbackCycle, rejectCrossTableCycle(alloc, &declared, "srv:1", "alpha", a_reads_b));
+    // Reading an upstream that does not depend on the candidate is fine.
+    try rejectCrossTableCycle(alloc, &declared, "srv:1", "gamma", a_reads_b);
+    const inbound = try inboundDeclarationsAlloc(alloc, &declared, "srv:1");
+    defer alloc.free(inbound);
+    try testing.expectEqual(@as(usize, 1), inbound.len);
+}

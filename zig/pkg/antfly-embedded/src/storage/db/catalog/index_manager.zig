@@ -1580,6 +1580,15 @@ pub const IndexManager = struct {
     /// Delivers staged context notices after generated records commit
     /// (installed by the owning DB; outside every apply lock when invoked).
     context_drain: ?struct { ptr: *anyopaque, drain_fn: *const fn (*anyopaque) void } = null,
+    /// Replicated (Raft) owners: dependency-store mutations become leader
+    /// proposals validated by every replica (installed by the host).
+    context_replication: ?@import("../context_dependency_db.zig").Replication = null,
+    /// Serializes the owner leader's proposals. Never taken on the apply
+    /// path, so a proposer waiting for its entry cannot block apply.
+    context_proposal_mutex: std.atomic.Mutex = .unlocked,
+    /// Plans and commits context-dependency changes for components without
+    /// the primary store (the enrichment runtime), installed by the DB.
+    context_committer: ?@import("../context_dependency_db.zig").Committer = null,
     context_table_id: []const u8 = "",
     context_inbound: []const @import("../enrichment/context_notices.zig").DeclaredConfig = &.{},
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
@@ -16160,6 +16169,21 @@ pub const IndexManager = struct {
 
     pub fn unlockContextDependencies(self: *IndexManager) void {
         self.context_dependency_mutex.unlock();
+    }
+
+    pub fn lockContextProposals(self: *IndexManager) void {
+        self.lockAtomicWithBackoff(&self.context_proposal_mutex);
+    }
+
+    pub fn unlockContextProposals(self: *IndexManager) void {
+        self.context_proposal_mutex.unlock();
+    }
+
+    /// Whether context-dependency state is replicated and this replica may
+    /// not mutate it (a follower).
+    pub fn contextFollower(self: *const IndexManager) bool {
+        const replication = self.context_replication orelse return false;
+        return !replication.isOwner();
     }
 
     /// Whether writes to this table can affect any context dependency (own

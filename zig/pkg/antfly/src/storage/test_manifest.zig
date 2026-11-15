@@ -259,6 +259,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_worker;
     _ = @import("antfly_local_sources").storage_db_enrichment_media_pass;
     _ = @import("antfly_local_sources").storage_db_enrichment_vector_labels;
+    _ = @import("antfly_local_sources").storage_db_enrichment_context_dependency_command;
     _ = @import("antfly_local_sources").storage_db_enrichment_context_dependency_store;
     _ = @import("antfly_local_sources").storage_db_enrichment_context_notices;
     _ = @import("antfly_local_sources").storage_db_enrichment_context_resolution;

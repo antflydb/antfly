@@ -1445,6 +1445,14 @@ fn setPromotionOwner(self: *DB, owner: ?@import("db/promotion_runtime.zig").Prom
     return .{ .value = self.setPromotionOwner(owner) };
 }
 
+fn installContextHost(self: *DB, config: DB.ContextHostConfig) engine.Outcome(void) {
+    return .{ .value = self.installContextHost(config) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn runContextMaintenance(self: *DB) engine.Outcome(bool) {
+    return .{ .value = self.runContextMaintenance() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn advanceGeneratedArtifactCleanupPage(self: *DB, index_name: ?[]const u8) engine.Outcome(DB.GeneratedArtifactCleanupAdvanceResult) {
     return .{ .value = self.advanceGeneratedArtifactCleanupPage(index_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

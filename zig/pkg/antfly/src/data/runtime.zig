@@ -12665,7 +12665,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.context_dependency != null or proposal_req.row_policy_publication != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12715,6 +12715,7 @@ pub const DataServer = struct {
     }
 
     pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.context_dependency != null) return @import("../common/data_raft_protocol.zig").batch_context_dependency_protocol_version;
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))

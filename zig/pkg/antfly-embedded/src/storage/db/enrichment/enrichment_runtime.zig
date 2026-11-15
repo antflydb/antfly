@@ -17708,9 +17708,10 @@ fn processAsset(
     if (request.context_sources_json.len > 0 and
         enrichment_config_validation.producerConsumesPromptText(producer_cfg.type))
     {
-        // Ordered (replicated serverless) publication has no dependency
-        // fence yet; refuse explicitly rather than publish unfenced output.
-        if (context != null) return error.ContextSourcesUnsupportedInOrderedPublication;
+        // Ordered publication fences dependencies through replicated publish
+        // intents, which need the host's context replication; without it,
+        // refuse explicitly rather than publish unfenced output.
+        if (context != null and runtime.index_manager.context_committer == null) return error.ContextSourcesUnsupportedInOrderedPublication;
         context_publish = (captureContextSources(runtime, request, artifact_name, raw, window, scope) catch |err| {
             std.log.warn("context source capture deferred artifact={s} doc_key_bytes={d}: {s}", .{ artifact_name, request.doc_key.len, @errorName(err) });
             return err;
@@ -17928,6 +17929,22 @@ fn commitContextDependencyPlan(
     comptime planFn: anytype,
     args: anytype,
 ) !@typeInfo(@typeInfo(@TypeOf(planFn)).@"fn".return_type.?).error_union.payload {
+    // Replicated owners: the DB proposes the plan to the group (validated by
+    // every replica); planning may repeat when its read set went stale.
+    if (runtime.index_manager.context_committer) |committer| {
+        const Result = @typeInfo(@typeInfo(@TypeOf(planFn)).@"fn".return_type.?).error_union.payload;
+        const Pass = struct {
+            args: @TypeOf(args),
+            result: ?Result = null,
+            fn run(p: *anyopaque, a: Allocator, reader: context_dependency_store.Reader, plan: *context_dependency_store.Plan) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(p));
+                self.result = try @call(.auto, planFn, .{ a, reader, plan } ++ self.args);
+            }
+        };
+        var pass = Pass{ .args = args };
+        try committer.commit(runtime.alloc, .{ .ptr = &pass, .plan_fn = Pass.run });
+        return pass.result.?;
+    }
     runtime.index_manager.lockContextDependencies();
     defer runtime.index_manager.unlockContextDependencies();
     var publication_store = try RuntimePublicationStore.init(runtime);
@@ -18007,6 +18024,37 @@ fn applyContextPublishTxn(runtime: *EnrichmentRuntime, batch: anytype, doc_key: 
         else => return err,
     };
     try context_dependency_store.applyPlanToTxn(batch, &plan);
+}
+
+fn recordContextPublishIntent(runtime: *EnrichmentRuntime, doc_key: []const u8, artifact: []const u8, publish: *const ContextPublish, output: []const u8) !void {
+    const committer = runtime.index_manager.context_committer orelse return error.ContextSourcesUnsupportedInOrderedPublication;
+    var output_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(output, &output_digest, .{});
+    const resolution = &publish.resolution;
+    const now_ms: u64 = @intCast(@divTrunc(runtime.clock.nowRealtimeNs(), std.time.ns_per_ms));
+    const Pass = struct {
+        doc_key: []const u8,
+        artifact: []const u8,
+        digest: [32]u8,
+        input: context_dependency_store.PublishInput,
+        fn run(p: *anyopaque, a: Allocator, reader: context_dependency_store.Reader, plan: *context_dependency_store.Plan) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            try context_dependency_store.planPublishIntent(a, reader, plan, self.doc_key, self.artifact, self.digest, self.input);
+        }
+    };
+    var pass = Pass{ .doc_key = doc_key, .artifact = artifact, .digest = output_digest, .input = .{
+        .capture = publish.capture,
+        .tuples = publish.tuples,
+        .input_fingerprint = resolution.rendered.fingerprint,
+        .frontier = resolution.frontier,
+        .published_at_ms = @intCast(now_ms),
+        .inputs = resolution.inputs,
+        .queries = resolution.queries,
+        .absent = resolution.absent,
+        .snapshot = resolution.snapshot,
+        .refresh_due_ms = if (resolution.refresh_interval_ms == 0) 0 else now_ms +| resolution.refresh_interval_ms,
+    } };
+    try committer.commit(runtime.alloc, .{ .ptr = &pass, .plan_fn = Pass.run });
 }
 
 /// Sample the document's same-shard adjacency from the graph index named by
@@ -19631,7 +19679,12 @@ fn applyAssetProducerBatchOutput(
     const privacy_output = try @import("../../../privacy/materialize.zig").output(runtime.alloc, item.source_text, item.request.producer_json, produced);
     defer if (privacy_output) |value| runtime.alloc.free(value);
     const validated = privacy_output orelse produced;
-    if (item.producer_context) |*value| return enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated);
+    if (item.producer_context) |*value| {
+        // Record the dependency publication for exactly these bytes; every
+        // replica promotes it when the ordered publication applies.
+        if (item.context_publish) |publish| try recordContextPublishIntent(runtime, item.request.doc_key, requestArtifactName(item.request), publish, validated);
+        return enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated);
+    }
     var writes: std.ArrayListUnmanaged(KVPair) = .empty;
     defer writes.deinit(runtime.alloc);
     try writes.appendSlice(runtime.alloc, &.{
