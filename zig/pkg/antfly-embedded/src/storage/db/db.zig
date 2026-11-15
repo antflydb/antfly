@@ -38615,11 +38615,15 @@ pub const DB = struct {
             for (sources) |source| alloc.free(source);
             alloc.free(sources);
         }
-        for (sources) |source| {
+        const vector = kind == .dense_vector or kind == .sparse_vector;
+        // Vector coverage is certified once for the whole index generation.
+        // Its counter key never depends on a per-source dependency scope.
+        const checks = if (vector) @min(sources.len, 1) else sources.len;
+        for (sources[0..checks]) |source| {
             if (budget) |b| try b.consume(source.len);
-            const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index, source, plan);
-            defer alloc.free(scope);
-            const counts = try DerivedCoverageCounters.load(alloc, read, if (kind == .dense_vector or kind == .sparse_vector) index else scope, generation);
+            const scope: ?[]u8 = if (vector) null else try @import("artifact_producer_readiness.zig").localScopeAllocWithBudget(alloc, index, source, plan, budget);
+            defer if (scope) |value| alloc.free(value);
+            const counts = try DerivedCoverageCounters.load(alloc, read, scope orelse index, generation);
             const total = counts.source_total orelse (try range_cardinality.loadOrProveEmptyFromTxn(read)) orelse return false;
             if (total == 0) continue;
             if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or counts.produced.? +| counts.skipped.? != total) return false;
@@ -155038,6 +155042,16 @@ test "db dense index inspection binds current chunk vectors and never invokes in
     try std.testing.expectError(error.DeadlineExceeded, @import("privacy_read.zig").requirePublishedWithBudget(&db, a, .{}, &preflight_expired));
     var policy_limited: inspection_budget.Budget = .{ .max_bytes = 1 };
     try std.testing.expectError(error.ResourceBudgetExceeded, @import("privacy_read.zig").captureWithBudget(&db, a, &policy_limited));
+    // Vector coverage has no source-scope dependency. A plan without a
+    // completion graph and a single counter-read budget must suffice.
+    {
+        var coverage_read = try db.core.store.beginReadTxn();
+        defer coverage_read.abort();
+        var no_graph: index_manager_mod.IndexManager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{} };
+        var vector_budget: inspection_budget.Budget = .{ .max_visits = 2, .max_bytes = 4096 };
+        try std.testing.expect(try db.privacyLocalIndexSourcesCompleteWithBudget(a, &coverage_read, "dense", .dense_vector, &no_graph, &vector_budget));
+        try std.testing.expectEqual(@as(usize, 1), vector_budget.visits);
+    }
     var replay_busy = db.core.snapshot_replay_admission.acquireMutation();
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.getDocumentArtifactManifest(a, "doc", "dense"));
     replay_busy.release();
