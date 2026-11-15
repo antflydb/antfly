@@ -1687,7 +1687,8 @@ tags:
       1. **Embedding API Unavailable**
          - Enrichment retries automatically when service recovers
          - Documents remain indexed (without embeddings) for full-text search
-         - Use `sync_level: enrichments` to precompute enrichments before committing.
+         - On supported mutation surfaces, use `commit_requires: direct_enrichments`
+           to precompute eligible enrichments before committing. `sync_level` selects a wait.
            A synchronous producer failure rejects the write. Failures detected after a
            document has committed retain it and may report `committed_repair_required` so
            operators can repair the derived state.
@@ -7942,6 +7943,248 @@ paths:
           $ref: '#/components/responses/ServiceUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/index-aliases/{aliasName}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: aliasName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - index_management
+      operationId: getTableIndexAlias
+      summary: Inspect an index alias
+      responses:
+        '200':
+          description: Current alias and committed readiness proof
+          headers:
+            ETag:
+              description: Strong validator required by conditional alias deletion
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexAlias'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '409':
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    put:
+      tags:
+        - index_management
+      operationId: putTableIndexAlias
+      summary: Atomically create or swap an index alias
+      description: Requires table administration. The target must satisfy the reported readiness proof.
+        Creation requires expected_index to be absent; replacement requires the exact current target.
+        Retry the identical request with the same idempotency key to reconcile an ambiguous response,
+        including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained
+        receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table.
+        Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations
+        with HTTP 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IndexAliasRequest'
+      responses:
+        '200':
+          description: Current alias and committed readiness proof
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexAlias'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '409':
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+        '501':
+          description: This index kind or runtime does not support alias mutations
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      tags:
+        - index_management
+      operationId: deleteTableIndexAlias
+      summary: Conditionally delete an index alias
+      description: Requires table administration and the exact ETag returned by GET. The whole table-definition
+        CAS prevents concurrent swaps or recreations from being deleted. Physical indexes and retained
+        PUT idempotency receipts remain unchanged. A retry after successful deletion returns 404; a stale
+        validator against a recreated alias returns 412.
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Alias deleted; physical indexes remain available by name
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Concurrent catalog change or a dependent catalog binding
+        '412':
+          description: Alias changed since the supplied ETag was read
+        '428':
+          description: If-Match is required
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: The metadata runtime does not support alias mutations
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: aliasName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - index_management
+      operationId: getNamespaceTableIndexAlias
+      summary: Inspect an index alias
+      responses:
+        '200':
+          description: Current alias and committed readiness proof
+          headers:
+            ETag:
+              description: Strong validator required by conditional alias deletion
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexAlias'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '409':
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    put:
+      tags:
+        - index_management
+      operationId: putNamespaceTableIndexAlias
+      summary: Atomically create or swap an index alias
+      description: Requires table administration. The target must satisfy the reported readiness proof.
+        Creation requires expected_index to be absent; replacement requires the exact current target.
+        Retry the identical request with the same idempotency key to reconcile an ambiguous response,
+        including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained
+        receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table.
+        Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations
+        with HTTP 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IndexAliasRequest'
+      responses:
+        '200':
+          description: Current alias and committed readiness proof
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexAlias'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '409':
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+        '501':
+          description: This index kind or runtime does not support alias mutations
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      tags:
+        - index_management
+      operationId: deleteNamespaceTableIndexAlias
+      summary: Conditionally delete an index alias
+      description: Requires table administration and the exact ETag returned by GET. The whole table-definition
+        CAS prevents concurrent swaps or recreations from being deleted. Physical indexes and retained
+        PUT idempotency receipts remain unchanged. A retry after successful deletion returns 404; a stale
+        validator against a recreated alias returns 412.
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Alias deleted; physical indexes remain available by name
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Concurrent catalog change or a dependent catalog binding
+        '412':
+          description: Alias changed since the supplied ETag was read
+        '428':
+          description: If-Match is required
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '501':
+          description: The metadata runtime does not support alias mutations
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -25572,6 +25815,11 @@ components:
 
         descriptor in the corresponding SQLColumn. They are not JSON columns.
       properties:
+        resolved_indexes:
+          type: array
+          items:
+            type: string
+          description: Concrete graph index names selected from the statement catalog cut.
         columns:
           type: array
           items:
@@ -29147,6 +29395,51 @@ components:
         format: byte
       minItems: 2
       maxItems: 2
+    CommitRequires:
+      type: string
+      enum:
+        - none
+        - direct_enrichments
+      description: >
+        Admission prerequisite independent of sync_level. Explicit none commits the
+
+        source without precomputing enrichments. direct_enrichments requires eligible
+
+        document-local producers to succeed, committing their outputs and coverage
+
+        atomically with the source; producer failure rejects the whole batch.
+
+        Artifact-source stages, committed graph/neighbor context, grouped producers,
+
+        protected producers and PDF page-image embeddings remain asynchronous.
+
+        Configured producers with no eligible request reject the requirement.
+
+        Direct admission has an 8 MiB and 16384-row budget for the complete mutation,
+
+        including source keys/values, artifact effects, deletions, coverage, revisions,
+
+        counters and replay payload. Both the submitted source envelope and final
+
+        physical effect set must fit; this is not an artifact-only allowance.
+
+        Supported by embedded batches, server/Raft writes and distributed transactions.
+
+        Raft prepares on the leader and replays immutable effects without inference.
+
+        Transactions reserve the complete envelope before voting prepared; their
+
+        conservative reservation can reject a batch below the final physical limit.
+
+        Serverless supports source-local pipeline stages through conditional atomic
+
+        WAL batches (at most 1024 mutations and 8 MiB including WAL framing).
+
+        Backends without that capability reject before source admission.
+
+        Omission retains legacy embedded precomputation for enrichments/full_index
+
+        during the compatibility window; other surfaces retain their existing waits.
     SyncLevel:
       type: string
       enum:
@@ -29157,18 +29450,25 @@ components:
         - full_index
       default: propose
       description: >
-        Synchronization level for batch operations:
+        Response acknowledgment/publication barrier, independent of commit_requires:
 
         - "propose": Wait for Raft proposal acceptance (fastest, default)
 
-        - "write": Wait for the write to be durably applied to the local key-value store
+        - "write": Wait for durable application to the local key-value store
 
         - "full_text": Wait for full-text index WAL write
 
-        - "enrichments": Precompute enrichments before committing the document. A synchronous
-          producer failure rejects the write; post-commit worker failures retain the document
-          and may return `committed_repair_required`.
-        - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+        - "enrichments": Wait for this write's enrichment publication
+
+        - "full_index": Wait for full-text, enrichment and vector-index publication
+
+        A post-commit wait failure never rolls back the source. Terminal background
+
+        failures may return committed_repair_required. During the embedded migration
+
+        window, omitting commit_requires retains legacy precomputation for enrichments
+
+        and full_index; explicit none disables that implicit admission prerequisite.
     ShardConfig:
       type: object
       required:
@@ -31245,6 +31545,8 @@ components:
                 - op: $addToSet
                   path: $.tags
                   value: vip
+        commit_requires:
+          $ref: '#/components/schemas/CommitRequires'
         sync_level:
           $ref: '#/components/schemas/SyncLevel'
       example:
@@ -31365,6 +31667,15 @@ components:
       required:
         - tables
       properties:
+        commit_requires:
+          allOf:
+            - $ref: '#/components/schemas/CommitRequires'
+          description: >
+            Default admission prerequisite for tables without an explicit commit_requires.
+
+            A table-level value overrides this default. Staged transaction statements
+
+            retain the strongest prerequisite selected for each table.
         tables:
           type: object
           description: >
@@ -31456,6 +31767,15 @@ components:
         - read_set
         - tables
       properties:
+        commit_requires:
+          allOf:
+            - $ref: '#/components/schemas/CommitRequires'
+          description: >
+            Default admission prerequisite for tables without an explicit commit_requires.
+
+            A table-level value overrides this default. Staged transaction statements
+
+            retain the strongest prerequisite selected for each table.
         read_set:
           type: array
           description: >
@@ -36422,6 +36742,11 @@ components:
         - graph_revision
         - complete
       properties:
+        resolved_indexes:
+          type: array
+          items:
+            type: string
+          description: Concrete graph index names selected from the statement catalog cut.
         wire_version:
           type: integer
           enum:
@@ -38090,6 +38415,11 @@ components:
         - took
         - status
       properties:
+        resolved_indexes:
+          type: array
+          items:
+            type: string
+          description: Concrete index names selected for this query before embedding and execution.
         source_ranking:
           type: string
           enum:
@@ -53709,6 +54039,55 @@ components:
           items:
             type: string
           description: IDs of retrieved documents (for retrieval metrics)
+    IndexAlias:
+      type: object
+      required:
+        - index
+        - swapped_at_ms
+        - require
+        - idempotency_key
+        - readiness
+      properties:
+        index:
+          type: string
+        previous_index:
+          type: string
+          nullable: true
+        swapped_at_ms:
+          type: integer
+          format: int64
+        require:
+          type: string
+          enum:
+            - queryable
+            - complete
+        idempotency_key:
+          type: string
+        readiness:
+          $ref: '#/components/schemas/IndexReadinessStatus'
+    IndexAliasRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - index
+        - idempotency_key
+      properties:
+        index:
+          type: string
+          minLength: 1
+          maxLength: 256
+        expected_index:
+          type: string
+        require:
+          type: string
+          enum:
+            - queryable
+            - complete
+          default: complete
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 256
     IndexMaintenanceOwnerProof:
       type: object
       additionalProperties: false

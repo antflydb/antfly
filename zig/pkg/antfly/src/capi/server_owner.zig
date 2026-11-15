@@ -2267,6 +2267,24 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.sqlPolicyBeginCommandJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .has_index_aliases => {
+                    const value = handle.store.hasIndexAliases(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .has_index_alias_lifecycle_state => {
+                    const value = handle.store.hasIndexAliasLifecycleState(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .validate_table_index_mutation => |input| {
+                    const Validation = @import("../metadata/storage/raft_apply_contract.zig").TableIndexMutationValidation;
+                    const result: Validation = result: {
+                        handle.store.validateTableIndexMutation(group_id, input.before, input.after) catch |err| {
+                            break :result Validation.fromError(err) orelse break :blk storageOwnerStatusFromError(err);
+                        };
+                        break :result .valid;
+                    };
+                    break :blk metadataProjectionJson(alloc, out_json, result);
+                },
                 .require_policy_index_mutation_allowed => |input| {
                     handle.store.requirePolicyIndexMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);
@@ -4097,6 +4115,24 @@ pub fn storageOwnerPreflightWriteAdmission(
     var batch = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer batch.deinit(handle.alloc);
     local_write.validateGroupedSourceBatch(handle.alloc, &handle.db, batch.req.writes, batch.req.deletes, batch.req.transforms) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerPrepareEnrichments(owner: ?*anyopaque, request: *const kernel_owner_abi.WriteAdmissionRequest, out_command: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_command.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var owned = batch_api.parseOwnerBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+    const Adapter = struct {
+        fn canceled(ptr: *const anyopaque) bool {
+            const input: *const kernel_owner_abi.WriteAdmissionRequest = @ptrCast(@alignCast(ptr));
+            return if (input.cancellation_fn) |callback| callback(input.cancellation_ctx) != 0 else false;
+        }
+    };
+    const command = handle.db.prepareDirectEnrichmentsWithContext(handle.alloc, owned.req, .{ .io = handle.db.backend_runtime.io() orelse return storageOwnerStatusFromError(error.BackendRuntimeIoUnavailable), .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else null, .cancellation = .{ .ptr = request, .is_cancelled_fn = Adapter.canceled } }) catch |err| return storageOwnerStatusFromError(err);
+    out_command.* = .{ .ptr = command.ptr, .len = @intCast(command.len) };
     return .ok;
 }
 

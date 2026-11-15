@@ -167,7 +167,7 @@ pub fn run(io: std.Io) !void {
                 var artifact_store = store.artifactStore();
                 const result_allocator = if (mode == .native and single_quota) a else wa;
                 const result = if (mode == .source)
-                    try publication.buildWithReuse(wa, &artifact_store, state.table, &source, store.identity, context, .none, state.clock(), state.lease(), null, .{ .store = store, .table_id = state.table.table_id, .recipe = catalog.desiredFingerprint(state.table), .context = context }, .{})
+                    try publication.buildWithReuse(wa, &artifact_store, state.table, &source, store.identity, context, .none, state.clock(), state.lease(), null, .{ .store = store, .table_id = state.table.table_id, .recipe = try catalog.desiredFingerprint(a, state.table), .context = context }, .{})
                 else
                     try @import("lake_execution_native_client.zig").build(result_allocator, io, state.table, .{}, try store.executionDescriptor(), context, .none, state.clock(), state.lease(), null, .{}, .{}, &cause);
                 defer result_allocator.free(result);

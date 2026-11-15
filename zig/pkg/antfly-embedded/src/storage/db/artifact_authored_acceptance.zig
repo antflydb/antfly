@@ -284,7 +284,7 @@ fn validateRecord(selected: *const Key, raw: []const u8) !void {
 const gc_cursor_key = "\x00\x00__artifact_publication__:authored-gc";
 const GcCursor = [181]u8;
 
-fn mutationStamp(txn: anytype, authority: publication.Authority) !publication.Digest {
+pub fn mutationStamp(txn: anytype, authority: publication.Authority) !publication.Digest {
     const owners = @import("../source_authority.zig");
     const owner = (try owners.load(txn)) orelse return error.OnlineSourceScopeChanged;
     if (!std.mem.eql(u8, &owner.namespace, &authority.namespace)) return error.ArtifactCatalogDrift;

@@ -84,6 +84,11 @@ fn chunkTextMinimumContent(
     return try chunks.toOwnedSlice(alloc);
 }
 
+pub fn chunkTextWithConfigJsonControlled(alloc: Allocator, text: []const u8, config_json: []const u8, context: ?@import("antfly_inference_execution_context").RequestContext) ![]Chunk {
+    if (context) |control| try control.check();
+    return chunkTextWithConfigJson(alloc, text, config_json);
+}
+
 pub fn chunkTextWithConfigJson(
     alloc: Allocator,
     text: []const u8,

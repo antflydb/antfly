@@ -57,6 +57,8 @@ pub const GeoShapeRelation = enum {
 };
 
 pub const SyncLevel = @import("mutation_values.zig").SyncLevel;
+pub const CommitRequires = @import("mutation_values.zig").CommitRequires;
+pub const parseCommitRequires = @import("mutation_values.zig").parseCommitRequires;
 pub const parsePublicSyncLevelText = @import("mutation_values.zig").parsePublicSyncLevelText;
 pub const parsePublicSyncLevelJson = @import("mutation_values.zig").parsePublicSyncLevelJson;
 pub const publicSyncLevelText = @import("mutation_values.zig").publicSyncLevelText;
@@ -327,6 +329,9 @@ pub const BatchRequest = struct {
     /// select revision_v1; an absent wire field always decodes as legacy.
     document_version_scheme: DocumentVersionScheme = .admit_current,
     sync_level: SyncLevel = .write,
+    commit_requires: ?CommitRequires = null,
+    /// Private immutable producer effects. Never accepted by public codecs.
+    prepared_enrichments_json: ?[]const u8 = null,
     /// Internal single-participant transaction contract. Transform expansion
     /// still runs under the DB apply lock, but the batch is rejected before
     /// mutation if it would emit graph projection deltas that the distributed
@@ -401,7 +406,7 @@ pub const BatchRequest = struct {
 /// Promote a borrowed public view without copying or granting private authority.
 /// The caller retains every buffer through the synchronous mutation call.
 pub fn fromPublicMutation(req: @import("mutation_values.zig").PublicBatchRequest) BatchRequest {
-    return .{ .writes = req.writes, .deletes = req.deletes, .transforms = req.transforms, .graph_writes = req.graph_writes, .graph_deletes = req.graph_deletes, .sync_level = req.sync_level };
+    return .{ .writes = req.writes, .deletes = req.deletes, .transforms = req.transforms, .graph_writes = req.graph_writes, .graph_deletes = req.graph_deletes, .sync_level = req.sync_level, .commit_requires = req.commit_requires };
 }
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
@@ -1753,6 +1758,8 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    commit_requires: ?CommitRequires = null,
+    prepared_enrichments_json: ?[]const u8 = null,
     document_version_scheme: DocumentVersionScheme = .admit_current,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
@@ -1930,6 +1937,7 @@ pub const GraphQueryDiagnosticSink = struct {
     record_fn: *const fn (*anyopaque, []const u8, []const u8, []const u8) void,
 };
 
+pub const IndexAliasFence = struct { name: []const u8, incarnation: u64 };
 pub const SearchRequest = struct {
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
@@ -1937,6 +1945,7 @@ pub const SearchRequest = struct {
 
     /// Private authoritative metadata assertion. Zero means no active masking;
     /// a nonzero value must match the installed policy before reading data.
+    index_alias_fences: []const IndexAliasFence = &.{},
     privacy_policy_version: ?[64]u8 = null,
     /// Trusted graph admission workspace; never part of the public wire DSL.
     graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
@@ -2160,6 +2169,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "index_alias_fences",
     "privacy_policy_version",
     "graph_work_budget",
     // Conditional delivery runs after child authorization and retrieval.
@@ -5187,6 +5197,7 @@ pub const DerivedWorkerStats = struct {
     workers: u64 = 0,
     failed_workers: u64 = 0,
     workers_with_replay_debt: u64 = 0,
+    workers_waiting_for_replay_input: u64 = 0,
     max_replay_lag_sequences: u64 = 0,
     recoverable_retries: u64 = 0,
     writer_locked_retries: u64 = 0,

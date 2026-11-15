@@ -46,6 +46,7 @@ const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").A
 const LmdbBackend = @import("../../../build_support/embedded/storage.zig").LmdbBackend;
 
 pub const AddTestsOptions = struct {
+    strip: bool,
     inference_enable_cuda: bool,
     apple_bridge: ?std.Build.LazyPath = null,
     vopr: *std.Build.Module,
@@ -141,6 +142,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_source_file = b.path("pkg/antfly/src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = options.strip,
     });
     test_imports.configure(b, antfly_test_mod, true, true);
     antfly_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
@@ -258,6 +260,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const admission_api_tests = b.addTest(.{
         .root_module = admission_api_root,
         .filters = &.{
+            "commit requirements",
+            "http handler honors public serverless sync levels",
             "public table create index preserves permanent inference budget",
             "public artifact enrichment preserves permanent inference budget",
             "PDF embedding input public contract",
@@ -436,6 +440,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-store-observer-test", "Run store report admission, fencing, and ownership regressions").dependOn(&b.addRunArtifact(store_observer_tests).step);
 
+    // Committed alias tests use the metadata persistence owner, including its
+    // kernel-owned WAL; the lean coordinator target has no such provider.
+    const alias_raft_filters: []const []const u8 = &.{ "metadata alias", "index alias Raft admission", "index alias lifecycle presence" };
+    const alias_raft_tests = b.addTest(.{
+        .name = "index-alias-raft-tests",
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = alias_raft_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-raft-test", "Verify committed alias rejection and durable store-admission indexes")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_raft_tests, alias_raft_filters).step);
+    const alias_metadata_http_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"index alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-metadata-http-test", "Verify alias preflight conflicts across metadata HTTP routes and forwarding")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_metadata_http_tests, &.{"index alias"}).step);
     const system_catalog_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
@@ -3405,6 +3427,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
         .dependOn(&addFilteredTestRunArtifact(b, text_frontier_tests).step);
+    const native_source_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_native_source_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, native_source_mod, true, true);
+    const native_source_filters = selectTestFilters(b, &.{"external lake execution"});
+    const native_source_tests = b.addTest(.{
+        .root_module = native_source_mod,
+        .filters = native_source_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-native-source-test", "Verify native source memory bounds, immutable receipts and reopen")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, native_source_tests, native_source_filters).step);
     const recent_native_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_recent_native_test_root.zig"),
         .target = target,
@@ -3507,7 +3543,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     root_test_step.dependOn(api_tests_addTests_result.distributed_query_availability_step);
     const run_lib_api_standalone_backup_restore_tests = api_tests_addTests_result.run_lib_api_standalone_backup_restore_tests;
-    const run_public_api_parity_aggregate_tests = api_tests_addTests_result.run_public_api_parity_aggregate_tests;
+    const public_api_parity_step = api_tests_addTests_result.public_api_parity_step;
     const run_lib_api_auth_tests = api_tests_addTests_result.run_lib_api_auth_tests;
     const run_algebraic_dynamic_template_tests = api_tests_addTests_result.run_algebraic_dynamic_template_tests;
     const run_lib_api_connections_tests = api_tests_addTests_result.run_lib_api_connections_tests;
@@ -3550,6 +3586,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "cdc work permit ",
             "metadata proposal receipt ",
             "metadata reconciliation plan uses one terminal receipt for ordered apply",
+            "metadata reconciliation sequential plans fence rejection proofs after a transition",
             "metadata reconciliation never appends an ordinary placement after hidden BEGIN races preflight",
             "table workflow cancellation stops before reconciliation lease work",
             "table workflow can drive real metadata service topology and split setup",
@@ -3590,6 +3627,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_metadata_service_tests = addFilteredTestRunArtifact(b, lib_metadata_service_tests);
     const lib_metadata_service_test_step = b.step("antfly-metadata-service-test", "Run metadata service/control-loop integration tests");
     lib_metadata_service_test_step.dependOn(&run_lib_metadata_service_tests.step);
+
+    const metadata_admission_proof_tests = b.addTest(.{
+        .name = "metadata-admission-proof-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "metadata reconciliation sequential plans fence rejection proofs after a transition",
+            "metadata mutation non-admission classification excludes ambiguous authority failures",
+            "metadata http server maps source split merge doc identity conflicts",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-admission-proof-test", "Verify compound metadata proposal outcomes and HTTP replay proofs")
+        .dependOn(&addFilteredTestRunArtifact(b, metadata_admission_proof_tests).step);
 
     const cypher_status_protocol_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -5436,9 +5486,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const integration_test_step = b.step("antfly-integration-test", "Run focused real HTTP and public API integration suites");
     integration_test_step.dependOn(&run_lib_metadata_vopr_public_integration_tests.step);
     integration_test_step.dependOn(&run_lib_metadata_vopr_forwarding_integration_tests.step);
-    // Both aggregates share this run node, so the default test DAG executes
-    // the stateful parity suite once. The focused alias remains independent.
-    integration_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
+    // Both aggregates share the audited focused owner group, so the default
+    // test DAG executes each stateful parity fixture exactly once.
+    integration_test_step.dependOn(public_api_parity_step);
     // Keep document-identity regressions in the owning integration suite.
     // The mixed lifecycle artifact remains intact so removing its public
     // shortcut does not discard metadata, cache, or distributed-query cases.
@@ -5569,6 +5619,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     memory_metadata_step.dependOn(&b.addRunArtifact(memory_standalone_tests).step);
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
+    const standalone_alias_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"index alias standalone"},
+    });
+    b.step("antfly-index-alias-catalog-test", "Verify index alias CAS, deletion guards, rollback and restart").dependOn(&b.addRunArtifact(standalone_alias_tests).step);
     const standalone_ddl_tests = b.addTest(.{
         .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"system catalog standalone relation coordinator"},
@@ -5618,6 +5673,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = lib_standalone_runtime_test_mod,
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
+            "index alias standalone",
             "privacy standalone progress retains routing and join planning generations",
             "privacy standalone compact bindings refresh on policy publication and survive progress",
             "standalone metadata admission observes cancellation",
@@ -5829,6 +5885,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const inference_host_tests = b.addTest(.{
         .root_module = test_imports.runtime.inference_host,
         .filters = &.{
+            "commit requirements sparse host operation preserves execution revision",
             "local generate message conversion preserves tool history and admission",
             "local generate message conversion gives video its own field and rejects mixed media",
             "local generate video reaches a Gemma 4 model through the linked provider",
@@ -6032,7 +6089,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_api_document_runs_tests.step);
     unit_test_step.dependOn(&run_document_runs_protocol_tests.step);
     // The storage support artifact owns portable backup; keep its focused target.
-    unit_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
+    unit_test_step.dependOn(public_api_parity_step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(&run_provider_default_tests.step);
@@ -7026,6 +7083,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
         .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
+    const producer_recovery_tests = b.addTest(.{
+        .name = "producer-recovery-tests",
+        .root_module = db_test_mod,
+        .filters = &.{ "db pending producer replay", "db replay retires deleted parent", "db writer open resumes generated enrichment replay from journal" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-producer-recovery-test", "Verify pending producer recovery preserves publication debt and retires deleted inputs")
+        .dependOn(&addFilteredTestRunArtifact(b, producer_recovery_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const inference_evaluation_tests = b.addTest(.{
         .name = "inference-evaluation-storage-tests",
@@ -7495,6 +7560,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_merge_cutover_step = b.step("antfly-storage-db-merge-cutover-test", "Run the merge cutover enrichment reopen DB test");
     db_merge_cutover_step.dependOn(&run_db_merge_cutover_tests.step);
 
+    const alias_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"index alias storage fences"} });
+    b.step("antfly-index-alias-storage-test", "Verify alias generation assertions under real storage read leases").dependOn(&addFilteredTestRunArtifact(b, alias_storage_tests).step);
     const index_document_native_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"index document checkpoint native storage"} });
     b.step("antfly-index-document-native-test", "Verify indexed document source guards, cleanup and native lease takeover").dependOn(&addFilteredTestRunArtifact(b, index_document_native_tests).step);
     const db_shared_embedding_tests = b.addTest(.{
@@ -7623,6 +7690,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_graph_publication.",
             "storage.db.artifact_inventory.",
             "storage.db.artifact_native_stream.",
+            "storage.db.prepared_producer_acceptance.",
             "storage.db.artifact_producer_context.",
             "storage.db.artifact_producer_dispatch.",
             "storage.db.artifact_producer_input.",
@@ -7856,6 +7924,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.text_memory_stats.",
             "storage.db.transform.",
             "storage.db.mutation_commit_disposition_test.",
+            "storage.db.commit_requirements.",
             "storage.db.mutation_plan.",
             "storage.db.transform_read_plan.",
             "storage.db.typed_doc_values_coverage.",

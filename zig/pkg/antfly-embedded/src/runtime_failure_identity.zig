@@ -31,6 +31,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .replay_document_not_visible, .err = error.ReplayDocumentNotVisible },
     .{ .status = .storage_descriptor_pressure, .err = error.StorageDescriptorPressure },
     .{ .status = .process_fd_quota_exceeded, .err = error.ProcessFdQuotaExceeded },
     .{ .status = .system_fd_quota_exceeded, .err = error.SystemFdQuotaExceeded },
@@ -676,6 +677,10 @@ const mappings = [_]Mapping{
     .{ .status = .storage_unavailable, .err = error.StorageUnavailable },
     .{ .status = .transaction_too_large, .err = error.TransactionTooLarge },
     .{ .status = .unsupported_operation, .err = error.UnsupportedOperation },
+    .{ .status = .unsupported_commit_requirement, .err = error.UnsupportedCommitRequirement },
+    .{ .status = .commit_requirement_unavailable, .err = error.CommitRequirementUnavailable },
+    .{ .status = .commit_requirement_too_large, .err = error.CommitRequirementTooLarge },
+    .{ .status = .commit_requirement_failed, .err = error.CommitRequirementFailed },
     .{ .status = .incomplete_seed_artifact, .err = error.IncompleteSeedArtifact },
     .{ .status = .invalid_artifact_boundary, .err = error.InvalidArtifactBoundary },
     .{ .status = .invalid_artifact_chunk_size, .err = error.InvalidArtifactChunkSize },

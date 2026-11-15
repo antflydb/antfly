@@ -117,23 +117,52 @@ def test_routed_document_reads_preserve_budget_on_every_gateway(
             assert actual == expected, cluster.debug_logs()
 
 
-def _enroll_store_root_once(client, api_url, proof, *, timeout_s=30.0):
+def _enroll_store_root_once(
+    client, api_url, proof, *, timeout_s=30.0, resolve_api_url=None
+):
     """Resolve uncertain enrollment by exact identity; never replay the write."""
     identity = proof["identity"]
     deadline = time.monotonic() + timeout_s
     auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+
+    def current_url(remaining):
+        if resolve_api_url is None:
+            return api_url
+        try:
+            return resolve_api_url(remaining)
+        except (requests.Timeout, requests.ConnectionError):
+            return None
+
+    # Discover before sending the one mutation. Discovery may be retried;
+    # once submission begins only exact-identity observations are safe.
+    while (remaining := deadline - time.monotonic()) > 0:
+        target = current_url(remaining)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if target is not None:
+            break
+        time.sleep(min(0.1, remaining))
+    else:
+        target = None
+    assert target is not None and remaining > 0, (
+        "store-root enrollment route unavailable"
+    )
     try:
         response = client.post(
-            f"{api_url}/store-roots/enroll",
+            f"{target}/store-roots/enroll",
             json=proof,
             auth=auth,
-            timeout=min(5.0, timeout_s),
+            timeout=min(5.0, remaining),
         )
     except (requests.Timeout, requests.ConnectionError):
         response = None
     if response is not None:
         if response.ok:
             assert response.json() == identity, response.text
+            assert time.monotonic() <= deadline, (
+                "store-root enrollment response exceeded deadline"
+            )
             return
         try:
             failure = response.json()
@@ -152,9 +181,16 @@ def _enroll_store_root_once(client, api_url, proof, *, timeout_s=30.0):
             _check_response(response)
     last = None
     while (remaining := deadline - time.monotonic()) > 0:
+        target = current_url(remaining)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if target is None:
+            time.sleep(min(0.1, remaining))
+            continue
         try:
             status = client.post(
-                f"{api_url}/store-roots/enrollment-status",
+                f"{target}/store-roots/enrollment-status",
                 json=identity,
                 auth=auth,
                 timeout=min(5.0, remaining),
@@ -165,6 +201,9 @@ def _enroll_store_root_once(client, api_url, proof, *, timeout_s=30.0):
             last = (status.status_code, status.text)
             if status.ok:
                 assert status.json() == identity, status.text
+                assert time.monotonic() <= deadline, (
+                    "store-root enrollment observation exceeded deadline"
+                )
                 return
             # A conflicting identity or authorization error is permanent.
             assert status.status_code in (404, 503, 504), last
@@ -1417,7 +1456,17 @@ class ThreeByThreeBackupCluster:
         self._enroll_store_roots()
 
     def _enroll_store_roots(self) -> None:
-        incarnation = self.metadata_snapshot(0)["status"]["metadata_incarnation"]
+        leader = self.metadata_stable_leader_id(timeout_s=30)
+        assert leader is not None, self.debug_logs()
+        incarnation = self.metadata_snapshot(leader - 1)["status"][
+            "metadata_incarnation"
+        ]
+
+        def current_api_url(remaining):
+            self.assert_processes_alive()
+            current = self.metadata_leader_id_once(request_timeout_s=min(1, remaining))
+            return None if current is None else self.metadata_public_urls[current - 1]
+
         for node_id in range(4, 7):
             proof = subprocess.run(
                 [
@@ -1440,7 +1489,10 @@ class ThreeByThreeBackupCluster:
                 cwd=REPO_ROOT,
             )
             _enroll_store_root_once(
-                requests, self.metadata_public_urls[0], json.loads(proof.stdout)
+                requests,
+                self.metadata_public_urls[leader - 1],
+                json.loads(proof.stdout),
+                resolve_api_url=current_api_url,
             )
 
     def metadata_snapshot(self, index: int, *, request_timeout_s: float = 1.0) -> dict:
@@ -2426,6 +2478,59 @@ def test_online_merge_setup_batches_stop_on_ambiguous_failure(monkeypatch):
     assert len(calls[0]) == 8
 
 
+def _admit_metadata_transition(
+    submit, observe, *, timeout_s=30, clock=time.monotonic, sleep=time.sleep
+):
+    """After uncertain submission, observe durable identity without resubmitting."""
+    deadline = clock() + timeout_s
+    observation_only = False
+    last = None
+    while (remaining := deadline - clock()) > 0:
+        if observation_only:
+            try:
+                if observe(remaining):
+                    assert clock() <= deadline, (
+                        "metadata transition observation exceeded its deadline"
+                    )
+                    return
+            except (requests.Timeout, requests.ConnectionError) as error:
+                last = str(error)
+        else:
+            try:
+                response = submit(remaining)
+            except (requests.Timeout, requests.ConnectionError) as error:
+                observation_only = True
+                last = str(error)
+                continue
+            last = (response.status_code, dict(response.headers), response.text)
+            if response.status_code == 202:
+                assert clock() <= deadline, (
+                    "metadata transition submission exceeded its deadline"
+                )
+                return
+            outcome = response.headers.get("X-Antfly-Raft-Mutation-Outcome")
+            not_admitted = (
+                response.headers.get(
+                    "X-Antfly-Metadata-Mutation-Not-Admitted", ""
+                ).lower()
+                == "true"
+            )
+            if (
+                response.status_code == 503
+                and outcome == "unknown-v1"
+                and not not_admitted
+            ):
+                observation_only = True
+                continue
+            assert (
+                response.status_code == 503
+                and outcome == "not-proposed-v1"
+                and not_admitted
+            ), last
+        sleep(min(0.1, max(0, deadline - clock())))
+    raise AssertionError(f"metadata transition admission deadline exceeded: {last}")
+
+
 def _exercise_online_document_merge(
     cluster,
     *,
@@ -2520,19 +2625,48 @@ def _exercise_online_document_merge(
         assert expected_range["end_key"] is None or key < expected_range["end_key"]
     if timings:
         timings.mark("merge.discover_donor_receiver")
-    accepted = session.post(
-        f"{cluster.metadata_admin_urls[leader - 1]}/internal/v1/tables/{physical_name}/merge",
-        headers=internal_service_headers(),
-        json={
-            "donor_group_id": donor,
-            "receiver_group_id": receiver,
-            "allow_doc_identity_reassignment": True,
-        },
-        timeout=20,
-    )
-    assert accepted.status_code == 202, (
-        f"{accepted.status_code}: {accepted.text}\n{cluster.debug_logs()}"
-    )
+    # This fixture exclusively owns its unique table and donor/receiver pair.
+    # A lost reply converges through that durable identity, not another POST.
+    next_route = leader - 1
+
+    def submit_merge(remaining):
+        nonlocal next_route
+        cluster.assert_processes_alive()
+        route = next_route % len(cluster.metadata_admin_urls)
+        next_route += 1
+        return session.post(
+            f"{cluster.metadata_admin_urls[route]}/internal/v1/tables/{physical_name}/merge",
+            headers=internal_service_headers(),
+            json={
+                "donor_group_id": donor,
+                "receiver_group_id": receiver,
+                "allow_doc_identity_reassignment": True,
+            },
+            timeout=min(20, remaining),
+        )
+
+    def observe_merge(remaining):
+        nonlocal next_route
+        cluster.assert_processes_alive()
+        route = next_route % len(cluster.metadata_admin_urls)
+        next_route += 1
+        response = session.get(
+            f"{cluster.metadata_admin_urls[route]}/metadata/v1/admin/snapshot",
+            timeout=min(2, remaining),
+        )
+        if response.status_code == 503:
+            return False
+        snapshot = _check_response(response)
+        return any(
+            int(value["donor_group_id"]) == donor
+            and int(value["receiver_group_id"]) == receiver
+            for value in snapshot.get("merge_transitions", [])
+        )
+
+    try:
+        _admit_metadata_transition(submit_merge, observe_merge)
+    except AssertionError as error:
+        raise AssertionError(f"{error}\n{cluster.debug_logs()}") from error
     if timings:
         timings.mark("merge.admission")
     observed_online: dict | None = None

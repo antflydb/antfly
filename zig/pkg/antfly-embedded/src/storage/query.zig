@@ -233,12 +233,10 @@ pub fn executeStorageKernelGraphEdges(
     };
     try checkQueryDeadline(control_req);
     try local_graph.validateGraphEdgesTensorAccessPath(alloc, req);
-    const result = try db.graphEdgesForInternalReadBoundedAt(alloc, req.index_name, req.key, req.edge_types, req.direction, req.identity_read_generation, req.ttl_now_ns, req.max_edges, req.max_owned_bytes, req.max_scanned_rows);
-    errdefer {
-        graph_mod.GraphIndex.freeEdges(alloc, result.edges);
-    }
+    var result = try db.graphEdgesForInternalRead(alloc, req);
+    errdefer result.deinit(alloc);
     try checkQueryDeadline(control_req);
-    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
+    return result;
 }
 
 pub fn validateGraphHydrateIncomingIndexIdentity(

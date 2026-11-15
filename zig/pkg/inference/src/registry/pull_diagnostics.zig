@@ -16,7 +16,16 @@
 //! Shared by registry CLI reporting and the linked inference JSON response.
 const std = @import("std");
 
+pub fn glinerSpanConfigMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.MissingGlinerSpanEncoderConfig => "GLiNER span encoder configuration is missing: include encoder_config/config.json from the same pinned checkpoint, or a legacy config.json with hidden_size, intermediate_size, num_hidden_layers, num_attention_heads, vocab_size and max_position_embeddings; re-pull the complete pinned bundle into a new cache directory",
+        error.InvalidGlinerSpanEncoderConfig => "GLiNER span encoder configuration is invalid: restore encoder_config/config.json from the same pinned checkpoint; do not infer encoder geometry from model_name or copy configuration from an unrelated model",
+        else => null,
+    };
+}
+
 pub fn glinerMessage(err: anyerror) ?[]const u8 {
+    if (glinerSpanConfigMessage(err)) |message| return message;
     return switch (err) {
         error.UnsupportedGlinerBoundaryConfiguration,
         error.InvalidGlinerBoundaryConfig,
@@ -66,4 +75,12 @@ test "gliner boundary pull diagnostics only recommend the base revision for the 
     try std.testing.expectEqualStrings(expected, reviewedBaseRef("fastino/gliner2.5-base-v1@future").?);
     try std.testing.expect(reviewedBaseRef("fastino/gliner2.5-base-v1-other") == null);
     try std.testing.expect(reviewedBaseRef("fastino/gliner2.5-multi-v1") == null);
+}
+
+test "gliner span configuration diagnostics name the sidecar and missing geometry" {
+    const message = glinerMessage(error.MissingGlinerSpanEncoderConfig).?;
+    for ([_][]const u8{ "encoder_config/config.json", "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads", "vocab_size", "max_position_embeddings", "pinned" }) |field|
+        try std.testing.expect(std.mem.indexOf(u8, message, field) != null);
+    try std.testing.expect(glinerSpanConfigMessage(error.OutOfMemory) == null);
+    try std.testing.expect(std.mem.indexOf(u8, glinerMessage(error.InvalidGlinerSpanEncoderConfig).?, "do not infer") != null);
 }

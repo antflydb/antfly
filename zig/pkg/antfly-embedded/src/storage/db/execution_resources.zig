@@ -1085,7 +1085,15 @@ pub const PreparedCommitDisposition = struct {
     }
 };
 
+pub const PreparationCapture = struct {
+    request_digest: [32]u8 = @splat(0),
+    alloc: Allocator,
+    json: ?[]u8 = null,
+};
+
 pub const BatchExecutionOptions = struct {
+    preparation_context: ?@import("antfly_inference_execution_context").RequestContext = null,
+    preparation_capture: ?*PreparationCapture = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
     /// Native-only completion observation; never encoded in a replicated command.
@@ -1352,6 +1360,7 @@ pub const DocumentExtractionChunkView = struct {
 };
 
 pub const DocumentExtractionCatalogView = struct {
+    children_pending: bool = false,
     chunks: []DocumentExtractionChunkView = &.{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -1716,18 +1725,25 @@ pub const PrecomputedCoverageOutcome = struct {
     }
 };
 
+/// Definitions and document keys borrow the preparation's pinned catalog and
+/// source envelope. Only the filtered consumer slice outlives its window plan.
 pub const PrecomputedCoverageCandidate = struct {
     request: enrichment_types.GeneratedEnrichmentRequest,
     produced: bool,
 
     pub fn deinit(self: @This(), alloc: Allocator) void {
-        enrichment_types.freeGeneratedRequest(alloc, self.request);
+        alloc.free(self.request.consumer_indexes);
     }
 };
 
 pub const GeneratedBatchWritePlan = struct {
     alloc: Allocator,
+    // Borrowed from the request's pinned write-plan lease. Direct preparation
+    // expands only one window, never the full document/producer cross product.
+    catalog: ?index_manager_mod.IndexManager.WritePlanSnapshot = null,
     rows: []index_manager_mod.IndexManager.WritePlanSnapshot.BorrowedGeneratedRowPlan,
+    /// Admission capability captured from the same pinned catalog as the rows.
+    direct_gate_supported: bool = true,
     initialized: usize = 0,
 
     pub fn deinit(self: *GeneratedBatchWritePlan) void {
@@ -1762,10 +1778,11 @@ pub const GeneratedEmbeddingMemo = struct {
 
     alloc: Allocator,
     reuse_stored_artifacts: bool = false,
+    context: ?@import("antfly_inference_execution_context").RequestContext = null,
     dense: std.AutoHashMapUnmanaged(Key, []f32) = .empty,
     generations: std.StringHashMapUnmanaged(embedder_mod.DenseEmbedder.TextGeneration) = .empty,
     sparse: std.AutoHashMapUnmanaged(Key, SparseValue) = .empty,
-    sparse_revisions: std.StringHashMapUnmanaged(?[32]u8) = .empty,
+    sparse_generations: std.StringHashMapUnmanaged(embedder_mod.SparseEmbedder.Generation) = .empty,
 
     pub fn init(alloc: Allocator) GeneratedEmbeddingMemo {
         return .{ .alloc = alloc };
@@ -1775,9 +1792,9 @@ pub const GeneratedEmbeddingMemo = struct {
         var names = self.generations.keyIterator();
         while (names.next()) |name| self.alloc.free(name.*);
         self.generations.deinit(self.alloc);
-        var sparse_names = self.sparse_revisions.keyIterator();
+        var sparse_names = self.sparse_generations.keyIterator();
         while (sparse_names.next()) |name| self.alloc.free(name.*);
-        self.sparse_revisions.deinit(self.alloc);
+        self.sparse_generations.deinit(self.alloc);
         var dense_values = self.dense.valueIterator();
         while (dense_values.next()) |vector| self.alloc.free(vector.*);
         self.dense.deinit(self.alloc);
@@ -1856,20 +1873,24 @@ pub const GeneratedEmbeddingMemo = struct {
     /// One immutable provider lease per model per synchronous preparation.
     pub fn generation(self: *@This(), provider: embedder_mod.DenseEmbedder, name: []const u8) !embedder_mod.DenseEmbedder.TextGeneration {
         if (self.generations.get(name)) |captured| return captured;
-        const captured = try provider.captureTextGeneration(self.alloc, name);
+        const captured = try provider.withRequestContext(self.context).captureTextGeneration(self.alloc, name);
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
         try self.generations.put(self.alloc, owned, captured);
         return captured;
     }
 
-    pub fn sparseRevision(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !?[32]u8 {
-        if (self.sparse_revisions.get(name)) |revision| return revision;
-        const revision = try provider.captureRevision(self.alloc, name);
+    pub fn sparseGeneration(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !embedder_mod.SparseEmbedder.Generation {
+        if (self.sparse_generations.get(name)) |captured| return captured;
+        const captured = try provider.withRequestContext(self.context).captureGeneration(self.alloc, name);
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
-        try self.sparse_revisions.put(self.alloc, owned, revision);
-        return revision;
+        try self.sparse_generations.put(self.alloc, owned, captured);
+        return captured;
+    }
+
+    pub fn sparseRevision(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !?[32]u8 {
+        return (try self.sparseGeneration(provider, name)).revision;
     }
 
     /// One final check after every producer has finished, before preparation
@@ -1879,12 +1900,12 @@ pub const GeneratedEmbeddingMemo = struct {
         var dense_generations = self.generations.iterator();
         while (dense_generations.next()) |entry| {
             const provider = dense_provider orelse return error.MissingDenseEmbedder;
-            try provider.requireTextGeneration(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+            try provider.withRequestContext(self.context).requireTextGeneration(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
         }
-        var sparse_generations = self.sparse_revisions.iterator();
+        var sparse_generations = self.sparse_generations.iterator();
         while (sparse_generations.next()) |entry| {
             const provider = sparse_provider orelse return error.MissingSparseEmbedder;
-            try provider.requireRevision(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+            try provider.withRequestContext(self.context).requireRevision(self.alloc, entry.key_ptr.*, entry.value_ptr.revision);
         }
     }
 
@@ -1944,9 +1965,145 @@ pub const GeneratedEmbeddingMemo = struct {
 pub const GeneratedPrecomputeMode = enum {
     none,
     all,
+    direct,
+};
+
+/// Owns prepared artifact bytes and reserves durable output before retaining
+/// each row. The budget is shared with deletion accounting and survives flushes.
+pub const PreparedArtifactWrites = struct {
+    context: ?@import("antfly_inference_execution_context").RequestContext = null,
+    list: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    items: []types.BatchWrite = &.{},
+    budget: ?*@import("commit_requirements.zig").OutputBudget = null,
+
+    pub fn append(self: *@This(), alloc: Allocator, write: types.BatchWrite) !void {
+        const before = if (self.budget) |budget| budget.* else null;
+        errdefer if (self.budget) |budget| if (before) |value| {
+            budget.* = value;
+        };
+        if (self.budget) |budget| {
+            try budget.reserve(write.key.len, 1);
+            try budget.reserve(write.value.len, 0);
+        }
+        try self.list.append(alloc, write);
+        self.items = self.list.items;
+        if (self.budget) |budget| budget.writes_seen = self.items.len;
+    }
+
+    pub fn toOwnedSlice(self: *@This(), alloc: Allocator) ![]types.BatchWrite {
+        const result = try self.list.toOwnedSlice(alloc);
+        self.items = self.list.items;
+        return result;
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.list.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedArtifactDeletes = struct {
+    list: std.ArrayListUnmanaged([]const u8) = .empty,
+    items: [][]const u8 = &.{},
+    budget: ?*@import("commit_requirements.zig").OutputBudget = null,
+
+    pub fn append(self: *@This(), alloc: Allocator, key: []const u8) !void {
+        const before = if (self.budget) |budget| budget.* else null;
+        errdefer if (self.budget) |budget| if (before) |value| {
+            budget.* = value;
+        };
+        if (self.budget) |budget| try budget.reserve(key.len, 1);
+        try self.list.append(alloc, key);
+        self.items = self.list.items;
+        if (self.budget) |budget| budget.deletes_seen = self.items.len;
+    }
+
+    pub fn toOwnedSlice(self: *@This(), alloc: Allocator) ![][]const u8 {
+        const result = try self.list.toOwnedSlice(alloc);
+        self.items = self.list.items;
+        return result;
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.list.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedProducer = enrichment_types.PreparedProducer;
+
+/// Native effect language, independent of model runtimes and local write-plan
+/// generation numbers. Arrays/bytes use the binary-safe private JSON writer.
+pub const PreparedEnrichments = struct {
+    request_digest: [32]u8,
+    version: u16 = 1,
+    catalog_digest: [32]u8,
+    schema_version: ?u32 = null,
+    authority: ?@import("artifact_publication.zig").Authority = null,
+    writes: []const types.BatchWrite,
+    deletes: []const []const u8,
+    graph_writes: []const types.GraphEdgeWrite = &.{},
+    graph_deletes: []const types.GraphEdgeDelete = &.{},
+    guards: []const Guard,
+    artifact_writes: []const types.BatchWrite,
+    artifact_deletes: []const []const u8,
+    pending: []const enrichment_types.GeneratedEnrichmentRef,
+    coverage: []const PrecomputedCoverageOutcome,
+    producers: []const PreparedProducer,
+    pending_children: bool = false,
+
+    pub fn requestDigest(a: Allocator, req: types.BatchRequest) ![32]u8 {
+        const value = .{
+            .writes = req.writes,
+            .deletes = req.deletes,
+            .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
+            .predicates = req.predicates,
+            .range_guards = req.range_guards,
+            .document_version_scheme = req.document_version_scheme,
+            .integrity = req.integrity,
+            .integrity_commands = req.integrity_commands,
+            .schema_version = req.schema_version,
+            .relational_schema_version = req.relational_schema_version,
+            .relational_integrity_generation_set = req.relational_integrity_generation_set,
+            .relational_activation = req.relational_activation,
+            .relational_retirement = req.relational_retirement,
+            .relational_index_maintenance = req.relational_index_maintenance,
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
+            .relational_repair = req.relational_repair,
+            .normalized_graph_rows = req.normalized_graph_rows,
+        };
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+        try @import("relational_integrity_json.zig").writeCompact(value, &stream);
+        const bytes = try output.toOwnedSlice();
+        defer a.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        return digest;
+    }
+
+    pub const Guard = struct {
+        document: []const u8,
+        key: []const u8,
+        value_digest: ?[32]u8,
+        position: ?@import("artifact_publication.zig").Position,
+        artifact_position: ?@import("artifact_publication.zig").Position = null,
+        local_revision: ?u64 = null,
+    };
+
+    pub fn jsonStringify(self: @This(), stream: anytype) !void {
+        return @import("relational_integrity_json.zig").writeCompact(self, stream);
+    }
 };
 
 pub const PrecomputedGeneratedBatch = struct {
+    pending_catalog_work: bool = false,
+    pending_child_work: bool = false,
+    prepared_producers: []const PreparedProducer = &.{},
     artifact_writes: []types.BatchWrite = &.{},
     artifact_delete_keys: []const []const u8 = &.{},
     documents: []const derived_types.DerivedDocument = &.{},
@@ -1959,6 +2116,8 @@ pub const PrecomputedGeneratedBatch = struct {
     // allocation walks out of those exits; each batch pays one call while LLVM
     // optimizes one cleanup body instead of copies throughout the commit CFG.
     pub noinline fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
+        for (self.prepared_producers) |request| alloc.free(request.doc_key);
+        if (self.prepared_producers.len != 0) alloc.free(self.prepared_producers);
         for (self.artifact_writes) |write| {
             alloc.free(@constCast(write.key));
             alloc.free(@constCast(write.value));

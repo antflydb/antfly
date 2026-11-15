@@ -198,7 +198,7 @@ fn buildAttemptWithCloudMemory(a: A, artifact_store: *stores.ArtifactStore, tabl
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return error.InvalidExternalTableBinding;
     defer binding.deinit(a);
     const pinned = try coverage.pin(source, context);
-    const signature: catalog.Signature = .{ .desired = catalog.desiredFingerprint(table), .source = pinned.source, .credentials = try source.credentialIdentity(binding.binding), .store = store_identity };
+    const signature: catalog.Signature = .{ .desired = try catalog.desiredFingerprint(a, table), .source = pinned.source, .credentials = try source.credentialIdentity(binding.binding), .store = store_identity };
     if (!std.meta.eql(signature, attempt.signature)) return error.LakeIndexPublicationFenceChanged;
     const scope: stores.UploadScope = .{ .domain = uploadDomainWithNamespace(table.table_id, store_identity, current.value.namespace), .attempt = attempt.token };
     try scope.validate();

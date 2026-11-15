@@ -195,7 +195,17 @@ pub const NamespacePolicy = struct {
     rerank_terms_publish_min_pending_records: u64 = 64,
 };
 
+pub const CatalogUpdate = union(enum) {
+    policy: NamespacePolicy,
+    definition: struct { table: []const u8, schema: []const u8, read_schema: []const u8, indexes: []const u8 },
+};
+
 pub const NamespaceRecord = struct {
+    pub fn jsonStringify(self: @This(), stream: anytype) !void {
+        try stream.write(.{ .name = self.name, .created_at_ns = self.created_at_ns, .policy = self.policy });
+    }
+
+    policy_epoch: u64 = 0,
     name: []u8,
     created_at_ns: u64,
     policy: NamespacePolicy = .{},

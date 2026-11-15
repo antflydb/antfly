@@ -37,7 +37,7 @@ pub const AddTestsResult = struct {
     hosted_recovery_step: *std.Build.Step,
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
-    run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
+    public_api_parity_step: *std.Build.Step,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -76,6 +76,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{ "privacy", "artifact publication upload", "ordered artifact inventory publication queue", "snappy", "lsm.table_file", "vector replay coalescing cancels and revives" } });
     const privacy_step = b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts");
     privacy_step.dependOn(&b.addRunArtifact(privacy_tests).step);
+    const privacy_transition_tests = b.addTest(.{
+        .root_module = privacy_mod,
+        .filters = &.{ "privacy API and transport contracts", "privacy policy replacement", "privacy new index migration", "privacy model migration", "index alias legacy incarnation", "index alias conditional deletion", "alias deletion rejects validators" },
+    });
+    b.step("antfly-privacy-transition-test", "Verify policy generation replacement and protected model migration")
+        .dependOn(&b.addRunArtifact(privacy_transition_tests).step);
+
     const owner_readiness_transport_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{"privacy compact owner readiness transport"} });
     b.step("cypher-owner-readiness-transport-test", "Verify compact selected-owner HTTP transport budgets and namespaces")
         .dependOn(&b.addRunArtifact(owner_readiness_transport_tests).step);
@@ -321,6 +328,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http invalid filter query response names the offending node",
         "api http unsupported filter query response names the offending node",
         "api http server drop table observes metadata absence before local cleanup",
+    };
+    // Native integration fixtures instantiate a complete cluster. Keep that
+    // code-generation working set separate from the transport/SQL contracts;
+    // the former combined object exceeded CI's entire 20 GiB compiler budget.
+    const public_api_integration_filters = [_][]const u8{
         "public api smoke integration creates table inserts and queries documents",
         "public api integration supports hybrid query pruner and reranker",
         "provisioned table write source routes batch writes across ranges",
@@ -328,6 +340,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "public api split integration uses distributed global text stats for bm25 and significant_terms",
         "public api multi-node integration routes CRUD from a non-host node",
     };
+    // An explicit compile filter already selects one small closure. Preserve
+    // the legacy single-owner focused path instead of compiling/running it in
+    // both shards. Runtime-only filters use the fixed buckets and union audit.
+    const focused_public_api_compile = selectTestFilters(b, &.{}).len != 0;
+    const public_api_integration_runtime_filters: []const []const u8 = &public_api_integration_filters;
+    const public_api_integration = @import("linked_tests.zig").add(b, .{
+        .name = "public-api-integration",
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_integration_runtime_filters),
+        .max_rss = 0,
+    });
     const public_api_parity_runtime_filters = selectTestFilters(b, &public_api_parity_default_filters);
     const public_api_parity = @import("linked_tests.zig").add(b, .{
         .name = "public-api-parity",
@@ -344,20 +367,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const public_api_parity_tests = public_api_parity.executable;
+    const public_api_compile_step = b.step("public-api-parity-compile", "Compile public API contract and integration owners without running fixtures");
+    public_api_compile_step.dependOn(&public_api_parity_tests.step);
+    public_api_compile_step.dependOn(&public_api_integration.executable.step);
     const run_public_api_parity_tests = addFilteredTestRunArtifactWithRuntimeFilters(
         b,
         public_api_parity_tests,
         public_api_parity_runtime_filters,
     );
-    const run_public_api_parity_aggregate_tests = addFilteredTestRunArtifactWithRuntimeFilters(
-        b,
-        public_api_parity_tests,
-        public_api_parity_runtime_filters,
-    );
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
-    run_public_api_parity_aggregate_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
-    public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
+    if (focused_public_api_compile) {
+        public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
+    } else {
+        @import("../../../build_support/antfly/test_support.zig").addOwnerTestRuns(b, public_api_parity_test_step, &.{
+            .{ .artifact = public_api_parity_tests, .filters = &public_api_parity_default_filters },
+            .{ .artifact = public_api_integration.executable, .filters = &public_api_integration_filters },
+        }, &.{});
+        public_api_parity_test_step.dependOn(&openapi_root_check.step);
+    }
 
     const lib_api_auth_default_filters = [_][]const u8{
         "trusted principal table operations",
@@ -450,6 +478,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("antfly-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
+    const alias_http_tests = b.addTest(.{
+        .name = "index-alias-http-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{"index alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_alias_http_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, alias_http_tests, &.{"index alias"});
+    b.step("antfly-index-alias-http-test", "Verify alias routes, table permissions and readiness over HTTP").dependOn(&run_alias_http_tests.step);
+    lib_api_auth_test_step.dependOn(&run_alias_http_tests.step);
 
     // The real MCP transport/database security regression does not need the
     // monolithic library discovery root or its full-suite memory reservation.
@@ -1002,6 +1039,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configureConsumer(b, api_table_reads_docid_test_mod);
     api_table_reads_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const index_alias_tests = @import("linked_tests.zig").add(b, .{
+        .name = "index-alias-tests",
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{"index alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-test", "Verify alias admission, SQL graph binding, query pinning and HTTP registration").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, index_alias_tests.executable, &.{"index alias"}).step);
     const api_public_table_http_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_public_table_http_test_root.zig"),
         .target = target,
@@ -1721,7 +1765,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const evaluation_graph_step = b.step("inference-evaluation-graph-test", "Verify final-ranked graph starts in public and cross-range queries");
-    const evaluation_public_graph = b.addRunArtifact(public_api_parity_tests);
+    const evaluation_public_graph = b.addRunArtifact(if (focused_public_api_compile) public_api_parity_tests else public_api_integration.executable);
     evaluation_public_graph.addArgs(&.{ "--test-filter", "public api integration supports hybrid query pruner and reranker" });
     const evaluation_distributed_graph = b.addRunArtifact(write_implementation_tests);
     evaluation_distributed_graph.addArgs(&.{ "--test-filter", "hosted cross-range graph start set follows final reranking" });
@@ -2083,7 +2127,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // aggregate-gate runs on one lane so bounded CI hosts do not convert
     // aggregate memory pressure into allocator failures. Focused aliases use
     // the independent run artifacts above.
-    run_api_table_writes_production_regression_unit_tests.step.dependOn(&run_public_api_parity_aggregate_tests.step);
+    run_api_table_writes_production_regression_unit_tests.step.dependOn(public_api_parity_test_step);
     const api_table_writes_production_regression_step = b.step("antfly-api-table-writes-lifecycle-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const replica_retirement_batch_tests = @import("linked_tests.zig").addPair(b, .{
@@ -2548,7 +2592,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     return .{
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
-        .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
+        .public_api_parity_step = public_api_parity_test_step,
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,
@@ -2566,7 +2610,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
         .hosted_recovery_tests = hosted_recovery_tests,
         .hosted_recovery_step = hosted_recovery_step,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, lib_api_auth_tests, cypher_cohort_tests.executable, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, public_api_integration.executable, lib_api_auth_tests, cypher_cohort_tests.executable, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,
