@@ -89,6 +89,100 @@ pub const VersionedOverlayEntry = struct {
 
 const OverlayMap = std.StringHashMapUnmanaged(*VersionedOverlayEntry);
 
+/// Ordered key index, one per root, mirroring exactly the key set each
+/// `OverlayMap` holds (same owned key bytes -- a node's `.key` is the
+/// identical slice the hashmap already owns, never a second copy).
+/// `OverlayMap` alone answers "what is key K's current chain" in O(1);
+/// it cannot answer "what is the smallest key >= K" without scanning
+/// every entry, which is exactly the O(n log n) `keysWithPrefixAlloc`
+/// (dupe every match, then sort) used to cost on every cursor open
+/// (docs/design/lite-performance/lite-single-commit-write-path.md,
+/// perf/lwa-overlay-order). A treap gives seek-at-or-after/-before and
+/// prefix iteration in O(log n) (+ O(k) to walk k results), maintained
+/// incrementally: `appendVersion`/`decodeLogicalMutationsPayload` insert
+/// a node the first time a key appears in this window; `reclaim`'s own
+/// whole-key drop and `removeLastVersion`'s abort path remove it. The
+/// version chain itself (`maps[root]`'s value) is unaffected -- this
+/// indexes the key *set*, not any particular version.
+const OrderedTreap = std.Treap([]const u8, struct {
+    fn compare(a: []const u8, b: []const u8) std.math.Order {
+        return std.mem.order(u8, a, b);
+    }
+}.compare);
+const OrderedNode = OrderedTreap.Node;
+
+/// Smallest node at or after (or strictly after, if `strict`) `key`,
+/// starting the walk from `start` (a root pointer) -- O(log n) expected,
+/// mirroring `docstore.zig`'s `Cursor.overlayAtOrAfter` (same algorithm,
+/// generalized with `strict` since that one call site never needed it).
+fn orderedLowerBound(start: ?*OrderedNode, key: []const u8, strict: bool) ?*OrderedNode {
+    var node = start;
+    var result: ?*OrderedNode = null;
+    while (node) |current| {
+        const order = std.mem.order(u8, current.key, key);
+        if (order == .gt or (!strict and order == .eq)) {
+            result = current;
+            node = current.children[0];
+        } else node = current.children[1];
+    }
+    return result;
+}
+
+/// Largest node at or before (or strictly before, if `strict`) `key`.
+/// Mirrors `docstore.zig`'s `Cursor.overlayAtOrBefore`.
+fn orderedUpperBound(start: ?*OrderedNode, key: []const u8, strict: bool) ?*OrderedNode {
+    var node = start;
+    var result: ?*OrderedNode = null;
+    while (node) |current| {
+        const order = std.mem.order(u8, current.key, key);
+        if (order == .lt or (!strict and order == .eq)) {
+            result = current;
+            node = current.children[1];
+        } else node = current.children[0];
+    }
+    return result;
+}
+
+/// Smallest node whose key starts with `prefix`, or null if none --
+/// the classic BST "find leftmost key matching this prefix" descent: a
+/// node matching the prefix is a candidate (keep looking left for a
+/// smaller match); a node sorting before the prefix can only have
+/// matches (if any) to its right; a node sorting after it (and not
+/// matching) can only have matches (if any) to its left.
+fn orderedFirstWithPrefix(start: ?*OrderedNode, prefix: []const u8) ?*OrderedNode {
+    var node = start;
+    var result: ?*OrderedNode = null;
+    while (node) |current| {
+        if (std.mem.startsWith(u8, current.key, prefix)) {
+            result = current;
+            node = current.children[0];
+        } else if (std.mem.order(u8, current.key, prefix) == .lt) {
+            node = current.children[1];
+        } else {
+            node = current.children[0];
+        }
+    }
+    return result;
+}
+
+/// Largest node whose key starts with `prefix`, or null if none --
+/// mirror image of `orderedFirstWithPrefix`.
+fn orderedLastWithPrefix(start: ?*OrderedNode, prefix: []const u8) ?*OrderedNode {
+    var node = start;
+    var result: ?*OrderedNode = null;
+    while (node) |current| {
+        if (std.mem.startsWith(u8, current.key, prefix)) {
+            result = current;
+            node = current.children[1];
+        } else if (std.mem.order(u8, current.key, prefix) == .lt) {
+            node = current.children[1];
+        } else {
+            node = current.children[0];
+        }
+    }
+    return result;
+}
+
 /// Three roots' worth of versioned overlay, plus the bookkeeping needed to
 /// reclaim superseded versions safely. Shared across every `NativeFile`
 /// instance (writer or reader) open on the same inode in this process --
@@ -103,6 +197,11 @@ const OverlayMap = std.StringHashMapUnmanaged(*VersionedOverlayEntry);
 pub const SharedRedoOverlay = struct {
     mutex: std.Io.Mutex = .init,
     maps: [3]OverlayMap = .{ .empty, .empty, .empty },
+    /// Ordered key index per root -- see this file's own doc comment on
+    /// `OrderedTreap` above. Kept in lockstep with `maps`: every key
+    /// `maps[root]` holds has exactly one node here, sharing the same
+    /// owned key bytes (freed once, via `maps`' own cleanup).
+    ordered: [3]OrderedTreap = .{ .{}, .{}, .{} },
     /// Page-shaped writes not yet reflected on disk (external value
     /// chains only -- see `RedoCommitState`'s own doc comment in
     /// native.zig for why only those, never B-tree pages, ever need this),
@@ -152,19 +251,38 @@ pub const SharedRedoOverlay = struct {
     pending_retirement_versions: u64 = 0,
 
     pub fn deinit(self: *SharedRedoOverlay, allocator: Allocator) void {
-        for (&self.maps) |*map| {
+        for (&self.maps, 0..) |*map, root_index| {
+            const root: u8 = @intCast(root_index);
             var it = map.iterator();
             while (it.next()) |kv| {
+                self.destroyOrderedKey(allocator, root, kv.key_ptr.*);
                 allocator.free(kv.key_ptr.*);
                 _ = kv.value_ptr.*.destroyChain(allocator);
             }
             map.deinit(allocator);
         }
+        self.ordered = .{ .{}, .{}, .{} };
         var pages_it = self.pages.valueIterator();
         while (pages_it.next()) |bytes| allocator.free(bytes.*);
         self.pages.deinit(allocator);
         self.pins.deinit(allocator);
         self.* = undefined;
+    }
+
+    /// Removes `key`'s node from `ordered[root]` and frees it -- never
+    /// the key bytes themselves, which `maps[root]` owns and frees on
+    /// its own schedule (`ordered`'s nodes borrow that same slice; see
+    /// this file's own `OrderedTreap` doc comment). A no-op if `key`
+    /// has no node (should not happen given the two structures are kept
+    /// in lockstep, but a missing node is harmless to tolerate here).
+    /// Callers hold `self.mutex` already (or, from `deinit`, have
+    /// exclusive access with nothing left to synchronize against).
+    fn destroyOrderedKey(self: *SharedRedoOverlay, allocator: Allocator, root: u8, key: []const u8) void {
+        var entry = self.ordered[root].getEntryFor(key);
+        if (entry.node) |node| {
+            entry.set(null);
+            allocator.destroy(node);
+        }
     }
 
     /// Stages (or replaces) a page-shaped write, keyed by page id. Takes
@@ -328,6 +446,10 @@ pub const SharedRedoOverlay = struct {
         } else {
             const owned_key = try allocator.dupe(u8, key);
             errdefer allocator.free(owned_key);
+            const ordered_node = try allocator.create(OrderedNode);
+            errdefer allocator.destroy(ordered_node);
+            var ordered_entry = self.ordered[root].getEntryFor(owned_key);
+            ordered_entry.set(ordered_node);
             gop.key_ptr.* = owned_key;
         }
         gop.value_ptr.* = node;
@@ -358,6 +480,7 @@ pub const SharedRedoOverlay = struct {
             // the append un-supersedes it.
             self.pending_retirement_versions -|= 1;
         } else if (self.maps[root].fetchRemove(key)) |kv| {
+            self.destroyOrderedKey(allocator, root, kv.key);
             allocator.free(kv.key);
         }
         allocator.free(node.value);
@@ -451,6 +574,18 @@ pub const SharedRedoOverlay = struct {
     /// use-after-free risk once another thread can concurrently mutate
     /// or reclaim it. The caller frees each key and the returned slice
     /// (`allocator.free` on each element, then on the slice itself).
+    ///
+    /// O(log n + k) (k = the number of matching keys): seeks straight to
+    /// the first match via `ordered[root]` (§ this file's own `OrderedTreap`
+    /// doc comment) and walks forward only through the matches, which are
+    /// already in order -- no scan of the other `n - k` keys, no sort.
+    /// Previously O(n log n): iterated every key in the (unordered)
+    /// hashmap checking `startsWith`, then sorted whatever matched. That
+    /// cost -- `SharedRedoOverlay.keysWithPrefixAlloc` plus the
+    /// `std.sort.block` after it -- is what every merged-cursor open used
+    /// to pay regardless of how narrow a scan's own prefix was (the
+    /// unordered map gives no way to skip non-matching keys), growing
+    /// with total overlay size rather than result size.
     pub fn keysWithPrefixAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, prefix: []const u8) ![][]u8 {
         std.debug.assert(root < 3);
         self.mutex.lockUncancelable(io);
@@ -460,17 +595,67 @@ pub const SharedRedoOverlay = struct {
             for (list.items) |k| allocator.free(k);
             list.deinit(allocator);
         }
-        var it = self.maps[root].keyIterator();
-        while (it.next()) |k| {
-            if (std.mem.startsWith(u8, k.*, prefix)) try list.append(allocator, try allocator.dupe(u8, k.*));
+        var node = orderedFirstWithPrefix(self.ordered[root].root, prefix);
+        while (node) |n| {
+            try list.append(allocator, try allocator.dupe(u8, n.key));
+            const next = n.next();
+            node = if (next != null and std.mem.startsWith(u8, next.?.key, prefix)) next else null;
         }
-        const keys = try list.toOwnedSlice(allocator);
-        std.mem.sort([]u8, keys, {}, struct {
-            fn less(_: void, a: []u8, b: []u8) bool {
-                return std.mem.order(u8, a, b) == .lt;
-            }
-        }.less);
-        return keys;
+        return try list.toOwnedSlice(allocator);
+    }
+
+    /// Smallest key under `root` that starts with `prefix`, or null if
+    /// none -- O(log n), the single-result sibling of
+    /// `keysWithPrefixAlloc` for a caller that only needs the first
+    /// match (e.g. an existence probe) and must not pay to materialize
+    /// every match.
+    pub fn firstKeyWithPrefixAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, prefix: []const u8) !?[]u8 {
+        std.debug.assert(root < 3);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const node = orderedFirstWithPrefix(self.ordered[root].root, prefix) orelse return null;
+        return try allocator.dupe(u8, node.key);
+    }
+
+    /// Largest key under `root` that starts with `prefix`, or null if
+    /// none -- O(log n), symmetric with `firstKeyWithPrefixAlloc`.
+    pub fn lastKeyWithPrefixAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, prefix: []const u8) !?[]u8 {
+        std.debug.assert(root < 3);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const node = orderedLastWithPrefix(self.ordered[root].root, prefix) orelse return null;
+        return try allocator.dupe(u8, node.key);
+    }
+
+    /// Smallest key under `root` that is `>= key` (or `> key` if
+    /// `strict`) and starts with `prefix`, or null if none -- O(log n).
+    /// Correct whenever the caller's own `key` is itself within (at or
+    /// after the start of) the `prefix` bucket, which every call site
+    /// in this codebase satisfies (`prefix` itself, or a key already
+    /// known to match it): the matching keys form one contiguous range
+    /// in sorted order, so once the raw (prefix-unaware) lower bound for
+    /// `key` stops matching `prefix`, nothing further in sorted order
+    /// can match it either.
+    pub fn seekKeyAtOrAfterAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, prefix: []const u8, key: []const u8, strict: bool) !?[]u8 {
+        std.debug.assert(root < 3);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const node = orderedLowerBound(self.ordered[root].root, key, strict) orelse return null;
+        if (!std.mem.startsWith(u8, node.key, prefix)) return null;
+        return try allocator.dupe(u8, node.key);
+    }
+
+    /// Largest key under `root` that is `<= key` (or `< key` if
+    /// `strict`) and starts with `prefix`, or null if none -- O(log n).
+    /// Same contiguous-range reasoning as `seekKeyAtOrAfterAlloc`,
+    /// mirrored.
+    pub fn seekKeyAtOrBeforeAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, prefix: []const u8, key: []const u8, strict: bool) !?[]u8 {
+        std.debug.assert(root < 3);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const node = orderedUpperBound(self.ordered[root].root, key, strict) orelse return null;
+        if (!std.mem.startsWith(u8, node.key, prefix)) return null;
+        return try allocator.dupe(u8, node.key);
     }
 
     /// One key's current (head/newest) version, fully owned -- returned
@@ -649,7 +834,8 @@ pub const SharedRedoOverlay = struct {
         const min_pin = self.minPinLocked();
         const floor = @min(self.durable_checkpoint_sequence, min_pin orelse self.durable_checkpoint_sequence);
         self.reclaimed_through = @max(self.reclaimed_through, floor);
-        for (&self.maps) |*map| {
+        for (&self.maps, 0..) |*map, root_index| {
+            const root: u8 = @intCast(root_index);
             // Collected rather than removed mid-iteration: this map's
             // iterator does not tolerate a concurrent `remove`/
             // `fetchRemove` of the entry it is currently visiting.
@@ -721,6 +907,7 @@ pub const SharedRedoOverlay = struct {
             }
             for (drop_keys.items) |key| {
                 if (map.fetchRemove(key)) |removed| {
+                    self.destroyOrderedKey(allocator, root, removed.key);
                     allocator.free(removed.key);
                     // `removed.value` is `keep_node` itself (its own
                     // `.older` was already severed and separately
@@ -813,6 +1000,10 @@ pub const SharedRedoOverlay = struct {
             } else {
                 const owned_key = try allocator.dupe(u8, key);
                 errdefer allocator.free(owned_key);
+                const ordered_node = try allocator.create(OrderedNode);
+                errdefer allocator.destroy(ordered_node);
+                var ordered_entry = self.ordered[root].getEntryFor(owned_key);
+                ordered_entry.set(ordered_node);
                 gop.key_ptr.* = owned_key;
             }
             gop.value_ptr.* = node;
@@ -900,4 +1091,336 @@ test "redo overlay reclaim keeps versions a live pin still needs and drops the r
     overlay.reclaim(a, std.testing.io, 3);
     try std.testing.expectEqual(@as(?VersionedOverlayEntry, null), try overlay.resolveAlloc(a, std.testing.io, 2, "k", 3));
     try std.testing.expectEqual(@as(usize, 0), overlay.count(std.testing.io, 2));
+}
+
+// perf/lwa-overlay-order: tests for the ordered key index (`ordered`,
+// `orderedLowerBound`/`orderedUpperBound`/`orderedFirstWithPrefix`/
+// `orderedLastWithPrefix`, and the `*KeyWithPrefixAlloc`/`seekKey*Alloc`/
+// `keysWithPrefixAlloc` methods built on them).
+
+test "redo overlay ordered index: keysWithPrefixAlloc returns matches in sorted order regardless of insertion order" {
+    const a = std.testing.allocator;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(a);
+
+    // Inserted out of sorted order on purpose.
+    for ([_][]const u8{ "p/charlie", "p/alpha", "other/zz", "p/echo", "p/bravo", "other/aa", "p/delta" }, 1..) |key, seq| {
+        try overlay.appendVersion(a, std.testing.io, 2, key, seq, try a.dupe(u8, "v"), false, 0, 0);
+    }
+
+    const keys = try overlay.keysWithPrefixAlloc(a, std.testing.io, 2, "p/");
+    defer {
+        for (keys) |k| a.free(k);
+        a.free(keys);
+    }
+    const expected = [_][]const u8{ "p/alpha", "p/bravo", "p/charlie", "p/delta", "p/echo" };
+    try std.testing.expectEqual(expected.len, keys.len);
+    for (expected, keys) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "redo overlay ordered index: first/last/seek-at-or-after/seek-at-or-before agree with a plain sort" {
+    const a = std.testing.allocator;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(a);
+
+    for ([_][]const u8{ "m/5", "m/1", "m/9", "m/3", "m/7" }, 1..) |key, seq| {
+        try overlay.appendVersion(a, std.testing.io, 0, key, seq, try a.dupe(u8, "v"), false, 0, 0);
+    }
+
+    {
+        const first = (try overlay.firstKeyWithPrefixAlloc(a, std.testing.io, 0, "m/")).?;
+        defer a.free(first);
+        try std.testing.expectEqualStrings("m/1", first);
+    }
+    {
+        const last = (try overlay.lastKeyWithPrefixAlloc(a, std.testing.io, 0, "m/")).?;
+        defer a.free(last);
+        try std.testing.expectEqualStrings("m/9", last);
+    }
+    // Non-strict at-or-after an existing key returns that key; strict
+    // skips to the next one.
+    {
+        const at = (try overlay.seekKeyAtOrAfterAlloc(a, std.testing.io, 0, "m/", "m/3", false)).?;
+        defer a.free(at);
+        try std.testing.expectEqualStrings("m/3", at);
+    }
+    {
+        const after = (try overlay.seekKeyAtOrAfterAlloc(a, std.testing.io, 0, "m/", "m/3", true)).?;
+        defer a.free(after);
+        try std.testing.expectEqualStrings("m/5", after);
+    }
+    // Seeking after a key between two real keys lands on the next real
+    // one -- the point of an ordered index over an unordered map.
+    {
+        const between = (try overlay.seekKeyAtOrAfterAlloc(a, std.testing.io, 0, "m/", "m/4", false)).?;
+        defer a.free(between);
+        try std.testing.expectEqualStrings("m/5", between);
+    }
+    {
+        const before = (try overlay.seekKeyAtOrBeforeAlloc(a, std.testing.io, 0, "m/", "m/3", false)).?;
+        defer a.free(before);
+        try std.testing.expectEqualStrings("m/3", before);
+    }
+    {
+        const strictly_before = (try overlay.seekKeyAtOrBeforeAlloc(a, std.testing.io, 0, "m/", "m/3", true)).?;
+        defer a.free(strictly_before);
+        try std.testing.expectEqualStrings("m/1", strictly_before);
+    }
+    // Past either end: nothing.
+    try std.testing.expectEqual(@as(?[]u8, null), try overlay.seekKeyAtOrAfterAlloc(a, std.testing.io, 0, "m/", "m/9", true));
+    try std.testing.expectEqual(@as(?[]u8, null), try overlay.seekKeyAtOrBeforeAlloc(a, std.testing.io, 0, "m/", "m/1", true));
+}
+
+test "redo overlay ordered index: a prefix scan never crosses into a neighboring prefix's keys" {
+    const a = std.testing.allocator;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(a);
+
+    // "n/" sorts strictly between "m/" and "o/" -- both neighbors exist
+    // on either side so a lower/upper-bound walk that forgot to check
+    // the prefix at all would wrongly wander into them.
+    for ([_][]const u8{ "m/zzz", "n/b", "n/a", "o/aaa" }, 1..) |key, seq| {
+        try overlay.appendVersion(a, std.testing.io, 1, key, seq, try a.dupe(u8, "v"), false, 0, 0);
+    }
+
+    const keys = try overlay.keysWithPrefixAlloc(a, std.testing.io, 1, "n/");
+    defer {
+        for (keys) |k| a.free(k);
+        a.free(keys);
+    }
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqualStrings("n/a", keys[0]);
+    try std.testing.expectEqualStrings("n/b", keys[1]);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try overlay.seekKeyAtOrAfterAlloc(a, std.testing.io, 1, "n/", "n/b", true));
+    try std.testing.expectEqual(@as(?[]u8, null), try overlay.seekKeyAtOrBeforeAlloc(a, std.testing.io, 1, "n/", "n/a", true));
+
+    const first = (try overlay.firstKeyWithPrefixAlloc(a, std.testing.io, 1, "n/")).?;
+    defer a.free(first);
+    try std.testing.expectEqualStrings("n/a", first);
+    const last = (try overlay.lastKeyWithPrefixAlloc(a, std.testing.io, 1, "n/")).?;
+    defer a.free(last);
+    try std.testing.expectEqualStrings("n/b", last);
+
+    // An empty prefix (an unscoped scan) sees everything, in order.
+    const everything = try overlay.keysWithPrefixAlloc(a, std.testing.io, 1, "");
+    defer {
+        for (everything) |k| a.free(k);
+        a.free(everything);
+    }
+    const expected_all = [_][]const u8{ "m/zzz", "n/a", "n/b", "o/aaa" };
+    try std.testing.expectEqual(expected_all.len, everything.len);
+    for (expected_all, everything) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "redo overlay ordered index: removeLastVersion (abort) drops only its own key from the index" {
+    const a = std.testing.allocator;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(a);
+
+    try overlay.appendVersion(a, std.testing.io, 2, "d/1", 1, try a.dupe(u8, "v1"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "d/2", 2, try a.dupe(u8, "v2"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "d/3", 3, try a.dupe(u8, "v3"), false, 0, 0);
+
+    // Undo "d/2"'s own (only) version, as an aborted transaction would.
+    overlay.removeLastVersion(a, std.testing.io, 2, "d/2");
+
+    const keys = try overlay.keysWithPrefixAlloc(a, std.testing.io, 2, "d/");
+    defer {
+        for (keys) |k| a.free(k);
+        a.free(keys);
+    }
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqualStrings("d/1", keys[0]);
+    try std.testing.expectEqualStrings("d/3", keys[1]);
+    try std.testing.expectEqual(@as(usize, 2), overlay.count(std.testing.io, 2));
+
+    // Seeking at-or-after the removed key's own position now lands on
+    // its successor, not on a stale entry.
+    const after = (try overlay.seekKeyAtOrAfterAlloc(a, std.testing.io, 2, "d/", "d/2", false)).?;
+    defer a.free(after);
+    try std.testing.expectEqualStrings("d/3", after);
+}
+
+test "redo overlay ordered index: reclaim's whole-key drop removes it from the index too" {
+    const a = std.testing.allocator;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(a);
+
+    try overlay.appendVersion(a, std.testing.io, 2, "r/one", 1, try a.dupe(u8, "v1"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "r/two", 2, try a.dupe(u8, "v2"), false, 0, 0);
+    // Overwrite "r/two" so it has a superseded version to collapse, not
+    // just a single untouched one -- exercises reclaim's real drop path
+    // rather than a no-op.
+    try overlay.appendVersion(a, std.testing.io, 2, "r/two", 3, try a.dupe(u8, "v2-updated"), false, 0, 0);
+
+    // No pin at all: a reclaim covering everything drops "r/one" and
+    // "r/two" entirely (nothing could ever need the overlay for them
+    // again, by this module's own "no live pin" rule).
+    overlay.reclaim(a, std.testing.io, 3);
+
+    try std.testing.expectEqual(@as(usize, 0), overlay.count(std.testing.io, 2));
+    const keys = try overlay.keysWithPrefixAlloc(a, std.testing.io, 2, "r/");
+    defer {
+        for (keys) |k| a.free(k);
+        a.free(keys);
+    }
+    try std.testing.expectEqual(@as(usize, 0), keys.len);
+    try std.testing.expectEqual(@as(?[]u8, null), try overlay.firstKeyWithPrefixAlloc(a, std.testing.io, 2, "r/"));
+    try std.testing.expectEqual(@as(?[]u8, null), try overlay.lastKeyWithPrefixAlloc(a, std.testing.io, 2, "r/"));
+
+    // Interleave more inserts after the drop: the index must still be
+    // internally consistent (no stale node left behind confusing a
+    // later lookup/insert at the same key).
+    try overlay.appendVersion(a, std.testing.io, 2, "r/one", 4, try a.dupe(u8, "v1-again"), false, 0, 0);
+    const resolved = (try overlay.resolveAlloc(a, std.testing.io, 2, "r/one", 4)).?;
+    defer a.free(resolved.value);
+    try std.testing.expectEqualStrings("v1-again", resolved.value);
+    const first = (try overlay.firstKeyWithPrefixAlloc(a, std.testing.io, 2, "r/")).?;
+    defer a.free(first);
+    try std.testing.expectEqualStrings("r/one", first);
+}
+
+test "redo overlay ordered index: a concurrent reader's prefix scans stay well-formed while a writer appends and reclaims" {
+    const a = std.testing.allocator;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(a);
+
+    // A pin at sequence 0, held for the whole test: `reclaim`'s own
+    // floor is `min(durable_checkpoint_sequence, min_pin)` (see its own
+    // doc comment), so with a pin at 0 nothing with `sequence >= 1`
+    // (every real version here) is ever collapsed or dropped --
+    // `reclaim` still runs its full locked walk on every call below,
+    // genuinely interleaving with the reader's own lookups, just
+    // without changing the key set, so the final counts below are
+    // deterministic regardless of how the two threads happened to
+    // interleave.
+    try overlay.pin(a, std.testing.io, 0);
+    defer overlay.unpin(std.testing.io, 0);
+
+    const total: u64 = 300;
+    const Writer = struct {
+        overlay: *SharedRedoOverlay,
+        allocator: std.mem.Allocator,
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.work() catch |err| {
+                self.failure = err;
+            };
+            self.done.store(true, .release);
+        }
+
+        fn work(self: *@This()) !void {
+            var seq: u64 = 1;
+            while (seq <= total) : (seq += 1) {
+                var buf: [16]u8 = undefined;
+                const key = try std.fmt.bufPrint(&buf, "c/{d:0>8}", .{seq});
+                try self.overlay.appendVersion(self.allocator, std.testing.io, 2, key, seq, try self.allocator.dupe(u8, "v"), false, 0, 0);
+                if (seq % 10 == 0) {
+                    // No pin is ever held in this test, so this collapses
+                    // every key to its single (never-superseded) live
+                    // version -- exercises `reclaim`'s own tree-walk
+                    // running concurrently with the reader's lookups
+                    // below without ever actually dropping a key (there
+                    // is nothing to drop until the writer stops touching
+                    // a key further), still a real interleaving of the
+                    // two structures' own locked sections.
+                    self.overlay.reclaim(self.allocator, std.testing.io, seq);
+                }
+            }
+        }
+    };
+    var writer: Writer = .{ .overlay = &overlay, .allocator = a };
+
+    const Reader = struct {
+        overlay: *SharedRedoOverlay,
+        allocator: std.mem.Allocator,
+        writer_done: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.work() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        fn work(self: *@This()) !void {
+            while (!self.writer_done.load(.acquire)) {
+                const keys = try self.overlay.keysWithPrefixAlloc(self.allocator, std.testing.io, 2, "c/");
+                defer {
+                    for (keys) |k| self.allocator.free(k);
+                    self.allocator.free(keys);
+                }
+                var previous: ?[]const u8 = null;
+                for (keys) |k| {
+                    try std.testing.expect(std.mem.startsWith(u8, k, "c/"));
+                    if (previous) |p| try std.testing.expect(std.mem.order(u8, p, k) == .lt);
+                    previous = k;
+                }
+
+                var cursor: ?[]u8 = try self.overlay.firstKeyWithPrefixAlloc(self.allocator, std.testing.io, 2, "c/");
+                var count: usize = 0;
+                while (cursor) |c| {
+                    defer self.allocator.free(c);
+                    try std.testing.expect(std.mem.startsWith(u8, c, "c/"));
+                    count += 1;
+                    if (count > total + 1) return error.UnboundedOverlayWalk;
+                    cursor = try self.overlay.seekKeyAtOrAfterAlloc(self.allocator, std.testing.io, 2, "c/", c, true);
+                }
+            }
+        }
+    };
+    var reader: Reader = .{ .overlay = &overlay, .allocator = a, .writer_done = &writer.done };
+
+    const reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    writer_thread.join();
+    reader_thread.join();
+
+    try std.testing.expectEqual(@as(?anyerror, null), writer.failure);
+    try std.testing.expectEqual(@as(?anyerror, null), reader.failure);
+    try std.testing.expectEqual(total, overlay.count(std.testing.io, 2));
+    const final_keys = try overlay.keysWithPrefixAlloc(a, std.testing.io, 2, "c/");
+    defer {
+        for (final_keys) |k| a.free(k);
+        a.free(final_keys);
+    }
+    try std.testing.expectEqual(@as(usize, total), final_keys.len);
+}
+
+test "redo overlay microbenchmark: a narrow prefix probe against 10k entries (the hasGraphEndpointCleanup/hasPrefixTxn shape)" {
+    const a = std.testing.allocator;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(a);
+
+    // 10k primary-write-shaped keys diverted into the overlay, none of
+    // them under the probe's own prefix below -- exactly
+    // `DocStore.hasGraphEndpointCleanup`'s real-world shape: a primary-
+    // only write path diverts its document keys into the documents
+    // root, and the graph endpoint cleanup queue (checked on every
+    // commit via `hasPrefixTxn`) has no entries at all in that same
+    // root. Before perf/lwa-overlay-order, `keysWithPrefixAlloc` (and so
+    // every cursor open through it) paid for all 10k regardless of the
+    // probe's own prefix matching none of them.
+    const total: u64 = 10_000;
+    var seq: u64 = 1;
+    while (seq <= total) : (seq += 1) {
+        var buf: [24]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "\x02db/doc/{d:0>10}", .{seq});
+        try overlay.appendVersion(a, std.testing.io, 2, key, seq, try a.dupe(u8, "v"), false, 0, 0);
+    }
+
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    const iterations: usize = 500;
+    for (0..iterations) |_| {
+        const keys = try overlay.keysWithPrefixAlloc(a, std.testing.io, 2, "\x00\x00graph_endpoint_cleanup/");
+        a.free(keys);
+    }
+    const elapsed_ns: u64 = @intCast(@max(0, started.durationTo(std.Io.Clock.awake.now(std.testing.io)).nanoseconds));
+    std.debug.print(
+        "OVERLAY_PREFIX_PROBE total_entries={d} iterations={d} ns_per_probe={d}\n",
+        .{ total, iterations, elapsed_ns / iterations },
+    );
 }
