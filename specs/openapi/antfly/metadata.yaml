@@ -17795,6 +17795,10 @@ paths:
       responses:
         "200":
           description: Current alias and committed readiness proof
+          headers:
+            ETag:
+              description: Strong validator required by conditional alias deletion
+              schema: {type: string}
           content:
             application/json:
               schema: {$ref: "indexes.yaml#/components/schemas/IndexAlias"}
@@ -17832,6 +17836,34 @@ paths:
           description: Stale expected target, incompatible kind, unready target, or catalog conflict
         "501":
           description: This index kind or runtime does not support alias mutations
+    delete:
+      tags: [index_management]
+      operationId: deleteTableIndexAlias
+      summary: Conditionally delete an index alias
+      description: Requires table administration and the exact ETag returned by GET. The whole table-definition CAS prevents concurrent swaps or recreations from being deleted. Physical indexes and retained PUT idempotency receipts remain unchanged. A retry after successful deletion returns 404; a stale validator against a recreated alias returns 412.
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Alias deleted; physical indexes remain available by name
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Concurrent catalog change or a dependent catalog binding
+        "412":
+          description: Alias changed since the supplied ETag was read
+        "428":
+          description: If-Match is required
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: The metadata runtime does not support alias mutations
+
   /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}:
     parameters:
       - name: databaseName
@@ -17857,6 +17889,10 @@ paths:
       responses:
         "200":
           description: Current alias and committed readiness proof
+          headers:
+            ETag:
+              description: Strong validator required by conditional alias deletion
+              schema: {type: string}
           content:
             application/json:
               schema: {$ref: "indexes.yaml#/components/schemas/IndexAlias"}
@@ -17894,6 +17930,34 @@ paths:
           description: Stale expected target, incompatible kind, unready target, or catalog conflict
         "501":
           description: This index kind or runtime does not support alias mutations
+    delete:
+      tags: [index_management]
+      operationId: deleteNamespaceTableIndexAlias
+      summary: Conditionally delete an index alias
+      description: Requires table administration and the exact ETag returned by GET. The whole table-definition CAS prevents concurrent swaps or recreations from being deleted. Physical indexes and retained PUT idempotency receipts remain unchanged. A retry after successful deletion returns 404; a stale validator against a recreated alias returns 412.
+      parameters:
+        - name: If-Match
+          in: header
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Alias deleted; physical indexes remain available by name
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Concurrent catalog change or a dependent catalog binding
+        "412":
+          description: Alias changed since the supplied ETag was read
+        "428":
+          description: If-Match is required
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: The metadata runtime does not support alias mutations
+
   /tables/{tableName}/indexes:
     parameters:
       - name: tableName

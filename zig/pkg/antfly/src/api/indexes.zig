@@ -81,13 +81,43 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
-    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
-    try @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(alloc, index_json);
-    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
+    // Compose new physical consumers with the current privacy graph in the
+    // same table CAS. Existing protected consumers are immutable through this
+    // endpoint; migration creates B, waits for completeness, then swaps A's alias.
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    try privacy.validateUserConfiguration(alloc, index_json);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
+    if (current.value != .object) return error.InvalidTableIndexMetadata;
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
     defer config.deinit();
+    if (config.value != .object) return error.InvalidCreateIndexRequest;
+    if (try privacy.current(alloc, current.value)) |owned| {
+        var resource = owned;
+        defer resource.deinit();
+        if (resource.value.policy.mode == .redact_for_search_and_ai) {
+            if (std.mem.startsWith(u8, index_name, "_privacy_") or
+                @import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.PrivacyManagedGraph;
+            if (current.value.object.contains(index_name)) {
+                var logical_root = try std.json.parseFromSlice(std.json.Value, alloc, resource.value.unprotected_indexes_json, .{});
+                defer logical_root.deinit();
+                const existing = logical_root.value.object.get(index_name) orelse return error.PrivacyManagedGraph;
+                if (!try equivalentIndexConfigValues(alloc, index_name, existing, config.value)) return error.PrivacyManagedGraph;
+                return alloc.dupe(u8, current_indexes_json);
+            }
+            if (current.value.object.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |bindings| {
+                if (bindings != .object) return error.InvalidTableIndexMetadata;
+                if (bindings.object.contains(index_name)) return error.IndexAliasNameConflict;
+            }
+            const logical = try addIndexToTableIndexesJsonWithIo(alloc, io, resource.value.unprotected_indexes_json, index_name, index_json);
+            defer alloc.free(logical);
+            var replacement = resource.value;
+            replacement.unprotected_indexes_json = logical;
+            return try privacy.install(alloc, current_indexes_json, replacement);
+        }
+    }
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
 
     const root = switch (current.value) {
         .object => |object| object,
@@ -207,6 +237,34 @@ pub fn removeIndexFromTableIndexesJson(
     index_name: []const u8,
 ) !?[]u8 {
     try @import("antfly_local_sources").api_index_metadata.aliases.ensureUnreferenced(alloc, current_indexes_json, index_name);
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var live = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
+    defer live.deinit();
+    if (try privacy.current(alloc, live.value)) |owned| {
+        var resource = owned;
+        defer resource.deinit();
+        if (resource.value.policy.mode == .redact_for_search_and_ai) {
+            if (std.mem.startsWith(u8, index_name, "_privacy_") or
+                @import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.PrivacyManagedGraph;
+            if (!live.value.object.contains(index_name)) return null;
+            var declarations = try std.json.parseFromSlice(std.json.Value, alloc, resource.value.unprotected_indexes_json, .{});
+            defer declarations.deinit();
+            // Synthesized serving guards are owned by privacy, not by index DDL.
+            if (!declarations.value.object.contains(index_name)) return error.PrivacyManagedGraph;
+            const logical = (try removeIndexFromTableIndexesJson(alloc, resource.value.unprotected_indexes_json, index_name)) orelse return null;
+            defer alloc.free(logical);
+            var replacement = resource.value;
+            replacement.unprotected_indexes_json = logical;
+            const updated = try privacy.install(alloc, current_indexes_json, replacement);
+            errdefer alloc.free(updated);
+            var result = try std.json.parseFromSlice(std.json.Value, alloc, updated, .{});
+            defer result.deinit();
+            if (result.value.object.contains(index_name)) return error.PrivacyManagedGraph;
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, updated);
+            try @import("antfly_local_sources").api_index_metadata.aliases.validateDependencyMutation(alloc, current_indexes_json, updated);
+            return updated;
+        }
+    }
     try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
     if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
@@ -11422,4 +11480,89 @@ test "ordered artifact inventory enrichment list owns configs through allocation
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "privacy new index migration preserves protected serving generations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}";
+    const logical = try addIndexToTableIndexesJson(a, "{}", "a", index);
+    const resource = try privacy.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null);
+    const initial = try privacy.install(a, logical, resource);
+    var pinned = (try std.json.parseFromSlice(std.json.Value, a, initial, .{})).value;
+    try pinned.object.put(a, aliases.key, (try std.json.parseFromSlice(std.json.Value, a, "{\"search\":{\"index\":\"a\"}}", .{})).value);
+    const before = try std.json.Stringify.valueAlloc(a, pinned, .{});
+    const updated = try addIndexToTableIndexesJson(a, before, "b", index);
+    try aliases.validateDependencyMutation(a, before, updated);
+    try validateArtifactEnrichmentsForTableIndexesJson(a, updated);
+    const after = (try std.json.parseFromSlice(std.json.Value, a, updated, .{})).value;
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, pinned.object.get("a").?, .{}), try std.json.Stringify.valueAlloc(a, after.object.get("a").?, .{}));
+    const b = after.object.get("b").?;
+    try std.testing.expect(b.object.get("embedder") == null);
+    try std.testing.expect(std.mem.startsWith(u8, b.object.get("sources").?.array.items[0].object.get("artifact").?.string, "_privacy_"));
+    try std.testing.expectEqualStrings(updated, try addIndexToTableIndexesJson(a, updated, "b", index));
+    try std.testing.expectError(error.PrivacyManagedGraph, addIndexToTableIndexesJson(a, updated, "a", "{\"type\":\"full_text\"}"));
+    try std.testing.expectError(error.IndexAliasNameConflict, addIndexToTableIndexesJson(a, updated, "search", index));
+    try std.testing.expectError(error.PrivacyExternalEmbeddingsUnsupported, addIndexToTableIndexesJson(a, updated, "external", "{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}"));
+    try std.testing.expectError(error.PrivacyUnsupportedIndexType, addIndexToTableIndexesJson(a, updated, "graph", "{\"type\":\"graph\"}"));
+    const stored = (try privacy.current(a, after)).?.value;
+    const disabled = try privacy.next(a, stored, .{ .mode = .monitor, .fields = &.{"body"} }, try privacy.etag(a, stored));
+    const restored = (try std.json.parseFromSlice(std.json.Value, a, try privacy.install(a, updated, disabled), .{})).value;
+    try std.testing.expect(restored.object.get("b").?.object.contains("embedder"));
+}
+
+test "privacy model migration retires only unreferenced consumers and their private producers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}";
+    const raw = try privacy.install(a, try addIndexToTableIndexesJson(a, "{}", "a", index), try privacy.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null));
+    var root = (try std.json.parseFromSlice(std.json.Value, a, try addIndexToTableIndexesJson(a, raw, "b", index), .{})).value;
+    try root.object.put(a, aliases.key, (try std.json.parseFromSlice(std.json.Value, a, "{\"search\":{\"index\":\"a\"}}", .{})).value);
+    try std.testing.expectError(error.IndexReferencedByAlias, removeIndexFromTableIndexesJson(a, try std.json.Stringify.valueAlloc(a, root, .{}), "a"));
+    try root.object.getPtr(aliases.key).?.object.getPtr("search").?.object.put(a, "index", .{ .string = "b" });
+    const before = try std.json.Stringify.valueAlloc(a, root, .{});
+    const updated = (try removeIndexFromTableIndexesJson(a, before, "a")).?;
+    const result = (try std.json.parseFromSlice(std.json.Value, a, updated, .{})).value;
+    try std.testing.expect(!result.object.contains("a"));
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, root.object.get("b").?, .{}), try std.json.Stringify.valueAlloc(a, result.object.get("b").?, .{}));
+    try std.testing.expectEqual(root.object.get("enrichments").?.array.items.len - 2, result.object.get("enrichments").?.array.items.len);
+    try std.testing.expectError(error.PrivacyManagedGraph, removeIndexFromTableIndexesJson(a, updated, "full_text_index_v0"));
+    try std.testing.expectError(error.IndexReferencedByAlias, removeIndexFromTableIndexesJson(a, updated, "b"));
+    try aliases.validateDependencyMutation(a, before, updated);
+    try validateArtifactEnrichmentsForTableIndexesJson(a, updated);
+}
+
+test "privacy new index targeted activation installs only its root producer closure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/target-closure", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const reconcile = @import("antfly_local_sources").metadata_local_index_reconcile;
+    _ = try reconcile.reconcileDbIndexesWithOptions(a, &db, "{\"serving\":{\"type\":\"full_text\"}}", .{});
+    const desired =
+        \\{"serving":{"type":"full_text"},"target":{"type":"full_text","artifact_name":"chunks"},"sibling":{"type":"full_text","artifact_name":"unrelated"},"enrichments":[{"name":"units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},{"name":"chunks","kind":"chunk","source_artifact_name":"units","field":"text","chunk_size":128},{"name":"unrelated","kind":"chunk","field":"body","chunk_size":128}]}
+    ;
+    const added = try reconcile.reconcileDbIndexTargetWithOptions(a, &db, desired, "target", .{});
+    try std.testing.expectEqual(@as(usize, 2), added.enrichments_added);
+    const configs = try db.listEnrichments(a);
+    defer {
+        for (configs) |*cfg| cfg.deinit(a);
+        a.free(configs);
+    }
+    try std.testing.expectEqual(@as(usize, 2), configs.len);
+    for (configs) |cfg| try std.testing.expect(!std.mem.eql(u8, cfg.name, "unrelated"));
+    const again = try reconcile.reconcileDbIndexTargetWithOptions(a, &db, desired, "target", .{});
+    try std.testing.expectEqual(@as(usize, 0), again.enrichments_added);
+    const indexes = try db.listIndexes(a);
+    defer db_mod.types.freeIndexConfigs(a, indexes);
+    try std.testing.expectEqual(@as(usize, 2), indexes.len);
 }

@@ -4415,6 +4415,11 @@ pub const DB = struct {
                 const replay_started_ns = monotonicTimeNs();
                 replayPendingDerivedBatches(&db, null, null, .{}) catch |err| switch (err) {
                     error.ArtifactRepairRequired => {},
+                    // Producer replies may still be pending after a crash. Keep
+                    // the journal/checkpoints intact and let the worker resume
+                    // after the owner opens and generated work can run again.
+                    // Workerless callers retain the synchronous drain contract.
+                    error.ReplayDocumentNotVisible => if (!db.start_index_workers) return err,
                     else => return err,
                 };
                 profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
@@ -33808,7 +33813,7 @@ pub const DB = struct {
                 .cancellation = options.cancellation,
             });
         }
-        self.executor.notifySequence(sequence);
+        self.executor.requestSequence(sequence);
         if (!options.follow_new_targets) return;
         if (options.no_progress_timeout_ns != 0) {
             // The threaded executor's waitForAll has no deadline, and the
@@ -33883,7 +33888,7 @@ pub const DB = struct {
             try wait.check();
             return;
         }
-        self.executor.notifySequence(sequence);
+        self.executor.requestSequence(sequence);
         try self.executor.waitForAllWithVisibilityWait(sequence, wait);
     }
 
@@ -33915,7 +33920,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("runDerivedUntilTargets", .{ self, sequence, index_names });
         if (sequence == 0 or index_names.len == 0) return;
         if (!self.executor.hasWorkers()) return;
-        self.executor.notifyIndexes(sequence, index_names);
+        self.executor.requestIndexes(sequence, index_names);
         try self.executor.waitForIndexes(sequence, index_names);
     }
 
@@ -33928,7 +33933,7 @@ pub const DB = struct {
         if (sequence == 0 or index_names.len == 0) return;
         try wait.check();
         if (!self.executor.hasWorkers()) return;
-        self.executor.notifyIndexes(sequence, index_names);
+        self.executor.requestIndexes(sequence, index_names);
         try self.executor.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
     }
 
@@ -107775,7 +107780,7 @@ test "db run_until_idle does not hang on an edges-only row when a generated enri
     try std.testing.expect(std.mem.indexOf(u8, b_value, "hello") != null);
 }
 
-test "collectTextDocumentWritesForIndex tolerates a missing document only when told to give up" {
+test "collectTextDocumentWritesForIndex requires durable evidence before retiring a missing document" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -107787,13 +107792,8 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
     defer db.close();
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
 
-    // "doc:never" is targeted for full-text replay but was never written --
-    // the same shape a thin-replay-reconstructed synthetic upsert has for an
-    // `_edges`-only document (issue #938): no primary row will ever appear
-    // for it. Without tolerate_missing_replay_documents this is the ordinary
-    // "not visible yet, retry" signal; with it (set only after bounded
-    // retries on this exact window have been exhausted) it must be a no-op
-    // skip instead.
+    // Absence alone cannot distinguish a legitimate pending producer from
+    // a damaged source row. Both retain debt until evidence or repair arrives.
     const documents = [_]derived_types.DerivedDocument{.{
         .key = "doc:never",
         .targets = &.{.{ .kind = .full_text, .index_name = "ft_v1" }},
@@ -107824,18 +107824,16 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
             "ft_v1",
             false,
             db.core.index_manager.byte_range,
-            .{ .tolerate_missing_replay_documents = true },
+            .{},
         );
         defer collected.deinit();
-        try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+        try std.testing.expectEqual(@as(usize, 1), collected.missing_required);
         try std.testing.expectEqual(@as(usize, 0), collected.docs.items.len);
     }
 
-    // A skipped document is not silently lost: it is counted per owner and
-    // index, both directly and through the same status listDerivedReplayDebt
-    // surfaces.
+    // Retrying never records a successful skip or manufactures coverage.
     try std.testing.expectEqual(
-        @as(u64, 1),
+        @as(u64, 0),
         db.core.index_manager.resource_manager.?.replayDocumentNotVisibleSkippedTotal(
             resource_manager_mod.replayOwnerIdFromPtr(db.core.index_manager),
             "ft_v1",
@@ -107849,7 +107847,7 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
     var saw_ft_v1 = false;
     for (debt) |status| {
         if (!std.mem.eql(u8, status.index_name, "ft_v1")) continue;
-        try std.testing.expectEqual(@as(u64, 1), status.replay_document_not_visible_skipped);
+        try std.testing.expectEqual(@as(u64, 0), status.replay_document_not_visible_skipped);
         saw_ft_v1 = true;
     }
     try std.testing.expect(saw_ft_v1);
@@ -154783,4 +154781,139 @@ test "db commit requirements coverage candidates share pinned configuration acro
         try std.testing.expectEqual(config.ptr, candidate.request.source_template.ptr);
         try std.testing.expect(candidate.request.consumer_indexes.ptr != consumers[0..].ptr);
     }
+}
+
+test "db pending producer replay opens without claiming completion and resumes after input arrives" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    var sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, path, .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+        const batch = derived_types.DerivedBatch{
+            .documents = &.{.{ .key = "pending", .targets = &.{.{ .kind = .dense_vector, .index_name = "dense" }} }},
+        };
+        sequence = db.core.store.reserveNextReplaySequence(1);
+        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, sequence);
+        defer change_journal_mod.deinitRecord(alloc, &record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, record);
+        defer alloc.free(encoded);
+        try replay_stream_mod.appendOpaque(alloc, db.core.store, sequence, encoded);
+    }
+    // The synchronous contract still exposes the exact pending dependency.
+    try std.testing.expectError(error.ReplayDocumentNotVisible, DB.open(alloc, path, .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } }));
+    var db = try DB.open(alloc, path, .{ .start_index_workers = true, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    {
+        const debt = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (debt) |*item| item.deinit(alloc);
+            alloc.free(debt);
+        }
+        var found = false;
+        for (debt) |item| if (std.mem.eql(u8, item.index_name, "dense")) {
+            found = true;
+            try std.testing.expect(item.catch_up_required);
+            try std.testing.expect(item.applied_sequence < sequence);
+        };
+        try std.testing.expect(found);
+    }
+    const stored = try internal_keys.documentKeyAlloc(alloc, "pending");
+    defer alloc.free(stored);
+    try db.core.store.putBatch(&.{.{ .key = stored, .value = "{\"embedding\":[1,0]}" }}, &.{});
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "pending", "dense");
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+    // This fixture writes below the normal commit notifier. Publish availability
+    // explicitly; a visibility wait alone must not invalidate dependency waits.
+    db.executor.notifySequence(sequence);
+    try db.runDerivedUntil(sequence);
+    const debt = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (debt) |*item| item.deinit(alloc);
+        alloc.free(debt);
+    }
+    for (debt) |item| if (std.mem.eql(u8, item.index_name, "dense")) {
+        try std.testing.expect(!item.catch_up_required);
+        try std.testing.expectEqual(sequence, item.applied_sequence);
+    };
+}
+
+test "db replay retires deleted parent chunks without resurrecting inline afterimages" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "parent", .value = "{\"body\":\"old\"}" }}, .sync_level = .full_index });
+    try db.batch(.{ .deletes = &.{"parent"}, .sync_level = .full_index });
+    const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 0);
+    defer alloc.free(chunk);
+    const documents = [_]derived_types.DerivedDocument{ .{ .key = chunk }, .{ .key = chunk, .cleaned_value = "{\"text\":\"old\"}" } };
+    var collected = try collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &documents, db.core.index_manager.byte_range, .{}, null);
+    defer collected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+    try std.testing.expectEqual(@as(usize, 0), collected.items.len);
+}
+
+test "db replay retires deleted parent or certified chunk tail but rejects missing live members" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const generations = @import("artifact_chunk_generation.zig");
+    const manifests = @import("artifact_chunk_manifest.zig");
+    const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 0);
+    defer alloc.free(chunk);
+    const tail = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 1);
+    defer alloc.free(tail);
+    const scope = (try manifests.keyForMemberAlloc(alloc, chunk)).?;
+    defer alloc.free(scope);
+    var builder = manifests.Builder.init();
+    try builder.append(0, "accepted");
+    const spec = try generations.Spec.init(.{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, scope, @splat(3), builder.finish(), 1);
+    var plan = try generations.Plan.init(alloc, scope, spec);
+    defer plan.deinit();
+    const encoded = spec.encode();
+    try db.core.store.putBatch(&.{.{ .key = plan.head_key, .value = &encoded }}, &.{});
+    var collected = try collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &.{.{ .key = tail }}, db.core.index_manager.byte_range, .{}, null);
+    defer collected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+    try std.testing.expectEqual(@as(usize, 0), collected.items.len);
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &.{.{ .key = chunk }}, db.core.index_manager.byte_range, .{}, null));
+}
+
+test "db pending producer replay never ages missing full text input into completed coverage" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const sequence = db.core.store.reserveNextReplaySequence(1);
+    const batch = derived_types.DerivedBatch{ .documents = &.{.{ .key = "pending", .targets = &.{.{ .kind = .full_text, .index_name = "text" }} }} };
+    var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, sequence);
+    defer change_journal_mod.deinitRecord(alloc, &record);
+    const encoded = try change_journal_mod.encodeRecord(alloc, record);
+    defer alloc.free(encoded);
+    try replay_stream_mod.appendOpaque(alloc, db.core.store, sequence, encoded);
+    // Cross the old retry threshold without sleeping or running a worker.
+    const manager = db.core.index_manager.resource_manager.?;
+    const owner = resource_manager_mod.replayOwnerIdFromPtr(db.core.index_manager);
+    var attempts: usize = 0;
+    while (!manager.shouldEscalateReplayDocumentNotVisible(owner, "text", sequence)) : (attempts += 1) {
+        try std.testing.expect(attempts < 100_000);
+    }
+    try std.testing.expectError(error.ReplayDocumentNotVisible, db.runDerivedUntil(sequence));
+    try std.testing.expectEqual(@as(u64, 0), try db.core.loadAppliedSequence(alloc, "text"));
+    try std.testing.expectEqual(@as(u64, 0), manager.replayDocumentNotVisibleSkippedTotal(owner, "text"));
+    const stored = try internal_keys.documentKeyAlloc(alloc, "pending");
+    defer alloc.free(stored);
+    try db.core.store.putBatch(&.{.{ .key = stored, .value = "{\"body\":\"arrived\"}" }}, &.{});
+    try db.runDerivedUntil(sequence);
+    try std.testing.expectEqual(sequence, try db.core.loadAppliedSequence(alloc, "text"));
 }

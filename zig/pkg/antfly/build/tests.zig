@@ -442,14 +442,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     // Committed alias tests use the metadata persistence owner, including its
     // kernel-owned WAL; the lean coordinator target has no such provider.
+    const alias_raft_filters: []const []const u8 = &.{ "metadata alias", "index alias Raft admission", "index alias lifecycle presence" };
     const alias_raft_tests = b.addTest(.{
         .name = "index-alias-raft-tests",
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{"metadata alias"},
+        .filters = alias_raft_filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-index-alias-raft-test", "Verify committed alias rejection and durable store-admission indexes")
-        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_raft_tests, &.{"metadata alias"}).step);
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_raft_tests, alias_raft_filters).step);
     const alias_metadata_http_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
         .filters = &.{"index alias"},
@@ -7082,6 +7083,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
         .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
+    const producer_recovery_tests = b.addTest(.{
+        .name = "producer-recovery-tests",
+        .root_module = db_test_mod,
+        .filters = &.{ "db pending producer replay", "db replay retires deleted parent", "db writer open resumes generated enrichment replay from journal" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-producer-recovery-test", "Verify pending producer recovery preserves publication debt and retires deleted inputs")
+        .dependOn(&addFilteredTestRunArtifact(b, producer_recovery_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const inference_evaluation_tests = b.addTest(.{
         .name = "inference-evaluation-storage-tests",

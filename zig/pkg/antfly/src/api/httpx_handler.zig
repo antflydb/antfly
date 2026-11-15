@@ -10371,12 +10371,18 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const table = (try self.resolvePublicTableName(ctx, table_name, &identity)) orelse return ctx.response.build();
         defer ctx.allocator.free(table);
-        const permission: usermgr.PermissionType = if (ctx.request.method == .PUT) .admin else .read;
+        const permission: usermgr.PermissionType = if (ctx.request.method == .GET) .read else .admin;
         if (identity) |authenticated| if (!http_server_mod.permissionsAllow(authenticated.permissions, .table, table, permission)) return jsonErrorResponse(ctx, 403, "table permission required");
         const name = (try decodePathParamOrBadRequest(ctx, alias_name)) orelse return ctx.response.build();
         defer ctx.allocator.free(name);
         const body = if (ctx.request.method == .PUT) (try ctx.body()) orelse "" else null;
-        const response = @import("index_aliases.zig").execute(self.api_server, ctx.allocator, table, name, body, operationContext(ctx, identity)) catch |err| {
+        var observed_etag: ?[]u8 = null;
+        defer if (observed_etag) |tag| ctx.allocator.free(tag);
+        const result = if (ctx.request.method == .DELETE)
+            @import("index_aliases.zig").remove(self.api_server, ctx.allocator, table, name, ctx.header("If-Match"), operationContext(ctx, identity))
+        else
+            @import("index_aliases.zig").executeObserved(self.api_server, ctx.allocator, table, name, body, operationContext(ctx, identity), &observed_etag);
+        const response = result catch |err| {
             if (err == error.MetadataMutationOutcomeUnknown) {
                 try ctx.setHeader(metadata_http_routes.Routes.raft_mutation_outcome_header, metadata_http_routes.Routes.raft_mutation_outcome_unknown);
                 try ctx.setHeader("Retry-After", "1");
@@ -10384,6 +10390,8 @@ pub const AntflyApiHandler = struct {
             return jsonErrorResponse(ctx, switch (err) {
                 error.TableNotFound, error.IndexNotFound, error.IndexAliasNotFound, error.NotFound => 404,
                 error.InvalidIndexAliasRequest => 400,
+                error.IndexAliasPreconditionRequired => 428,
+                error.IndexAliasPreconditionFailed => 412,
                 error.MetadataTopologyCommandTooLarge, error.IndexAliasNameConflict, error.IndexAliasExpectedIndexMismatch, error.IndexAliasIdempotencyConflict, error.IncompatibleIndexAliasTarget, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.IndexAliasTargetNotReady, error.IndexAliasReceiptCapacity, error.TableGenerationChanged, error.TableTransitionActive, error.VectorMigrationActive, error.Conflict => 409,
                 error.UnsupportedOperation, error.IndexAliasProtocolUpgradeRequired, error.TableTopologyProtocolUpgradeRequired => 501,
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout, error.MetadataMutationOutcomeUnknown => 503,
@@ -10393,6 +10401,7 @@ pub const AntflyApiHandler = struct {
             }, @errorName(err));
         };
         defer ctx.allocator.free(response);
+        if (observed_etag) |tag| try ctx.setHeader("ETag", tag);
         return jsonResponse(ctx, 200, response);
     }
 
@@ -10400,6 +10409,14 @@ pub const AntflyApiHandler = struct {
         return self.indexAliasRequest(ctx, table_name, alias_name);
     }
     pub fn putTableIndexAlias(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response {
+        return self.indexAliasRequest(ctx, table_name, alias_name);
+    }
+    pub fn deleteTableIndexAlias(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response {
+        return self.indexAliasRequest(ctx, table_name, alias_name);
+    }
+    pub fn deleteNamespaceTableIndexAlias(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
         return self.indexAliasRequest(ctx, table_name, alias_name);
     }
     pub fn getNamespaceTableIndexAlias(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response {
@@ -10452,7 +10469,6 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
-        if (try self.privacyCatalogMutationBlocked(ctx, decoded_table_name, decoded_index_name)) |response| return response;
         if (@import("relational_witness_ddl.zig").reserved(decoded_index_name)) return witnessDDLError(ctx, error.ReservedForeignKeySupportIndex);
         const body_data = (try ctx.body()) orelse "";
         const destinations_allowed = graphResolverDestinationsAllowed(
@@ -10479,7 +10495,6 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
-        if (try self.privacyCatalogMutationBlocked(ctx, decoded_table_name, decoded_index_name)) |response| return response;
         if (@import("relational_witness_ddl.zig").reserved(decoded_index_name)) return witnessDDLError(ctx, error.ReservedForeignKeySupportIndex);
         var resp = try public_table_http.handleTableDeleteIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
@@ -11736,7 +11751,7 @@ test "httpx index alias routes register with the generated API" {
     try handler.registerRoutes(&server);
 }
 
-test "httpx index alias GET permits readers and PUT requires table admin and readiness" {
+test "httpx index alias GET permits readers and mutations require table admin and conditional deletion" {
     const a = std.testing.allocator;
     var auth = try initTestAuthManager(a);
     try bindTestAuthManager(a, &auth);
@@ -11794,10 +11809,18 @@ test "httpx index alias GET permits readers and PUT requires table admin and rea
     var denied = try requestWithRetry(&client, io.io(), .PUT, url, body, &reader_headers, 10);
     defer denied.deinit();
     try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    var denied_delete = try requestWithRetry(&client, io.io(), .DELETE, url, null, &reader_headers, 10);
+    defer denied_delete.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied_delete.status.code);
     var pending = try requestWithRetry(&client, io.io(), .PUT, url, body, &admin_headers, 10);
     defer pending.deinit();
     try std.testing.expectEqual(@as(u16, 409), pending.status.code);
     try std.testing.expectEqual(@as(usize, 0), source.commits);
+    const delete_headers = [_][2][]const u8{ .{ "authorization", admin_auth }, .{ "If-Match", get.headers.get("etag").? } };
+    var deleted = try requestWithRetry(&client, io.io(), .DELETE, url, null, &delete_headers, 10);
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(u16, 200), deleted.status.code);
+    try std.testing.expectEqual(@as(usize, 1), source.commits);
 }
 
 fn listenHttpxE2eServer(server: *httpx.Server) void {

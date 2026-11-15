@@ -583,6 +583,9 @@ pub const RaftApplyStore = struct {
     pub fn hasIndexAliases(self: *RaftApplyStore, group_id: u64) !bool {
         return self.catalogProjection(bool, self.alloc, group_id, .has_index_aliases);
     }
+    pub fn hasIndexAliasLifecycleState(self: *RaftApplyStore, group_id: u64) !bool {
+        return self.catalogProjection(bool, self.alloc, group_id, .has_index_alias_lifecycle_state);
+    }
     pub fn validateTableIndexMutation(self: *RaftApplyStore, group_id: u64, before: metadata.TableRecord, after: metadata.TableRecord) !void {
         const result = try self.catalogProjection(contract.TableIndexMutationValidation, self.alloc, group_id, .{ .validate_table_index_mutation = .{ .before = before, .after = after } });
         try result.requireValid();

@@ -2569,7 +2569,11 @@ export interface paths {
          */
         put: operations["putTableIndexAlias"];
         post?: never;
-        delete?: never;
+        /**
+         * Conditionally delete an index alias
+         * @description Requires table administration and the exact ETag returned by GET. The whole table-definition CAS prevents concurrent swaps or recreations from being deleted. Physical indexes and retained PUT idempotency receipts remain unchanged. A retry after successful deletion returns 404; a stale validator against a recreated alias returns 412.
+         */
+        delete: operations["deleteTableIndexAlias"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2595,7 +2599,11 @@ export interface paths {
          */
         put: operations["putNamespaceTableIndexAlias"];
         post?: never;
-        delete?: never;
+        /**
+         * Conditionally delete an index alias
+         * @description Requires table administration and the exact ETag returned by GET. The whole table-definition CAS prevents concurrent swaps or recreations from being deleted. Physical indexes and retained PUT idempotency receipts remain unchanged. A retry after successful deletion returns 404; a stale validator against a recreated alias returns 412.
+         */
+        delete: operations["deleteNamespaceTableIndexAlias"];
         options?: never;
         head?: never;
         patch?: never;
@@ -37537,6 +37545,8 @@ export interface operations {
             /** @description Current alias and committed readiness proof */
             200: {
                 headers: {
+                    /** @description Strong validator required by conditional alias deletion */
+                    ETag?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -37599,6 +37609,60 @@ export interface operations {
             };
         };
     };
+    deleteTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header: {
+                "If-Match": string;
+            };
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Alias deleted; physical indexes remain available by name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Concurrent catalog change or a dependent catalog binding */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Alias changed since the supplied ETag was read */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description If-Match is required */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description The metadata runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     getNamespaceTableIndexAlias: {
         parameters: {
             query?: never;
@@ -37616,6 +37680,8 @@ export interface operations {
             /** @description Current alias and committed readiness proof */
             200: {
                 headers: {
+                    /** @description Strong validator required by conditional alias deletion */
+                    ETag?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -37672,6 +37738,62 @@ export interface operations {
             };
             500: components["responses"]["InternalServerError"];
             /** @description This index kind or runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    deleteNamespaceTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header: {
+                "If-Match": string;
+            };
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Alias deleted; physical indexes remain available by name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Concurrent catalog change or a dependent catalog binding */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Alias changed since the supplied ETag was read */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description If-Match is required */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description The metadata runtime does not support alias mutations */
             501: {
                 headers: {
                     [name: string]: unknown;

@@ -4754,7 +4754,7 @@ pub const ApiHttpServer = struct {
         defer self.source.freeAdminSnapshot(&snapshot);
         for (snapshot.stores) |store| {
             if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
-            if (!metadata_table_manager.indexAliasesProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.IndexAliasProtocolUpgradeRequired;
+            if (!metadata_table_manager.indexAliasLifecycleProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.IndexAliasProtocolUpgradeRequired;
         }
         // Empty data fleets are valid for object tables. The durable alias
         // admission and subsequent store admission enforce the protocol floor.
@@ -18076,6 +18076,12 @@ pub const ApiHttpServer = struct {
         // operation idempotent across retries and leadership changes.
         const assembled_indexes_json = indexes_api.addIndexToTableIndexesJsonWithIo(alloc, self.inferenceIo(), table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
             error.IndexAliasNameConflict, error.IndexReferencedByAlias => return error.Conflict,
+            error.PrivacyManagedGraph => return error.Conflict,
+            error.PrivacyUnsupportedIndexType,
+            error.PrivacyExternalEmbeddingsUnsupported,
+            error.PrivacyEmbeddingProducerRequired,
+            error.PrivacyUnknownArtifactSource,
+            => return error.InvalidIndexRequest,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
@@ -18588,7 +18594,7 @@ pub const ApiHttpServer = struct {
                 external_table = schema.external_base_source != null;
             }
             if (@import("relational_index_mutation.zig").drop(alloc, before, index_name) catch |err| switch (err) {
-                error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+                error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
                 else => return error.InternalFailure,
             }) |replacement| {
                 defer metadata_table_manager.freeTable(alloc, replacement);
@@ -18610,9 +18616,10 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
-            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.PrivacyManagedGraph, error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.PrivacyUnknownArtifactSource,
             error.InvalidEnrichmentConfig,
             error.ConflictingEnrichmentConfig,
             error.MissingEmbeddingArtifactEnrichment,
@@ -63999,7 +64006,7 @@ test "index alias admission accepts empty object fleets and fences incompatible 
     stores[0].role = "metadata";
     try server.ensureIndexAliasAdmission(.{});
     stores[0].role = "data";
-    stores[0].artifact_sources_protocol_version = 3;
+    stores[0].artifact_sources_protocol_version = 4;
     try server.ensureIndexAliasAdmission(.{});
     try std.testing.expectEqual(@as(usize, 4), fake.frees);
 }
