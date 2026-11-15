@@ -407,6 +407,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"source effects"},
     });
     const run_source_effects_tests = b.addRunArtifact(source_effects_tests);
+    const source_control_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/metadata/source_control.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"source control"},
+    });
+    const run_source_control_tests = b.addRunArtifact(source_control_tests);
+    const source_control_storage_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "metadata source control", "metadata raft apply store snapshot key registry covers every durable projection class" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const source_control_service_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"source control requires its coordinated decoder floor"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const source_control_step = b.step("source-control-test", "Verify durable source reservations, receipt frontiers and metadata recovery");
+    const run_source_control_storage_tests = b.addRunArtifact(source_control_storage_tests);
+    const run_source_control_service_tests = b.addRunArtifact(source_control_service_tests);
+    source_control_step.dependOn(&run_source_control_tests.step);
+    source_control_step.dependOn(&run_source_control_storage_tests.step);
+    source_control_step.dependOn(&run_source_control_service_tests.step);
     const source_transaction_step = b.step("source-transaction-test", "Verify shared source envelopes and complete CDC transaction checkpoints");
     const run_source_transaction_tests = b.addRunArtifact(source_transaction_tests);
     source_transaction_step.dependOn(&run_source_transaction_tests.step);
@@ -6217,6 +6242,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("source-admission-codec-test", "Verify bounded durable source receipts and pending replay fencing").dependOn(&run_source_admission_codec_tests.step);
     unit_test_step.dependOn(&run_source_admission_codec_tests.step);
     unit_test_step.dependOn(&run_source_effects_tests.step);
+    unit_test_step.dependOn(&run_source_control_tests.step);
+    unit_test_step.dependOn(&run_source_control_storage_tests.step);
+    unit_test_step.dependOn(&run_source_control_service_tests.step);
     const committed_history_step = b.step("docstore-history-test", "Verify atomic committed before/after images, prepared credits and retention");
     committed_history_step.dependOn(&run_committed_history_tests.step);
     committed_history_step.dependOn(&run_committed_frame_tests.step);

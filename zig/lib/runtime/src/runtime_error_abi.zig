@@ -1142,6 +1142,12 @@ pub const Detail = enum(c_int) {
     incomplete_replication_transaction,
     unsupported_replication_truncate,
     unsupported_replication_message,
+    invalid_source_control,
+    source_control_corrupt,
+    source_control_conflict,
+    source_admission_backpressure,
+    source_pending_work,
+    replication_projection_incomplete,
 };
 
 pub const Status = extern struct {
@@ -2198,6 +2204,12 @@ pub fn statusFromError(err: anyerror) Status {
         error.IncompleteReplicationTransaction => status(.retryable, .incomplete_replication_transaction),
         error.UnsupportedReplicationTruncate => status(.unsupported, .unsupported_replication_truncate),
         error.UnsupportedReplicationMessage => status(.unsupported, .unsupported_replication_message),
+        error.InvalidSourceControl => status(.invalid_argument, .invalid_source_control),
+        error.SourceControlCorrupt => status(.corrupt, .source_control_corrupt),
+        error.SourceControlConflict => status(.conflict, .source_control_conflict),
+        error.SourceAdmissionBackpressure => status(.unavailable, .source_admission_backpressure),
+        error.SourcePendingWork => status(.conflict, .source_pending_work),
+        error.ReplicationProjectionIncomplete => status(.unsupported, .replication_projection_incomplete),
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
             // the owning side's name in diagnostics instead of leaving an
@@ -3268,6 +3280,12 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .incomplete_replication_transaction => "IncompleteReplicationTransaction",
         .unsupported_replication_truncate => "UnsupportedReplicationTruncate",
         .unsupported_replication_message => "UnsupportedReplicationMessage",
+        .invalid_source_control => "InvalidSourceControl",
+        .source_control_corrupt => "SourceControlCorrupt",
+        .source_control_conflict => "SourceControlConflict",
+        .source_admission_backpressure => "SourceAdmissionBackpressure",
+        .source_pending_work => "SourcePendingWork",
+        .replication_projection_incomplete => "ReplicationProjectionIncomplete",
     };
 }
 
@@ -3936,7 +3954,7 @@ test "positional IO errors preserve identity without becoming retryable pressure
 }
 
 test "source admission and history failures retain exact native boundary identities" {
-    for ([_]anyerror{ error.InvalidSourceAdmission, error.SourceAdmissionCorrupt, error.SourceBindingConflict, error.SourceReceiptExpired, error.SourceCheckpointConflict, error.SourcePayloadConflict, error.SourceTableMismatch, error.SourceTransactionIdentityConflict, error.SourceAlreadyCommitted, error.SourceOutcomeUnresolved, error.InvalidHistoryAdmission, error.HistoryCorrupt, error.HistoryResynchronizationRequired, error.HistoryCheckpointConflict, error.HistoryConsumerConflict, error.HistoryPreparedTransactionsPresent, error.HistoryConsumerLimit, error.HistoryMixedControl, error.HistoryTransactionFailed, error.HistoryTooLarge, error.HistorySchemaTooLarge, error.HistoryFull, error.HistoryMultipleTransactions, error.HistoryAuthorityRequired, error.InvalidCommittedFrame, error.InvalidReplicationCheckpoint, error.InvalidReplicationTransaction, error.IncompleteReplicationTransaction, error.UnsupportedReplicationTruncate, error.UnsupportedReplicationMessage }) |err| {
+    for ([_]anyerror{ error.InvalidSourceAdmission, error.SourceAdmissionCorrupt, error.SourceBindingConflict, error.SourceReceiptExpired, error.SourceCheckpointConflict, error.SourcePayloadConflict, error.SourceTableMismatch, error.SourceTransactionIdentityConflict, error.SourceAlreadyCommitted, error.SourceOutcomeUnresolved, error.InvalidHistoryAdmission, error.HistoryCorrupt, error.HistoryResynchronizationRequired, error.HistoryCheckpointConflict, error.HistoryConsumerConflict, error.HistoryPreparedTransactionsPresent, error.HistoryConsumerLimit, error.HistoryMixedControl, error.HistoryTransactionFailed, error.HistoryTooLarge, error.HistorySchemaTooLarge, error.HistoryFull, error.HistoryMultipleTransactions, error.HistoryAuthorityRequired, error.InvalidCommittedFrame, error.InvalidReplicationCheckpoint, error.InvalidReplicationTransaction, error.IncompleteReplicationTransaction, error.UnsupportedReplicationTruncate, error.UnsupportedReplicationMessage, error.InvalidSourceControl, error.SourceControlCorrupt, error.SourceControlConflict, error.SourceAdmissionBackpressure, error.SourcePendingWork, error.ReplicationProjectionIncomplete }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
 }

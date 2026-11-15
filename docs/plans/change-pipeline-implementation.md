@@ -147,6 +147,46 @@ arbitrary non-identity key expressions cannot silently inherit that guarantee.
 Writable-Iceberg transformation/admission and accepted-versus-catalog-committed
 progress remain separate required adapters.
 
+## In progress: durable source actor control authority
+
+- `metadata/source_control.zig` defines immutable source/provider/destination
+  binding, explicit generation, stable pending sequence/batch/checkpoint/time,
+  payload and delivery-plan digests, original transaction identity and recovery
+  manifest. Catalog ordinal is a locator, not source identity. Identity hashes
+  use explicit versioned field projections.
+- Accepted and authoritatively committed frontiers remain separate. Bounded
+  outstanding receipts retain the correlation while writable-Iceberg catalog
+  commit lags WAL acceptance. Native adapters can report an already committed
+  receipt atomically. This state never claims that an index has published.
+- Reservations retain worst-case encoded receipt credits before destination
+  admission. Operation count and encoded-byte limits apply independently; only
+  committed-prefix proof releases receipt backlog.
+- Catalog/revision/binding CAS fences mutation. Replan requires a not-admitted
+  proof and retains the original logical batch, source offset, sequence, payload
+  and accepted timestamp. Ambiguous attempts cannot be discarded. Rejected
+  attempts can retire only under their original reservation identity; a new
+  generation requires complete retirement first.
+- Metadata transition tag 83 persists the authority and a constant-time per-table
+  work counter. Live work blocks table retirement. Both state and counters are
+  included in Raft snapshots; the coordinated decoder floor is version 90.
+- Private service helpers use linearizable reads, preflight validation, durable
+  proposal/application receipts and exact observed state. Lost acknowledgments
+  and failed CAS never grant source progress. Corruption, backpressure and
+  conflicts retain their runtime error identities.
+- Seven standalone control tests pass, along with real metadata reopen, stale
+  catalog fencing, snapshot install, table-drop protection, snapshot projection
+  registry and decoder-floor checks. `zig build source-control-test
+  source-transaction-test -j2` passes, including all 18 CDC regressions. All 56
+  runtime error ABI tests pass. Current logs:
+  `zig/source-control-complete-qualification.log` and
+  `zig/source-control-error-abi-test.log`.
+
+The managed source actor and destination adapters still need to invoke these
+operations. Receipt/fencing references are private adapter outputs, not
+self-authorizing public strings: native and writable-Iceberg adapters must prove
+their engine-specific outcomes before accepting, committing, replanning or
+retiring source work. No source actor/public capability is advertised yet.
+
 ## Remaining implementation phases
 
 1. Finish root history tests, prepared credit accounting and native integration.

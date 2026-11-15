@@ -56,6 +56,7 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
+const source_control = @import("../source_control.zig");
 pub const apply_contract = @import("raft_apply_contract.zig");
 const platform_time = @import("antfly_platform").time;
 const restore_staging = @import("../restore_staging.zig");
@@ -6003,6 +6004,7 @@ pub const TransitionCommand = union(enum) {
         node_id: u64,
         group_id: u64,
     },
+    apply_source_control: []const u8,
     upsert_replication_source_status: metadata.ReplicationSourceStatusRecord,
     claim_replication_source_cutover: struct {
         expected_replication_sources_json: []const u8,
@@ -6078,7 +6080,7 @@ pub const TransitionCommand = union(enum) {
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .mutate_lake_index_lifecycle => |*command| command.mutation.deinitOwned(alloc),
-            .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
+            .apply_source_control, .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
             .apply_transaction_sessions, .apply_resolver_authority, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_completion_reference, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
@@ -6236,6 +6238,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
                 return error.InvalidTableDefinitionReplacement;
             }
         },
+        .apply_source_control => |bytes| try source_control.validateEncodedWrite(bytes),
         .mutate_lake_index_lifecycle => |mutation| {
             // Row zero owns composed-query artifacts without a logical table.
             if (mutation.table_id == 0) switch (mutation.mutation) {
@@ -15299,6 +15302,78 @@ pub const RaftApplyStore = struct {
         return try decodeTableRecord(alloc, encoded);
     }
 
+    pub fn getSourceControl(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, source_id: source_control.Digest) ![]u8 {
+        var buffer: [256]u8 = undefined;
+        return self.store.get(a, try source_control.keyForGroup(&buffer, group_id, table_id, source_id)) catch |err| switch (err) {
+            error.NotFound => source_control.encode(a, .{}),
+            else => err,
+        };
+    }
+    fn applySourceControlTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        var parsed_write = try source_control.parseWrite(self.alloc, bytes);
+        defer parsed_write.deinit();
+        const write = parsed_write.value;
+        var buffer: [256]u8 = undefined;
+        const table_bytes = (try stagingGet(txn, try tableKeyForGroup(&buffer, group_id, write.table_id))) orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const table = try decodeTableRecord(a, table_bytes);
+        if (!std.mem.eql(u8, &write.expected_catalog_digest, &source_control.digest(table.replication_sources_json))) return;
+        const key = try source_control.keyForGroup(&buffer, group_id, write.table_id, write.source_id);
+        const existing = try stagingGet(txn, key);
+        var parsed_state: ?std.json.Parsed(source_control.State) = if (existing) |raw| try source_control.parse(self.alloc, raw) else null;
+        defer if (parsed_state) |*state| state.deinit();
+        const state = if (parsed_state) |value| value.value else source_control.State{};
+        if (state.revision != write.expected_revision) return;
+        const scope = switch (write.mutation) {
+            .configure, .reseed => |configured| configured,
+            else => state.scope orelse return,
+        };
+        if (state.scope) |prior| {
+            if (!std.mem.eql(u8, &prior.identity(), &write.expected_binding)) return;
+        } else if (write.mutation != .configure or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
+        switch (write.mutation) {
+            .configure, .reseed, .reserve, .replan => {
+                const definition = source_control.definitionDigest(a, table.replication_sources_json, scope.source_ordinal) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return,
+                };
+                if (!std.mem.eql(u8, &definition, &scope.definition)) return;
+            },
+            // Already accepted work can drain after configuration replacement;
+            // its current catalog CAS and original source binding still fence it.
+            .accept, .commit, .retire, .reject_and_retire => {},
+        }
+        const next = write.mutation.apply(a, state) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        const output = source_control.encode(a, next) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        if (existing) |raw| if (std.mem.eql(u8, raw, output)) return;
+        var work_buffer: [256]u8 = undefined;
+        const work_key = try source_control.workKey(&work_buffer, group_id, write.table_id);
+        const work = try stagingGet(txn, work_key);
+        const count = if (work) |value| blk: {
+            if (value.len != 8) return error.InvalidSourceControl;
+            break :blk std.mem.readInt(u64, value[0..8], .little);
+        } else 0;
+        if (source_control.hasWork(state) != source_control.hasWork(next)) {
+            const next_count = if (source_control.hasWork(next))
+                std.math.add(u64, count, 1) catch return error.InvalidSourceControl
+            else
+                std.math.sub(u64, count, 1) catch return error.InvalidSourceControl;
+            var encoded_count: [8]u8 = undefined;
+            std.mem.writeInt(u64, &encoded_count, next_count, .little);
+            try txn.put(work_key, &encoded_count);
+        }
+        try txn.put(key, output);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+    }
+
     pub fn getLakeIndexLifecycle(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
         var buffer: [160]u8 = undefined;
         return self.store.get(a, try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table_id)) catch |err| switch (err) {
@@ -18564,6 +18639,7 @@ pub const RaftApplyStore = struct {
         reallocation_request_pending,
         catalog_revision,
         lake_source_owner,
+        source_control,
     };
     const MetadataSnapshotKey = union(enum) {
         prefix: MetadataSnapshotKeyFn,
@@ -18603,6 +18679,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .table, .key = .{ .prefix = tablePrefixForGroup } },
         .{ .projection = .resolver_namespaces, .key = .{ .prefix = resolverNamespacePrefix } },
         .{ .projection = .lake_index_lifecycle, .key = .{ .prefix = lakeIndexLifecyclePrefixForGroup } },
+        .{ .projection = .source_control, .key = .{ .prefix = source_control.prefixForGroup } },
         .{ .projection = .lake_source_owner, .key = .{ .prefix = lakeSourceOwnerPrefixForGroup } },
         .{ .projection = .table_transition_fence, .key = .{ .prefix = tableTransitionFencePrefixForGroup } },
         .{ .projection = .schema_progress, .key = .{ .prefix = schemaProgressPrefixForGroup } },
@@ -18682,6 +18759,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.placement_version) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count),
             .advance_resolver_namespace, .apply_resolver_authority => metadataSnapshotProjectionBit(.resolver_namespaces) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
             .mutate_lake_index_lifecycle => metadataSnapshotProjectionBit(.lake_index_lifecycle),
+            .apply_source_control => metadataSnapshotProjectionBit(.source_control),
             .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .apply_table_topology => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
@@ -21267,6 +21345,7 @@ pub const RaftApplyStore = struct {
             },
             .advance_resolver_namespace => |intent| try self.applyResolverNamespaceAdvanceTxn(txn, group_id, intent),
             .apply_resolver_authority => |bytes| try self.applyResolverAuthorityTxn(txn, group_id, bytes),
+            .apply_source_control => |bytes| try self.applySourceControlTxn(txn, group_id, bytes),
             .mutate_lake_index_lifecycle => |mutation| {
                 try self.applyLakeIndexLifecycleTxn(txn, group_id, mutation.table_id, mutation.expected_revision, mutation.mutation);
             },
@@ -21930,6 +22009,11 @@ pub const RaftApplyStore = struct {
     /// rejection must precede logical unbinding: Raft commits rejected commands
     /// as no-ops, while standalone aborts and exposes the precise policy error.
     fn removeTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, expected_generation: u64) !void {
+        var source_work_buffer: [256]u8 = undefined;
+        if (try stagingGet(txn, try source_control.workKey(&source_work_buffer, group_id, table_id))) |work| {
+            if (work.len != 8) return error.InvalidSourceControl;
+            if (std.mem.readInt(u64, work[0..8], .little) != 0) return error.TableTransitionActive;
+        }
         if (try self.fkGenerationTableLockedTxn(txn, group_id, table_id)) return error.TableTransitionActive;
         const fence = try self.loadTableTransitionFenceTxn(txn, group_id, table_id);
         if (fence.active()) return error.TableTransitionActive;
@@ -28106,6 +28190,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    apply_source_control = 83,
     apply_sql_completion_reference = 81,
     advance_resolver_namespace = 80,
     apply_transaction_sessions = 82,
@@ -28394,6 +28479,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         },
         .apply_resolver_authority => |bytes| {
             try out.append(alloc, @backingInt(TransitionTag.apply_resolver_authority));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_source_control => |bytes| {
+            try source_control.validateEncodedWrite(bytes);
+            try out.append(alloc, @backingInt(TransitionTag.apply_source_control));
             try appendRequiredString(alloc, &out, bytes);
         },
         .mutate_lake_index_lifecycle => |mutation| {
@@ -28884,6 +28974,15 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 .replacement = replacement,
                 .relation_guard = guard,
             } };
+        },
+        .apply_source_control => blk: {
+            const len = try readInt(encoded, &pos, u32);
+            if (len == 0 or len > source_control.max_state_bytes or len > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
+            const bytes = encoded[pos..][0..len];
+            pos += len;
+            if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            try source_control.validateEncodedWrite(bytes);
+            break :blk .{ .apply_source_control = try alloc.dupe(u8, bytes) };
         },
         .mutate_lake_index_lifecycle => blk: {
             const table_id = try readInt(encoded, &pos, u64);
@@ -45165,4 +45264,184 @@ test "selected owner readiness durable transition index rebuilds and retires act
     defer a.free(retired);
     try std.testing.expectEqual(@as(usize, 0), retired.len);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.ownerReadinessTransitions(a, 21, request, .{ .deadline_ns = 0 }));
+}
+
+test "metadata source control survives reopen fences catalog and protects table retirement" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-control", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{}",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]",
+    };
+    try store.applyStandaloneCommand(group_id, .{ .upsert_table = table });
+    const scope: source_control.Scope = .{
+        .table_id = 7,
+        .source_id = @splat(1),
+        .source_ordinal = 0,
+        .generation = 1,
+        .definition = try source_control.definitionDigest(a, table.replication_sources_json, 0),
+        .provider = @splat(3),
+        .destination = .native,
+        .destination_binding = @splat(7),
+    };
+    var write: source_control.Write = .{
+        .table_id = 7,
+        .source_id = scope.source_id,
+        .expected_revision = 0,
+        .expected_binding = scope.identity(),
+        .expected_catalog_digest = source_control.digest(table.replication_sources_json),
+        .mutation = .{ .configure = scope },
+    };
+    const configured_bytes = try source_control.encodeWrite(ca, write);
+    const frame = try encodeTransitionCommand(ca, .{ .apply_source_control = configured_bytes });
+    var decoded = (try decodeTransitionCommand(a, frame)) orelse return error.TestUnexpectedResult;
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings(configured_bytes, decoded.apply_source_control);
+    try store.applyStandaloneCommand(group_id, decoded);
+    write.expected_revision = 1;
+    const reservation: source_control.Reservation = .{
+        .sequence = 1,
+        .batch_id = "one",
+        .checkpoint = "commit-1",
+        .accepted_at_ns = 100,
+        .payload_digest = @splat(4),
+        .plan_digest = @splat(5),
+        .transaction_id = @splat(6),
+        .destination = .native,
+        .delivery_manifest = "{\"coordinator\":7}",
+    };
+    write.mutation = .{ .reserve = reservation };
+    const reserve_bytes = try source_control.encodeWrite(ca, write);
+    try store.applyStandaloneCommand(group_id, .{ .apply_source_control = reserve_bytes });
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.TableTransitionActive, store.removeTableTxn(&txn, group_id, 7, 0));
+    }
+    store.deinit();
+    store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    const retained = try store.getSourceControl(a, group_id, 7, scope.source_id);
+    defer a.free(retained);
+    var parsed = try source_control.parse(a, retained);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 2), parsed.value.revision);
+    try std.testing.expectEqualStrings("commit-1", parsed.value.pending.?.checkpoint);
+    var stale = write;
+    stale.expected_revision = 2;
+    stale.expected_catalog_digest = @splat(9);
+    stale.mutation = .{ .accept = .{ .reservation_digest = reservation.identity(scope), .receipt = "native-receipt", .commit_reference = "native-committed" } };
+    try store.applyStandaloneCommand(group_id, .{ .apply_source_control = try source_control.encodeWrite(ca, stale) });
+    const unchanged = try store.getSourceControl(a, group_id, 7, scope.source_id);
+    defer a.free(unchanged);
+    try std.testing.expectEqualStrings(retained, unchanged);
+    stale.expected_catalog_digest = write.expected_catalog_digest;
+    try store.applyStandaloneCommand(group_id, .{ .apply_source_control = try source_control.encodeWrite(ca, stale) });
+    const committed = try store.getSourceControl(a, group_id, 7, scope.source_id);
+    defer a.free(committed);
+    var finished = try source_control.parse(a, committed);
+    defer finished.deinit();
+    try std.testing.expectEqual(@as(u64, 1), finished.value.accepted.sequence);
+    try std.testing.expectEqual(@as(u64, 1), finished.value.committed.sequence);
+    try std.testing.expect(!source_control.hasWork(finished.value));
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var buffer: [256]u8 = undefined;
+        const count = try txn.get(try source_control.workKey(&buffer, group_id, 7));
+        try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, count[0..8], .little));
+    }
+}
+
+test "metadata source control snapshot installs pending source authority and retention work counters" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-control-snapshot", .{tmp.sub_path});
+    defer a.free(source_root);
+    const target_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-control-installed", .{tmp.sub_path});
+    defer a.free(target_root);
+    var source = try RaftApplyStore.init(a, .{ .root_dir = source_root });
+    defer source.deinit();
+    var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+    defer target.deinit();
+    const group_id = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{
+        .table_id = 19,
+        .name = "source-snapshot",
+        .schema_json = "{}",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"orders\"}]",
+    };
+    const scope: source_control.Scope = .{
+        .table_id = table.table_id,
+        .source_id = @splat(2),
+        .source_ordinal = 0,
+        .generation = 1,
+        .provider = @splat(3),
+        .definition = try source_control.definitionDigest(a, table.replication_sources_json, 0),
+        .destination = .native,
+        .destination_binding = @splat(4),
+    };
+    var write: source_control.Write = .{
+        .table_id = table.table_id,
+        .source_id = scope.source_id,
+        .expected_revision = 0,
+        .expected_binding = scope.identity(),
+        .expected_catalog_digest = source_control.digest(table.replication_sources_json),
+        .mutation = .{ .configure = scope },
+    };
+    const table_frame = try encodeTransitionCommand(ca, .{ .upsert_table = table });
+    const configure_frame = try encodeTransitionCommand(ca, .{ .apply_source_control = try source_control.encodeWrite(ca, write) });
+    write.expected_revision = 1;
+    write.mutation = .{ .reserve = .{
+        .sequence = 1,
+        .batch_id = "retained",
+        .checkpoint = "opaque-cp",
+        .accepted_at_ns = 123,
+        .payload_digest = @splat(4),
+        .plan_digest = @splat(5),
+        .transaction_id = @splat(6),
+        .destination = .native,
+        .delivery_manifest = "{\"original_coordinator\":7}",
+    } };
+    const reserve_frame = try encodeTransitionCommand(ca, .{ .apply_source_control = try source_control.encodeWrite(ca, write) });
+    const entries = try raft_state_machine.encodeCommittedEntries(ca, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_frame },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = configure_frame },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = reserve_frame },
+    });
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = 3, .entries_bytes = entries });
+    var prepared = (try source.snapshotBuilder().prepareSnapshot(group_id, 3)) orelse return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    var materialized = try prepared.materialize(a);
+    defer materialized.deinit(a);
+    const snapshot = switch (materialized) {
+        .bytes => |bytes| bytes,
+        .artifact => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group_id, 3, snapshot));
+    const expected = try source.getSourceControl(a, group_id, table.table_id, scope.source_id);
+    defer a.free(expected);
+    const installed = try target.getSourceControl(a, group_id, table.table_id, scope.source_id);
+    defer a.free(installed);
+    try std.testing.expectEqualStrings(expected, installed);
+    var restored = try source_control.parse(a, installed);
+    defer restored.deinit();
+    try std.testing.expectEqualStrings("opaque-cp", restored.value.pending.?.checkpoint);
+    var txn = try target.store.beginWriteTxn();
+    defer txn.abort();
+    try std.testing.expectError(error.TableTransitionActive, target.removeTableTxn(&txn, group_id, table.table_id, 0));
 }

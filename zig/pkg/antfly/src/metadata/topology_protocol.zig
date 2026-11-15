@@ -120,7 +120,9 @@ const std = @import("std");
 /// Version 86 admits authenticated demand locators in opening bundles.
 /// Version 87 admits bootstrap selectors in reader protocol 100 publications.
 /// Version 88 admits bounded inline map navigation in reader protocol 101.
-pub const current_version: u16 = 89;
+/// Version 90 adds source-control reservations and separate accepted/committed frontiers.
+pub const current_version: u16 = 90;
+pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
