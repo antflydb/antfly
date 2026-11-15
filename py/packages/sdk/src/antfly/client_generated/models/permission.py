@@ -25,7 +25,11 @@ class Permission:
         Attributes:
             resource_type (ResourceType): Type of resource: table, user, inference, or global ('*'). Use inference with
                 resource '*' to grant access to unified inference routes. Example: table.
-            type_ (PermissionType): Type of permission. Example: read.
+            type_ (PermissionType): Type of permission. replicate explicitly permits authorized changefeed and PostgreSQL
+                logical replication access to the selected resource. It does not grant ordinary read, write, or administrative
+                access. read, write, and curator do not imply replicate. admin includes replicate. Replication still requires
+                current row/field policies and feed, slot, and publication ownership checks; a replication position is not an
+                access credential. Example: read.
             resource (str | Unset): Resource name (e.g., table name, target username, or '*' for all inference operations or
                 a global grant). Example: orders_table.
             table_target (CatalogTableScope | Unset): A table or all tables in an explicit namespace. A missing table

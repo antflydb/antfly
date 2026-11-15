@@ -80,17 +80,21 @@ pub const PermissionType = enum {
     write,
     curator,
     admin,
+    /// Explicit export authority, independent of ordinary reads and writes.
+    replicate,
 
     pub fn fromSlice(raw: []const u8) !PermissionType {
         if (std.mem.eql(u8, raw, "read")) return .read;
         if (std.mem.eql(u8, raw, "write")) return .write;
         if (std.mem.eql(u8, raw, "curator")) return .curator;
         if (std.mem.eql(u8, raw, "admin")) return .admin;
+        if (std.mem.eql(u8, raw, "replicate")) return .replicate;
         return error.InvalidPermissionType;
     }
 
     /// Curators can read the table and use its admitted curation service, but
-    /// cannot perform arbitrary writes or administer the table.
+    /// cannot perform arbitrary writes or administer the table. Replication
+    /// requires its own grant; its holders do not acquire SELECT authority.
     pub fn allows(self: PermissionType, required: PermissionType) bool {
         return self == .admin or self == required or (self == .curator and required == .read);
     }
@@ -2580,4 +2584,66 @@ test "inherited row filters preserve large same-scope policy boundaries" {
     const combined = (try combinedRowFilterForTable(a, filters, "docs")).?;
     defer combined.deinit(a);
     try std.testing.expect(combined.composed);
+}
+
+test "usermgr replication privilege is independent of ordinary access and narrows API key grants" {
+    try std.testing.expectEqual(PermissionType.replicate, try PermissionType.fromSlice("replicate"));
+    for ([_]PermissionType{ .read, .write, .curator }) |permission| {
+        try std.testing.expect(!permission.allows(.replicate));
+        try std.testing.expect(!PermissionType.replicate.allows(permission));
+        const left: Permission = .{ .resource_type = .table, .resource = @constCast("docs"), .type = permission };
+        const right: Permission = .{ .resource_type = .table, .resource = @constCast("docs"), .type = .replicate };
+        try std.testing.expect(permissionIntersection(left, right) == null);
+        try std.testing.expect(permissionIntersection(right, left) == null);
+    }
+    try std.testing.expect(PermissionType.admin.allows(.replicate));
+    try std.testing.expect(!PermissionType.replicate.allows(.admin));
+    const admin: Permission = .{ .resource_type = .table, .resource = @constCast("*"), .type = .admin };
+    const replica: Permission = .{ .resource_type = .table, .resource = @constCast("docs"), .type = .replicate };
+    try std.testing.expectEqual(PermissionType.replicate, permissionIntersection(admin, replica).?.permission_type);
+    try std.testing.expectEqualStrings("docs", permissionIntersection(admin, replica).?.resource);
+}
+test "usermgr replication keys obey live role revocation persistence and layered row policy" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    var read = [_]Permission{try Permission.initOwned(a, .table, "docs", .read)};
+    defer read[0].deinit(a);
+    var user = try manager.createUser("replicator", "secret", &read);
+    defer user.deinit(a);
+    var replication = [_]Permission{try Permission.initOwned(a, .table, "docs", .replicate)};
+    defer replication[0].deinit(a);
+    try std.testing.expectError(error.PrivilegeEscalation, manager.createApiKey("replicator", "cannot_export", &replication, &.{}, null));
+    try manager.addPermissionToSubject("role:replication", replication[0]);
+    try manager.addRoleToUser("replicator", "role:replication");
+    try manager.setSubjectRowFilter("role:replication", "docs", "{\"term\":{\"tenant\":\"a\"}}");
+    var filters = [_]RowFilterEntry{try RowFilterEntry.initOwned(a, "docs", "{\"term\":{\"team\":\"b\"}}")};
+    defer filters[0].deinit(a);
+    var key = try manager.createApiKey("replicator", "export", &replication, &filters, null);
+    defer key.deinit(a);
+    const credential = try std.fmt.allocPrint(a, "api-key:{s}", .{key.key.key_id});
+    defer a.free(credential);
+    const checks = [_]UserManager.PermissionCheck{.{ .resource_type = .table, .resource = "docs", .permission_type = .replicate }};
+    try std.testing.expect(try manager.permissionsCurrentlyAllowed("replicator", credential, &checks));
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("replicator", credential, &.{.{ .resource_type = .table, .resource = "docs", .permission_type = .read }}));
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("replicator", credential, &.{.{ .resource_type = .table, .resource = "other", .permission_type = .replicate }}));
+    manager.deinit();
+    manager = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    var validated = try manager.validateApiKey(key.key.key_id, key.key_secret);
+    defer validated.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
+    try std.testing.expectEqual(PermissionType.replicate, validated.permissions[0].type);
+    const filter = (try combinedRowFilterForTable(a, validated.row_filter, "docs")).?;
+    defer filter.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, filter.json, "tenant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter.json, "team") != null);
+    try manager.removeRoleFromUser("replicator", "role:replication");
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowed("replicator", credential, &checks));
+    var revoked = try manager.validateApiKey(key.key.key_id, key.key_secret);
+    defer revoked.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), revoked.permissions.len);
 }

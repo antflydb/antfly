@@ -15850,11 +15850,11 @@ export interface components {
          */
         ResourceType: "table" | "database" | "namespace" | "tablespace" | "graph" | "user" | "inference" | "*";
         /**
-         * @description Type of permission.
+         * @description Type of permission. replicate explicitly permits authorized changefeed and PostgreSQL logical replication access to the selected resource. It does not grant ordinary read, write, or administrative access. read, write, and curator do not imply replicate. admin includes replicate. Replication still requires current row/field policies and feed, slot, and publication ownership checks; a replication position is not an access credential.
          * @example read
          * @enum {string}
          */
-        PermissionType: "read" | "write" | "curator" | "admin";
+        PermissionType: "read" | "write" | "curator" | "admin" | "replicate";
         /** @description A table or all tables in an explicit namespace. A missing table selects the namespace; a table named '*' remains literal. */
         CatalogTableScope: {
             /** @default default */

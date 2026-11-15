@@ -30663,7 +30663,7 @@ fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std
             if (entry.key_ptr.len == 0 or std.mem.eql(u8, entry.key_ptr.*, "*") or entry.value_ptr.* != .array) return error.Unauthorized;
             for (entry.value_ptr.array.items) |operation| {
                 const name = jsonStringValue(operation) orelse return error.Unauthorized;
-                if (!std.mem.eql(u8, name, "read") and !std.mem.eql(u8, name, "write") and !std.mem.eql(u8, name, "admin")) return error.Unauthorized;
+                if (!std.mem.eql(u8, name, "read") and !std.mem.eql(u8, name, "write") and !std.mem.eql(u8, name, "admin") and !std.mem.eql(u8, name, "replicate")) return error.Unauthorized;
             }
             try appendTrustedPrincipalPermissionsForTable(alloc, &out, entry.key_ptr.*, entry.value_ptr.array.items);
         }
@@ -30696,6 +30696,8 @@ fn appendTrustedPrincipalPermissionsForTable(
             try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .read));
         } else if (std.mem.eql(u8, operation, "write")) {
             try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .write));
+        } else if (std.mem.eql(u8, operation, "replicate")) {
+            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .replicate));
         } else if (std.mem.eql(u8, operation, "admin")) {
             try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .admin));
         } else if (std.mem.eql(u8, operation, "*")) {
@@ -31204,6 +31206,7 @@ fn permissionTypeFromOpenApi(value: usermgr_openapi.PermissionType) usermgr.Perm
         .write => .write,
         .curator => .curator,
         .admin => .admin,
+        .replicate => .replicate,
     };
 }
 
@@ -31226,6 +31229,7 @@ fn permissionTypeToOpenApi(value: usermgr.PermissionType) usermgr_openapi.Permis
         .write => .write,
         .curator => .curator,
         .admin => .admin,
+        .replicate => .replicate,
     };
 }
 
@@ -63755,5 +63759,28 @@ test "system catalog row filter composition rejects oversized tails with bounded
             // The unvisited tail must not affect composition allocations.
             try std.testing.expectEqual(expected, measured.allocated_bytes);
         } else prefix_allocation = measured.allocated_bytes;
+    }
+}
+
+test "trusted principal replication grants are explicit scoped and round trip through public permissions" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"table_operations\":{\"docs\":[\"replicate\"]}}",
+        "{\"tables\":[\"docs\"],\"operations\":[\"replicate\"]}",
+    }) |json| {
+        var payload = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer payload.deinit();
+        const grants = try trustedPrincipalPermissionsFromPayload(a, payload.value.object);
+        defer freePermissions(a, grants);
+        try std.testing.expect(permissionsAllow(grants, .table, "docs", .replicate));
+        try std.testing.expect(!permissionsAllow(grants, .table, "other", .replicate));
+        for ([_]usermgr.PermissionType{ .read, .write, .curator, .admin }) |permission| try std.testing.expect(!permissionsAllow(grants, .table, "docs", permission));
+        const public = try clonePermissionsToOpenApi(a, grants);
+        defer a.free(public);
+        try std.testing.expectEqual(usermgr_openapi.PermissionType.replicate, public[0].type);
+        try std.testing.expectEqual(usermgr.PermissionType.replicate, permissionTypeFromOpenApi(public[0].type));
+        const encoded = try std.json.Stringify.valueAlloc(a, public[0].type, .{});
+        defer a.free(encoded);
+        try std.testing.expectEqualStrings("\"replicate\"", encoded);
     }
 }

@@ -567,6 +567,40 @@ allocation failures, partial-frame rejection and legacy envelope decoding. Logs:
 `zig/pg-slot-durable-final-qualification.log`, `zig/pg-slot-control-test.log`.
 
 
+## In progress: explicit replication permission
+
+The auth OpenAPI contract now defines `replicate` as independent table-export
+permission. `read`, `write` and `curator` do not imply it; replication-only grants
+do not imply SELECT or mutation access. Existing `admin` grants include it. The
+native enum appends the new member to preserve existing ordinal assignments.
+API-key grants intersect with current owner authority, including inherited roles
+and live revocation. Historical projection and ownership remain additional
+requirements, not consequences of possessing the grant.
+
+Signed gateway `operations` and scoped `table_operations` can carry this explicit
+grant. Native/public permission conversions, generated clients, and Antfarm's
+permission editor carry the same value. `make generate` completed with local Zig
+caches and the pinned frontend toolchain, including TypeScript/frontend checks.
+Unrelated model-explorer kernel output from that full generator was restored.
+
+This permission alone does not expose a stream. Production changefeed and
+logical-replication admission still must require the grant, bind immutable user
+and table identities, reauthorize historical row/field policy, and check slot or
+publication ownership. Runtime capability/upgrade admission remains necessary
+before public replication activation.
+
+Qualification: `zig build antfly-usermgr-test lib-usermgr-abi-test -j2`
+passes the native authorization, storage and independent ABI cases. The added
+ABI case and focused signed-gateway/public-conversion cases pass with
+`zig build antfly-api-auth-test lib-usermgr-abi-test
+-Dtest-filter='trusted principal replication grants'
+-Dtest-filter='trusted principal table operations' -j2`.
+`GOWORK=off GOEXPERIMENT=simd go test ./...` passes in `go/pkg/sdk` with local
+HTTP test listeners enabled. Logs: `zig/replication-privilege-usermgr-test.log`,
+`zig/replication-privilege-final-qualification.log`,
+`go/pkg/sdk/replication-permission-sdk-qualified.log`, and
+`change-pipeline-replication-generate-qualified.log`.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

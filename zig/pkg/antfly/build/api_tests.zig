@@ -382,6 +382,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_api_auth_default_filters = [_][]const u8{
         "trusted principal table operations",
+        "trusted principal replication grants",
         "storage migration job observation preserves admitted and unpublished catalog state",
         "storage migration command admission fences delayed starts across handlers",
         "api http server requires auth on public routes when enabled",

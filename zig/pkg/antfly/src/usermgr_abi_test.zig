@@ -42,3 +42,22 @@ test "usermgr archive boundary preserves secure randomness errors and releases m
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+test "usermgr archive boundary preserves replication grants and current revocation" {
+    const manager = usermgr_abi_create() orelse return error.TestSetupFailed;
+    defer usermgr_abi_destroy(manager);
+    var permission = try auth.Permission.initOwned(manager.alloc, .table, "docs", .replicate);
+    defer permission.deinit(manager.alloc);
+    try manager.addPermissionToUser("alice", permission);
+    try std.testing.expect(try manager.permissionCurrentlyAllowed("alice", .table, "docs", .replicate));
+    try std.testing.expect(!try manager.permissionCurrentlyAllowed("alice", .table, "docs", .read));
+    var key = try manager.createApiKey("alice", "replication", &.{permission}, &.{}, null);
+    defer key.deinit(manager.alloc);
+    var validated = try manager.validateApiKey(key.key.key_id, key.key_secret);
+    defer validated.deinit(manager.alloc);
+    try std.testing.expectEqual(auth.PermissionType.replicate, validated.permissions[0].type);
+    try manager.removePermissionFromUser("alice", "docs", .table);
+    var revoked = try manager.validateApiKey(key.key.key_id, key.key_secret);
+    defer revoked.deinit(manager.alloc);
+    try std.testing.expectEqual(@as(usize, 0), revoked.permissions.len);
+}
