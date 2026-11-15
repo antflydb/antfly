@@ -1884,7 +1884,19 @@ pub const Owner = struct {
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
             }
-            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and
+            // `sequence_unchanged` exists to catch a redo-only commit that
+            // the header/metadata comparisons below cannot see on their own
+            // (the comment above). Without a redo log, the physical
+            // checkpoint *is* the only commit record: every commit,
+            // including a lease-only one, bumps `committedSequence()` by
+            // bumping the checkpoint's own `commit_sequence`, so requiring
+            // it unchanged here would force a full reopen for exactly the
+            // lease bookkeeping this fast path exists to adopt cheaply.
+            // `runtimeMetadataUnchanged`/`loadedIndexInputsUnchanged` already
+            // prove no primary/index root moved; that is sufficient on a
+            // non-redo file, which has no logical watermark separate from
+            // the physical one for `sequence_unchanged` to protect.
+            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
                 try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
             {
                 // Lease bookkeeping and unpublished shadow files do not change
