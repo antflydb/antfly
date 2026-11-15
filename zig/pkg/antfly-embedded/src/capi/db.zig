@@ -1373,7 +1373,7 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
                 };
             } else connection.gate.mutex.lockUncancelable(handleLockIo());
             guard.connection_gate_held = true;
-            root = (if (pinned) connection.pin() else connection.refresh(&guard.path_lease, intent)) catch |err| {
+            root = (if (pinned) connection.pin() else connection.refresh(&guard.path_lease, intent, false)) catch |err| {
                 guard.entry_error = capi.mapError(err);
                 return guard;
             };
