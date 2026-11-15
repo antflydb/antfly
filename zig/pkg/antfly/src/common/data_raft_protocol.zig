@@ -98,3 +98,16 @@ pub const batch_merge_retirements_protocol_version: u16 = 20;
 /// Version 22 adds qualified endpoint cleanup, ordered retirement stamps, and
 /// bounded owner revival pages. It subsumes version 21 endpoint incarnations.
 pub const batch_graph_cleanup_generation_protocol_version: u16 = 22;
+
+/// A decoder ceiling must not claim the retention apply protocol when this
+/// serving compiler unit has no compiled native owner dispatch.
+pub fn maximumForHistoryApply(native_history_apply: bool) u16 {
+    return if (native_history_apply) batch_protocol_version else @min(batch_protocol_version, batch_history_control_protocol_version - 1);
+}
+
+test "data raft protocol advertisement requires native history apply support" {
+    const std = @import("std");
+    try std.testing.expectEqual(batch_protocol_version, maximumForHistoryApply(true));
+    try std.testing.expect(maximumForHistoryApply(false) < batch_history_control_protocol_version);
+    try std.testing.expectEqual(@as(u16, 29), maximumForHistoryApply(false));
+}

@@ -1367,6 +1367,30 @@ capability advertisement, feed root binding, topology/history transfer and
 file-backed multi-node recovery qualification remain required. Public feeds,
 bootstrap and existing-client qualification are not complete.
 
+## In progress: serving-profile protocol advertisement
+
+The internal capability response now derives its data-Raft ceiling from the
+actual serving compiler unit. Compiled native-owner profiles advertise the full
+supported decoder/apply version; profiles without native history apply stop at
+29 and cannot authorize the protocol-30 retention barrier. This is an internal
+protocol capability, not an advertisement of public feeds, bootstrap or lake
+row-history support.
+
+The production distributed and API runtime archives select the same native
+control profile. Qualification checks both supported/unsupported ceilings and
+the actual HTTP JSON response for the selected profile. It also retains the
+internal-service-principal boundary for the capability path. The focused
+`history-serving-capability-test` belongs to the normal API auth gate; its HTTP
+runtime discovery anchor ensures the handler tests execute rather than passing
+an empty selection. Logs: `zig/history-serving-protocol-capability-qualification.log`
+and `zig/history-serving-capability-http-qualification.log`.
+
+Both implementation issues remain open. Their live requirements still include
+native and writable-Iceberg destination integration, public HTTP/SQL feeds,
+coherent bootstrap, retained topology/recovery semantics and qualification of
+actual pgoutput with a pinned existing CDC client. The private native control
+milestones do not replace that scope.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

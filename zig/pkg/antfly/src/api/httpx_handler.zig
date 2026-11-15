@@ -363,6 +363,27 @@ fn requiresInternalServicePrincipal(path: []const u8) bool {
     return in_internal_namespace and !standby_exempt;
 }
 
+test "internal capabilities advertise only the serving history apply profile" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .GET, "http://127.0.0.1/internal/v1/capabilities");
+    defer request.deinit();
+    var context = httpx.Context.init(a, std.testing.io, &request);
+    defer context.deinit();
+    // Capability serving does not depend on a particular hosted table/root.
+    var handler: AntflyApiHandler = undefined;
+    var response = try handler.internalCapabilities(&context);
+    defer response.deinit();
+    const Parsed = struct { data_raft_batch_protocol_version: u16, catalog_route_fence_protocol_version: u16 };
+    var parsed = try std.json.parseFromSlice(Parsed, a, response.body.?, .{});
+    defer parsed.deinit();
+    const protocol = @import("../common/data_raft_protocol.zig");
+    try std.testing.expectEqual(protocol.batch_protocol_version, protocol.maximumForHistoryApply(true));
+    try std.testing.expect(protocol.maximumForHistoryApply(false) < protocol.batch_history_control_protocol_version);
+    const expected = if (@import("storage_source_options").control_only) protocol.batch_protocol_version else protocol.batch_history_control_protocol_version - 1;
+    try std.testing.expectEqual(expected, parsed.value.data_raft_batch_protocol_version);
+    try std.testing.expectEqual(metadata_api.catalog_route_fence_protocol_current, parsed.value.catalog_route_fence_protocol_version);
+}
+
 test "internal namespace requires a service principal except hot standby" {
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1"));
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/capabilities"));
@@ -3705,7 +3726,7 @@ pub const AntflyApiHandler = struct {
 
     fn internalCapabilities(_: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return ctx.json(.{
-            .data_raft_batch_protocol_version = internal_batch_forwarding.raft_batch_protocol_version,
+            .data_raft_batch_protocol_version = @import("../common/data_raft_protocol.zig").maximumForHistoryApply(@import("storage_source_options").control_only),
             .catalog_route_fence_protocol_version = metadata_api.catalog_route_fence_protocol_current,
         });
     }
