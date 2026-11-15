@@ -227,6 +227,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db mixed extraction batches retain document checkpoint ownership in either order",
         "storage.db.db.test.db asset consuming asset validates upstream references at admission",
         "generic scalar chunks reject stale upstream and fence publication",
+        "grouped source upstream receipt narrows to the group unit, not the whole raw document",
         "asset preparation is lazy and byte bounded across retryable provider batches",
         "asset planning groups interleaved providers",
         "asset producer neighbor context samples local graph adjacency into the input and skip state",

@@ -40233,7 +40233,6 @@ const LocalSourceFence = struct {
 /// witness.
 fn declaredSourceTextAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8, raw: []const u8, name: []const u8) ![]const u8 {
     const entry = runtime.index_manager.getEnrichment(.asset, name) orelse return try runtime.alloc.dupe(u8, raw);
-    if (entry.group_source_json.len > 0) return try runtime.alloc.dupe(u8, raw);
     // `name`'s own source, and the value any source_field/source_template
     // of its own narrows: `raw` directly, unless `name` itself consumes
     // another asset (`source_artifact_name` set) rather than a field of
@@ -40241,7 +40240,17 @@ fn declaredSourceTextAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8, raw
     // `processAsset`. One hop is enough regardless of how deep the chain
     // above `name` goes: whatever `name`'s own immediate upstream most
     // recently published is already the correct narrowing input, however
-    // that upstream itself arrived at it.
+    // that upstream itself arrived at it. A group root has no upstream
+    // asset of its own (`source_artifact_name` is empty), so this also
+    // narrows it the same way: its catalog `source_field` is the literal
+    // "_group_unit" key (see index_manager's group-kind compilation), and
+    // extracting that from `raw` below reproduces exactly the bytes
+    // `processAsset` hashed as both parent and output when it wrote this
+    // artifact's receipt. Returning `raw` unnarrowed here, as a prior
+    // version of this function did, hashed the whole grouped-unit document
+    // as "parent" while the receipt was written against only the
+    // "_group_unit" sub-object, so this check never matched and the
+    // consumer never advanced past `error.EnrichmentSourceChanged`.
     const source_input = if (entry.source_artifact_name.len == 0) raw else blk: {
         const upstream_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", entry.source_artifact_name);
         defer runtime.alloc.free(upstream_key);
@@ -49515,6 +49524,83 @@ test "generic scalar chunks reject stale upstream and fence publication" {
     try std.testing.expectError(error.EnrichmentSourceChanged, storePutBatchGuarded(&runtime, &.{}, &.{}, .{ .doc_key = "doc", .digest = accepted.source_record_digest, .upstream_name = "units", .upstream_digest = accepted.upstream_digest }));
     // Cache reuse must validate the receipt again, not reuse the old proof.
     try std.testing.expectError(error.EnrichmentSourceChanged, getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null));
+}
+
+// Regression for the grouped-source enrichment-catch-up stall: a group
+// root's declared source narrows to its own "_group_unit" sub-object (see
+// index_manager's `source_field = "_group_unit"` for `.kind == .group`),
+// exactly like any other `.copy` producer's `field` narrows its receipt to
+// the extracted value rather than the whole raw document (see the sibling
+// test above and declaredSourceTextAlloc's doc comment). Before the fix,
+// `declaredSourceTextAlloc` special-cased `entry.group_source_json.len > 0`
+// to return the whole raw group-unit document unnarrowed, which never
+// matched the receipt a group root's own production actually wrote -- a
+// downstream consumer's upstream check failed with `EnrichmentSourceChanged`
+// on every retry, forever, with nothing to make it converge.
+test "grouped source upstream receipt narrows to the group unit, not the whole raw document" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "group-upstream-revisions" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/group-upstream-revisions", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+    var cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
+    defer freeWorkerChunkCache(alloc, &cache);
+
+    const groups = @import("../group_sources.zig");
+    const config = groups.Config{ .group_by = "thread", .order_by = "ordinal", .segment_by = "turn", .field = "text" };
+    try index_manager.addEnrichment(&store, .{ .name = "turns", .kind = .group, .source = config });
+    const local = @import("../artifact_local_publication.zig");
+    const entry = index_manager.getEnrichment(.asset, "turns").?;
+
+    const doc_key = "unit";
+    const parent_key = try documentSourceStoreKeyAlloc(&runtime, doc_key);
+    defer alloc.free(parent_key);
+    const upstream_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "turns");
+    defer alloc.free(upstream_key);
+    const receipt_key = try local.key(alloc, upstream_key);
+    defer alloc.free(receipt_key);
+
+    // The group-unit document the grouped planner materializes for a
+    // segment. Only its "_group_unit" sub-object is the group root's
+    // declared source.
+    const raw = "{\"_group_unit\":{\"text\":\"hello turn text\"}}";
+    // What a group root's `.copy` producer actually extracts and hashes as
+    // both parent and output: the "_group_unit" sub-object alone, not `raw`.
+    const narrowed = "{\"text\":\"hello turn text\"}";
+    try storePutWithRetry(&runtime, parent_key, raw);
+    try storePutWithRetry(&runtime, upstream_key, narrowed);
+    const receipt = local.encode(local.recipe(entry), narrowed, narrowed);
+    try storePutWithRetry(&runtime, receipt_key, &receipt);
+
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .chunk_text, .index_name = "chunks", .artifact_name = "chunks", .doc_key = doc_key, .upstream_artifact_name = "turns", .source_field = "text", .chunk_size = 512 };
+    const accepted = try getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null);
+    try std.testing.expectEqual(@as(usize, 1), accepted.chunks.len);
 }
 
 test "OCR sampling reuse gate requires current state before skipping extraction" {
