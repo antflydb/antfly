@@ -2267,6 +2267,20 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.sqlPolicyBeginCommandJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .has_index_aliases => {
+                    const value = handle.store.hasIndexAliases(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .validate_table_index_mutation => |input| {
+                    const Validation = @import("../metadata/storage/raft_apply_contract.zig").TableIndexMutationValidation;
+                    const result: Validation = result: {
+                        handle.store.validateTableIndexMutation(group_id, input.before, input.after) catch |err| {
+                            break :result Validation.fromError(err) orelse break :blk storageOwnerStatusFromError(err);
+                        };
+                        break :result .valid;
+                    };
+                    break :blk metadataProjectionJson(alloc, out_json, result);
+                },
                 .require_policy_index_mutation_allowed => |input| {
                     handle.store.requirePolicyIndexMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);
