@@ -2561,6 +2561,18 @@ export interface paths {
          *     such as the document-unit hierarchy extracted from a PDF, HTML page, or
          *     text field. The route is shard-aware; hosted deployments route the
          *     request to the data group that owns the source document key.
+         *
+         *     On a privacy-protected table, a dense index name without a same-named
+         *     asset also selects its stored text-chunk vectors for administrator
+         *     inspection. The response uses route_type `dense_index_inspection` and
+         *     manifest_version 1; raw manifest_json carries the versioned
+         *     `antfly.dense-index-inspection.v1` snapshot. Its current flag, policy,
+         *     index recipe, sanitized source and vector publication evidence belong
+         *     to one publication-fenced storage cut. The top-level artifact_id is empty;
+         *     member artifact IDs are included in the raw snapshot. This bounded
+         *     inspection does not re-embed missing vectors and does not alter normal
+         *     protected search projection permissions. See the table privacy guide
+         *     for the raw payload and supported recipe limits.
          */
         get: operations["getDocumentArtifactManifest"];
         put?: never;
@@ -38165,6 +38177,28 @@ export interface operations {
             };
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
+            /**
+             * @description Dense inspection exceeds fixed payload or traversal limits. The JSON
+             *     response has code `inspection_limit_exceeded`, retryable `false`,
+             *     and a `limits` object. Reduce the source or selected index recipe.
+             */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        code: "inspection_limit_exceeded";
+                        /** @enum {boolean} */
+                        retryable: false;
+                        message: string;
+                        limits: {
+                            [key: string]: number;
+                        };
+                    };
+                };
+            };
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
         };

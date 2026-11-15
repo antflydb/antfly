@@ -3460,6 +3460,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
+            413 => return error.ResourceBudgetExceeded,
             408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
@@ -3491,6 +3492,7 @@ pub const ApiHttpClient = struct {
         switch (response.status) {
             200 => return .{ .body = try self.alloc.dupe(u8, response.body) },
             404 => return error.NotFound,
+            413 => return error.ResourceBudgetExceeded,
             408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(response.body),
             503 => return remoteStorageReadUnavailableError(response.body),
@@ -3536,6 +3538,7 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
+            413 => return error.ResourceBudgetExceeded,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
@@ -5480,13 +5483,15 @@ fn consumerTests() type {
 
         test "api http client preserves storage read contention across group read endpoints" {
             const UnavailableExecutor = struct {
+                status: u16 = 503,
                 fn executor(self: *@This()) http_common.RequestExecutor {
                     return .{ .ptr = self, .vtable = &.{ .execute = execute } };
                 }
 
-                fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
                     return .{
-                        .status = 503,
+                        .status = self.status,
                         .body = try alloc.dupe(u8, "storage read temporarily unavailable"),
                     };
                 }
@@ -5508,6 +5513,10 @@ fn consumerTests() type {
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupGraphEdges(base_uri, 7, "docs", "{}"));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchGroupVectorWorker(base_uri, 7, "docs", "{}"));
+            executor.status = 413;
+            try std.testing.expectError(error.ResourceBudgetExceeded, client.fetchGroupDocumentArtifactManifest(base_uri, 7, "docs", "doc:a", "dense"));
+            try std.testing.expectError(error.ResourceBudgetExceeded, client.fetchGroupDocumentArtifactManifestControlled(base_uri, 7, "docs", "doc:a", "dense", .{}));
+            try std.testing.expectError(error.ResourceBudgetExceeded, client.fetchGroupDocumentArtifactManifest(base_uri, 7, "docs", "doc\x00a", "dense"));
         }
 
         test "api http client transfers query response buffers without copying" {

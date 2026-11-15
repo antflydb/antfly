@@ -408,6 +408,30 @@ def test_privacy_policy_replacement_and_new_model_migration(
     # The existing producer's inspection receipts are shared with B.
     assert len(calls["extract"]) == before
     wait_complete(api, table, "b")
+    # Persisted chunk vectors are inspected through the admin artifact boundary.
+    before_inspection = len(calls["embed"])
+    identities = {}
+    for name, model, expected in (
+        ("a0", "fixture", [1.0, 0.0]),
+        ("b", "fixture-v2", [0.0, 1.0]),
+    ):
+        manifest = api.get(f"/tables/{table}/documents/d0/artifacts/{name}?detail=raw")
+        assert manifest["route_type"] == "dense_index_inspection"
+        assert manifest["manifest_version"] == 1
+        snapshot = json.loads(manifest["manifest_json"])
+        assert snapshot["format"] == "antfly.dense-index-inspection.v1"
+        assert snapshot["current"] is True
+        assert snapshot["policy_version"] == api.get(path)["policy_version"]
+        assert snapshot["index"] == name and snapshot["document_id"] == "d0"
+        assert len(snapshot["vectors"]) == 1
+        vector = snapshot["vectors"][0]
+        assert vector["values"] == expected
+        assert vector["model"] == model
+        assert "@" not in vector["source_text"]
+        assert vector["source_text"] == json.loads(snapshot["document_json"])["body"]
+        identities[name] = snapshot["index_fingerprint"]
+    assert identities["a0"] != identities["b"]
+    assert len(calls["embed"]) == before_inspection
     api.put(
         alias,
         {

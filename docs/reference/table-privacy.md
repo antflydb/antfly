@@ -365,3 +365,68 @@ backoff; they cannot cause a blocked window to replay at the write rate. A retry
 requires both a notification and an elapsed deadline, so idle workers do not
 poll. Reopening retries retained debt. This applies to
 full-text consumers as well as vector consumers.
+
+### Inspect stored vectors as an administrator
+
+For a dense index protected by `redact_for_search_and_ai` and backed by text
+chunk embedding producers, an explicit
+artifact inspection can use the index name:
+
+```http
+GET /db/v1/tables/docs/documents/doc-id/artifacts/semantic-index?detail=raw
+```
+
+This uses the existing table administrator permission for raw artifact
+inspection. Tenant search and document projections retain their artifact
+restrictions. Existing asset names take precedence over an index with the
+same name. Index inspections are explicit lookups and are not added to asset
+manifest enumeration. Unprotected indexes and document-level, sparse, media,
+or elided-vector recipes are outside this inspection format.
+
+The response has `route_type: "dense_index_inspection"`, `manifest_version: 1`,
+and an empty top-level `artifact_id` because an index can consume many physical
+artifacts. Its raw `manifest_json` is a JSON string with format
+`antfly.dense-index-inspection.v1`. It contains the index name, physical
+coverage generation and recipe fingerprint; the active privacy policy version;
+the currently sanitized `document_json` and its SHA-256 fingerprint; and a
+`current` publication flag. Each vector carries its real artifact ID, producer
+name, provider/model identity, producer fingerprint, exact source text and
+SHA-256 fingerprint, the persisted artifact fingerprint and opaque provider cache identity, and
+persisted float values. Fingerprints are lowercase
+SHA-256 hex over the exact represented bytes.
+
+Source, selected chunk heads, recipe, publication guards, and stored vectors
+are captured while apply is held shared, with the source and vectors read from
+one storage snapshot. Standalone inspection uses the same source-guarded coverage generations and
+clean projection checkpoints as protected serving; ordered owners additionally
+verify per-output causal provenance. The payload identifies this authority and
+reports the index/checkpoint config hashes, checkpoint status, applied sequence
+and replay target sequence. It does not substitute asset privacy witnesses for
+vector authority. `current: false` and an `incomplete_reason` do not certify vector
+equivalence. Pending root publication never yields certified vectors.
+The operation never calls an embedding provider to reconstruct missing values.
+It seeks only the selected producers for this document and bounds inspection
+to 16 producers, 128 vectors, 65,536 float values and 1 MiB of source payloads.
+Identities are limited to 4 KiB and each producer configuration to 1 MiB.
+Publication preflight and traversal share a 512-visit, 2 MiB budget, including
+policy/configuration bytes, readiness nodes, index checks and empty unit heads.
+The five-second deadline starts at capture entry and is checked throughout.
+Ordered global readiness verifies one durable catalog authority and each
+producer counter once, without rebuilding per-producer dependency closures.
+Standalone vector readiness reads its index-generation coverage once and does
+not compute source scopes. Full-text scope traversal is linear in the dependency
+graph and charges the same budget during edge discovery, traversal and hashing;
+its existing v2 receipt identity is preserved. Fixed payload or traversal limits
+return HTTP 413 with code `inspection_limit_exceeded`, `retryable: false`, and
+the configured limits; deadline or publication contention remains retryable.
+No response is truncated. Capture excludes primary and replay publication using
+the existing snapshot admission gates, then releases those gates before JSON
+encoding. `checkpoint_generation` and `checkpoint_config_hash` can be checked
+against the independent live index status fields
+`projection_checkpoint_generation` and `projection_checkpoint_config_fingerprint`
+(the latter is hexadecimal).
+
+An independent oracle should compare these values against a separate invocation
+of the intended model on independently retrieved sanitized text. Check source
+revision, policy and index identity as well as the numeric values, and retain
+tenant permission checks separately.
