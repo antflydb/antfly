@@ -16,7 +16,7 @@ order: 5
 ## The Result
 
 The authenticated examples use `ANTFLY_ADMIN_PASSWORD` for your provisioned
-administrator credential. See [secure deployment](https://github.com/antflydb/antfly/blob/main/docs/auth.md#secure-deployment)
+administrator credential. See [secure deployment](/docs/reference/auth#secure-deployment)
 for setup; do not use the legacy `admin:admin` password.
 
 Every insert, update, and delete on a PostgreSQL table lands in an Antfly table without a sync job or a daemon in between. Antfly subscribes to PostgreSQL logical replication, backfills the existing rows, then follows the stream. Nothing changes in the application that writes to PostgreSQL. The table is created with a replication source, and rows can be read back from Antfly as soon as they land:
