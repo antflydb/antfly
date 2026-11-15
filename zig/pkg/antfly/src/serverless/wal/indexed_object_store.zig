@@ -394,7 +394,7 @@ pub const IndexedObjectStore = struct {
                 if (catalog) |epoch| {
                     if (current.value.catalog_epoch != epoch or current.value.catalog_pending_lsn != null) return error.VersionConflict;
                 }
-                if (read_set) |reads| try self.requirePreparedReadSet(scratch, pages, current.value, reads);
+                if (read_set) |reads| try self.requirePreparedReadSet(pages, current.value, reads);
                 const first = last + 1;
                 last = std.math.add(u64, last, group.payloads.len) catch return error.WalLsnExhausted;
                 if (self.max_new_lsn) |maximum| if (last > maximum) return error.PublicationLagExceeded;
@@ -495,15 +495,35 @@ pub const IndexedObjectStore = struct {
     /// Validate against exactly the immutable HEAD used by the following CAS.
     /// The document index includes tombstones; a missing key is trustworthy only
     /// when its complete post-read history has not been collected or pre-indexed.
-    fn requirePreparedReadSet(self: *@This(), a: A, pages: tree.Store, head: Head, reads: types.PreparedReadSet) !void {
-        _ = self;
+    fn requirePreparedReadSet(self: *@This(), pages: tree.Store, head: Head, reads: types.PreparedReadSet) !void {
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(self.alloc, 64 * 1024 * 1024);
+        defer quota.deinit();
+        return validatePreparedReadSet(quota.allocator(), pages, head, reads) catch |err| {
+            if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
+            return err;
+        };
+    }
+
+    fn validatePreparedReadSet(a: A, pages: tree.Store, head: Head, reads: types.PreparedReadSet) !void {
         if (reads.after_lsn > head.latest_lsn) return error.VersionConflict;
         if (reads.after_lsn == head.latest_lsn) return;
         if (head.physical_first_lsn > reads.after_lsn + 1) return error.VersionConflict;
         const index = head.document_index orelse return error.CommitRequirementUnavailable;
         if (index.first_lsn > reads.after_lsn + 1) return error.CommitRequirementUnavailable;
-        var documents: std.StringHashMapUnmanaged(void) = .empty;
-        for (reads.documents) |document| try documents.put(a, document, {});
+        const storage = try a.dupe([]const u8, reads.documents);
+        defer a.free(storage);
+        std.mem.sort([]const u8, storage, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.lessThan(u8, left, right);
+            }
+        }.less);
+        var count: usize = 0;
+        for (storage) |key| {
+            if (count != 0 and std.mem.eql(u8, storage[count - 1], key)) continue;
+            storage[count] = key;
+            count += 1;
+        }
+        const keys = storage[0..count];
         if (head.deferred_tail) |*tail| {
             const view = try tail.view();
             for (view.records[0..view.record_count]) |encoded| {
@@ -511,25 +531,41 @@ pub const IndexedObjectStore = struct {
                 if (record.lsn <= reads.after_lsn) continue;
                 if (record.external_payload) return error.InvalidWal;
                 const mutation = try @import("../api/codec.zig").decodeMutationView(record.payload);
-                if (mutation.kind != .catalog and documents.contains(mutation.doc_id)) return error.VersionConflict;
+                if (mutation.kind != .catalog and containsPreparedDocument(keys, mutation.doc_id)) return error.VersionConflict;
             }
         }
-        const keys = try a.alloc([]const u8, documents.count());
-        var it = documents.keyIterator();
-        var n: usize = 0;
-        while (it.next()) |key| : (n += 1) keys[n] = key.*;
-        std.mem.sort([]const u8, keys, {}, struct {
-            fn less(_: void, left: []const u8, right: []const u8) bool {
-                return std.mem.lessThan(u8, left, right);
+        // All windows observe the same immutable root. Reclaim traversal pages
+        // and owned results as we go instead of retaining them in the CAS arena.
+        var start: usize = 0;
+        while (start < keys.len) {
+            const end = @min(keys.len, start + tree.max_lookup_batch);
+            const found = try tree.lookupMany(a, pages, index.root, keys[start..end]);
+            defer {
+                for (found) |entry| if (entry) |value| value.deinit(a);
+                a.free(found);
             }
-        }.less);
-        const found = try tree.lookupMany(a, pages, index.root, keys);
-        for (found) |entry| if (entry) |value| {
-            if (value.value.len < 8) return error.InvalidWal;
-            const lsn = std.mem.readInt(u64, value.value[0..8], .big);
-            if (lsn < index.first_lsn or lsn > head.latest_lsn) return error.InvalidWal;
-            if (lsn > reads.after_lsn) return error.VersionConflict;
-        };
+            for (found) |entry| if (entry) |value| {
+                if (value.value.len < 8) return error.InvalidWal;
+                const lsn = std.mem.readInt(u64, value.value[0..8], .big);
+                if (lsn < index.first_lsn or lsn > head.latest_lsn) return error.InvalidWal;
+                if (lsn > reads.after_lsn) return error.VersionConflict;
+            };
+            start = end;
+        }
+    }
+
+    fn containsPreparedDocument(keys: []const []const u8, key: []const u8) bool {
+        var low: usize = 0;
+        var high = keys.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            switch (std.mem.order(u8, keys[mid], key)) {
+                .eq => return true,
+                .lt => low = mid + 1,
+                .gt => high = mid,
+            }
+        }
+        return false;
     }
 
     fn lookupReceipts(self: *@This(), a: A, pages: tree.Store, head: Head, ids: []const []const u8) ![]?tree.BatchEntry {
@@ -2864,5 +2900,102 @@ test "commit requirements prepared CAS retries reuse outputs and recheck documen
         }
         try std.testing.expectEqual(@as(usize, 1), probe.calls);
         if (probe.failure) |err| return err;
+    }
+}
+
+test "commit requirements read sets span lookup windows and reclaim traversal memory" {
+    const a = std.testing.allocator;
+    var memory: tree.testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = memory.store(), .target_bytes = 256 };
+    defer builder.deinit();
+    var names: [1024][32]u8 = undefined;
+    var keys: [1024][]const u8 = undefined;
+    var version: [8]u8 = undefined;
+    std.mem.writeInt(u64, &version, 1, .big);
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&names[i], "document-{d:0>6}", .{i});
+        try builder.add(key.*, &version);
+    }
+    const root = try builder.finish();
+    const head: IndexedObjectStore.Head = .{ .latest_lsn = 2, .document_index = .{ .first_lsn = 1, .root = root } };
+    for ([_]usize{ 512, 513, 1024 }) |count| {
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 128 * 1024);
+        defer quota.deinit();
+        try IndexedObjectStore.validatePreparedReadSet(quota.allocator(), memory.store(), head, .{ .after_lsn = 1, .documents = keys[0..count] });
+        try std.testing.expectEqual(@as(usize, 0), quota.live_bytes);
+        try std.testing.expect(!quota.limit_exceeded);
+    }
+    // Change the final key, beyond the first lookup window.
+    var changed_builder: tree.SortedBuilder = .{ .alloc = a, .store = memory.store(), .target_bytes = 256 };
+    defer changed_builder.deinit();
+    for (keys, 0..) |key, i| {
+        std.mem.writeInt(u64, &version, if (i == keys.len - 1) 2 else 1, .big);
+        try changed_builder.add(key, &version);
+    }
+    var changed = head;
+    changed.document_index.?.root = try changed_builder.finish();
+    try std.testing.expectError(error.VersionConflict, IndexedObjectStore.validatePreparedReadSet(a, memory.store(), changed, .{ .after_lsn = 1, .documents = &keys }));
+    // Duplicate keys do not consume additional lookup slots.
+    var duplicates: [1024][]const u8 = @splat(keys[0]);
+    try IndexedObjectStore.validatePreparedReadSet(a, memory.store(), head, .{ .after_lsn = 1, .documents = &duplicates });
+}
+
+test "commit requirements read validation maps quota exhaustion and releases allocations" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        fn get(_: *anyopaque, alloc: A, _: tree.Ref) ![]u8 {
+            const quota = @import("antfly_platform").allocator.reclamation.Quota.owner(alloc) orelse return error.MissingQuota;
+            try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), quota.max_live_bytes);
+            return alloc.alloc(u8, quota.max_live_bytes + 1);
+        }
+        fn put(_: *anyopaque, _: tree.Ref, _: []const u8) !void {
+            return error.UnexpectedWrite;
+        }
+    };
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var wal = try IndexedObjectStore.init(a, memory.client(), "db", "quota");
+    defer wal.deinit();
+    const pages: tree.Store = .{ .ptr = &memory, .get = Probe.get, .put = Probe.put };
+    const head: IndexedObjectStore.Head = .{ .latest_lsn = 2, .document_index = .{ .first_lsn = 1, .root = .{ .digest = @splat(1), .bytes = 128, .height = 0, .records = 1 } } };
+    try std.testing.expectError(error.CommitRequirementTooLarge, wal.requirePreparedReadSet(pages, head, .{ .after_lsn = 1, .documents = &.{"source"} }));
+}
+
+test "commit requirements maximum read set admits unrelated writes and rejects final dependency" {
+    const a = std.testing.allocator;
+    const mutations = @import("../api/codec.zig");
+    var names: [1024][32]u8 = undefined;
+    var keys: [1024][]const u8 = undefined;
+    for (&keys, 0..) |*key, i| key.* = try std.fmt.bufPrint(&names[i], "document-{d:0>6}", .{i});
+    for ([_]bool{ false, true }) |deferred| {
+        var memory = objectstore.MemoryClient.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("db");
+        var wal = try IndexedObjectStore.init(a, client, "db", "maximum-reads");
+        defer wal.deinit();
+        wal.catalog_fences_enabled = true;
+        wal.deferred_indexes_enabled = deferred;
+        const unrelated = try mutations.encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = "unrelated", .body = "A" });
+        defer a.free(unrelated);
+        const output = try mutations.encodeMutationAlloc(a, .{ .kind = .prepared, .doc_id = "result", .body = "prepared" });
+        defer a.free(output);
+        var cut = try wal.catalogFence(a, "docs");
+        defer cut.deinit(a);
+        _ = try wal.append("docs", 1, unrelated);
+        for ([_]usize{ 512, 513, 1024 }) |count| {
+            var id_buf: [32]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buf, "reads-{d}", .{count});
+            _ = try wal.appendPreparedWithReadSet("docs", 2, &.{output}, id, cut.fence, keys[0..count]);
+        }
+        const changed = try mutations.encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = keys[1023], .body = "changed" });
+        defer a.free(changed);
+        _ = try wal.append("docs", 3, changed);
+        const before = try wal.latestLsn("docs");
+        try std.testing.expectError(error.VersionConflict, wal.appendPreparedWithReadSet("docs", 4, &.{output}, "conflict", cut.fence, &keys));
+        try std.testing.expectEqual(before, try wal.latestLsn("docs"));
+        _ = try wal.materializePending("docs");
+        try std.testing.expectError(error.VersionConflict, wal.appendPreparedWithReadSet("docs", 4, &.{output}, "conflict-folded", cut.fence, &keys));
     }
 }

@@ -242,13 +242,16 @@ conditional atomic WAL batch admits all writes and deletes against the captured
 catalog epoch, with an operation receipt for exact replay and collision checks.
 Blind replacements and deletes have no source read dependency. Transform keys,
 including terminal no-op transforms and absent reads, form a bounded read set
-against the pre-read WAL cut. At admission, one batched document-index lookup
+against the pre-read WAL cut. At admission, document-index lookups in windows of at most 512 unique keys
 and a bounded deferred-tail check reject any change to those keys, including
 insert/delete or delete/recreate ABA. Collected or pre-index history fails closed.
 Every catalog-fenced WAL writer maintains this index, including tombstones;
 unrelated source and background writes do not invalidate prepared inference.
 The check uses the immutable HEAD selected for the append CAS. CAS retries
-recheck the read set and catalog without recomputing outputs.
+recheck the read set and catalog without recomputing outputs. Validation uses a
+reclaimable 64 MiB allocation quota; traversal pages and each window’s results
+are released as validation advances. Quota exhaustion fails closed as an oversized
+commit requirement.
 
 WAL HEAD format 8 and private mutation kind 6 publish a durable catalog-change
 intent before metadata changes. Catalog intents use the same
