@@ -139,11 +139,23 @@ gated batching separately, including unrelated-write latency during slow inferen
 
 The optional requirement is carried through batch and transaction codecs and all
 SDKs. Omitted and explicit `none` remain distinct. Transaction-level defaults
-apply only to tables without an override. Session cloning, persistence and
-statement coalescing retain the strongest prerequisite selected for each table.
+apply only to tables without an override, including mutation participants added
+by foreign-key cascade expansion. The coordinator retains that default through
+session cloning, persistence and expansion; explicit table-level `none` remains
+an override. Statement coalescing retains the strongest prerequisite selected
+for each table and the strongest default needed by later cascade expansion.
 Single-shard fast paths and grouped forwarding preserve the optional field.
 Requests with explicit requirements bypass the local write coalescer so each
 request retains its own preparation and source fences.
+
+For policy-protected relational writes, preparation authorizes the pinned old
+row and prepared postimage before invoking a producer. This check briefly holds
+the apply lock to validate source/schema fences and evaluate the leased policy
+bundle; inference runs after releasing it. Admission repeats policy and source
+validation so concurrent changes cannot turn an authorized preparation into an
+unauthorized commit. Serverless dense preparation resolves one immutable model
+lease for the entire request, shares it across documents and bounded provider
+partitions, and revalidates the current generation before admission.
 
 Preparation dispatches bounded windows of at most 32 documents and 256 KiB of
 source bytes, preserving native dense/sparse and asset provider batching. The

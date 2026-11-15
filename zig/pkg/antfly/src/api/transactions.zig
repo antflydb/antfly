@@ -110,8 +110,7 @@ pub const TableCommitRequest = struct {
     pub fn mergeFrom(self: *TableCommitRequest, alloc: std.mem.Allocator, other: TableCommitRequest) !void {
         // Staged statements may strengthen admission, never erase an earlier
         // prerequisite while coalescing the final table postimage.
-        if (other.batch.req.commit_requires == .direct_enrichments or self.batch.req.commit_requires == null)
-            self.batch.req.commit_requires = other.batch.req.commit_requires;
+        self.batch.req.commit_requires = db_mod.types.CommitRequires.strongest(self.batch.req.commit_requires, other.batch.req.commit_requires);
         if (other.range_guards) |guards| try self.mergeRangeGuards(alloc, guards.value);
         if (other.conflict_guards) |guards| try self.mergeConflictGuards(alloc, guards.value);
         if (self.schema_version != null and other.schema_version != null and self.schema_version != other.schema_version) return error.CatalogGenerationChanged;
@@ -180,6 +179,9 @@ pub const OwnedTransactionCommitRequest = struct {
     read_set: []TransactionReadItem = &.{},
     tables: []TableCommitRequest = &.{},
     sync_level: db_mod.types.SyncLevel = .propose,
+    // Retain the request default until integrity expansion has enlisted all
+    // mutation participants, including tables absent from the submitted JSON.
+    commit_requires: ?db_mod.types.CommitRequires = null,
 
     pub fn setConstraintTiming(self: *@This(), alloc: std.mem.Allocator, mode: @import("antfly_local_sources").storage_relational_index.ConstraintTiming) !void {
         if (mode.generation == null) self.constraint_timing.clearRetainingCapacity();
@@ -240,6 +242,7 @@ pub const OwnedTransactionCommitRequest = struct {
     pub fn clone(self: OwnedTransactionCommitRequest, alloc: std.mem.Allocator) !OwnedTransactionCommitRequest {
         var out: OwnedTransactionCommitRequest = .{
             .sync_level = self.sync_level,
+            .commit_requires = self.commit_requires,
         };
         errdefer out.deinit(alloc);
         try out.constraint_timing.appendSlice(alloc, self.constraint_timing.items);
@@ -272,6 +275,7 @@ pub const OwnedTransactionCommitRequest = struct {
     }
 
     pub fn mergeFrom(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, other: *const OwnedTransactionCommitRequest) !void {
+        self.commit_requires = db_mod.types.CommitRequires.strongest(self.commit_requires, other.commit_requires);
         for (other.constraint_timing.items) |mode| try self.setConstraintTiming(alloc, mode);
         for (other.catalog_bindings.items) |binding| try self.bind(alloc, binding.logical, binding.physical);
         try appendReadSet(alloc, self, other.read_set);
@@ -321,7 +325,8 @@ pub const OwnedTransactionCommitRequest = struct {
             offset += table_writes.len;
             out[i] = .{
                 .table_name = self.physicalName(table.table_name),
-                .commit_requires = table.batch.req.commit_requires,
+                .commit_requires = table.batch.req.commit_requires orelse self.commit_requires,
+                .default_commit_requires = self.commit_requires,
                 .schema_version = table.schema_version,
                 .relational_schema_version = table.relational_schema_version,
                 .relational_integrity_generation_set = if (table.conflict_guards) |guards| guards.value.generation_set else null,
@@ -2634,6 +2639,7 @@ pub const SessionRegistry = struct {
             try appendBatchWrites(alloc, &replacement, writes.items);
             try appendBatchDeletes(alloc, &replacement, deletes.items);
             syncBatchReq(&replacement);
+            replacement.req.commit_requires = target.batch.req.commit_requires;
             target.batch.deinit(alloc);
             target.batch = replacement;
         }
@@ -4379,6 +4385,7 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
     errdefer req.deinit(alloc);
     req.tables = try parseTables(alloc, root.get("tables") orelse return error.InvalidTransactionCommitRequest);
     const requirement = if (root.get("commit_requires")) |value| try db_mod.types.parseCommitRequires(value) else null;
+    req.commit_requires = requirement;
     for (req.tables) |*table| if (table.batch.req.commit_requires == null) {
         table.batch.req.commit_requires = requirement;
     };
@@ -4427,6 +4434,7 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
         try out.appendSlice(alloc, batch_json);
     }
     try out.append(alloc, '}');
+    if (req.commit_requires) |requirement| try out.print(alloc, ",\"commit_requires\":\"{s}\"", .{@tagName(requirement)});
     try out.appendSlice(alloc, ",\"sync_level\":");
     try appendJsonString(alloc, &out, syncLevelText(req.sync_level));
     if (trusted and req.constraint_timing.items.len != 0) {
@@ -4824,6 +4832,7 @@ fn parseCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTrans
 
     const tables_value = root.get("tables") orelse return error.InvalidTransactionCommitRequest;
     req.tables = try parseTables(alloc, tables_value);
+    req.commit_requires = default_requirement;
     for (req.tables) |*table| if (table.batch.req.commit_requires == null) {
         table.batch.req.commit_requires = default_requirement;
     };
@@ -8314,6 +8323,21 @@ test "commit requirements survive transaction session cloning persistence and st
     var view = try recovered.distributedTables(a);
     defer view.deinit();
     for (view.tables) |table| try std.testing.expectEqual(if (std.mem.eql(u8, table.table_name, "docs")) db_mod.types.CommitRequires.direct_enrichments else .none, table.commit_requires.?);
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, recovered.commit_requires.?);
+    for (view.tables) |table| try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, table.default_commit_requires.?);
+    var cloned = try recovered.clone(a);
+    defer cloned.deinit(a);
+    var weaker = try parseMultiBatchRequest(a, "{\"commit_requires\":\"none\",\"tables\":{\"later\":{\"inserts\":{\"c\":{}}}}}");
+    defer weaker.deinit(a);
+    try cloned.mergeFrom(a, &weaker);
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, cloned.commit_requires.?);
+    const stored = try encodeCommitRequestMode(a, cloned, true);
+    defer a.free(stored);
+    var parsed_stored = try std.json.parseFromSlice(std.json.Value, a, stored, .{});
+    defer parsed_stored.deinit();
+    var restored = try parseStoredCommitValue(a, parsed_stored.value);
+    defer restored.deinit(a);
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, restored.commit_requires.?);
     var staged = try request.tables[0].clone(a);
     defer staged.deinit(a);
     var next = try parseMultiBatchRequest(a, "{\"commit_requires\":\"none\",\"tables\":{\"docs\":{\"inserts\":{\"c\":{}}}}}");
@@ -8321,4 +8345,10 @@ test "commit requirements survive transaction session cloning persistence and st
     try staged.mergeFrom(a, next.tables[0]);
     try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, staged.batch.req.commit_requires.?);
     try std.testing.expectEqual(@as(usize, 2), staged.batch.writes.len);
+    try cloned.mergeFrom(a, &next);
+    try SessionRegistry.normalizeSqlStage(undefined, a, &recovered, &cloned, &next);
+    for (cloned.tables) |table| if (std.mem.eql(u8, table.table_name, "docs")) {
+        try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, table.batch.req.commit_requires.?);
+        try std.testing.expectEqual(@as(usize, 2), table.batch.writes.len);
+    };
 }

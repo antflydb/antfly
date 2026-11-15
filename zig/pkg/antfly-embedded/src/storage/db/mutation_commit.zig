@@ -679,6 +679,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         opts.restore_timestamps,
                         opts.restore_staging != null or opts.preserve_logical_values,
                     );
+                    // Authorize the exact old/postimage pair before exposing
+                    // source fields to any producer. The policy lease pins the
+                    // bundle; source/schema fences tie this short locked check
+                    // to the rows prepared above. No inference runs under this
+                    // lock, and admission repeats authorization after inference.
+                    if (decoded_prepared == null and (requires_inline_generated or opts.preparation_capture != null)) if (opts.row_policy_principal) |principal| {
+                        if (opts.ordered_apply_receipt != null) {
+                            try tryLockApplyForPortableRuntime(self);
+                        } else {
+                            try self.lockApplyForPortableRuntime();
+                        }
+                        defer S.ownerField(self, "core").*.unlockApply();
+                        if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+                        if (request_schema_binding == null) try self.validatePreparedSchemaViewLocked(request_schema_view);
+                        try self.validateTransformReadSnapshot(transform_snapshot);
+                        try self.validateGeneratedWriteReadSnapshot(preparation.generated_snapshot);
+                        try self.enforceRowPolicyMutationLocked(view, effective_req, rows, principal);
+                    };
                     if (prepared_index_keys) |*keys| {
                         var largest_document: usize = 0;
                         var largest_tuple: usize = 0;
@@ -798,6 +816,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                 }
             };
+            // A policy-bearing mutation must not fall back to a producer path
+            // that has no relational postimages to authorize (for example an
+            // unsupported metadata-key mutation).
+            if (opts.row_policy_principal != null and preparation.rows == null and
+                (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0))
+                return error.RowPolicyMutationUnsupported;
             // Document-mode tables have no `PreparedRelationalWrite`/write-plan
             // row encoding to hoist, but generated-enrichment precompute (asset
             // extraction, chunking, embedding) for `.enrichments`/`.full_index`/

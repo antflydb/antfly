@@ -524,6 +524,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_graph_publication;
     _ = @import("antfly_local_sources").storage_db_artifact_inventory;
     _ = @import("antfly_local_sources").storage_db_artifact_native_stream;
+    _ = @import("antfly_local_sources").storage_db_prepared_producer_acceptance;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_context;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_dispatch;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_input;

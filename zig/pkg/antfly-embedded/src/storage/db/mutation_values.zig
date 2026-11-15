@@ -100,7 +100,15 @@ pub const SyncLevel = enum {
 
 /// Admission prerequisite, independent of the response visibility barrier.
 /// Optional at ingress to retain the embedded legacy migration boundary.
-pub const CommitRequires = enum { none, direct_enrichments };
+pub const CommitRequires = enum {
+    none,
+    direct_enrichments,
+
+    pub fn strongest(previous: ?CommitRequires, incoming: ?CommitRequires) ?CommitRequires {
+        if (previous == .direct_enrichments or incoming == .direct_enrichments) return .direct_enrichments;
+        return previous orelse incoming;
+    }
+};
 
 pub fn parseCommitRequires(value: std.json.Value) !?CommitRequires {
     if (value == .null) return null;

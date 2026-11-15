@@ -500,11 +500,7 @@ pub const ManagedRuntime = struct {
         }
         if (enricher) |*value| {
             value.prepared_catalog = digest;
-            value.execution_context = context;
-            if (value.chunk_embedder) |provider| value.chunk_embedder = provider.withRequestContext(context);
-            if (value.sparse_embedder) |provider| value.sparse_embedder = provider.withRequestContext(context);
-            if (value.chunk_embedder) |provider| value.prepared_dense_generation = try provider.captureTextGeneration(self.alloc, value.chunk_embedding_name.?);
-            if (value.sparse_embedder) |provider| value.prepared_sparse_revision = try provider.captureRevision(self.alloc, value.sparse_embedding_name.?);
+            try value.captureDirectProviders(context);
         }
         const pipeline = enrichment_mod.builtinPipelineForPolicy(policy);
         var eligible: usize = 0;

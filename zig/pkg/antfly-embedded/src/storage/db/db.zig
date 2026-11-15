@@ -154481,3 +154481,44 @@ test "db commit requirements sealed retries reject changed range guards and vers
     try db.writeTransaction(transaction, request);
     try db.abortTransaction(transaction, 200);
 }
+
+test "db commit requirements reject row policy before producer dispatch" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-policy-before-model");
+    defer directory.cleanup();
+    var provider = CountingDenseEmbedder{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .enrichment = .{ .owner_id = "policy-test", .dense_embedder = provider.interface() } });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.batch(.{ .writes = &.{.{ .key = "private", .value = "{\"body\":\"protected tenant source\"}" }}, .commit_requires = .none });
+    try db.addEnrichment(.{ .name = "vectors", .kind = .embedding, .field = "body", .expected_dims = 2, .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"dense\",\"dimensions\":2}" });
+    var view = db.core.acquireSchemaView().?;
+    defer view.release();
+    const schema = view.tableSchema().*;
+    const schema_bytes = try schema_mod.serializeSchema(a, schema);
+    defer a.free(schema_bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema_bytes, &digest, .{});
+    const policies = @import("../../system_catalog/policies.zig");
+    const deny: policies.Predicate = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = false } } }}, .root = 0 };
+    const bundle = try std.json.Stringify.valueAlloc(a, policies.InstallSnapshot{ .table_id = 1, .schema_version = 1, .schema_digest = digest, .policy_generation = 7, .catalog_epoch = 9, .phase = .active, .records = &.{.{ .id = 1, .generation = 7, .table_id = 1, .schema_version = 1, .schema_digest = digest, .name = "deny", .commands = .{ .insert = true, .update = true, .delete = true }, .roles = &.{"public"}, .using = deny, .with_check = deny }}, .settings = &.{} }, .{});
+    defer a.free(bundle);
+    db.local_execution.row_policy_bundle = try row_policy_bundle_mod.Installed.init(a, bundle, 1, schema);
+    db.local_execution.row_policy_gate = row_policy_gate_mod.Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1, .row_policy_phase = .active, .row_policy_generation = 7, .row_policy_catalog_epoch = 9 });
+    const principal: row_policy_authority_mod.Payload = .{ .principal = "alice", .roles = &.{}, .auth_revision = 1, .table_id = 1, .table = "docs", .database = "main", .policy_generation = 7, .catalog_epoch = 9, .access = .write, .expires = 1 };
+    var lease = try db.local_execution.row_policy_gate.enterReplicatedPrincipal(&principal);
+    defer lease.release();
+    const requests = [_]types.BatchRequest{
+        .{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"denied insert\"}" }}, .commit_requires = .direct_enrichments },
+        .{ .writes = &.{.{ .key = "private", .value = "{\"body\":\"denied replacement\"}" }}, .commit_requires = .direct_enrichments },
+        .{ .transforms = &.{.{ .key = "private", .operations = &.{.{ .op = .set, .path = "body", .value_json = "\"denied transform\"" }} }}, .commit_requires = .direct_enrichments },
+    };
+    for (requests) |request| {
+        var capture: execution_resources.PreparationCapture = .{ .alloc = a };
+        defer if (capture.json) |bytes| a.free(bytes);
+        try std.testing.expectError(error.RowPolicyDenied, db.batchInternal(request, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = &principal, .row_policy_lease = &lease }));
+        try std.testing.expect(capture.json == null);
+        try std.testing.expectEqual(@as(usize, 0), provider.calls);
+    }
+}

@@ -225,6 +225,23 @@ pub const SparseEnricher = struct {
         self.* = undefined;
     }
 
+    /// Resolve once for the entire admission attempt. All bounded partitions
+    /// and documents execute against the same immutable provider generation.
+    pub fn captureDirectProviders(self: *SparseEnricher, context: @import("antfly_inference_execution_context").RequestContext) !void {
+        self.execution_context = context;
+        if (self.chunk_embedder) |provider| {
+            const controlled = provider.withRequestContext(context);
+            const generation = try controlled.captureTextGeneration(self.alloc, self.chunk_embedding_name.?);
+            self.prepared_dense_generation = generation;
+            self.chunk_embedder = controlled.withTextGeneration(generation);
+        }
+        if (self.sparse_embedder) |provider| {
+            const controlled = provider.withRequestContext(context);
+            self.sparse_embedder = controlled;
+            self.prepared_sparse_revision = try controlled.captureRevision(self.alloc, self.sparse_embedding_name.?);
+        }
+    }
+
     /// Execute only source-local stages against an uncommitted postimage.
     /// This request-owned enricher never appends WAL or publishes artifacts.
     pub fn prepareDirectBody(self: *SparseEnricher, body: []const u8, policy: catalog_mod.NamespacePolicy, exclude_model_sources: bool) ![]u8 {
@@ -4743,4 +4760,65 @@ test "commit requirements serverless model cancellation survives error classific
     probe.canceled.store(false, .release);
     enricher.execution_context = .{ .io = std.testing.io, .deadline_ns = 0 };
     try std.testing.expectError(error.Timeout, enricher.prepareDirectBody("{\"text\":\"expired\"}", .{ .enrichment_enabled = true }, false));
+}
+
+test "serverless managed runtime commit requirements pin one dense generation across documents and partitions" {
+    const work = @import("antfly_inference_work");
+    const Context = @import("antfly_inference_execution_context").RequestContext;
+    const Probe = struct {
+        revision: u8 = 1,
+        resolutions: usize = 0,
+        calls: usize = 0,
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedUnpinnedInference;
+        }
+        fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8, _: u32) ![]const []const f32 {
+            return error.UnexpectedUnpinnedInference;
+        }
+        fn resolve(ptr: *anyopaque, _: Allocator, _: []const u8, context: ?Context) !work.CapabilityLease {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolutions += 1;
+            return .{ .capabilities = .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .batch = .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, .model_revision = @as([32]u8, @splat(self.revision)) } };
+        }
+        fn planned(ptr: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8, dims: u32, context: ?Context, lease: work.CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(texts.len <= 2);
+            try std.testing.expectEqual(@as(u8, 1), lease.capabilities.?.model_revision.?[0]);
+            const vectors = try a.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| a.free(vector);
+                a.free(vectors);
+            }
+            for (vectors) |*vector| {
+                const values = try a.alloc(f32, dims);
+                @memset(values, 1);
+                vector.* = values;
+                initialized += 1;
+            }
+            self.revision = 2;
+            return vectors;
+        }
+    };
+    const a = std.testing.allocator;
+    var probe = Probe{};
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    try enricher.setChunkEmbedder(.{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch, .dense_embed_batch_planned_fn = Probe.planned, .resolve_part_lease_fn = Probe.resolve }, "dense", 2);
+    try enricher.captureDirectProviders(.{ .io = std.testing.io, .deadline_ns = null });
+    const policy: catalog_mod.NamespacePolicy = .{ .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .require_model };
+    for (0..2) |_| {
+        const body = try enricher.prepareDirectBody("{\"text\":\"one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone twentytwo twentythree twentyfour\"}", policy, false);
+        defer a.free(body);
+    }
+    try std.testing.expect(probe.calls >= 4);
+    try std.testing.expectEqual(@as(usize, 1), probe.resolutions);
+    const provider = enricher.chunk_embedder.?;
+    try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(a, "dense", enricher.prepared_dense_generation.?));
+    // A -> B -> A cannot admit mixed vectors: both bodies used the A lease.
+    probe.revision = 1;
+    try provider.requireTextGeneration(a, "dense", enricher.prepared_dense_generation.?);
 }

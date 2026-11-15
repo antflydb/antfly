@@ -7641,6 +7641,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_graph_publication.",
             "storage.db.artifact_inventory.",
             "storage.db.artifact_native_stream.",
+            "storage.db.prepared_producer_acceptance.",
             "storage.db.artifact_producer_context.",
             "storage.db.artifact_producer_dispatch.",
             "storage.db.artifact_producer_input.",
