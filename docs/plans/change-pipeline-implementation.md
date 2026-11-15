@@ -779,9 +779,59 @@ read/send never acknowledges data. Cleanup must select only the first garbage
 record, persist bounded provider continuations, durably retire its upload ID,
 and prove the attempt is physically empty before returning capacity. Enumeration
 success alone is insufficient when a provider reports retained/nonempty scopes.
-A live or new upload must never be covered by a cleanup cutoff. A runtime worker,
-durable cleanup continuation field and integrated fault/restart qualification are
-still required; the current filesystem collector is a qualification fixture.
+A live or new upload must never be covered by a cleanup cutoff. The runtime cleanup worker and durable continuation contract below now implement
+this path. Production namespace resolution/scheduling and the upload/publication
+worker remain required; the earlier manual filesystem collector is an isolated
+storage qualification fixture.
+
+## In progress: bounded runtime spool cleanup
+
+`metadata/pg_spool_cleanup.zig` drives storage reclamation through the actual
+metadata service read/propose/observe contract. Its internal registry must
+authorize maintenance and resolve the recorded immutable storage namespace. It
+selects only the first irreversible garbage record; live or uploading records
+stop the sweep without touching storage. It durably fences the original upload
+ID, checkpoints that observation before deleting data, and resumes the exact
+provider continuation from slot state. Opaque tokens are bounded, canonically
+base64url encoded and internal; only the first garbage record may hold progress.
+Protocol 95 gates this persisted checkpoint contract.
+
+Each call admits bounded storage work/deletions, including provider-owned journal
+maintenance. Cancellation and storage errors retain the reservation. Provider
+continuations are saved only after completed work, and metadata authority is
+re-read after I/O. A concurrent collector's newer checkpoint cannot be overwritten.
+An unknown proposal response stops further work; the next call observes durable
+progress before continuing. An explicitly obsolete provider continuation restarts
+private discovery within the same fenced garbage scope; it never changes the
+client acknowledgement or upload reservation. Native feed acknowledgement is
+unaffected.
+
+Enumeration exhaustion cannot return capacity. Artifact stores must separately
+prove that the original scope is fenced and its payload/inventory are gone. The
+filesystem implementation checks its authoritative retirement floor and both
+attempt directories under the storage barrier. A complete checkpoint records the
+internal evidence; a subsequent pass verifies physical absence again before
+removing the reservation. The metadata reducer requires the recorded completion
+proof. Writable spool providers must support both retirement and absence proof.
+
+`zig build pg-spool-test -j2` qualifies the worker against actual filesystem and
+metadata stores. Both reopen between sweep pages. It covers lost fence/page/GC
+responses, cancellation after deletion, partial storage failure, concurrent
+checkpoint interference, obsolete provider cursor recovery, refusal to release
+capacity without absence evidence,
+and preservation/readability of a later live transaction. The metadata snapshot
+case transfers an opaque cleanup checkpoint to another owner before completing
+and replaying reclamation. Pure reducer checks cover stale revisions, canonical
+tokens, immutable completion and proof matching. Relevant logs:
+`zig/pg-spool-cleanup-runtime-qualification.log`,
+`zig/pg-spool-cleanup-control-test.log` and
+`zig/pg-spool-cleanup-metadata-qualification.log`.
+
+This is a private worker, not a registered production replication endpoint. The
+production owner still must supply namespace credentials, lifecycle scheduling,
+shared-storage qualification and the upload/publication worker. Coherent cuts,
+typed historical relational rows, public endpoints and existing-client
+qualification remain part of the full implementation objective.
 
 ## Working constraints
 

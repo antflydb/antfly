@@ -33,7 +33,7 @@ pub const Adapter = struct {
         // Verified reads use either the bounded whole-object capability or the
         // store's exact-size metadata check followed by a bounded range read.
         if (std.mem.allEqual(u8, &namespace, 0)) return error.PgSpoolStorageUnsupported;
-        if (access == .write and (store.vtable.put_scoped == null or store.vtable.retire_scoped_uploads == null)) return error.PgSpoolStorageUnsupported;
+        if (access == .write and (store.vtable.put_scoped == null or store.vtable.retire_scoped_uploads == null or store.vtable.scoped_uploads_reclaimed == null)) return error.PgSpoolStorageUnsupported;
         if (store.upload_scope) |authority| if (!std.mem.eql(u8, &authority.domain, &scope.domain) or !std.mem.eql(u8, &authority.attempt, &scope.attempt)) return error.InvalidArtifactUploadScope;
         var scoped = store;
         scoped.upload_scope = scope;

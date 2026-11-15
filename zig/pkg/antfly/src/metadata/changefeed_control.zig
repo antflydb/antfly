@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 94;
+pub const protocol_version: u16 = 95;
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
 pub const max_roots = 4096;
@@ -405,7 +405,7 @@ pub const Mutation = union(enum) {
         var next = state;
         switch (self) {
             .slot => |operation| {
-                const cleanup = operation == .reclaim_spool and (state.phase == .closing or state.phase == .reset_required);
+                const cleanup = (operation == .reclaim_spool or operation == .checkpoint_spool_cleanup) and (state.phase == .closing or state.phase == .reset_required);
                 if (state.phase != .streaming and state.phase != .bootstrap and !cleanup) return error.ChangefeedResynchronizationRequired;
                 try slotDefinition(state.definition.?);
                 switch (operation) {
@@ -454,6 +454,7 @@ pub const Mutation = union(enum) {
                         if (abandonment.now >= state.expires_at) return error.ChangefeedLeaseExpired;
                         next.slot = try (state.slot orelse return error.ChangefeedConflict).abandonSpool(a, abandonment.session, abandonment.now, abandonment.id);
                     },
+                    .checkpoint_spool_cleanup => |checkpoint| next.slot = try (state.slot orelse return error.ChangefeedConflict).checkpointSpoolCleanup(a, checkpoint.id, checkpoint.storage, checkpoint.expected, checkpoint.progress),
                     .reclaim_spool => |reclamation| next.slot = try (state.slot orelse return error.ChangefeedConflict).reclaimSpool(a, reclamation.id, reclamation.storage, reclamation.proof),
                     .confirm => |confirmation| {
                         if (state.phase != .streaming) return error.ChangefeedConflict;
@@ -1296,6 +1297,7 @@ test "changefeed slot atomically publishes reserved spool and retains cleanup de
     try std.testing.expect(state.slot.?.session == null);
     state = try step(a, state, .{ .release_root = .{ .namespace = testNamespace(7), .ownership_epoch = 1, .proof = @splat(5) } });
     try std.testing.expectError(error.ChangefeedConflict, step(a, state, .finish_close));
+    state = try step(a, state, .{ .slot = .{ .checkpoint_spool_cleanup = .{ .id = 1, .storage = spec.storage, .expected = 0, .progress = .{ .revision = 1, .fenced = true, .complete = true, .proof = @splat(5) } } } });
     state = try step(a, state, .{ .slot = .{ .reclaim_spool = .{ .id = 1, .storage = spec.storage, .proof = @splat(5) } } });
     state = try step(a, state, .finish_close);
     var closed = try parse(std.testing.allocator, try encode(a, state));

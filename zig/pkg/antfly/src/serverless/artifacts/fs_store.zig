@@ -552,6 +552,32 @@ pub const FsStore = struct {
         // A crash leaves at most one staging record per domain.
         try writeFileAtomicallyAt(path, &bytes, cancellation, "pending-v2");
     }
+    pub fn scopedUploadsReclaimed(self: *FsStore, scope: artifact_store.UploadScope, cancellation: CancellationToken) !bool {
+        try scope.validate();
+        var threaded = threadedIo();
+        defer threaded.deinit();
+        const io = threaded.io();
+        var guard = try self.scopeFenceGuard(io, scope.domain, .shared, cancellation);
+        defer guard.deinit();
+        if (scope.fencingToken() > try self.readScopeFloor(io, scope.domain)) return false;
+        const payload = try std.fmt.allocPrint(self.alloc, "{s}/graph/{s}/{s}", .{ self.root_dir, std.fmt.bytesToHex(&scope.domain, .lower), std.fmt.bytesToHex(&scope.attempt, .lower) });
+        defer self.alloc.free(payload);
+        const inventory = try std.fmt.allocPrint(self.alloc, "{s}/{s}/{s}", .{ self.inventory_root, std.fmt.bytesToHex(&scope.domain, .lower), std.fmt.bytesToHex(&scope.attempt, .lower) });
+        defer self.alloc.free(inventory);
+        for ([_][]const u8{ payload, inventory }) |path| {
+            try cancellation.check();
+            std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            return false;
+        }
+        return true;
+    }
+    fn erasedScopedUploadsReclaimed(raw: *anyopaque, scope: artifact_store.UploadScope, cancellation: CancellationToken) !bool {
+        const self: *FsStore = @ptrCast(@alignCast(raw));
+        return self.scopedUploadsReclaimed(scope, cancellation);
+    }
     fn erasedRetireScopedUploads(raw: *anyopaque, domain: [32]u8, through: u64, cancellation: CancellationToken) !void {
         const self: *FsStore = @ptrCast(@alignCast(raw));
         return self.retireScopedUploads(domain, through, cancellation);
@@ -1201,6 +1227,7 @@ pub const FsStore = struct {
         .put_with_cancellation = erasedPutWithCancellation,
         .put_scoped = erasedPutScoped,
         .retire_scoped_uploads = erasedRetireScopedUploads,
+        .scoped_uploads_reclaimed = erasedScopedUploadsReclaimed,
         .visit_scoped_uploads = erasedVisitScopedUploads,
         .cleanup_retired_scoped_temporaries = cleanupRetiredScopedTemporaries,
         .reclaim_retired_scoped_inventory = reclaimRetiredScopedInventory,

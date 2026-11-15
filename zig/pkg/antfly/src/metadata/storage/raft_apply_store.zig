@@ -45800,10 +45800,32 @@ test "metadata changefeed control logical slot survives reopen snapshot failover
     try std.testing.expectEqual(@as(usize, 0), confirmed.value.cursors.len);
     try std.testing.expectEqual(charge, confirmed.value.slot.?.spool.charged_bytes);
     try std.testing.expectEqual(.garbage, confirmed.value.slot.?.spool.records[0].phase);
+    try h.mutate(.{ .slot = .{ .checkpoint_spool_cleanup = .{ .id = 1, .storage = spec.storage, .expected = 0, .progress = .{ .revision = 1, .fenced = true, .continuation = "cGFnZQ" } } } });
+    const cleanup_path = try std.fmt.allocPrint(a, "{s}-cleanup-owner", .{target_path});
+    defer a.free(cleanup_path);
+    var cleanup_owner = try RaftApplyStore.init(a, .{ .root_dir = cleanup_path });
+    defer cleanup_owner.deinit();
+    {
+        var checkpoint = (try target.snapshotBuilder().prepareSnapshot(group, h.index)) orelse return error.TestUnexpectedResult;
+        defer checkpoint.deinit();
+        var payload = try checkpoint.materialize(a);
+        defer payload.deinit(a);
+        const bytes = switch (payload) {
+            .bytes => |value| value,
+            .artifact => return error.TestUnexpectedResult,
+        };
+        try std.testing.expect(try cleanup_owner.snapshotBuilder().installSnapshot(a, group, h.index, bytes));
+    }
+    h.store = &cleanup_owner;
+    var cleanup_resumed = try h.read();
+    defer cleanup_resumed.deinit();
+    try std.testing.expectEqualStrings("cGFnZQ", cleanup_resumed.value.slot.?.spool.records[0].cleanup.continuation);
+    try std.testing.expectEqual(charge, cleanup_resumed.value.slot.?.spool.charged_bytes);
+    try h.mutate(.{ .slot = .{ .checkpoint_spool_cleanup = .{ .id = 1, .storage = spec.storage, .expected = 1, .progress = .{ .revision = 2, .fenced = true, .complete = true, .proof = @splat(5) } } } });
     const reclamation: changefeed_control.Mutation = .{ .slot = .{ .reclaim_spool = .{ .id = 1, .storage = spec.storage, .proof = @splat(5) } } };
     try h.mutate(reclamation);
-    target.deinit();
-    target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    cleanup_owner.deinit();
+    cleanup_owner = try RaftApplyStore.init(a, .{ .root_dir = cleanup_path });
     try h.mutate(reclamation);
     var cleaned = try h.read();
     defer cleaned.deinit();

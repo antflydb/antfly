@@ -53,6 +53,7 @@ pub const Mutation = union(enum) {
     publish_spool: struct { session: Session, now: u64, id: u64, manifest: Digest, content: Digest },
     abandon_spool: struct { session: Session, now: u64, id: u64 },
     reclaim_spool: struct { id: u64, storage: Digest, proof: Digest },
+    checkpoint_spool_cleanup: struct { id: u64, storage: Digest, expected: u64, progress: spool_control.Cleanup },
     pub fn validate(self: Mutation) !void {
         switch (self) {
             .configure => |v| {
@@ -76,6 +77,10 @@ pub const Mutation = union(enum) {
             .abandon_spool => |v| {
                 try validSession(v.session, v.now);
                 if (v.id == 0) return error.InvalidChangefeed;
+            },
+            .checkpoint_spool_cleanup => |v| {
+                if (v.id == 0 or !nz(v.storage)) return error.InvalidChangefeed;
+                try v.progress.validate();
             },
             .reclaim_spool => |v| if (v.id == 0 or !nz(v.storage) or !nz(v.proof)) return error.InvalidChangefeed,
             .release => |v| try validSession(v.session, v.now),
@@ -309,6 +314,12 @@ pub const State = struct {
         next.observed_at = now;
         return next;
     }
+    pub fn checkpointSpoolCleanup(self: State, a: A, id: u64, storage: Digest, expected: u64, progress: spool_control.Cleanup) !State {
+        try self.validate();
+        var next = self;
+        next.spool = try self.spool.checkpoint(a, id, storage, expected, progress);
+        return next;
+    }
     pub fn reclaimSpool(self: State, a: A, id: u64, storage: Digest, proof: Digest) !State {
         try self.validate();
         var next = self;
@@ -434,6 +445,10 @@ test "logical slot allocation failures leave the original mapping owned and inta
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationProbe, .{});
 }
 
+fn testCompleteCleanup(state: State, a: A, id: u64, storage: Digest) !State {
+    const old = (state.spool.find(id) orelse return error.TestUnexpectedResult).cleanup;
+    return state.checkpointSpoolCleanup(a, id, storage, old.revision, .{ .revision = old.revision + 1, .fenced = true, .complete = true, .proof = @splat(5) });
+}
 fn testSpoolScope(state: State, id: u64) spool_control.Scope {
     var scope: spool_control.Scope = .{ .namespace = @splat(9), .domain = spool_control.Scope.domainFor(feedId(state.database, state.name), 1), .attempt = @splat(7) };
     std.mem.writeInt(u64, scope.attempt[0..8], id, .big);
@@ -478,6 +493,7 @@ test "logical slot spool reservation publication feedback and physical reclamati
     try std.testing.expectEqual(charge, state.spool.charged_bytes);
     try std.testing.expectEqual(.garbage, state.spool.records[0].phase);
     try std.testing.expectError(error.ChangefeedConflict, state.reclaimSpool(a, 1, @splat(1), @splat(5)));
+    state = try testCompleteCleanup(state, a, 1, spec.storage);
     state = try state.reclaimSpool(a, 1, spec.storage, @splat(5));
     try state.validate();
     try std.testing.expectEqual(@as(u64, 0), state.spool.charged_bytes);
@@ -505,6 +521,7 @@ test "logical slot abandoned uploads retain quota fence old owners and freeze pr
     const second = testSpoolSpec(state, 2, max_pending_bytes);
     try std.testing.expectError(error.ChangefeedBackpressure, state.reserveSpool(a, current, 152, 2, testSpoolScope(state, 2), second));
     try std.testing.expectError(error.ChangefeedConflict, state.publishSpool(a, current, 152, 1, @splat(6), @splat(7)));
+    state = try testCompleteCleanup(state, a, 1, spec.storage);
     state = try state.reclaimSpool(a, 1, spec.storage, @splat(5));
     var changed = second;
     changed.projection = @splat(10);
@@ -516,6 +533,7 @@ test "logical slot abandoned uploads retain quota fence old owners and freeze pr
     try std.testing.expect(state.session == null);
     try std.testing.expectEqual(.garbage, state.spool.records[0].phase);
     try std.testing.expectError(error.ChangefeedResynchronizationRequired, state.acquire(@splat(3), 2, 154, 201));
+    state = try testCompleteCleanup(state, a, 2, second.storage);
     state = try state.reclaimSpool(a, 2, second.storage, @splat(5));
     try state.validate();
     try std.testing.expectEqual(@as(u64, 0), state.spool.charged_bytes);
@@ -533,7 +551,9 @@ fn spoolAllocationProbe(a: A) !void {
     const confirmed = try published.confirm(a, session, 103, 101);
     defer a.free(confirmed.spool.records);
     defer a.free(confirmed.entries);
-    const reclaimed = try confirmed.reclaimSpool(a, 1, spec.storage, @splat(5));
+    const checkpointed = try testCompleteCleanup(confirmed, a, 1, spec.storage);
+    defer a.free(checkpointed.spool.records);
+    const reclaimed = try checkpointed.reclaimSpool(a, 1, spec.storage, @splat(5));
     defer a.free(reclaimed.spool.records);
     try reclaimed.validate();
 }
@@ -558,6 +578,7 @@ test "logical slot spool record bound survives abandoned uploads and rejects out
     const second = state.spool.records[1];
     try std.testing.expectError(error.ChangefeedConflict, state.reclaimSpool(a, second.id, second.spec.storage, @splat(5)));
     const first = state.spool.records[0];
+    state = try testCompleteCleanup(state, a, first.id, first.spec.storage);
     state = try state.reclaimSpool(a, first.id, first.spec.storage, @splat(5));
     state = try state.reserveSpool(a, session, 103, id, testSpoolScope(state, id), testSpoolSpec(state, id, 47));
     try state.validate();
@@ -568,4 +589,32 @@ test "logical slot spool record bound survives abandoned uploads and rejects out
     damaged = state;
     damaged.spool.charged_bytes -= 1;
     try std.testing.expectError(error.InvalidChangefeed, damaged.validate());
+}
+
+test "logical slot cleanup checkpoints fence opaque progress and require the recorded completion proof" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try State.initialize(@splat(1), "slot", @splat(1), 1024);
+    state = try state.acquire(@splat(2), 0, 100, 150);
+    const session = state.session.?;
+    const spec = testSpoolSpec(state, 1, 100);
+    state = try state.reserveSpool(a, session, 101, 1, testSpoolScope(state, 1), spec);
+    state = try state.abandonSpool(a, session, 102, 1);
+    try std.testing.expectError(error.ChangefeedConflict, state.reclaimSpool(a, 1, spec.storage, @splat(5)));
+    const first: spool_control.Cleanup = .{ .revision = 1, .fenced = true, .continuation = "Zmlyc3Q" };
+    const charge = state.spool.charged_bytes;
+    state = try state.checkpointSpoolCleanup(a, 1, spec.storage, 0, first);
+    const retry = try state.checkpointSpoolCleanup(a, 1, spec.storage, 0, first);
+    try std.testing.expectEqual(state.spool.records.ptr, retry.spool.records.ptr);
+    try std.testing.expectEqual(charge, retry.spool.charged_bytes);
+    try std.testing.expectError(error.InvalidChangefeed, state.checkpointSpoolCleanup(a, 1, spec.storage, 1, .{ .revision = 2, .fenced = true, .continuation = "Zh" }));
+    try std.testing.expectError(error.InvalidChangefeed, state.checkpointSpoolCleanup(a, 1, spec.storage, 1, .{ .revision = 2, .continuation = "Zg" }));
+    try std.testing.expectError(error.ChangefeedConflict, state.checkpointSpoolCleanup(a, 1, spec.storage, 0, .{ .revision = 2, .fenced = true, .continuation = "c2Vjb25k" }));
+    state = try state.checkpointSpoolCleanup(a, 1, spec.storage, 1, .{ .revision = 2, .fenced = true, .complete = true, .proof = @splat(9) });
+    try std.testing.expectError(error.ChangefeedConflict, state.checkpointSpoolCleanup(a, 1, spec.storage, 2, .{ .revision = 3, .fenced = true }));
+    try std.testing.expectError(error.ChangefeedConflict, state.reclaimSpool(a, 1, spec.storage, @splat(5)));
+    state = try state.reclaimSpool(a, 1, spec.storage, @splat(9));
+    try state.validate();
+    try std.testing.expectEqual(@as(u64, 0), state.spool.charged_bytes);
 }

@@ -92,6 +92,29 @@ pub fn reservationBytes(bytes: u64) !u64 {
     }
     return bytes + 16 * messages + 32 * parts + 8 * nodes + 48 * (messages + nodes) + 304;
 }
+pub const max_cleanup_token_bytes = 2048;
+pub const Cleanup = struct {
+    revision: u64 = 0,
+    /// Canonical base64url without padding; never a public cursor.
+    continuation: []const u8 = "",
+    fenced: bool = false,
+    complete: bool = false,
+    proof: Digest = @splat(0),
+    pub fn validate(self: Cleanup) !void {
+        if (self.continuation.len > max_cleanup_token_bytes) return error.InvalidChangefeed;
+        for (self.continuation) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return error.InvalidChangefeed;
+        const codec = std.base64.url_safe_no_pad;
+        const length = codec.Decoder.calcSizeForSlice(self.continuation) catch return error.InvalidChangefeed;
+        var decoded: [max_cleanup_token_bytes]u8 = undefined;
+        codec.Decoder.decode(decoded[0..length], self.continuation) catch return error.InvalidChangefeed;
+        var encoded: [max_cleanup_token_bytes]u8 = undefined;
+        if (!std.mem.eql(u8, codec.Encoder.encode(&encoded, decoded[0..length]), self.continuation)) return error.InvalidChangefeed;
+        if ((self.revision != 0 and !self.fenced) or self.complete != nz(self.proof) or (self.complete and !self.fenced) or (self.revision == 0 and (self.fenced or self.complete or self.continuation.len != 0))) return error.InvalidChangefeed;
+    }
+    pub fn eql(self: Cleanup, other: Cleanup) bool {
+        return self.revision == other.revision and self.fenced == other.fenced and self.complete == other.complete and same(self.proof, other.proof) and std.mem.eql(u8, self.continuation, other.continuation);
+    }
+};
 pub const Record = struct {
     id: u64,
     scope: Scope,
@@ -100,9 +123,12 @@ pub const Record = struct {
     phase: enum { uploading, live, garbage } = .uploading,
     manifest: Digest = @splat(0),
     content: Digest = @splat(0),
+    cleanup: Cleanup = .{},
     pub fn validate(self: Record) !void {
         try self.scope.validate();
         try self.spec.validate();
+        try self.cleanup.validate();
+        if (self.phase != .garbage and self.cleanup.revision != 0) return error.InvalidChangefeed;
         if (self.id == 0 or std.mem.readInt(u64, self.scope.attempt[0..8], .big) != self.id or !same(self.scope.domain, Scope.domainFor(self.spec.feed, self.spec.epoch)) or !same(self.spec.storage, self.scope.storageIdentity()) or self.charged != try reservationBytes(self.spec.bytes)) return error.InvalidChangefeed;
         if (nz(self.manifest) != nz(self.content) or (self.phase == .uploading and nz(self.manifest)) or (self.phase == .live and !nz(self.manifest))) return error.InvalidChangefeed;
     }
@@ -123,6 +149,7 @@ pub const Ledger = struct {
         var uploading: u32 = 0;
         for (self.records, 0..) |record, index| {
             try record.validate();
+            if (index != 0 and record.cleanup.revision != 0) return error.InvalidChangefeed;
             if (record.id != self.collected_through + index + 1 or !same(record.spec.projection, self.projection.?) or !same(record.spec.definition, self.definition.?)) return error.InvalidChangefeed;
             if (record.phase == .uploading) uploading += 1;
             charged = std.math.add(u64, charged, record.charged) catch return error.InvalidChangefeed;
@@ -199,6 +226,19 @@ pub const Ledger = struct {
         next.records = records;
         return next;
     }
+    pub fn checkpoint(self: Ledger, a: A, id: u64, storage: Digest, expected: u64, progress: Cleanup) !Ledger {
+        try self.validate();
+        try progress.validate();
+        if (self.records.len == 0 or self.records[0].id != id or self.records[0].phase != .garbage or !same(self.records[0].spec.storage, storage)) return error.ChangefeedConflict;
+        const old = self.records[0].cleanup;
+        if (progress.eql(old)) return self;
+        if (old.complete or old.revision != expected or progress.revision != (std.math.add(u64, expected, 1) catch return error.ChangefeedConflict) or (old.fenced and !progress.fenced)) return error.ChangefeedConflict;
+        const records = try a.dupe(Record, self.records);
+        records[0].cleanup = progress;
+        var next = self;
+        next.records = records;
+        return next;
+    }
     /// A monotonic prefix floor makes lost cleanup responses idempotent with
     /// constant memory. Storage must durably fence late writes and reclaim the
     /// entire recorded attempt before supplying this internal completion proof.
@@ -206,7 +246,7 @@ pub const Ledger = struct {
         try self.validate();
         if (id == 0 or !nz(storage) or !nz(proof)) return error.InvalidChangefeed;
         if (id <= self.collected_through) return self;
-        if (self.records.len == 0 or self.records[0].id != id or self.records[0].phase != .garbage or !same(self.records[0].spec.storage, storage)) return error.ChangefeedConflict;
+        if (self.records.len == 0 or self.records[0].id != id or self.records[0].phase != .garbage or !same(self.records[0].spec.storage, storage) or !self.records[0].cleanup.complete or !same(self.records[0].cleanup.proof, proof)) return error.ChangefeedConflict;
         var next = self;
         next.records = try a.dupe(Record, self.records[1..]);
         next.collected_through = id;

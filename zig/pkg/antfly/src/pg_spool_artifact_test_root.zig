@@ -36,6 +36,11 @@ test "pg spool artifact adapter persists verified pages closure and exact replay
     const session = state.session.?;
     var scope: artifacts.UploadScope = .{ .domain = slot.spool_control.Scope.domainFor(slot.feedId(state.database, state.name), 1), .attempt = @splat(2) };
     std.mem.writeInt(u64, scope.attempt[0..8], 1, .big);
+    var no_proof_vtable = store.vtable.*;
+    no_proof_vtable.scoped_uploads_reclaimed = null;
+    var no_proof_store = store;
+    no_proof_store.vtable = &no_proof_vtable;
+    try std.testing.expectError(error.PgSpoolStorageUnsupported, adapter.Adapter.init(no_proof_store, scope, .write, .{}));
     var writer = try adapter.Adapter.init(store, scope, .write, .{});
     try std.testing.expectError(error.PgSpoolStorageUnsupported, writer.requireShared());
     const rows = 130;
@@ -115,7 +120,9 @@ test "pg spool artifact adapter persists verified pages closure and exact replay
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, payload_attempt, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, inventory_attempt, .{}));
     try std.testing.expect(!try reader_store.store.retainedClosure(&id, .{}));
-    const reclaimed = try confirmed.reclaimSpool(a, 1, plan.binding.storage, @splat(5));
+    const checkpointed = try confirmed.checkpointSpoolCleanup(a, 1, plan.binding.storage, 0, .{ .revision = 1, .fenced = true, .complete = true, .proof = @splat(5) });
+    defer a.free(checkpointed.spool.records);
+    const reclaimed = try checkpointed.reclaimSpool(a, 1, plan.binding.storage, @splat(5));
     defer a.free(reclaimed.spool.records);
     try reclaimed.validate();
     try std.testing.expectEqual(@as(u64, 0), reclaimed.spool.charged_bytes);
@@ -186,4 +193,8 @@ test "pg spool artifact durable retirement drains writers and rejects corrupt fl
     // Neither upload nor lower/idempotent retirement can erase a corrupt floor.
     try std.testing.expectError(error.ArtifactUploadFenceCorrupt, store.putScoped(fresh, "must fail closed", .{}));
     try std.testing.expectError(error.ArtifactUploadFenceCorrupt, second.retireScopedUploads(scope.domain, 1, .{}));
+}
+
+test "pg spool artifact cleanup worker resumes durable cursors across reopen and unknown outcomes" {
+    try @import("pg_spool_cleanup_test.zig").run();
 }

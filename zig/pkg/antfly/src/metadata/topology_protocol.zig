@@ -124,7 +124,8 @@ const std = @import("std");
 /// Version 92 binds private provider continuations to outbound delivery/ACK cursors.
 /// Version 93 adds fenced logical-slot sessions and atomic LSN/feed confirmation.
 /// Version 94 retains fenced slot spool reservations and cleanup accounting.
-pub const current_version: u16 = 94;
+/// Version 95 persists slot spool cleanup checkpoints before capacity release.
+pub const current_version: u16 = 95;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;
