@@ -7702,19 +7702,50 @@ pub const NativeFile = struct {
         // and the real log in lockstep by construction.
         const outcome = pctx.outcome orelse meta_outcome;
         if (pctx.compact orelse meta_ctx.compact) |compact| {
-            // `CompactCheckpoint` carries no `redo_folded_through` of its
-            // own (a log record's own embedded checkpoint is always just
-            // the *tip* as of that commit, never a fold boundary -- only
-            // `checkpointRedoLog`'s own fold and `prepareVacuum`'s
-            // compaction ever advance one, and neither ever appends a log
-            // record for the commit that does) -- so `toCheckpointSlot()`
-            // comes back with the field defaulted to zero. Restore the
-            // value this on-disk slot actually carried: the latest log
-            // record only ever refines the *tip* (roots/commit_sequence),
-            // never the fold boundary, which stays exactly what the real,
-            // physically-published checkpoint slot said it was.
-            self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
-            self.header.checkpoints[self.header.active_checkpoint].redo_folded_through = folded_through;
+            // perf/lwa-restore-open-txn: a bare (non-Txn) commit (schema/
+            // catalog bookkeeping, a transaction-manager intent record,
+            // ...) publishes straight to the on-disk checkpoint slot and
+            // never appends a matching log record at all -- the exact
+            // "log-full bare-slot fallback" case `redo_folded_through`'s
+            // own doc comment already names as a real-publish path that
+            // can leave `commit_sequence` ahead of what the log itself
+            // reflects. When such a bare commit lands *after* this log's
+            // own latest record, `checkpoint` above (loaded from the
+            // on-disk slot before anything in this function ran) is
+            // already strictly newer than `compact` -- every root pointer
+            // it carries (`catalog_root_page` included) is the correct,
+            // current one. Unconditionally overwriting it with `compact
+            // .toCheckpointSlot()`'s older tip regresses those roots back
+            // to pages the bare commit's own allocation may already have
+            // retired and reused for something else: a concurrent or
+            // later open then either reads the wrong physical page kind
+            // (`error.UnexpectedNativePageKind`) or, when the retired
+            // page still looks structurally plausible, silently resolves
+            // a stale, pre-bare-commit view -- including a document
+            // logged just before the bare commit going missing from a
+            // fresh open, since this same regression also drags
+            // `commit_sequence`, and therefore every overlay resolution's
+            // own `mark`, backward with it. Apply the log's own tip only
+            // when it is actually newer than what the on-disk slot
+            // already published; otherwise the on-disk slot already is
+            // the correct, current state and this function has nothing
+            // to refine.
+            if (compact.commit_sequence > checkpoint.commit_sequence) {
+                // `CompactCheckpoint` carries no `redo_folded_through` of
+                // its own (a log record's own embedded checkpoint is
+                // always just the *tip* as of that commit, never a fold
+                // boundary -- only `checkpointRedoLog`'s own fold and
+                // `prepareVacuum`'s compaction ever advance one, and
+                // neither ever appends a log record for the commit that
+                // does) -- so `toCheckpointSlot()` comes back with the
+                // field defaulted to zero. Restore the value this on-disk
+                // slot actually carried: the latest log record only ever
+                // refines the *tip* (roots/commit_sequence), never the
+                // fold boundary, which stays exactly what the real,
+                // physically-published checkpoint slot said it was.
+                self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
+                self.header.checkpoints[self.header.active_checkpoint].redo_folded_through = folded_through;
+            }
         }
 
         // `checkpointRedoLog`'s own fold consumes a fresh `commit_sequence`
