@@ -101,15 +101,19 @@ pub const Service = struct {
     /// The complete primary and direct-output postimages cross one durable
     /// visibility boundary. A stale optimistic read set publishes no prefix.
     pub fn ingestPreparedBatch(self: *Service, req: api_types.IngestBatchRequest, fence: wal_mod.types.CatalogFence) !api_types.IngestBatchResult {
+        return self.ingestPreparedBatchWithReadSet(req, fence, &.{});
+    }
+
+    pub fn ingestPreparedBatchWithReadSet(self: *Service, req: api_types.IngestBatchRequest, fence: wal_mod.types.CatalogFence, documents: []const []const u8) !api_types.IngestBatchResult {
         var quota = @import("antfly_platform").allocator.reclamation.Quota.init(self.alloc, 64 * 1024 * 1024);
         defer quota.deinit();
-        return self.ingestPreparedBatchBounded(req, fence, quota.allocator()) catch |err| {
+        return self.ingestPreparedBatchBounded(req, fence, documents, quota.allocator()) catch |err| {
             if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
             return err;
         };
     }
 
-    fn ingestPreparedBatchBounded(self: *Service, req: api_types.IngestBatchRequest, fence: wal_mod.types.CatalogFence, backing: Allocator) !api_types.IngestBatchResult {
+    fn ingestPreparedBatchBounded(self: *Service, req: api_types.IngestBatchRequest, fence: wal_mod.types.CatalogFence, documents: []const []const u8, backing: Allocator) !api_types.IngestBatchResult {
         if (!self.wal.supportsCatalogFences()) return error.CommitRequirementUnavailable;
         const operation = req.operation_id orelse return error.InvalidWalOperationId;
         if (req.mutations.len == 0) return .{ .namespace = try self.alloc.dupe(u8, req.namespace), .mutation_count = 0, .start_lsn = 0, .end_lsn = 0 };
@@ -130,7 +134,7 @@ pub const Service = struct {
         }
         const namespace = try self.alloc.dupe(u8, req.namespace);
         errdefer self.alloc.free(namespace);
-        const result = try self.wal.appendPrepared(req.namespace, req.timestamp_ns, payloads, operation, fence);
+        const result = try self.wal.appendPreparedWithReadSet(req.namespace, req.timestamp_ns, payloads, operation, fence, documents);
         return .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = result.start_lsn, .end_lsn = result.end_lsn };
     }
 
@@ -421,7 +425,7 @@ test "commit requirements serverless prepared batch commits source outputs and d
     const prepared = try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(a, body, 6);
     defer a.free(prepared);
     const request: api_types.IngestBatchRequest = .{ .namespace = "docs", .timestamp_ns = 2, .operation_id = "gate", .mutations = &.{ .{ .kind = .prepared, .doc_id = "new", .body = prepared }, .{ .kind = .delete, .doc_id = "victim" } } };
-    try std.testing.expectError(error.VersionConflict, service.ingestPreparedBatch(request, .{ .latest_lsn = 0 }));
+    try std.testing.expectError(error.VersionConflict, service.ingestPreparedBatchWithReadSet(request, .{ .latest_lsn = 0 }, &.{"victim"}));
     try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
     const invalid_body = try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(a, "{\"text\":\"source\",\"chunk_embeddings\":[4]}", 6);
     defer a.free(invalid_body);
