@@ -601,6 +601,44 @@ HTTP test listeners enabled. Logs: `zig/replication-privilege-usermgr-test.log`,
 `go/pkg/sdk/replication-permission-sdk-qualified.log`, and
 `change-pipeline-replication-generate-qualified.log`.
 
+## In progress: replication command and connection-owner boundary
+
+`pgwire/replication_commands.zig` parses bounded logical replication commands and
+negotiates committed-only text pgoutput v1. Slot creation retains snapshot and
+temporary choices for capability-aware backend admission. Known replication
+prefixes cannot fall through to SQL on malformed input. Publication names retain
+quoted identity; LSN parsing rejects overflow, options reject duplicates, and
+unsupported protocol guarantees fail before metadata work.
+
+`Backend.VTable.open_replication_session` is an optional authenticated owner
+factory. The protocol refuses logical startup when absent, restricts logical
+sessions to simple queries, and sends administration to that separate owner.
+Authorization runs before and after work; result shape and boundedness are
+checked. Owner resources close before credentials are released. Known committed
+or uncertain slot mutations report completion uncertainty without fabricating
+SQL transaction reconciliation work.
+
+The production native adapter still has no factory. START remains explicitly
+unsupported until its duplex CopyBoth lifecycle and durable transaction spool
+are implemented. This boundary does not qualify any existing CDC client.
+
+Qualification: `zig build pgwire-test pgoutput-test -j2` passes with local
+listeners permitted. It covers the full existing wire/session/lifecycle suite,
+new logical startup/owner/authorization/uncertain-outcome checks, and bounded
+parser/codec/allocation-failure tests. Final log:
+`zig/replication-session-reviewed-qualification.log`. An initial fixture bug
+returned a runtime-created callback table by dangling pointer; static tables
+fixed it, and the full suite was rerun successfully.
+
+Slot bootstrap integration must account for CREATE_REPLICATION_SLOT having no
+publication selection. The consistent database snapshot/history cut must exist
+before START_REPLICATION supplies publication names. Do not discover/activate
+only the selected roots at START and thereby lose intervening commits. The
+slot's durable publication/projection binding must also fence changed replay
+serialization; a different publication list cannot reuse an existing LSN mapping
+with different bytes. Database-wide cut ownership and this binding are still
+required integration work.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

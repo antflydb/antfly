@@ -460,10 +460,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_changefeed_json_tests = b.addRunArtifact(changefeed_json_tests);
     const pgoutput_tests = b.addTest(.{
-        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/pgwire/pgoutput.zig"), .target = target, .optimize = optimize }),
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/pgwire/replication_commands.zig"), .target = target, .optimize = optimize }),
     });
     const run_pgoutput_tests = b.addRunArtifact(pgoutput_tests);
-    const pgoutput_step = b.step("pgoutput-test", "Verify logical replication v1 encoding and feedback framing");
+    const pgoutput_step = b.step("pgoutput-test", "Verify pgoutput v1 encoding, feedback framing and replication command negotiation");
     pgoutput_step.dependOn(&run_pgoutput_tests.step);
 
     const changefeed_storage_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "metadata changefeed control", "metadata raft apply store snapshot key registry covers every durable projection class" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });

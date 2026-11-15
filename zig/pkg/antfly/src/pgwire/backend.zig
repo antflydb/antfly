@@ -17,6 +17,7 @@
 //! arena for every describe/execute call; returned slices must use that arena.
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
+pub const replication_commands = @import("replication_commands.zig");
 
 pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
@@ -230,6 +231,11 @@ pub const Backend = struct {
         reserve_completion: ?*const fn (*anyopaque, *@import("completion.zig").Completion, usize) anyerror!void = null,
         pin_completion: ?*const fn (*anyopaque, std.mem.Allocator, *@import("completion.zig").Completion) void = null,
         completion_safe: ?*const fn (*anyopaque, Identity) bool = null,
+        /// Authenticate explicit replication privilege and runtime capability;
+        /// a SQL identity or SELECT grant alone is insufficient. The returned
+        /// owner borrows this connection's identity until close. Missing
+        /// capability refuses logical startup, before any replication command.
+        open_replication_session: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!ReplicationSession = null,
     };
 };
 
@@ -248,3 +254,15 @@ pub const ReadStream = struct {
     validate: ?*const fn (*anyopaque, std.mem.Allocator, Request) anyerror!void = null,
 };
 pub const StreamPage = struct { result: Result, exhausted: bool };
+
+/// Connection-owned replication authority. Each operation must revalidate live
+/// credential, immutable database/table scope and publication/slot ownership.
+/// authorize runs at startup (null command), before execution and before reply.
+/// Commands and results borrow their caller arena. close releases connection
+/// leases/exported snapshots; durable recovery owns ambiguous metadata effects.
+pub const ReplicationSession = struct {
+    context: *anyopaque,
+    authorize: *const fn (*anyopaque, std.mem.Allocator, Request, ?replication_commands.Command) anyerror!void,
+    command: *const fn (*anyopaque, std.mem.Allocator, Request, replication_commands.Command) anyerror!Result,
+    close: *const fn (*anyopaque) void,
+};

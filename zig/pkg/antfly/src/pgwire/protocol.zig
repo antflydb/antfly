@@ -21,6 +21,7 @@ pub const backend = @import("backend.zig");
 const values = @import("values.zig");
 const formatting = @import("formatting.zig");
 const commands = @import("session_commands.zig");
+const replication_commands = backend.replication_commands;
 const settings_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const Spool = @import("cursor_spool.zig").Store;
 const Budget = @import("budget.zig").Budget;
@@ -102,6 +103,8 @@ pub const Session = struct {
     limits: Limits = .{},
     hooks: ?CancelHooks = null,
     identity: ?backend.Identity = null,
+    replication_mode: replication_commands.StartupMode = .normal,
+    replication: ?backend.ReplicationSession = null,
     database: ?[]u8 = null,
     namespace: ?[]u8 = null,
     session_id: ?[]u8 = null,
@@ -134,6 +137,7 @@ pub const Session = struct {
     deadline_changed: std.Io.Event = .unset,
     diagnostic: backend.Diagnostic = .{},
     mutation_ack_pending: bool = false,
+    replication_administration: bool = false,
     discard_after_reply: bool = false,
     completion_safe: bool = true,
     completion: @import("completion.zig").Completion = .{},
@@ -156,6 +160,10 @@ pub const Session = struct {
         self.savepoints.deinit(self.alloc);
         if (self.catalog_settings) |*state| state.deinit();
         if (self.cursor_budget) |budget| self.alloc.destroy(budget);
+        if (self.replication) |owner| {
+            owner.close(owner.context);
+            self.replication = null;
+        }
         if (self.identity) |identity| {
             self.source.vtable.disconnect(self.source.context, identity, self.session_id);
             if (self.source.vtable.completion_safe) |check| if (!check(self.source.context, identity)) self.addCompletion(self.session_id, null);
@@ -211,14 +219,20 @@ pub const Session = struct {
                 try renew(self.source.context, self.alloc, self.identity.?, payload[0 .. payload.len - 1]);
                 continue;
             }
+            if (self.replication_mode == .logical and tag != 'Q') {
+                try self.sendError("08P01", "logical replication connections require simple query protocol");
+                try self.writer.flush();
+                return error.ProtocolViolation;
+            }
             if (self.skip_until_sync and tag != 'S') continue;
             const timeout = self.statement_timeout orelse self.limits.statement_timeout_ms;
             self.setDeadline(if (timeout == 0) self.limits.statement_timeout_ms else @min(timeout, self.limits.statement_timeout_ms));
             self.diagnostic = .{};
             self.mutation_ack_pending = false;
+            self.replication_administration = false;
             self.dispatch(tag, payload) catch |err| {
                 const completion_code: []const u8 = if (self.diagnostic.code) |*code| code else sqlstate(err);
-                if (std.mem.eql(u8, completion_code, "40003") and !self.mutation_ack_pending) {
+                if (std.mem.eql(u8, completion_code, "40003") and !self.mutation_ack_pending and !self.replication_administration) {
                     self.completion_safe = false;
                     self.addCompletion(if (self.diagnostic.transaction_id) |*id| id else null, null);
                 }
@@ -245,7 +259,7 @@ pub const Session = struct {
                     self.status = .failed;
                 }
                 if (self.status == .idle) self.finishSqlCursors(false);
-                if (self.mutation_ack_pending) self.diagnostic.set("40003", "mutation committed but its acknowledgement failed; do not replay this statement", self.diagnostic.transaction_id, false);
+                if (self.mutation_ack_pending) self.diagnostic.set("40003", if (self.replication_administration) "replication command committed but acknowledgement failed; inspect slot state" else "mutation committed but its acknowledgement failed; do not replay this statement", self.diagnostic.transaction_id, false);
                 if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), @errorName(err));
                 if (tag == 'Q') try self.ready();
             };
@@ -279,6 +293,7 @@ pub const Session = struct {
                 196608 => {
                     var username: ?[]const u8 = null;
                     var database: ?[]const u8 = null;
+                    var replication_seen = false;
                     while (true) {
                         const key = try cursor.string();
                         if (key.len == 0) break;
@@ -289,6 +304,10 @@ pub const Session = struct {
                         } else if (std.mem.eql(u8, key, "database")) {
                             if (database != null) return error.ProtocolViolation;
                             database = value;
+                        } else if (std.mem.eql(u8, key, "replication")) {
+                            if (replication_seen) return error.ProtocolViolation;
+                            replication_seen = true;
+                            self.replication_mode = try replication_commands.startupMode(value);
                         } else if (std.mem.eql(u8, key, "client_encoding")) {
                             formatting.validateEncoding(value) catch |err| {
                                 self.diagnostic.set("22021", "unsupported startup parameter client_encoding; only UTF8 is supported", null, null);
@@ -334,6 +353,12 @@ pub const Session = struct {
                     // Authenticate first; database is only an untrusted
                     // resolution hint carried to the authorized backend.
                     if (database) |value| self.database = try self.alloc.dupe(u8, value);
+                    if (self.replication_mode == .logical) {
+                        const open = self.source.vtable.open_replication_session orelse return error.UnsupportedReplicationMode;
+                        self.replication = try open(self.source.context, self.alloc, self.identity.?, self.request("", &.{}, &.{}));
+                        const owner = self.replication.?;
+                        try owner.authorize(owner.context, self.alloc, self.request("", &.{}, &.{}), null);
+                    }
                     if (self.hooks) |hooks| try hooks.register(hooks.context, self);
                     try self.message('R', &.{ 0, 0, 0, 0 });
                     if (self.identity.?.renewable) {
@@ -861,6 +886,54 @@ pub const Session = struct {
         self.clearPrepared();
     }
 
+    fn replicationCommand(self: *Session, a: std.mem.Allocator, statement: []const u8, command_value: replication_commands.Command) !void {
+        const owner = self.replication orelse return error.UnsupportedReplicationMode;
+        // CopyBoth needs its own duplex lifecycle and retained spool owner.
+        // A START must never be answered as an ordinary SQL result or routed
+        // through a management callback which cannot establish that lifecycle.
+        if (command_value == .start) return error.UnsupportedReplicationMode;
+        if (self.status != .idle or self.session_id != null) return error.ActiveSqlTransaction;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        self.replication_administration = true;
+        const request_value = self.request(statement, &.{}, &.{});
+        try request_value.check();
+        try owner.authorize(owner.context, a, request_value, command_value);
+        const mutates = command_value != .identify_system;
+        // Logical slot administration does not create a SQL transaction
+        // completion receipt. The replication owner handles uncertain outcomes.
+        var result = try owner.command(owner.context, a, request_value, command_value);
+        defer result.deinit();
+        self.mutation_ack_pending = mutates and result.mutation_outcome == .committed;
+        const expected: []const u8 = switch (command_value) {
+            .identify_system => "IDENTIFY_SYSTEM",
+            .create_slot => "CREATE_REPLICATION_SLOT",
+            .drop_slot => "DROP_REPLICATION_SLOT",
+            .start => unreachable,
+        };
+        const columns: []const []const u8 = switch (command_value) {
+            .identify_system => &.{ "systemid", "timeline", "xlogpos", "dbname" },
+            .create_slot => &.{ "slot_name", "consistent_point", "snapshot_name", "output_plugin" },
+            .drop_slot => &.{},
+            .start => unreachable,
+        };
+        if (!std.mem.eql(u8, result.command_tag, expected) or result.transaction_status != .idle or result.session_id != null or result.continuation != null or result.transaction_id != null or result.ddl_receipt_json != null or result.rows_affected != 0 or result.columns.len != columns.len or result.rowCount() != @as(usize, if (command_value == .drop_slot) 0 else 1) or (if (mutates) result.mutation_outcome != .committed else result.mutation_outcome != null)) return error.InvalidResult;
+        if (result.columns.len > self.limits.columns or result.rowCount() > self.limits.result_rows) return error.ProgramLimitExceeded;
+        for (result.rows) |row| if (row.len != columns.len) return error.InvalidResult;
+        for (result.columns, columns, 0..) |column, name, index| {
+            const kind: backend.Type = if (command_value == .identify_system and index == 1) .integer else .string;
+            if (!std.mem.eql(u8, column.name, name) or column.type != kind or column.element_type != null or column.numeric_modifier != null) return error.InvalidResult;
+        }
+        owner.authorize(owner.context, a, request_value, command_value) catch |err| {
+            if (mutates) self.diagnostic.set("40003", "replication command committed; authorization changed before reply; inspect slot state", null, null);
+            return err;
+        };
+        if (result.columns.len != 0) try self.rowDescription(result.columns, &.{});
+        try self.dataResult(result, &.{});
+        try self.complete(result);
+    }
+
     fn dispatch(self: *Session, tag: u8, payload: []const u8) !void {
         var cursor = Cursor{ .bytes = payload };
         switch (tag) {
@@ -875,6 +948,14 @@ pub const Session = struct {
                 } else {
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena.deinit();
+                    if (replication_commands.recognizes(statement)) {
+                        if (self.replication_mode != .logical) return error.UnsupportedReplicationMode;
+                        var parsed = (try replication_commands.parse(arena.allocator(), statement)) orelse return error.PgReplicationSyntax;
+                        defer parsed.deinit();
+                        try self.replicationCommand(arena.allocator(), statement, parsed.command);
+                        try self.ready();
+                        return;
+                    }
                     if (try self.sessionCommand(arena.allocator(), statement)) {
                         if (self.status == .idle) {
                             self.clearPortals();
@@ -1930,8 +2011,12 @@ fn sqlstate(err: anyerror) []const u8 {
         error.DuplicatePortal => "42P03",
         error.DuplicateCursorName => "42P03",
         error.ProtocolViolation => "08P01",
+        error.MetadataMutationOutcomeUnknown => "40003",
+        error.ActiveSqlTransaction => "25001",
         error.OutOfMemory, error.ProgramLimitExceeded => "54000",
-        error.SyntaxError => "42601",
+        error.SyntaxError, error.PgReplicationSyntax => "42601",
+        error.InvalidReplicationOption, error.DuplicateReplicationOption, error.InvalidReplicationSlotName => "22023",
+        error.UnsupportedReplicationMode, error.UnsupportedReplicationOption => "0A000",
         error.InvalidSqlSyntax => "42601",
         error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => "22023",
         error.UnsupportedReadVisibility => "0A000",

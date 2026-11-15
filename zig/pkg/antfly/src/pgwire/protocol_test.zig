@@ -19,6 +19,14 @@ const backend = @import("backend.zig");
 
 const Mock = struct {
     describes: usize = 0,
+    replication_enabled: bool = false,
+    replication_denied: bool = false,
+    replication_revoke_after_command: bool = false,
+    replication_unknown: bool = false,
+    replication_opens: usize = 0,
+    replication_closes: usize = 0,
+    replication_checks: usize = 0,
+    replication_commands: usize = 0,
     catalog_rebind: bool = false,
     cached_shape_change: bool = false,
     executions: usize = 0,
@@ -104,9 +112,62 @@ const Mock = struct {
         }
     }
 
+    const source_tables: [2][2]backend.Backend.VTable = blk: {
+        var tables: [2][2]backend.Backend.VTable = undefined;
+        for (0..2) |native_index| for (0..2) |replication_index| {
+            tables[native_index][replication_index] = .{
+                .native_parameters = native_index == 1,
+                .authenticate = authenticate,
+                .refresh = refresh,
+                .describe = describe,
+                .execute = Mock.execute,
+                .load_settings = loadSettings,
+                .validate_namespace = validateNamespace,
+                .evaluate_parameters = evaluateParameters,
+                .fail_transaction = failTransaction,
+                .open_stream = openStream,
+                .disconnect = disconnect,
+                .open_replication_session = if (replication_index == 1) openReplication else null,
+            };
+        };
+        break :blk tables;
+    };
     fn source(self: *Mock) backend.Backend {
-        if (self.native_parameters) return .{ .context = self, .vtable = &.{ .native_parameters = true, .authenticate = authenticate, .refresh = refresh, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .refresh = refresh, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &source_tables[@intFromBool(self.native_parameters)][@intFromBool(self.replication_enabled)] };
+    }
+    fn openReplication(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.ReplicationSession {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_opens += 1;
+        if (self.replication_denied) return error.Forbidden;
+        return .{ .context = self, .authorize = replicationAuthorize, .command = replicationCommand, .close = replicationClose };
+    }
+    fn replicationAuthorize(raw: *anyopaque, _: std.mem.Allocator, request: backend.Request, _: ?backend.replication_commands.Command) !void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_checks += 1;
+        if (self.replication_denied or (self.replication_revoke_after_command and self.replication_commands != 0)) return error.Forbidden;
+    }
+    fn replicationClose(raw: *anyopaque) void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        self.replication_closes += 1;
+    }
+    fn replicationCommand(raw: *anyopaque, a: std.mem.Allocator, request: backend.Request, command: backend.replication_commands.Command) !backend.Result {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.replication_commands += 1;
+        if (self.replication_unknown) return error.MetadataMutationOutcomeUnknown;
+        const rows = try a.alloc([]const std.json.Value, if (command == .drop_slot) 0 else 1);
+        if (command == .identify_system) {
+            rows[0] = try a.dupe(std.json.Value, &.{ .{ .string = "123456789" }, .{ .integer = 1 }, .{ .string = "0/1" }, .{ .string = request.database orelse "db" } });
+            return .{ .columns = &.{ .{ .name = "systemid", .type = .string }, .{ .name = "timeline", .type = .integer }, .{ .name = "xlogpos", .type = .string }, .{ .name = "dbname", .type = .string } }, .rows = rows, .command_tag = "IDENTIFY_SYSTEM" };
+        }
+        if (command == .create_slot) {
+            rows[0] = try a.dupe(std.json.Value, &.{ .{ .string = command.create_slot.slot }, .{ .string = "0/1" }, .{ .string = "snapshot-fixture" }, .{ .string = "pgoutput" } });
+            return .{ .columns = &.{ .{ .name = "slot_name", .type = .string }, .{ .name = "consistent_point", .type = .string }, .{ .name = "snapshot_name", .type = .string }, .{ .name = "output_plugin", .type = .string } }, .rows = rows, .command_tag = "CREATE_REPLICATION_SLOT", .mutation_outcome = .committed };
+        }
+        if (command != .drop_slot) return error.TestUnexpectedResult;
+        return .{ .columns = &.{}, .rows = rows, .command_tag = "DROP_REPLICATION_SLOT", .mutation_outcome = .committed };
     }
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -2710,4 +2771,118 @@ test "pgwire producer capacity rejects execution before backend and preserves ro
     try std.testing.expectEqual(@as(usize, 1), mock.executions);
     try std.testing.expect(!session.completion.unknown);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "54000") != null);
+}
+
+test "pgwire logical startup authenticates and dispatches replication administration outside SQL" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput EXPORT_SNAPSHOT\x00");
+    try frame(&input.writer, 'Q', "DROP_REPLICATION_SLOT s WAIT\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.authentications);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_opens);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+    try std.testing.expectEqual(@as(usize, 7), mock.replication_checks);
+    try std.testing.expectEqual(@as(usize, 3), mock.replication_commands);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "CREATE_REPLICATION_SLOT") != null);
+}
+test "pgwire logical startup requires backend capability and explicit live authorization" {
+    for ([_]bool{ false, true }) |enabled| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        var mock: Mock = .{ .replication_enabled = enabled, .replication_denied = true };
+        if (enabled) try std.testing.expectError(error.Forbidden, run(&mock, input.written(), .{})) else try std.testing.expectError(error.UnsupportedReplicationMode, run(&mock, input.written(), .{}));
+        try std.testing.expectEqual(@as(usize, 1), mock.authentications);
+        try std.testing.expectEqual(@as(usize, 0), mock.replication_commands);
+        try std.testing.expectEqual(@as(usize, 1), mock.releases);
+    }
+}
+test "pgwire logical mode rejects extended messages and never sends START to SQL or administration" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '1', publication_names 'p')\x00");
+    try frame(&input.writer, 'Q', "START_REPLICATION SLOT s LOGICAL 0/0 (proto_version '2', publication_names 'p')\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_commands);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "0A000") != null);
+    input.writer.end = 0;
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'P', "\x00SELECT 1\x00\x00\x00");
+    mock = .{ .replication_enabled = true };
+    try std.testing.expectError(error.ProtocolViolation, run(&mock, input.written(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+    try std.testing.expectEqual(@as(usize, 0), mock.describes);
+}
+test "pgwire replication results recheck authorization and uncertain slots do not become SQL completion work" {
+    for ([_]bool{ false, true }) |unknown| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .replication_enabled = true, .replication_unknown = unknown, .replication_revoke_after_command = !unknown };
+        var out = try run(&mock, input.written(), .{});
+        defer out.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "40003") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") == null);
+        try std.testing.expect(mock.completion_safe_after_run);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_commands);
+    }
+}
+test "pgwire replication commands require logical startup while false preserves ordinary SQL" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00false\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+    try frame(&input.writer, 'Q', "SELECT 1\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 0), mock.replication_opens);
+    try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "0A000") != null);
+}
+
+test "pgwire failed logical authorization closes the opened owner before releasing identity" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    var mock: Mock = .{ .replication_enabled = true, .replication_revoke_after_command = true, .replication_commands = 1 };
+    try std.testing.expectError(error.Forbidden, run(&mock, input.written(), .{}));
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_opens);
+    try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+    try std.testing.expectEqual(@as(usize, 1), mock.releases);
+}
+test "pgwire malformed replication command cannot fall back to SQL and duplicate startup is rejected" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startupOptions(&input.writer, "replication\x00database\x00");
+    try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM/**/\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .replication_enabled = true };
+    var out = try run(&mock, input.written(), .{});
+    defer out.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "42601") != null);
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expectEqual(@as(usize, 0), mock.replication_commands);
+    input.writer.end = 0;
+    try startupOptions(&input.writer, "replication\x00database\x00replication\x00false\x00");
+    mock = .{ .replication_enabled = true };
+    try std.testing.expectError(error.ProtocolViolation, run(&mock, input.written(), .{}));
+    try std.testing.expectEqual(@as(usize, 0), mock.authentications);
 }

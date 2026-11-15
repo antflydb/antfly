@@ -10,6 +10,28 @@ native durable session owner, including savepoint rollback and constraint timing
 HTTP SQL support does not implicitly enable pgwire or make
 unsupported SQL shapes executable.
 
+Logical replication has a separate optional backend owner. The wire layer
+recognizes `replication=database`, authenticates first, and opens that owner only
+through `Backend.VTable.open_replication_session`. Ordinary SELECT permission is
+insufficient. Its live authorization callback runs at startup, before every
+replication administration command, and before the response. Owner close runs
+before the connection credential is released.
+
+`replication_commands.zig` parses bounded IDENTIFY_SYSTEM, logical slot creation,
+slot drop and pgoutput-v1 START commands. It preserves quoted publication names,
+rejects duplicate options and trailing commands, and never routes malformed
+replication commands through SQL. Physical replication, other plugins, binary
+output, logical messages, uncommitted streaming, two-phase and origin filtering
+are rejected explicitly. Creation carries temporary/snapshot choices to the
+backend, which must reject any runtime capability it cannot uphold.
+
+The transport currently implements the typed administration response boundary;
+START is rejected until its CopyBoth/spooling lifecycle is implemented. The
+native runtime adapter does not yet register this backend capability. These
+private contracts and wire tests do not establish existing-client compatibility
+or activate a production replication endpoint. Unknown slot administration stays
+with the replication owner rather than becoming SQL transaction completion work.
+
 SQL-language `PREPARE name [(types...)] AS statement`, `EXECUTE name
 [(expressions...)]`, and `DEALLOCATE [PREPARE] name|ALL` use the same bounded,
 connection-owned registry as wire Parse/Bind. Names survive transaction commit
