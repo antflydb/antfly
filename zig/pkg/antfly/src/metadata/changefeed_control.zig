@@ -140,6 +140,8 @@ pub const Root = struct {
     start: u64 = 0,
     delivered: Position = .{},
     acknowledged: Position = .{},
+    /// Whole-frame ACK propagated to this native consumer. Other consumers
+    /// may still retain these frames in the shared physical log.
     reclaimed_through: u64 = 0,
     snapshot: ?Snapshot = null,
     snapshot_delivered: BootstrapPosition = .{},
@@ -380,7 +382,9 @@ pub const Mutation = union(enum) {
                 if (state.roots[index].ownership_epoch != binding.previous) return error.ChangefeedConflict;
                 const roots = try a.dupe(Root, state.roots);
                 roots[index].ownership_epoch = binding.next;
-                roots[index].grant_sequence = stamp.sequence;
+                // A closing/reset feed can move to its surviving storage owner,
+                // but cannot issue a new enrollment grant after its close stamp.
+                if (state.phase != .closing and state.phase != .reset_required) roots[index].grant_sequence = stamp.sequence;
                 next.roots = roots;
             },
             .refresh_grant => |refresh| {
@@ -957,4 +961,17 @@ test "changefeed control refreshes old grants without changing root owner or rea
     try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .refresh_grant = .{ .namespace = root.namespace, .previous = root.grant_sequence } }));
     state = try step(a, state, .close);
     try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .refresh_grant = .{ .namespace = root.namespace, .previous = state.roots[0].grant_sequence } }));
+}
+
+test "changefeed closing owner relocation preserves the retired enrollment grant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testState(a, .now);
+    state = try step(a, state, .close);
+    const grant = state.roots[0].grant_sequence;
+    state = try step(a, state, .{ .rebind = .{ .namespace = state.roots[0].namespace, .previous = 1, .next = 2, .proof = @splat(1) } });
+    try std.testing.expectEqual(grant, state.roots[0].grant_sequence);
+    try std.testing.expect(state.authority_sequence > grant);
+    try std.testing.expectEqual(@as(u64, 2), state.roots[0].ownership_epoch);
 }

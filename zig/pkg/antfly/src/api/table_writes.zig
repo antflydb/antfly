@@ -44209,7 +44209,9 @@ fn implementationTests() type {
             defer if (open) db.close();
             const namespace = try db.nativeSourceAdmissionNamespace();
             const grant: db_mod.DB.HistoryConsumerGrant = .{ .namespace = namespace, .authority = @splat(9), .sequence = 1, .consumer = @splat(1), .definition = @splat(2), .expires_at_seconds = 1000, .policy_revision = 1 };
-            const enrolled = (try db.nativeHistoryConsumerControl(.{ .enroll = grant })).consumer.?;
+            var bound = BoundTableWriteSource.init("docs", &db);
+            const source = bound.source();
+            const enrolled = (try source.nativeHistoryConsumerControl(.{ .enroll = grant })).consumer.?;
             try db.batch(.{ .writes = &.{ .{ .key = "one", .value = "{\"value\":1}" }, .{ .key = "two", .value = "{\"value\":2}" } } });
             const ref: db_mod.DB.HistoryConsumerReference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.epoch, .grant = grant.sequence, .definition = grant.definition };
             _ = try db.nativeHistoryConsumerControl(.{ .renew = .{ .reference = ref, .previous = 1000, .next = 2000 } });
@@ -44220,7 +44222,7 @@ fn implementationTests() type {
             const found = (try db.nativeHistoryConsumerControl(.{ .inspect = ref })).consumer.?;
             try std.testing.expectEqual(enrolled.epoch, found.epoch);
             try std.testing.expectEqual(@as(u64, 2000), found.expires_at_seconds);
-            var page = try db.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101, .max_events = 1 });
+            var page = try source.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101, .max_events = 1 });
             defer page.deinit();
             try std.testing.expectEqual(@as(usize, 1), page.events.len);
             try std.testing.expectEqual(@as(u64, 0), page.next.sequence);
@@ -44231,7 +44233,7 @@ fn implementationTests() type {
             defer retry.deinit();
             try std.testing.expectEqualSlices(u8, page.events[0].key, retry.events[0].key);
             try std.testing.expectEqualSlices(u8, page.events[0].after.?, retry.events[0].after.?);
-            var tail = try db.nativeHistoryPage(a, .{ .reference = ref, .after = page.next, .now_seconds = 101, .max_events = 1 });
+            var tail = try source.nativeHistoryPage(a, .{ .reference = ref, .after = page.next, .now_seconds = 101, .max_events = 1 });
             defer tail.deinit();
             try std.testing.expectEqual(@as(u64, 1), tail.next.sequence);
             try std.testing.expectEqual(@as(u32, 0), tail.next.event);
@@ -44261,6 +44263,127 @@ fn implementationTests() type {
             var raft_db = try db_mod.DB.open(a, raft_path, raft_options);
             defer raft_db.close();
             try std.testing.expectError(error.OnlineSourceScopeChanged, raft_db.nativeHistoryConsumerControl(.{ .enroll = grant }));
+        }
+
+        test "native history consumer control adapter recovers metadata and root after lost progress replies" {
+            const root_adapter = @import("../metadata/native_changefeed_root.zig");
+            const control = @import("../metadata/changefeed_control.zig");
+            const Store = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
+            const Table = @import("../metadata/domain.zig").TableRecord;
+            const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+            const Harness = struct {
+                store: *Store,
+                a: std.mem.Allocator,
+                states: std.ArrayList(control.Parsed) = .empty,
+                definition: control.Definition,
+                fn deinit(self: *@This()) void {
+                    for (self.states.items) |*state| state.deinit();
+                    self.states.deinit(std.testing.allocator);
+                }
+                fn load(self: *@This()) !control.State {
+                    const bytes = try self.store.getChangefeedControl(std.testing.allocator, group, @splat(4));
+                    defer std.testing.allocator.free(bytes);
+                    var parsed = try control.parse(std.testing.allocator, bytes);
+                    errdefer parsed.deinit();
+                    try self.states.append(std.testing.allocator, parsed);
+                    return parsed.value;
+                }
+                fn mutate(self: *@This(), mutation: control.Mutation) !control.State {
+                    const before = try self.load();
+                    const write: control.Write = .{ .id = @splat(4), .authority = @splat(9), .owner = self.definition.owner, .authorization = self.definition.authorization, .expected_revision = before.revision, .expected_epoch = before.epoch, .mutation = mutation };
+                    try self.store.applyStandaloneCommand(group, .{ .apply_changefeed_control = try control.encodeWrite(self.a, write) });
+                    return self.load();
+                }
+                fn deliverAndAck(self: *@This(), state: control.State, page: anytype) !control.State {
+                    var delivery: control.Delivery = .{ .sequence = state.latest_delivery + 1, .before = state.latest_cursor, .cursor = @splat(0), .authority = control.hash(.{ .header = page.header.?, .first = page.first_ordinal, .next = page.next }), .issued_at = 200 + state.latest_delivery, .advances = &.{.{ .namespace = page.header.?.namespace, .position = .{ .sequence = page.next.sequence, .event = page.next.event } }} };
+                    delivery.cursor = delivery.identity(state.id, state.epoch);
+                    _ = try self.mutate(.{ .issue = delivery });
+                    return self.mutate(.{ .acknowledge = delivery.cursor });
+                }
+            };
+            const a = std.testing.allocator;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/native-feed-adapter", .{tmp.sub_path});
+            const meta_path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/native-feed-metadata", .{tmp.sub_path});
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native };
+            var db = try db_mod.DB.open(a, path, options);
+            var db_open = true;
+            defer if (db_open) db.close();
+            var store = try Store.init(a, .{ .root_dir = meta_path });
+            var meta_open = true;
+            defer if (meta_open) store.deinit();
+            const table: Table = .{ .table_id = 7, .name = "docs", .schema_json = "{}" };
+            try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+            var bound = BoundTableWriteSource.init("docs", &db);
+            var adapter = try root_adapter.Adapter.init(bound.source(), table);
+            const definition: control.Definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = control.tableBinding(table), .policy_revision = 1, .contract = .native_document }} };
+            var harness: Harness = .{ .store = &store, .a = scratch, .definition = definition };
+            defer harness.deinit();
+            var state = try harness.mutate(.{ .create = .{ .id = @splat(4), .definition = definition, .now = 100, .expires_at = 1000 } });
+            const plan = try adapter.plan(state);
+            state = try harness.mutate(.{ .plan_roots = &.{plan} });
+            const original_plan = state;
+            const lost_enrollment = try adapter.enroll(state);
+            // A primary commit occurs after root enrollment but before metadata
+            // receives that reply. Retrying must retain the original start cut.
+            try db.batch(.{ .writes = &.{ .{ .key = "one", .value = "{\"value\":1}" }, .{ .key = "two", .value = "{\"value\":2}" } } });
+            state = try harness.mutate(.{ .renew = .{ .now = 110, .expires_at = 1200 } });
+            const retried = try adapter.enroll(state);
+            try std.testing.expectEqual(lost_enrollment.enroll.consumer_epoch, retried.enroll.consumer_epoch);
+            try std.testing.expectEqual(lost_enrollment.enroll.start, retried.enroll.start);
+            state = try harness.mutate(retried);
+            // This fixture owns exactly one native root. It certifies only this
+            // known root set, without asserting a distributed/bootstrap cut.
+            state = try harness.mutate(.{ .seal = .{ .cut = control.hash(.{ .namespace = plan.namespace, .start = state.roots[0].start, .epoch = state.roots[0].consumer_epoch }) } });
+            const initial = state.latest_cursor;
+            var first = try adapter.read(a, state, initial, 200, 1, 1024 * 1024);
+            defer first.deinit();
+            try std.testing.expectEqual(@as(u32, 1), first.next.event);
+            state = try harness.deliverAndAck(state, first);
+            state = try harness.mutate(try adapter.flushAcknowledged(state));
+            try std.testing.expectEqual(@as(u64, 0), state.roots[0].reclaimed_through);
+            try std.testing.expectEqual(@as(u8, 0), try adapter.collect(state, 32));
+            var second = try adapter.read(a, state, state.latest_cursor, 201, 1, 1024 * 1024);
+            defer second.deinit();
+            try std.testing.expectEqual(@as(u64, 1), second.next.sequence);
+            state = try harness.deliverAndAck(state, second);
+            _ = try adapter.flushAcknowledged(state); // Lose native ACK reply.
+            try std.testing.expectEqual(@as(u8, 1), try adapter.collect(state, 32));
+            try db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"value\":3}" }} });
+            var third = try adapter.read(a, state, state.latest_cursor, 202, 1, 1024 * 1024);
+            defer third.deinit();
+            state = try harness.deliverAndAck(state, third);
+            // Metadata still records native ACK 0, while the root has ACK 1.
+            // A newer authorized target must recover that actual predecessor.
+            state = try harness.mutate(try adapter.flushAcknowledged(state));
+            try std.testing.expectEqual(@as(u64, 2), state.roots[0].reclaimed_through);
+            try std.testing.expectError(error.ChangefeedCursorExpired, adapter.read(a, state, initial, 203, 1, 1024 * 1024));
+            state = try harness.mutate(.close);
+            _ = try adapter.retire(state); // Lose root-release reply.
+            // Collection no longer needs the now-retired consumer credential.
+            try std.testing.expectEqual(@as(u8, 1), try adapter.collect(state, 32));
+            db.close();
+            db_open = false;
+            store.deinit();
+            meta_open = false;
+            db = try db_mod.DB.open(a, path, options);
+            db_open = true;
+            store = try Store.init(a, .{ .root_dir = meta_path });
+            meta_open = true;
+            adapter = try root_adapter.Adapter.init(bound.source(), table);
+            state = try harness.load();
+            state = try harness.mutate(try adapter.retire(state));
+            state = try harness.mutate(.finish_close);
+            try std.testing.expectEqual(control.Phase.deleted, state.phase);
+            try std.testing.expectEqual(@as(u8, 0), try adapter.collect(state, 32));
+            try std.testing.expectError(error.HistoryResynchronizationRequired, adapter.enroll(original_plan));
+            var object_table = table;
+            object_table.storage.engine = .object;
+            try std.testing.expectError(error.ChangefeedCapabilityUnsupported, root_adapter.Adapter.init(bound.source(), object_table));
         }
 
         test "bound source admission capability rejects unscoped and Raft-owned roots" {

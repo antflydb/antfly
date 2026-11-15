@@ -104,6 +104,8 @@ pub const BoundTableWriteSource = struct {
             .ptr = self,
             .vtable = &.{
                 .retire_source_attempt = retireSourceAttempt,
+                .native_history_consumer_control = nativeHistoryConsumerControl,
+                .native_history_page = nativeHistoryPage,
                 .admit_source_transaction = admitSourceTransaction,
                 .native_source_admission_namespace = nativeSourceAdmissionNamespace,
                 .resolve_source_admission = resolveSourceAdmissionCallback,
@@ -807,6 +809,16 @@ pub const BoundTableWriteSource = struct {
     fn retireSourceAttempt(ptr: *anyopaque, command: source_admission.Command) ![source_admission.fence_size]u8 {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         return (try self.activeDb()).retireSourceAttempt(command);
+    }
+
+    fn nativeHistoryConsumerControl(ptr: *anyopaque, command: table_write_source.history_consumer.Command) !table_write_source.history_consumer.Result {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return (try self.activeDb()).nativeHistoryConsumerControl(command);
+    }
+
+    fn nativeHistoryPage(ptr: *anyopaque, allocator: std.mem.Allocator, request: table_write_source.history_page.Request) !table_write_source.history_page.Page {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return (try self.activeDb()).nativeHistoryPage(allocator, request);
     }
 
     fn nativeSourceAdmissionNamespace(ptr: *anyopaque) ![24]u8 {

@@ -23,6 +23,8 @@ const db_mod = struct {
     pub const TextMemoryAttributionStats = @import("../storage/db/text_memory_stats.zig").TextMemoryAttributionStats;
 };
 const backend_types = @import("../storage/backend_types.zig");
+pub const history_consumer = @import("../storage/history_consumer.zig");
+pub const history_page = @import("../storage/history_page.zig");
 const table_create_contract = @import("table_create_contract.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
@@ -652,6 +654,10 @@ pub const TableWriteSource = struct {
         resolve_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command, db_mod.types.SyncLevel, db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome = null,
         release_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command) anyerror!void = null,
         retire_source_attempt: ?*const fn (*anyopaque, @import("../storage/source_admission.zig").Command) anyerror![@import("../storage/source_admission.zig").fence_size]u8 = null,
+        /// Private native owner capabilities. Appended to preserve callback
+        /// offsets for existing consumers; missing capability is unsupported.
+        native_history_consumer_control: ?*const fn (*anyopaque, history_consumer.Command) anyerror!history_consumer.Result = null,
+        native_history_page: ?*const fn (*anyopaque, std.mem.Allocator, history_page.Request) anyerror!history_page.Page = null,
     };
 
     pub fn activateRangeTracking(self: TableWriteSource, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
@@ -668,6 +674,16 @@ pub const TableWriteSource = struct {
     pub fn retireSourceAttempt(self: TableWriteSource, command: @import("../storage/source_admission.zig").Command) ![@import("../storage/source_admission.zig").fence_size]u8 {
         const callback = self.vtable.retire_source_attempt orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("retire_source_attempt", self.boundary_dispatch, callback, .{ self.ptr, command });
+    }
+
+    pub fn nativeHistoryConsumerControl(self: TableWriteSource, command: history_consumer.Command) !history_consumer.Result {
+        const callback = self.vtable.native_history_consumer_control orelse return error.ChangefeedCapabilityUnsupported;
+        return BoundaryAbi.call("native_history_consumer_control", self.boundary_dispatch, callback, .{ self.ptr, command });
+    }
+
+    pub fn nativeHistoryPage(self: TableWriteSource, allocator: std.mem.Allocator, request: history_page.Request) !history_page.Page {
+        const callback = self.vtable.native_history_page orelse return error.ChangefeedCapabilityUnsupported;
+        return BoundaryAbi.call("native_history_page", self.boundary_dispatch, callback, .{ self.ptr, allocator, request });
     }
 
     pub fn nativeSourceAdmissionNamespace(self: TableWriteSource) ![24]u8 {

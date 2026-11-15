@@ -212,11 +212,15 @@ pub const Command = union(enum) {
     renew: struct { reference: Reference, previous: u64, next: u64 },
     retire: Retirement,
     reclaim: struct { reference: Reference, max_frames: u8 = 1 },
+    /// Owner-scoped maintenance remains possible after the final consumer is
+    /// released. It never invents an ACK: the shared native floor still rules.
+    collect: struct { namespace: Namespace, authority: Digest, max_frames: u8 = 1 },
     pub fn namespace(self: Command) Namespace {
         return switch (self) {
             .enroll => |value| value.namespace,
             .inspect => |value| value.namespace,
             .retire => |value| value.namespace,
+            .collect => |value| value.namespace,
             .acknowledge => |value| value.reference.namespace,
             .renew => |value| value.reference.namespace,
             .reclaim => |value| value.reference.namespace,
@@ -242,18 +246,28 @@ pub fn apply(txn: anytype, command: Command) !Result {
             try retire(txn, value);
             break :blk .{};
         },
+        .collect => |value| blk: {
+            if (!nonzero(value.namespace) or !nonzero(value.authority)) return error.InvalidHistoryAdmission;
+            if (try load(txn) == null) return error.HistoryResynchronizationRequired;
+            _ = try stateFor(txn, value.namespace, value.authority);
+            break :blk .{ .reclaimed_frames = try reclaimFrames(txn, value.namespace, value.max_frames) };
+        },
         .reclaim => |value| blk: {
-            if (value.max_frames == 0 or value.max_frames > 32) return error.InvalidHistoryAdmission;
             const consumer = try inspect(txn, value.reference);
-            var count: u8 = 0;
-            while (count < value.max_frames) {
-                const before = (try history.load(txn)).?.reclaimed;
-                const done = try history.reclaim(txn, value.reference.namespace);
-                const after = (try history.load(txn)).?.reclaimed;
-                if (after > before) count += 1;
-                if (done) break;
-            }
-            break :blk .{ .consumer = consumer, .reclaimed_frames = count };
+            break :blk .{ .consumer = consumer, .reclaimed_frames = try reclaimFrames(txn, value.reference.namespace, value.max_frames) };
         },
     };
+}
+
+fn reclaimFrames(txn: anytype, namespace: Namespace, max_frames: u8) !u8 {
+    if (max_frames == 0 or max_frames > 32) return error.InvalidHistoryAdmission;
+    var count: u8 = 0;
+    while (count < max_frames) {
+        const before = (try history.load(txn)) orelse break;
+        const done = try history.reclaim(txn, namespace);
+        const after = (try history.load(txn)) orelse return error.HistoryCorrupt;
+        if (after.reclaimed > before.reclaimed) count += 1;
+        if (done) break;
+    }
+    return count;
 }

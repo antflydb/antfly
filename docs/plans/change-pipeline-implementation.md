@@ -364,6 +364,35 @@ retirement-before-enrollment fencing, rolled-back control changes, lost replies
 across renewal, and metadata grant refresh preserving read position. The normal
 changefeed control and unit targets now include the native integration check.
 
+## Native root adapter and table-source capabilities
+
+The private `TableWriteSource` contract now appends optional native consumer
+control and page-read callbacks. Bound sources invoke them through the existing
+callback boundary; missing capabilities return an explicit unsupported outcome.
+`metadata/native_changefeed_root.zig` binds an adapter to the observed immutable
+metadata table incarnation and actual persisted native namespace. The current
+adapter exposes local native document roots; object, relational, snapshot and
+lifecycle capabilities require their respective implementation/qualification.
+
+The adapter recovers original enrollment epochs/starts across lost replies,
+applies a renewed metadata lease to the recovered native consumer, reconstructs
+positions from retained opaque cursors, and flushes ACKs from the root's observed
+predecessor after a lost native reply. Owner-scoped collection can reclaim a
+bounded number of frames even after the final consumer is retired, while the
+shared native floor protects other consumers and prepared credits. Moving a
+closing/reset feed to another storage owner preserves its retired enrollment
+grant rather than creating a grant newer than its close fence.
+
+Integration exercises the table-source callbacks with real native and metadata
+stores: commit between enrollment and its lost reply, lease extension, partial
+and whole-frame ACK, lost native ACK followed by a newer target, root-release
+reply loss, both stores reopening, collection after final release, and rejection
+of delayed enrollment after collection. These are root/control recovery checks.
+The adapter does not authenticate a public client, project/filter images, certify
+a distributed completion or construct a consistent snapshot. Provisioned/hosted
+root selection, owner RPCs, feed reconciliation and public transports remain
+required before advertising public changefeeds.
+
 ## Remaining implementation phases
 
 1. Finish root history tests, prepared credit accounting and native integration.
