@@ -6285,6 +6285,24 @@ pub const ReadView = struct {
     /// doc comment); captured as two separate fields regardless, so a
     /// future caller that opens this on a handle where they genuinely
     /// diverge gets the correct answer without this type changing.
+    ///
+    /// perf/lwa-restore-open-txn (design doc §9.8): this constructor
+    /// already pinned correctly (`openAt` below takes the overlay pin
+    /// and the inode reader-table pin together, atomically with respect
+    /// to itself) -- the bug was a caller, `docstore.zig`'s
+    /// `Txn.openReadWithPrefix`'s `store.read_only` short-circuit,
+    /// capturing `store.file.activeCheckpoint()` into a bare `Txn`
+    /// literal instead of ever calling `open`/`openAt` at all, so nothing
+    /// pinned it: a concurrent fold's own `SharedRedoOverlay.reclaim`
+    /// (gated on `minimumPinnedSequence`, which only ever protects a mark
+    /// some live pin actually registered) could drop an overlay-only
+    /// (unfolded) key that bare checkpoint still depended on, between the
+    /// capture and the read -- a fully committed, redo-log-only document
+    /// going missing from a fresh `.query_readonly` open racing a live
+    /// writer's own background maintenance fold. Fixed at that call
+    /// site, not here: it now opens a real `ReadView` and keeps it pinned
+    /// for the `Txn`'s own lifetime (released in `abort()`), the same
+    /// scope every other read path already gets this primitive for.
     pub fn open(file: *NativeFile, io: std.Io) !ReadView {
         return openAt(file, io, file.activeCheckpoint());
     }
@@ -7239,6 +7257,43 @@ pub const NativeFile = struct {
         // anything else touches `result.header`/`result.manifest_commits_enabled`
         // below. Every production opener of a redo-log file reaches this.
         if (header.redo_log_capacity != 0) try result.recoverRedoLog(allocator, io);
+        // perf/lwa-restore-open-txn (design doc §9.8): settle a read-only
+        // handle's checkpoint/overlay mark to the latest actually-durable
+        // state *once*, here, at open -- before anything else can pin or
+        // read against it. `recoverRedoLog` just above already replayed
+        // the physical log, but that scan itself races a live writer's
+        // own concurrent commit/fold on the same inode with no exclusion
+        // at all (this open never takes any lock a writer's commit also
+        // takes): a `.query_readonly` connection opening while a
+        // background maintenance fold is mid-flight could settle on a
+        // checkpoint/mark pair that is internally inconsistent with
+        // what the fold is about to publish. Pin conservatively at
+        // whatever the scan above found, call the one primitive that
+        // walks past this process's own last-applied sequence via the
+        // shared lock region's published watermark and decodes anything
+        // new directly into the shared overlay (`refreshCrossProcessRedoOverlay`,
+        // the exact same call a cross-process reopen already uses,
+        // §9.3b -- works identically for a same-process fold's own
+        // publish), then drop the pin: once settled, a read-only
+        // handle's own checkpoint never changes again on its own (it
+        // never commits), so nothing further needs protecting until the
+        // next actual read pins it afresh (`ReadView.open`/`openAt`,
+        // already correct -- see that function's own doc comment). This
+        // keeps the read-only "frozen at open" contract several existing
+        // tests depend on (a later write on a *different* handle must
+        // never retroactively change what this one already settled on)
+        // while still closing the race window during settling itself.
+        if (opts.read_only and !opts.externally_locked and header.redo_log_capacity != 0) {
+            if (result.redo) |*redo| {
+                const settle_mark = result.readMark(result.activeCheckpoint());
+                try redo.shared.pin(std.heap.page_allocator, io, settle_mark);
+                defer redo.shared.unpin(io, settle_mark);
+                result.refreshCrossProcessRedoOverlay() catch |err| switch (err) {
+                    error.InvalidTransactionState => {},
+                    else => return err,
+                };
+            }
+        }
         if (plain_reader) {
             // Register with the coordinator *before* acquiring the
             // registry grant below, so `blocks_exclusive` reflects whether
@@ -35318,6 +35373,58 @@ test "lite redo log bulk-built document index over max_keys passes check() after
         defer a.free(value);
         try std.testing.expectEqualSlices(u8, mutation.value, value);
     }
+}
+
+// perf/lwa-restore-open-txn (design doc §9.8): `ReadView.open`'s own
+// checkpoint/mark determination used to come straight from
+// `file.activeCheckpoint()` with no pin at all -- the handle's one-time
+// snapshot from `recoverRedoLog`, never refreshed. A concurrent fold's own
+// `SharedRedoOverlay.reclaim` has no way to know an unpinned reader still
+// depends on an overlay-only (unfolded) key below that stale snapshot, so
+// it drops it the moment the fold's own checkpoint becomes durable -- a
+// fully committed, redo-log-only document going missing from a fresh
+// `.query_readonly` open (`storage.lite.restore_staging.zig`'s export
+// path) racing a live writer's own background maintenance fold. Fixed by
+// pinning conservatively *before* refreshing to the latest published
+// state, then re-pinning at whatever that refresh finds, so a concurrent
+// fold's `reclaim` can never see a gap -- see `ReadView.open`'s own doc
+// comment for the full mechanism. `getDocumentAlloc` on the raw file
+// (what this test used before the fix) never pins at all; going through
+// `ReadView.open` instead is exactly the change `docstore.zig`'s
+// `Txn.openReadWithPrefix` read_only short-circuit also needs, and gets,
+// below.
+test "lite redo log reader opened before a fold still resolves a key the fold's own reclaim would otherwise drop" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-reader-before-fold.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 4 * 1024 * 1024);
+    defer file.close();
+    try file.beginTransaction();
+    try file.putDocument("doc:a", "hello");
+    try file.commitTransaction();
+
+    // A fresh reader opens now, while "doc:a" is still overlay-only
+    // (unfolded), and immediately establishes its ReadView -- design doc
+    // §9.8's one read primitive -- pinning the mark that covers "doc:a"'s
+    // own commit.
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer reader.close();
+    var view = try ReadView.open(&reader, std.testing.io);
+    defer view.release(std.testing.io);
+
+    // The writer now folds and durably reclaims: "doc:a" moves into a
+    // real page its own, newer checkpoint points at. `reclaim`'s own
+    // floor must never drop below `reader`'s live pin, so "doc:a"'s
+    // overlay version survives even though `view`'s own checkpoint still
+    // predates the fold.
+    try file.checkpointRedoLogWithDurability(true);
+
+    const value = (try view.getDocumentAlloc(a, "doc:a")) orelse return error.TestExpectedEqual;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("hello", value);
 }
 
 // perf/lwa-bulk-alloc: one transaction that mixes a handful of individual
