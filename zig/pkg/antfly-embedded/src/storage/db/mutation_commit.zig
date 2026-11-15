@@ -1317,25 +1317,43 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 null;
             defer if (graph_publication) |*lease| lease.release();
 
+            // perf/lwa-write-overhead: a single probe/read `Txn` opened lazily
+            // here and reused by every read-only prep check below (instead of
+            // each check opening and aborting its own) -- see this function's
+            // own `batchProbe` helper just below. Nothing in this prep phase
+            // durably writes to `core.store` before the batch's own commit
+            // runs much further down, and Lite's probe reads are a "current
+            // tip, no snapshot clone" view that never holds a store-wide lock
+            // past its own `beginProbeTxn()` call -- so every one of these
+            // checks sees exactly the state it would have seen opening its
+            // own probe at that same point, and holding this one open a
+            // while longer costs nothing a later `beginWrite` would notice.
+            var batch_probe: ?docstore_mod.DocStore.Txn = null;
+            defer if (batch_probe) |*t| t.abort();
+            const batchProbe = struct {
+                fn get(probe: *?docstore_mod.DocStore.Txn, inner_self: anytype) !*docstore_mod.DocStore.Txn {
+                    if (probe.* == null) probe.* = try S.ownerField(inner_self, "core").*.store.beginProbeTxn();
+                    return &probe.*.?;
+                }
+            }.get;
+
             var coordinated_handoff = false;
             if (req.split_replication != null or req.split_checkpoint != null) {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
-                coordinated_handoff = try @import("relational_integrity_handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, &topology_read, req);
+                const topology_read = try batchProbe(&batch_probe, self);
+                coordinated_handoff = try @import("relational_integrity_handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
             if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
+                const topology_read = try batchProbe(&batch_probe, self);
                 // Source retention remains authoritative after its brief pin
                 // fence is released. Receiving another merge would replace that
                 // source's range state while its immutable cut/tail are in use.
-                if (try @import("../retained_effects.zig").load(&topology_read)) |retained| {
+                if (try @import("../retained_effects.zig").load(topology_read)) |retained| {
                     const namespace = @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace);
                     if (retained.active() and std.mem.eql(u8, &retained.namespace, &namespace)) return error.IntegrityTopologyBusy;
                 }
-                coordinated_handoff = try @import("online_integrity_shadow.zig").admit(S.ownerField(self, "alloc").*, &topology_read, req, S.ownerField(self, "core").*.identity_namespace);
-                if (!coordinated_handoff) coordinated_handoff = try @import("relational_integrity_handoff.zig").admitMergeRequest(S.ownerField(self, "alloc").*, &topology_read, req);
+                coordinated_handoff = try @import("online_integrity_shadow.zig").admit(S.ownerField(self, "alloc").*, topology_read, req, S.ownerField(self, "core").*.identity_namespace);
+                if (!coordinated_handoff) coordinated_handoff = try @import("relational_integrity_handoff.zig").admitMergeRequest(S.ownerField(self, "alloc").*, topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
             // hot-standby carries already committed effects, including prepared decisions
@@ -1344,9 +1362,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!coordinated_handoff and opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply and (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or
                 effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0))
             {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
-                try @import("relational_integrity_topology.zig").requireUnfenced(&topology_read);
+                const topology_read = try batchProbe(&batch_probe, self);
+                try @import("relational_integrity_topology.zig").requireUnfenced(topology_read);
             }
 
             // A pending coalescer flush may itself run a complete nested batch and
@@ -1426,7 +1443,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Untagged historical commands retain their original semantics.
             const document_revisions = effective_req.document_version_scheme != .legacy;
             const document_version = if (document_revisions and relationalColumns(self) == null)
-                try @import("../ttl.zig").nextDocumentVersion(S.ownerField(self, "core").*.store, S.ownerField(self, "alloc").*, batch_timestamp_ns, effective_req.writes, effective_req.deletes)
+                try @import("../ttl.zig").nextDocumentVersionTxn(try batchProbe(&batch_probe, self), S.ownerField(self, "alloc").*, batch_timestamp_ns, effective_req.writes, effective_req.deletes)
             else
                 null;
 
@@ -1448,12 +1465,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // path too. The key-oriented intent index keeps this O(touched keys)
             // instead of scanning every outstanding transaction.
             if (opts.transaction_resolution == null) {
-                try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
+                try S.ownerField(self, "core").*.checkOrdinaryWriteConflictsWithProbe(effective_ops.writes, effective_ops.deletes, try batchProbe(&batch_probe, self));
                 var graph_sources: std.ArrayList(types.BatchWrite) = .empty;
                 defer graph_sources.deinit(S.ownerField(self, "alloc").*);
                 for (effective_req.graph_writes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
                 for (effective_req.graph_deletes) |edge| try graph_sources.append(S.ownerField(self, "alloc").*, .{ .key = edge.source, .value = "" });
-                try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(graph_sources.items, &.{});
+                try S.ownerField(self, "core").*.checkOrdinaryWriteConflictsWithProbe(graph_sources.items, &.{}, try batchProbe(&batch_probe, self));
             }
             try self.validateTransformReadSnapshot(transform_snapshot);
             // Catches a concurrent commit to one of this batch's own write keys
@@ -2017,7 +2034,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             const identity_capacity_start_ns = monotonicTimeNs();
             if (!S.ownerField(self, "bulk_identity").*.enabled or effective_req.deletes.len != 0) {
-                try self.failIfIdentityOrdinalExhaustedForNewUpserts(write_buffers.identity_upsert_keys.items);
+                try failIfIdentityOrdinalExhaustedForNewUpsertsTxn(self, try batchProbe(&batch_probe, self), write_buffers.identity_upsert_keys.items);
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
@@ -2737,7 +2754,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (profile) |active_profile| active_profile.source_sequence = sequence;
             const identity_metadata_start_ns = monotonicTimeNs();
             const identity_live_before = if (write_buffers.identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
-                (try doc_identity.fastStatsFromStore(S.ownerField(self, "core").*.store)).live_ordinals
+                (try doc_identity.fastStatsFromTxn(try batchProbe(&batch_probe, self))).live_ordinals
             else
                 0;
             var used_trusted_identity_path = false;
@@ -4879,9 +4896,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn failIfIdentityOrdinalExhaustedForNewUpserts(self: anytype, doc_ids: []const []const u8) !void {
             if (doc_ids.len == 0) return;
-
             var txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
             defer txn.abort();
+            try failIfIdentityOrdinalExhaustedForNewUpsertsTxn(self, &txn, doc_ids);
+        }
+
+        /// Same as `failIfIdentityOrdinalExhaustedForNewUpserts`, reading
+        /// through an already-open probe/read transaction instead of
+        /// opening (and aborting) its own. perf/lwa-write-overhead: lets a
+        /// mutation's own prep phase share one transaction across this and
+        /// its other read-only checks instead of paying a separate overlay
+        /// pin/unpin for each.
+        pub fn failIfIdentityOrdinalExhaustedForNewUpsertsTxn(self: anytype, txn: anytype, doc_ids: []const []const u8) !void {
+            if (doc_ids.len == 0) return;
 
             const raw_next = txn.get(internal_keys.identity_next_ordinal_key[0..]) catch |err| switch (err) {
                 error.NotFound => return,
@@ -4896,7 +4923,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (doc_ids) |doc_id| {
                 if (seen.contains(doc_id)) continue;
                 try seen.put(S.ownerField(self, "alloc").*, doc_id, {});
-                if (try doc_identity.lookupOrdinalTxn(S.ownerField(self, "alloc").*, &txn, doc_id) != null) continue;
+                if (try doc_identity.lookupOrdinalTxn(S.ownerField(self, "alloc").*, txn, doc_id) != null) continue;
                 return error.DocOrdinalExhausted;
             }
         }
