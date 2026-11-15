@@ -876,6 +876,26 @@ fn initNativeSingleFile(
     runtime_store.* = try store.runtimeStore(allocator);
     errdefer runtime_store.deinit();
 
+    // These two catalog reads are the first thing any opener of `store.file`
+    // does -- before any `Txn`/`ReadView` of its own exists to protect the
+    // checkpoint `docstore.Store.openWithOptions`/`createWithOptions` just
+    // recovered. A concurrent writer's own background fold (same process:
+    // a maintenance thread; another process: a cross-process writer) can
+    // reclaim that checkpoint's pages, or drop its still-unfolded redo-log
+    // content, in the gap between recovering it and this call reading
+    // through it -- reached by every caller of `initNativeSingleFile`
+    // alike, read-only or not: `lite_connection.zig`'s `Owner.
+    // refreshMaintenanceSnapshot` opens exactly this way for its own
+    // detached maintenance snapshot (read-write, not `read_only`, so
+    // `docstore.Store.openWithOptions`'s own `pin_read_checkpoint` never
+    // applies to it), and reclamation work that instance later performs
+    // itself must not be held back by a pin outliving these two reads --
+    // hence a short-lived `ReadView`, released immediately below, rather
+    // than relying on (or extending) any longer-lived pin the opener might
+    // separately hold for its own lifetime.
+    var init_probe_view = try native.ReadView.open(&store.file, store.file.runtime());
+    defer init_probe_view.release(store.file.runtime());
+
     const artifact_profile = try store.file.getCatalogRecordAlloc(allocator, artifact_profile_catalog_key);
     defer if (artifact_profile) |profile| allocator.free(profile);
     if (artifact_profile) |profile| {

@@ -4974,6 +4974,31 @@ pub const OpenOptions = struct {
     /// barrier to also flush the drive's own write cache (`F_FULLFSYNC` on
     /// Darwin; no effect on platforms without that distinction).
     full_fsync: bool = false,
+    /// Pin the checkpoint this open recovers -- both the overlay mark `M`
+    /// (`SharedRedoOverlay.pins`, protecting still-unfolded redo-log
+    /// content from a concurrent fold's own reclaim) and the checkpoint
+    /// `C` itself (`inode_lock.Entry.reader_pins`, protecting its pages
+    /// from reuse) -- before this function returns, released in
+    /// `close()`. Only `docstore.Store.openWithOptions` sets this
+    /// (whenever `opts.read_only`): a *fresh*, standalone open with no
+    /// `Txn`/`ReadView` of its own to pin it, read through immediately
+    /// after open returns (`backend.zig`'s `initNativeSingleFile`, a
+    /// caller's own first `getCatalogRecordAlloc`, ...) with nothing else
+    /// protecting the checkpoint it just recovered from a concurrent
+    /// writer's own background fold in between. Deliberately opt-in, not
+    /// a blanket rule keyed on `read_only and !internal_reader`: several
+    /// internal call sites (`docstore.initializeReadGenerationAssumeLocked`'s
+    /// own read-generation open chief among them) open a read-only
+    /// `NativeFile` directly, outlive any single read, and already have
+    /// their own, separately-scoped pin lifecycle
+    /// (`Store.pinInitializedReadGeneration`/`releaseReadGeneration`) tied
+    /// to individual `ReadPin`s coming and going -- pinning *this* open
+    /// unconditionally and for its own unrelated lifetime would starve
+    /// every future fold the moment one such generation existed, since
+    /// nothing ever closes it to release the pin (confirmed: broke "lite
+    /// redo-log idle-flush timer checkpoints an uncheckpointed overlay
+    /// without a foreground checkpoint call" during development).
+    pin_read_checkpoint: bool = false,
 };
 
 /// Per-owner writer-lease timing, exposed under `background_publications`.
@@ -6799,15 +6824,27 @@ pub const NativeFile = struct {
     /// (`acquireReaderFence`/`captureFullReadSnapshot`), released in
     /// `releaseReaderFence` or, defensively, in `close()`.
     reader_fence_lock: ?inode_lock.Handle = null,
-    /// Set by `captureFullReadSnapshot` on the *returned* snapshot reader
-    /// when it registers a pin in `inode_lock.Entry.reader_pins` (the
-    /// in-process reader-pin registry -- see that field's own doc
-    /// comment) protecting the checkpoint this reader was opened at.
-    /// Released in `close()`; `null` for every other NativeFile (the pin
-    /// lives on the returned snapshot reader, not on `self`, the live
-    /// writer file that created it).
+    /// Set by `captureFullReadSnapshot` on the *returned* snapshot reader,
+    /// and by `openWithRuntime` for every read-only, non-`internal_reader`
+    /// open, when it registers a pin in `inode_lock.Entry.reader_pins`
+    /// (the in-process reader-pin registry -- see that field's own doc
+    /// comment) protecting the checkpoint this reader was opened at (or,
+    /// for `captureFullReadSnapshot`, the checkpoint the *writer* that
+    /// captured it was already on). Released in `close()`; `null` for a
+    /// write open, an `internal_reader` probe, or the live writer file
+    /// that called `captureFullReadSnapshot` itself (the pin lives on the
+    /// returned snapshot reader, not on `self`, in that case).
     reader_pin_entry: ?*inode_lock.Entry = null,
     reader_pin_sequence: u64 = 0,
+    /// The overlay mark `M` pinned in `SharedRedoOverlay.pins` (via
+    /// `redo.shared.pinUnlessReclaimed`) by `openWithRuntime` for every
+    /// read-only, non-`internal_reader` open on a redo-log file, mirroring
+    /// `reader_pin_entry`/`reader_pin_sequence`'s own role for the
+    /// page-reuse side of the same (C, M) pin pair (`ReadView.open`'s own
+    /// doc comment). `null` for a legacy (non-redo) file, a write open, or
+    /// an `internal_reader` probe. Must be released (`redo.shared.unpin`)
+    /// before `close()` tears down `self.redo` below.
+    open_time_overlay_pin_mark: ?u64 = null,
     /// §9.3b: this instance's own claimed reader slot in the shared lock
     /// region, used only by `refreshCrossProcessRedoOverlay` to pin the
     /// `commit_sequence` this process has safely caught up to in another
@@ -7347,6 +7384,47 @@ pub const NativeFile = struct {
         // anything else touches `result.header`/`result.manifest_commits_enabled`
         // below. Every production opener of a redo-log file reaches this.
         if (header.redo_log_capacity != 0) try result.recoverRedoLog(allocator, io);
+        // `opts.pin_read_checkpoint` (see its own doc comment for why
+        // this is opt-in, set only by `docstore.Store.openWithOptions`):
+        // pin the checkpoint this open just recovered before this
+        // function returns, so a caller like backend.zig's
+        // `initNativeSingleFile` -- which reads straight through
+        // `self.header`/`self.redo` the instant `openWithOptions`/
+        // `openWithIo` returns, with no `Txn`/`ReadView` of its own in
+        // between -- cannot land between "checkpoint recovered" and
+        // "something protects it," the exact gap a concurrent writer's
+        // own background fold can win: reclaiming the checkpoint's pages
+        // (or dropping its still-unfolded redo-log content) before this
+        // open's first real read ever runs.
+        //
+        // Use exactly the primitive `ReadView.open`/`Store.
+        // pinInitializedReadGeneration` already use for this, inlined
+        // (not `ReadView` itself: storing a `ReadView` whose own `file`
+        // field points back at this function's own `result` local would
+        // leave a dangling self-reference once `result` is returned by
+        // value) -- the overlay mark `M` first
+        // (`redo.shared.pinUnlessReclaimed`, which checks whether `M` was
+        // already reclaimed and pins it atomically under one lock, so no
+        // fold can slip between the check and the pin), then the
+        // checkpoint `C` (`inode_lock.pinReader`); released in reverse in
+        // `close()`. `pinUnlessReclaimed` failing with
+        // `error.ReadSnapshotReclaimed` propagates out of this open
+        // entirely -- exactly the error `restore_staging.zig`'s own
+        // reopen-and-retry loop (and any other caller that already
+        // handles a stale-snapshot reopen) already expects.
+        if (opts.pin_read_checkpoint) {
+            std.debug.assert(opts.read_only);
+            const checkpoint = result.activeCheckpoint();
+            const mark = result.readMark(checkpoint);
+            if (result.redo) |*redo| try redo.shared.pinUnlessReclaimed(std.heap.page_allocator, io, mark, checkpoint.commit_sequence);
+            errdefer if (result.redo) |*redo| redo.shared.unpin(io, mark);
+            if (result.inode_lock_ref.load(.acquire)) |entry| {
+                try inode_lock.pinReader(entry, io, .{ .data = checkpoint.commit_sequence, .metadata = checkpoint.commit_sequence });
+            }
+            result.reader_pin_entry = result.inode_lock_ref.load(.acquire);
+            result.reader_pin_sequence = checkpoint.commit_sequence;
+            result.open_time_overlay_pin_mark = mark;
+        }
         if (plain_reader) {
             // Register with the coordinator *before* acquiring the
             // registry grant below, so `blocks_exclusive` reflects whether
@@ -8953,13 +9031,19 @@ pub const NativeFile = struct {
 
     pub fn close(self: *NativeFile) void {
         std.debug.assert(self.reader_window_depth == 0);
+        const io = self.runtimeIo();
         if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
         self.transaction_writes = null;
         self.manifest_builder.deinit(self.allocator);
+        // Must run before `redo.deinit` just below, which frees the shared
+        // overlay this pin lives on.
+        if (self.open_time_overlay_pin_mark) |mark| {
+            if (self.redo) |*redo| redo.shared.unpin(io, mark);
+            self.open_time_overlay_pin_mark = null;
+        }
         if (self.redo) |*redo| redo.deinit(self.allocator);
         self.redo = null;
-        const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.page_cache.deinit(self.allocator);
         self.invalidateLedger();
@@ -9434,11 +9518,31 @@ pub const NativeFile = struct {
 
     /// Capture only the immutable header/inode fence. The caller can release
     /// its foreground gate before walking the protected page graphs.
+    ///
+    /// `pin_read_checkpoint = true`: this reader's whole reason to exist is
+    /// a long, unprotected walk (`completeAllocatorVerification`'s
+    /// `validateIndexedAllocator`/`validateIndexedOwnership`, reading many
+    /// data pages) that the caller deliberately runs *after* releasing the
+    /// admission gate (`verifyAllocatorAssumeLocked`'s own comment: "Keep
+    /// it outside both publication locks"), so a concurrent writer is free
+    /// to keep committing and folding while this walk is in flight. Before
+    /// this pin, nothing protected that walk's pages from exactly that
+    /// fold -- the header-equality check below only catches a change that
+    /// already happened by the time this function returns, not one that
+    /// happens during the walk this reader exists to run (confirmed: the
+    /// `benchcrash` sequential-batch repro's `UnexpectedNativePageKind`
+    /// traced here, through `validateIndexedOwnership`'s own
+    /// `decodePagePayload(raw, .data)`). Safe to hold for this reader's
+    /// whole lifetime, unlike a cached, open-ended one
+    /// (`initializeReadGenerationAssumeLocked`'s own): every caller closes
+    /// this reader itself once its one walk finishes (`allocatorVerificationSnapshot`/
+    /// `prepareAllocatorVerification`'s own `defer`), never retains or
+    /// reuses it across turns.
     pub fn captureAllocatorVerificationSnapshot(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !*NativeFile {
         if (cancel) |token| try token.check();
         const reader = try self.allocator.create(NativeFile);
         errdefer self.allocator.destroy(reader);
-        reader.* = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{ .read_only = true, .resource_manager = self.page_cache.resource_manager });
+        reader.* = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{ .read_only = true, .pin_read_checkpoint = true, .resource_manager = self.page_cache.resource_manager });
         errdefer reader.close();
         reader.page_cache_policy = .metadata_only;
         reader.allocator_cancel_token = cancel;
