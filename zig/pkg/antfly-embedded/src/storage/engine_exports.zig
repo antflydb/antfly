@@ -1134,6 +1134,9 @@ fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntent
     return .{ .value = self.writeTransaction(txn_id, req) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn nativeSourceAdmissionNamespace(self: *DB) engine.Outcome([24]u8) {
+    return .{ .value = self.nativeSourceAdmissionNamespace() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn sourceAdmissionStatus(self: *DB, command: @import("source_admission.zig").Command) engine.Outcome(@import("source_admission.zig").Status) {
     return .{ .value = self.sourceAdmissionStatus(command) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

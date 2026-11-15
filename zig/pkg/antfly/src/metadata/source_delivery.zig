@@ -88,6 +88,14 @@ pub fn recover(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
     var state = try load(svc, a, scope, request);
     errdefer state.deinit();
     if (state.value.scope == null) return state;
+    if (state.value.scope.?.source_ordinal != scope.source_ordinal) {
+        // Ordinals locate catalog entries; relocating the same immutable source
+        // must preserve its pending authority and both progress frontiers.
+        try mutate(svc, a, scope, catalog, state.value, .{ .configure = scope }, request);
+        const next = try load(svc, a, scope, request);
+        state.deinit();
+        state = next;
+    }
     if (state.value.accepted.sequence != 0)
         try adapter.release(a, scope, state.value.accepted.reference, request);
     if (state.value.pending) |pending| {
@@ -259,7 +267,7 @@ test "delivery recovers lost destination and metadata acknowledgments before rel
     };
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const scope: control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(6) };
+    var scope: control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(6) };
     var svc: Service = .{ .a = a, .value = try control.encode(a, .{}) };
     defer a.free(svc.value);
     var adapter: Adapter = .{ .backing = arena.allocator() };
@@ -267,7 +275,9 @@ test "delivery recovers lost destination and metadata acknowledgments before rel
     try std.testing.expectError(error.TestLostDestinationReply, deliver(&svc, &adapter, a, scope, @splat(9), input, @as(i64, 1), Context{}));
     try std.testing.expectEqual(@as(i64, 1), adapter.counter);
     try std.testing.expectEqual(@as(usize, 0), adapter.releases);
-    // Restart recovery has no original input rows.
+    // Relocation while a reservation is pending keeps its original command
+    // authority. Restart recovery still has no original input rows.
+    scope.source_ordinal = 1;
     var recovered = try recover(&svc, &adapter, a, scope, @splat(9), Context{});
     try std.testing.expectEqual(@as(u64, 1), recovered.value.committed.sequence);
     try std.testing.expect(recovered.value.pending == null);
@@ -298,5 +308,12 @@ test "delivery recovers lost destination and metadata acknowledgments before rel
     defer final.deinit();
     try std.testing.expectEqual(@as(u64, 2), final.value.committed.sequence);
     try std.testing.expectEqualStrings("cyclic-cp", final.value.committed.checkpoint);
+    try std.testing.expectEqual(@as(usize, 2), adapter.admissions);
+    var moved = scope;
+    moved.source_ordinal = 2;
+    var relocated = try recover(&svc, &adapter, a, moved, @splat(9), Context{});
+    defer relocated.deinit();
+    try std.testing.expectEqual(@as(u32, 2), relocated.value.scope.?.source_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), relocated.value.committed.sequence);
     try std.testing.expectEqual(@as(usize, 2), adapter.admissions);
 }

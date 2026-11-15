@@ -217,9 +217,37 @@ metadata persistence/snapshot/decoder checks. Standalone delivery/control tests
 also pass (8 tests, no leaks). Logs: `zig/source-delivery-test.log` and
 `zig/source-delivery-native-qualification.log`.
 
-Production native capability validation and receipt encoding, real database plus
-metadata actor recovery tests, managed runner wiring, distributed source authority
-and writable-Iceberg adapters remain required. The callbacks and actor do not yet
+`metadata/native_source_delivery.zig` now implements the single-root native
+adapter: capability discovery checks persisted native ownership and exact
+namespace; preparation repeats the ownership check under the apply fence.
+Source identity and scope fence command construction, and the original
+coordinator locator survives rename/reopen. Admission validates the actual effect
+digest against the stored manifest. A bounded receipt retains command recovery
+authority with base64 provider strings, so worst-case JSON escaping cannot exhaust
+reserved receipt credits. Durable destination commit is distinct from index
+publication. Recovery and release verify persisted engine receipts.
+
+Real database plus metadata actor recovery tests pass: loss of the destination
+reply, both stores reopened, current table locator changed, recovery without
+source rows, loss of metadata acceptance acknowledgment, a release outage and
+changed-payload retry. The counter changes exactly once per accepted batch.
+The receipt codec's maximum-length/control-character round trip passes too.
+Checkpoint-only commits and unscoped/Raft-root rejection checks pass. The actor
+relocates the same immutable source after catalog reordering without resetting
+its pending reservation or frontiers. Standalone pending-relocation and real
+persisted catalog-reorder checks pass. `zig build source-admission-test
+source-control-test source-transaction-test -j2` passes, including all 18 CDC
+parser/stream regressions, metadata snapshot/recovery/decoder checks and native
+adapter qualification. Logs: `zig/native-source-adapter-final-qualification.log`
+and `zig/source-delivery-relocation-test.log`.
+
+Native BEGIN still needs a persisted source-purpose contract to distinguish source
+transactions from ordinary transaction IDs and freeze source-prepared intent sets.
+Distributed admission must carry that purpose and original participant authority
+through its private RPCs; current distributed source markers remain rejected.
+Managed
+runner wiring, distributed source authority and writable-Iceberg adapters remain
+required. The callbacks and actor do not yet
 advertise a public ingestion/changefeed capability.
 
 ## Remaining implementation phases

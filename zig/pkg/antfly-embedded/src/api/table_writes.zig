@@ -103,6 +103,8 @@ pub const BoundTableWriteSource = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .admit_source_transaction = admitSourceTransaction,
+                .native_source_admission_namespace = nativeSourceAdmissionNamespace,
                 .resolve_source_admission = resolveSourceAdmissionCallback,
                 .release_source_admission = releaseSourceAdmissionCallback,
                 .create_table = createTable,
@@ -790,6 +792,22 @@ pub const BoundTableWriteSource = struct {
         return {};
     }
 
+    fn admitSourceTransaction(ptr: *anyopaque, alloc: std.mem.Allocator, table: distributed_txn.TableCommitRequest, cancellation: db_mod.types.CancellationToken) !distributed_txn.CommitOutcome {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        const db = try self.activeDb();
+        _ = try db.nativeSourceAdmissionNamespace();
+        const command = table.source_admission orelse return error.InvalidSourceAdmission;
+        _ = try db.sourceAdmissionStatus(command);
+        var original = self.*;
+        original.table_name = table.table_name;
+        return (try commitBoundTransaction(&original, alloc, command.transactionId(), command.accepted_at_ns, &.{table}, .write, true, cancellation)) orelse error.SourceOutcomeUnresolved;
+    }
+
+    fn nativeSourceAdmissionNamespace(ptr: *anyopaque) ![24]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return (try self.activeDb()).nativeSourceAdmissionNamespace();
+    }
+
     fn resolveSourceAdmissionCallback(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, command: source_admission.Command, sync: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         return self.resolveSourceAdmission(alloc, name, command, sync, cancellation);
@@ -814,6 +832,7 @@ pub const BoundTableWriteSource = struct {
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         const db = try self.activeDb();
+        _ = try db.nativeSourceAdmissionNamespace();
         switch (try db.sourceAdmissionStatus(command)) {
             .absent => return null,
             .committed => return try sourceCommittedOutcome(db, command.transactionId(), original_table_name, sync_level, true, cancellation),
@@ -841,6 +860,7 @@ pub const BoundTableWriteSource = struct {
         command: source_admission.Command,
     ) !void {
         const db = try self.activeDb();
+        _ = try db.nativeSourceAdmissionNamespace();
         if (try db.sourceAdmissionReceipt(command) == null) return error.SourceOutcomeUnresolved;
         const status = db.getTransactionStatus(command.transactionId()) catch |err| switch (err) {
             error.TxnNotFound => return,

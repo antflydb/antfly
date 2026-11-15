@@ -82,10 +82,6 @@ pub const TableWriteSource = struct {
     supports_sql_range_guards: bool = false,
 
     pub const VTable = struct {
-        /// Missing capability is unsupported; a null result means the original
-        /// destination has authoritatively found no admission.
-        resolve_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command, db_mod.types.SyncLevel, db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome = null,
-        release_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command) anyerror!void = null,
         activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,
         txn_status_group_local_with_request: ?*const fn (
             ptr: *anyopaque,
@@ -649,6 +645,12 @@ pub const TableWriteSource = struct {
             index_json: ?[]const u8,
             stamp: metadata_api.CatalogMutationStamp,
         ) anyerror!?void = null,
+        /// Missing capability is unsupported; a null result means the original
+        /// destination has authoritatively found no admission.
+        admit_source_transaction: ?*const fn (*anyopaque, std.mem.Allocator, distributed_txn.TableCommitRequest, db_mod.types.CancellationToken) anyerror!distributed_txn.CommitOutcome = null,
+        native_source_admission_namespace: ?*const fn (*anyopaque) anyerror![24]u8 = null,
+        resolve_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command, db_mod.types.SyncLevel, db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome = null,
+        release_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command) anyerror!void = null,
     };
 
     pub fn activateRangeTracking(self: TableWriteSource, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
@@ -656,6 +658,16 @@ pub const TableWriteSource = struct {
         return BoundaryAbi.call("activate_range_tracking", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, context });
     }
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn admitSourceTransaction(self: TableWriteSource, alloc: std.mem.Allocator, table: distributed_txn.TableCommitRequest, cancellation: db_mod.types.CancellationToken) !distributed_txn.CommitOutcome {
+        const callback = self.vtable.admit_source_transaction orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("admit_source_transaction", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, cancellation });
+    }
+
+    pub fn nativeSourceAdmissionNamespace(self: TableWriteSource) ![24]u8 {
+        const callback = self.vtable.native_source_admission_namespace orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("native_source_admission_namespace", self.boundary_dispatch, callback, .{self.ptr});
+    }
 
     pub fn resolveSourceAdmission(self: TableWriteSource, alloc: std.mem.Allocator, original_table_name: []const u8, command: @import("../storage/source_admission.zig").Command, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
         const callback = self.vtable.resolve_source_admission orelse return error.UnsupportedOperation;

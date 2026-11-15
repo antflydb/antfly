@@ -25803,6 +25803,19 @@ pub const DB = struct {
         };
     }
 
+    /// Capability probe for the single-root native destination adapter. Raft
+    /// roots must use their ordered owner; a local handle cannot bypass it.
+    pub fn nativeSourceAdmissionNamespace(self: *DB) ![24]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeSourceAdmissionNamespace", .{self});
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.core.identity_namespace.table_id == 0) return error.OnlineSourceScopeChanged;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        _ = try @import("../source_authority.zig").require(&read, .native, namespace);
+        return namespace;
+    }
+
     pub fn sourceAdmissionStatus(self: *DB, command: @import("../source_admission.zig").Command) !@import("../source_admission.zig").Status {
         if (comptime storage_engine.enabled) return storage_engine.call("sourceAdmissionStatus", .{ self, command });
         if (self.isClosed()) return error.StorageUnavailable;
@@ -26113,6 +26126,9 @@ pub const DB = struct {
         if (req.source_admission) |command| {
             var source_read = try self.core.store.beginProbeTxn();
             defer source_read.abort();
+            // This command owns one root-local source head. An ordered Raft
+            // participant needs the distinct distributed source protocol.
+            _ = try @import("../source_authority.zig").require(&source_read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
             const source_plan = try source_admission_mod.prepare(source_arena.allocator(), &source_read, self.core.identity_namespace.table_id, txn_id, command);
             for (source_plan.writes) |write| try intents.append(preparation_alloc, .{ .key = write.key, .value = write.value });
             for (source_plan.deletes) |key| try intents.append(preparation_alloc, .{ .key = key, .value = null });

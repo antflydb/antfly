@@ -43898,6 +43898,176 @@ fn implementationTests() type {
             try std.testing.expect(released.committed.coordinator_table_name == null);
         }
 
+        test "bound source admission actor recovers real native and metadata stores after lost replies" {
+            const delivery = @import("../metadata/source_delivery.zig");
+            const native = @import("../metadata/native_source_delivery.zig");
+            const control = @import("../metadata/source_control.zig");
+            const Store = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
+            const Context = struct {
+                cancellation: db_mod.types.CancellationToken = .none,
+                pub fn ensureActive(_: @This()) !void {}
+            };
+            const Service = struct {
+                store: *Store,
+                metadata_group_id: u64 = @import("antfly_local_sources").common_group_ids.main_metadata_group_id,
+                revision: u64 = 0,
+                lose_accept_ack: bool = false,
+                lost: bool = false,
+                pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, version: u16) !void {
+                    try std.testing.expectEqual(control.protocol_version, version);
+                }
+                pub fn ensureLinearizableReadWithContext(_: *@This(), _: Context) !void {}
+                pub fn projectedStore(self: *@This()) ?*Store {
+                    return self.store;
+                }
+                pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: anytype) !u64 {
+                    try self.store.applyStandaloneCommand(self.metadata_group_id, .{ .apply_source_control = command.apply_source_control });
+                    var write = try control.parseWrite(std.testing.allocator, command.apply_source_control);
+                    defer write.deinit();
+                    self.lost = self.lose_accept_ack and write.value.mutation == .accept;
+                    self.revision += 1;
+                    return self.revision;
+                }
+                pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: Context) !void {
+                    if (self.lost) return error.TestLostMetadataReply;
+                }
+            };
+            const Adapter = struct {
+                inner: native.Adapter,
+                lose_reply: bool = true,
+                block_release: bool = false,
+                admissions: usize = 0,
+                pub fn validateScope(self: *@This(), scope: control.Scope) !void {
+                    return self.inner.validateScope(scope);
+                }
+                pub fn plan(self: *@This(), a: std.mem.Allocator, scope: control.Scope, input: delivery.Input, table: distributed_txn.TableCommitRequest) !delivery.Plan {
+                    return self.inner.plan(a, scope, input, table);
+                }
+                pub fn resolve(self: *@This(), a: std.mem.Allocator, scope: control.Scope, pending: control.Reservation, request: Context) !?delivery.Acceptance {
+                    return self.inner.resolve(a, scope, pending, request);
+                }
+                pub fn admit(self: *@This(), a: std.mem.Allocator, scope: control.Scope, pending: control.Reservation, table: distributed_txn.TableCommitRequest, request: Context) !delivery.Acceptance {
+                    self.admissions += 1;
+                    const result = try self.inner.admit(a, scope, pending, table, request);
+                    if (self.lose_reply) return error.TestLostDestinationReply;
+                    return result;
+                }
+                pub fn inspect(self: *@This(), a: std.mem.Allocator, scope: control.Scope, receipt: []const u8) !delivery.ReceiptIdentity {
+                    return self.inner.inspect(a, scope, receipt);
+                }
+                pub fn release(self: *@This(), a: std.mem.Allocator, scope: control.Scope, receipt: []const u8, request: Context) !void {
+                    if (self.block_release) return error.TestReleaseUnavailable;
+                    return self.inner.release(a, scope, receipt, request);
+                }
+            };
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/delivery-native", .{tmp.sub_path});
+            defer a.free(path);
+            const meta_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/delivery-metadata", .{tmp.sub_path});
+            defer a.free(meta_path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native };
+            var db = try db_mod.DB.open(a, path, options);
+            defer db.close();
+            try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"count\":0}" }}, .sync_level = .write });
+            var bound = BoundTableWriteSource.init("docs", &db);
+            var metadata_store = try Store.init(a, .{ .root_dir = meta_path });
+            defer metadata_store.deinit();
+            var svc: Service = .{ .store = &metadata_store };
+            const config = "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]";
+            try metadata_store.applyStandaloneCommand(svc.metadata_group_id, .{ .upsert_table = .{ .table_id = 7, .name = "docs", .schema_json = "{}", .replication_sources_json = config } });
+            var adapter: Adapter = .{ .inner = try native.Adapter.init(bound.source(), "docs") };
+            const scope: control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = try control.definitionDigest(a, config, 0), .provider = @splat(3), .destination = .native, .destination_binding = native.binding(adapter.inner.namespace) };
+            var catalog: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(config, &catalog, .{});
+            var input: delivery.Input = .{ .batch_id = "one", .checkpoint = "cp", .payload_digest = @splat(4), .accepted_at_ns = 20_000 };
+            var table: distributed_txn.TableCommitRequest = .{ .table_name = "docs", .transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }} };
+            try std.testing.expectError(error.TestLostDestinationReply, delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{}));
+            db.close();
+            metadata_store.deinit();
+            db = try db_mod.DB.open(a, path, options);
+            metadata_store = try Store.init(a, .{ .root_dir = meta_path });
+            bound = BoundTableWriteSource.init("renamed-docs", &db);
+            adapter.inner = try native.Adapter.init(bound.source(), "renamed-docs");
+            var recovered = try delivery.recover(&svc, &adapter, a, scope, catalog, Context{});
+            try std.testing.expectEqual(@as(u64, 1), recovered.value.committed.sequence);
+            try std.testing.expect(recovered.value.pending == null);
+            recovered.deinit();
+            table.table_name = "renamed-docs";
+            input.accepted_at_ns = 999_000;
+            var duplicate = try delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{});
+            duplicate.deinit();
+            try std.testing.expectEqual(@as(usize, 1), adapter.admissions);
+            input.payload_digest = @splat(5);
+            try std.testing.expectError(error.SourcePayloadConflict, delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{}));
+            input.batch_id = "two";
+            input.expected_checkpoint = "cp";
+            adapter.lose_reply = false;
+            svc.lose_accept_ack = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{}));
+            adapter.block_release = true;
+            try std.testing.expectError(error.TestReleaseUnavailable, delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{}));
+            adapter.block_release = false;
+            svc.lose_accept_ack = false;
+            var final = try delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{});
+            defer final.deinit();
+            try std.testing.expectEqual(@as(u64, 2), final.value.committed.sequence);
+            try std.testing.expectEqual(@as(usize, 2), adapter.admissions);
+            // Progress-only polls still commit the source checkpoint in the
+            // destination transaction, without inventing a document mutation.
+            input.batch_id = "progress-only";
+            input.expected_checkpoint = "cp";
+            input.checkpoint = "cp3";
+            input.payload_digest = @splat(6);
+            input.accepted_at_ns += 1;
+            table.transforms = &.{};
+            var progress_only = try delivery.deliver(&svc, &adapter, a, scope, catalog, input, table, Context{});
+            defer progress_only.deinit();
+            try std.testing.expectEqual(@as(u64, 3), progress_only.value.committed.sequence);
+            try std.testing.expectEqualStrings("cp3", progress_only.value.committed.checkpoint);
+            try std.testing.expectEqual(@as(usize, 3), adapter.admissions);
+            var row = (try db.lookup(a, "counter", .{})).?;
+            defer row.deinit(a);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, row.json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("count").?.integer);
+            // Reordering the current catalog relocates this same source; it
+            // cannot reset its checkpoint or allocate a new delivery identity.
+            const moved_config = "[{\"type\":\"postgres\",\"postgres_table\":\"other\"},{\"type\":\"postgres\",\"postgres_table\":\"users\"}]";
+            try metadata_store.applyStandaloneCommand(svc.metadata_group_id, .{ .upsert_table = .{ .table_id = 7, .name = "renamed-docs", .schema_json = "{}", .replication_sources_json = moved_config } });
+            var moved = scope;
+            moved.source_ordinal = 1;
+            std.crypto.hash.sha2.Sha256.hash(moved_config, &catalog, .{});
+            var relocated = try delivery.recover(&svc, &adapter, a, moved, catalog, Context{});
+            defer relocated.deinit();
+            try std.testing.expectEqual(@as(u32, 1), relocated.value.scope.?.source_ordinal);
+            try std.testing.expectEqual(@as(u64, 3), relocated.value.committed.sequence);
+            try std.testing.expectEqualStrings("cp3", relocated.value.committed.checkpoint);
+            try std.testing.expectEqual(@as(usize, 3), adapter.admissions);
+            // Namespace capability rejects a stale/recreated immutable target.
+            var wrong = scope;
+            wrong.table_id = 8;
+            try std.testing.expectError(error.SourceBindingConflict, adapter.inner.validateScope(wrong));
+        }
+
+        test "bound source admission capability rejects unscoped and Raft-owned roots" {
+            const native = @import("../metadata/native_source_delivery.zig");
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            for (0..2) |i| {
+                const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-capability-{d}", .{ tmp.sub_path, i });
+                defer a.free(path);
+                var options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } };
+                if (i == 1) options.online_source_authority = .raft;
+                var db = try db_mod.DB.open(a, path, options);
+                defer db.close();
+                var bound = BoundTableWriteSource.init("docs", &db);
+                try std.testing.expectError(error.OnlineSourceScopeChanged, native.Adapter.init(bound.source(), "docs"));
+            }
+        }
+
         test "bound single-group batch reports prepared intent conflicts" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
