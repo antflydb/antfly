@@ -71,6 +71,12 @@ pub const Reader = struct {
     /// `{"<artifact>": value|null}` (asset: parsed JSON or text; chunk:
     /// array of payloads; embedding: vector).
     artifacts_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8, names: []const []const u8) anyerror![]u8 = null,
+    /// Storage-engine evaluation of lowered row filters (`{"row":...}` tree
+    /// nodes). Required when a declaration has any.
+    row_filter: ?ctx.RowFilter = null,
+    /// A full public `QueryRequest` against a table, hits in rank order with
+    /// stored documents (at most `k`).
+    request_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, request_json: []const u8, k: u32) anyerror!Page = null,
     /// Ranked retrieval (full-text relevance or vector k-NN), rank order.
     search_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, query: SearchQuery) anyerror!Page = null,
 
@@ -252,6 +258,19 @@ pub fn scanFilterJsonAlloc(alloc: Allocator, bound: *const ctx.Bound) ![]u8 {
             try out.appendSlice(alloc, "}}");
         }
     }
+    // Lowered row filters at the top of the residual tree are exactly what
+    // the storage scan evaluates; artifact fields are not in stored rows.
+    if (residual) |params| if (params == .object) if (params.object.get("x")) |tree| if (tree == .array) {
+        for (tree.array.items) |node| {
+            if (node != .object) continue;
+            const row = node.object.get("row") orelse continue;
+            const text = try std.json.Stringify.valueAlloc(a, row, .{});
+            if (std.mem.indexOf(u8, text, ctx.artifacts_prefix) != null) continue;
+            if (pushed != 0) try out.append(alloc, ',');
+            pushed += 1;
+            try out.appendSlice(alloc, text);
+        }
+    };
     if (pushed == 0) {
         out.clearRetainingCapacity();
         return try out.toOwnedSlice(alloc);
@@ -439,9 +458,9 @@ fn resolveQuery(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ct
                 if (seen.contains(row.key)) continue;
                 // Equality prefilter first: artifact reads only for candidates.
                 const plain = try std.json.parseFromSliceLeaky(std.json.Value, a, row.value, .{});
-                if (source.artifact_names.len == 0 and !try ctx.rowMatches(a, bound, plain)) continue;
+                if (source.artifact_names.len == 0 and !try ctx.rowMatchesKeyed(a, bound, row.key, plain, reader.row_filter)) continue;
                 const parsed = if (source.artifact_names.len == 0) plain else try logicalRow(a, reader, source, row.key, row.value);
-                if (source.artifact_names.len != 0 and !try ctx.rowMatches(a, bound, parsed)) continue;
+                if (source.artifact_names.len != 0 and !try ctx.rowMatchesKeyed(a, bound, row.key, parsed, reader.row_filter)) continue;
                 const key = try a.dupe(u8, row.key);
                 try seen.put(a, key, {});
                 try matches.append(a, .{ .key = key, .row = parsed });
@@ -550,9 +569,14 @@ fn resolveGraph(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ct
 fn resolveSearch(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ctx.Bound) ![]ctx.ConsumedInput {
     const source = bound.source;
     if (bound.unsatisfiable) return &.{};
-    const search_fn = reader.search_fn orelse return error.ContextSearchUnavailable;
     const s = source.search;
-    var page = try search_fn(reader.ptr, alloc, source.table_id, .{ .text = bound.search_text, .text_field = s.text_field, .vector = bound.query_vector, .vector_index = s.vector_index, .k = s.k });
+    var page = if (s.request.len != 0) blk: {
+        const request_fn = reader.request_fn orelse return error.ContextSearchUnavailable;
+        break :blk try request_fn(reader.ptr, alloc, source.table_id, bound.search_request, s.k);
+    } else blk: {
+        const search_fn = reader.search_fn orelse return error.ContextSearchUnavailable;
+        break :blk try search_fn(reader.ptr, alloc, source.table_id, .{ .text = bound.search_text, .text_field = s.text_field, .vector = bound.query_vector, .vector_index = s.vector_index, .k = s.k });
+    };
     defer page.deinit(alloc);
     var members = std.ArrayListUnmanaged(ctx.ConsumedInput).empty;
     for (page.rows[0..@min(page.rows.len, s.k)], 0..) |row, rank| {
@@ -574,8 +598,11 @@ pub const MemoryTables = struct {
     /// table_id -> sorted rows
     tables: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(Row)) = .empty,
     queries: usize = 0,
+    /// Last bound `QueryRequest` received (owned).
+    last_request: ?[]u8 = null,
 
     pub fn deinit(self: *MemoryTables) void {
+        if (self.last_request) |r| self.alloc.free(r);
         for (self.tables.values()) |*rows| {
             for (rows.items) |row| {
                 self.alloc.free(row.key);
@@ -611,7 +638,7 @@ pub const MemoryTables = struct {
     }
 
     pub fn reader(self: *MemoryTables, own: []const u8) Reader {
-        return .{ .ptr = self, .own_table_id = own, .lookup_fn = lookup, .query_fn = query, .frontier_fn = frontier, .edges_fn = edges, .search_fn = search, .artifacts_fn = artifacts };
+        return .{ .ptr = self, .own_table_id = own, .lookup_fn = lookup, .query_fn = query, .frontier_fn = frontier, .edges_fn = edges, .search_fn = search, .artifacts_fn = artifacts, .request_fn = request };
     }
 
     /// Edges are rows of table "edges:<graph_index>" keyed "<source>|<type>|<target>".
@@ -685,6 +712,25 @@ pub const MemoryTables = struct {
         return .{ .rows = try out.toOwnedSlice(alloc), .exhausted = true };
     }
 
+    /// Stand-in query engine: rows containing `semantic_search`, up to `k`.
+    fn request(p: *anyopaque, alloc: Allocator, table_id: []const u8, request_json: []const u8, k: u32) anyerror!Page {
+        const self: *MemoryTables = @ptrCast(@alignCast(p));
+        if (self.last_request) |r| self.alloc.free(r);
+        self.last_request = try self.alloc.dupe(u8, request_json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, request_json, .{});
+        defer parsed.deinit();
+        const text = parsed.value.object.get("semantic_search").?.string;
+        var out = std.ArrayListUnmanaged(Row).empty;
+        errdefer out.deinit(alloc);
+        const rows = self.rowsFor(if (table_id.len == 0) "own" else table_id) orelse return .{ .rows = &.{}, .exhausted = true };
+        for (rows.items) |row| {
+            if (out.items.len >= k) break;
+            if (std.mem.indexOf(u8, row.value, text) == null) continue;
+            try out.append(alloc, .{ .key = try alloc.dupe(u8, row.key), .value = try alloc.dupe(u8, row.value) });
+        }
+        return .{ .rows = try out.toOwnedSlice(alloc), .exhausted = true };
+    }
+
     fn rowsFor(self: *MemoryTables, table_id: []const u8) ?*std.ArrayListUnmanaged(Row) {
         return self.tables.getPtr(table_id);
     }
@@ -731,7 +777,7 @@ fn testConfig(alloc: Allocator) !ctx.Config {
         }
     };
     var dummy: u8 = 0;
-    const stored = try ctx.canonicalFromPublicAlloc(alloc, value, null, .{ .ptr = &dummy, .resolve_fn = Resolve.resolve });
+    const stored = try ctx.canonicalFromPublicAlloc(alloc, value, null, .{ .ptr = &dummy, .resolve_fn = Resolve.resolve }, null);
     defer alloc.free(stored);
     return ctx.parseStoredJson(alloc, stored);
 }
@@ -894,4 +940,36 @@ test "context reads generated artifacts as fields and predicates" {
         "{\"policies\":{\"count\":1,\"members\":[{\"key\":\"p1\",\"value\":{\"_artifacts.summary\":\"short summary\",\"title\":\"one\"}}]}}",
         r.rendered.json,
     );
+}
+
+test "snapshot sources run a full bound QueryRequest through the host query engine" {
+    const alloc = testing.allocator;
+    var tables = MemoryTables{ .alloc = alloc };
+    defer tables.deinit();
+    for ([_][2][]const u8{ .{ "n1", "{\"title\":\"a solar\"}" }, .{ "n2", "{\"title\":\"b wind\"}" }, .{ "n3", "{\"title\":\"c solar\"}" } }) |r| try tables.put("own", r[0], r[1]);
+    var config = try ctx.parsePublicJson(alloc,
+        \\{"hybrid":{"search":{"request":{"semantic_search":{"$source":"/topic"},"indexes":["emb"],
+        \\  "full_text_search":{"match":{"$source":"/topic"},"field":"title"},"merge_config":{"strategy":"rrf"},
+        \\  "filter_query":{"field":"lang","term":"en"},"limit":1}},"fields":["title"],"tracking":"snapshot"}}
+    , "");
+    defer config.deinit();
+    try testing.expectEqual(@as(u32, 1), config.sources[0].search.k);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var bindings = try ctx.bindForKeyAlloc(alloc, &config, "dep", try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"topic\":\"solar\"}", .{}));
+    defer bindings.deinit();
+    var r = try resolveAlloc(alloc, tables.reader(""), &bindings, .{});
+    defer r.deinit(alloc);
+    try testing.expect(r.snapshot);
+    try testing.expectEqualStrings("{\"hybrid\":{\"count\":1,\"members\":[{\"key\":\"n1\",\"rank\":1,\"value\":{\"title\":\"a solar\"}}],\"tracking\":\"snapshot\"}}", r.rendered.json);
+    // Every `$source` was substituted before the host saw the request.
+    try testing.expect(std.mem.indexOf(u8, tables.last_request.?, "$source") == null);
+    try testing.expect(std.mem.indexOf(u8, tables.last_request.?, "\"match\":\"solar\"") != null);
+    // Requests must be snapshots, and may not page or retarget.
+    try testing.expectError(error.UnsupportedContextPredicate, ctx.parsePublicJson(alloc,
+        \\{"h":{"search":{"request":{"semantic_search":"x"}},"fields":["t"]}}
+    , ""));
+    try testing.expectError(error.UnsupportedContextPredicate, ctx.parsePublicJson(alloc,
+        \\{"h":{"search":{"request":{"semantic_search":"x","offset":10}},"fields":["t"],"tracking":"snapshot"}}
+    , ""));
 }

@@ -154995,6 +154995,59 @@ test "db context sources index match tokens and cosine similarity pivots" {
     }
 }
 
+fn contextSourcesTestLoweredDeclarationAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    const ctx_mod = @import("enrichment/context_sources.zig");
+    // Stand-in for the API's lowering: `wildcard` into its stored-row form.
+    const Lower = struct {
+        fn lower(_: ?*anyopaque, a: Allocator, v: std.json.Value) anyerror![]u8 {
+            const pattern = v.object.get("wildcard") orelse return error.UnsupportedQueryRequest;
+            return std.fmt.allocPrint(a, "{{\"wildcard\":{{\"path\":\"{s}\",\"pattern\":{f}}}}}", .{ v.object.get("field").?.string, std.json.fmt(pattern, .{}) });
+        }
+    };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    var config = try ctx_mod.parsePublicValueWith(alloc, parsed.value, null, .{ .lowering = .{ .lower_fn = Lower.lower } });
+    defer config.deinit();
+    return config.canonicalJsonAlloc(alloc);
+}
+
+test "db context sources evaluate antfly filter trees with storage row filters" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("context-sources-filter-tree");
+    defer tmp.cleanup();
+    var producer = GateAssetProducer{};
+    producer.allowAll();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const declaration = try contextSourcesTestLoweredDeclarationAlloc(alloc,
+        \\{"peers":{"query":{"filter_query":{"bool":{"filter":[{"field":"org","term":{"$source":"/org"}}],
+        \\  "must_not":[{"field":"sku","wildcard":{"$source":"/hide"}}]}}},"fields":["title"],"max_documents":10}}
+    );
+    defer alloc.free(declaration);
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .context_sources_json = declaration });
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+    try db.initOptionalEnrichmentRuntime(&config);
+    _ = try db.advanceContextShadowBackfill(64);
+    try db.batch(.{ .writes = &.{
+        .{ .key = "n:1", .value = "{\"org\":\"o\",\"sku\":\"US-1\",\"title\":\"a\"}" },
+        .{ .key = "doc:a", .value = "{\"body\":\"hello\",\"org\":\"o\",\"hide\":\"EU-*\"}" },
+    }, .sync_level = .write });
+    try contextSourcesTestCatchUp(&db);
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    // Excluded by the storage-evaluated `must_not`: nothing to rebuild.
+    try db.batch(.{ .writes = &.{.{ .key = "n:2", .value = "{\"org\":\"o\",\"sku\":\"EU-2\",\"title\":\"b\"}" }}, .sync_level = .write });
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    try db.batch(.{ .writes = &.{.{ .key = "n:3", .value = "{\"org\":\"o\",\"sku\":\"US-3\",\"title\":\"c\"}" }}, .sync_level = .write });
+    try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    try contextSourcesTestCatchUp(&db);
+    var state = (try db.contextDependencyState(alloc, "doc:a", "summary")).?;
+    defer state.deinit(alloc);
+    const manifest = (try db.contextDependencyManifest(alloc, "doc:a", "summary", state.published_version)).?;
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "n:3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "n:2") == null);
+}
+
 test "db context sources publish snapshot context as unverified with scheduled refresh" {
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("context-sources-snapshot");

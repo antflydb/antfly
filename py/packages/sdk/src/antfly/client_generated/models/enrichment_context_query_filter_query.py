@@ -11,13 +11,18 @@ T = TypeVar("T", bound="EnrichmentContextQueryFilterQuery")
 
 @_attrs_define
 class EnrichmentContextQueryFilterQuery:
-    """`{"conjuncts":[...]}` (or one bare conjunct) of: `term`/`terms` (equality, indexed subscriptions; at most one bound
-    `terms` set), `range` (`gt`/`gte`/`lt`/`lte`, numbers or strings such as ISO dates), `prefix`, `match` (filter-mode
-    full-text with `operator` and|or, evaluated with the pinned `antfly.context.simple.v1` analyzer: lowercase ASCII
-    words), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document
-    field; `model` names the embedding space and is part of the declaration). Values are literals or typed bindings
-    `{"$source":"/json/pointer"}` from the source document. Disjunctions, scored full-text, fuzzy/regex, and nearest-k
-    are rejected for live tracking.
+    """An Antfly `filter_query` (Query shape): `bool` (`must`/`filter`/`should`/`must_not`/`minimum_should_match`, filter-
+    context semantics), `conjuncts`, `disjuncts` (`min`), `match_all`, `match_none`, and leaves. Leaves evaluated by
+    context resolution itself: `term`/`terms` (equality; at the top of the conjunction they form indexed subscriptions,
+    at most one bound `terms` set), `range` (`gt`/`gte`/`lt`/`lte`), `numeric_range`/`term_range`
+    (`min`/`max`/`inclusive_*`), `prefix`, `match` and `match_phrase` (pinned `antfly.context.simple.v1` analyzer:
+    lowercase ASCII words; `operator` and|or), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}`
+    over a vector stored in a document field). Every other row-decidable leaf (wildcard, regexp, fuzzy, date and IP
+    ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches`) is lowered at admission into the storage
+    engine's per-row filter and evaluated per changed row. Values are literals or typed bindings
+    `{"$source":"/json/pointer"}` from the source document (in storage-evaluated leaves, string-valued positions only).
+    Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected for live
+    tracking; use a snapshot `search.request`.
 
     """
 

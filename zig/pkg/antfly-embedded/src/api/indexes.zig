@@ -20,6 +20,16 @@ pub const managed_embedder = @import("../inference/managed_embedder.zig");
 pub const document_content_hash = @import("../storage/db/document_content_hash.zig");
 pub const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 pub const context_sources = @import("../storage/db/enrichment/context_sources.zig");
+
+/// Lowers storage-evaluated `filter_query` clauses of live context sources
+/// with the same normalization queries use.
+pub fn contextFilterLowering() context_sources.FilterLowering {
+    return .{ .lower_fn = struct {
+        fn lower(_: ?*anyopaque, alloc: std.mem.Allocator, value: std.json.Value) anyerror![]u8 {
+            return @import("query_contract.zig").lowerPublicFilterToRowFilterAlloc(alloc, value);
+        }
+    }.lower };
+}
 /// Deterministic topological order, including chunk -> media-output -> chunk
 /// pipelines. Kind/name order only breaks ties between independent producers.
 /// External dependencies are left to catalog validation or the installed DB.
@@ -132,7 +142,7 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                             // Public objects are canonicalized here; the raw
                             // stored form is never accepted alongside them.
                             if (owned.context_sources_json.len > 0) return error.InvalidEnrichmentConfig;
-                            owned.context_sources_json = context_sources.canonicalFromPublicAlloc(alloc, sources, item.object.get("refresh"), null) catch |err| switch (err) {
+                            owned.context_sources_json = context_sources.canonicalFromPublicAlloc(alloc, sources, item.object.get("refresh"), null, contextFilterLowering()) catch |err| switch (err) {
                                 error.OutOfMemory => return err,
                                 else => return error.InvalidEnrichmentConfig,
                             };

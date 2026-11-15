@@ -638,6 +638,8 @@ pub fn planApplyNotice(
 pub const SourceLookup = struct {
     ptr: *anyopaque,
     lookup_fn: *const fn (ptr: *anyopaque, artifact: []const u8, spec: Digest) ?*const ctx.Source,
+    /// Storage evaluation of lowered row filters (absent: notify).
+    row_filter: ?ctx.RowFilter = null,
 };
 
 const RelevanceContext = struct {
@@ -652,7 +654,7 @@ const RelevanceContext = struct {
         const self: *RelevanceContext = @ptrCast(@alignCast(p));
         if (self.prev_unknown or residual.len == 0) return true;
         const source = self.sources.lookup_fn(self.sources.ptr, artifact, self.notice.spec) orelse return true;
-        return ctx.subscriberRelevant(self.alloc, source, residual, self.notice.key, self.prev, self.next);
+        return ctx.subscriberRelevant(self.alloc, source, residual, self.notice.key, self.prev, self.next, self.sources.row_filter);
     }
 };
 

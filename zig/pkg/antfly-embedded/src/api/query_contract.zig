@@ -13534,6 +13534,51 @@ fn parseInternalFilterQueryJsonAlloc(
     }
 }
 
+/// Lower one public filter clause into the stored-row filter that the
+/// storage engine evaluates per document (`PreparedPatternFilter`), for
+/// live context sources. Clauses that need a text index are rejected.
+pub fn lowerPublicFilterToRowFilterAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var structured = std.ArrayListUnmanaged([]u8).empty;
+    defer deinitOwnedStringArrayList(alloc, &structured);
+    var text = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+    defer deinitTextQueryArrayList(alloc, &text);
+    try appendPublicFilterOrTextClausesAlloc(alloc, &structured, &text, value, 10_000);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var clauses: usize = 0;
+    try out.appendSlice(alloc, "{\"conjuncts\":[");
+    for (structured.items) |clause| {
+        if (clauses != 0) try out.append(alloc, ',');
+        clauses += 1;
+        try out.appendSlice(alloc, clause);
+    }
+    for (text.items) |query| {
+        if (clauses != 0) try out.append(alloc, ',');
+        clauses += 1;
+        try appendPatternFilterQueryValue(alloc, &out, query, true);
+    }
+    try out.appendSlice(alloc, "]}");
+    if (clauses == 0) return error.UnsupportedQueryRequest;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+    defer parsed.deinit();
+    try db_mod.validateStructuredFilterValueAlloc(alloc, parsed.value);
+    if (rowFilterNeedsTextIndex(parsed.value)) return error.UnsupportedQueryRequest;
+    return out.toOwnedSlice(alloc);
+}
+
+fn rowFilterNeedsTextIndex(value: std.json.Value) bool {
+    switch (value) {
+        .object => |o| {
+            inline for (.{ "match", "match_phrase", "query_string", "multi_match" }) |key| if (o.get(key) != null) return true;
+            var it = o.iterator();
+            while (it.next()) |entry| if (rowFilterNeedsTextIndex(entry.value_ptr.*)) return true;
+        },
+        .array => |array| for (array.items) |item| if (rowFilterNeedsTextIndex(item)) return true,
+        else => {},
+    }
+    return false;
+}
+
 fn mergeInternalFilterJsonAlloc(
     alloc: std.mem.Allocator,
     public_json: []const u8,
@@ -21069,4 +21114,31 @@ test "api query contract structured dollar projection never exposes internal fie
     defer a.free(wire);
     try std.testing.expect(std.mem.indexOf(u8, wire, "private-proof") == null);
     try std.testing.expect(std.mem.indexOf(u8, wire, "_resolution_work") == null);
+}
+
+test "api query contract lowers live context filters into stored-row filters" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"wildcard":"EU-*","field":"sku"}
+        ,
+        \\{"field":"tags","equals":"blue"}
+        ,
+        \\{"min_lat":1,"min_lon":1,"max_lat":2,"max_lon":2,"field":"loc"}
+        ,
+        \\{"cidr":"10.0.0.0/8","field":"ip"}
+        ,
+        \\{"bool":true,"field":"active"}
+    }) |raw| {
+        var value = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer value.deinit();
+        const lowered = lowerPublicFilterToRowFilterAlloc(alloc, value.value) catch |err| {
+            std.debug.print("lowering {s}: {s}\n", .{ raw, @errorName(err) });
+            return err;
+        };
+        defer alloc.free(lowered);
+        try std.testing.expect(std.mem.indexOf(u8, lowered, "conjuncts") != null);
+    }
+    var match = try std.json.parseFromSlice(std.json.Value, alloc, "{\"match\":\"solar\",\"field\":\"t\"}", .{});
+    defer match.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, lowerPublicFilterToRowFilterAlloc(alloc, match.value));
 }

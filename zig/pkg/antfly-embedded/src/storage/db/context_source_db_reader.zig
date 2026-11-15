@@ -30,6 +30,14 @@ const context_resolution = @import("enrichment/context_resolution.zig");
 const context_sources = @import("enrichment/context_sources.zig");
 const graph_mod = @import("../../graph/graph.zig");
 
+/// Storage-engine evaluation of a lowered context row filter (the same
+/// per-document matcher stored scans use).
+pub const row_filter: context_sources.RowFilter = .{ .matches_fn = matchesRowFilter };
+
+fn matchesRowFilter(_: ?*anyopaque, alloc: Allocator, filter: std.json.Value, key: []const u8, row: std.json.Value) anyerror!bool {
+    return @import("query/graph_exec.zig").jsonDocMatchesPatternFilter(alloc, key, row, filter);
+}
+
 pub fn ownTable(comptime DB: type, db: *DB, own_table_id: []const u8) context_resolution.Reader {
     const Impl = Adapter(DB);
     return .{
@@ -37,6 +45,7 @@ pub fn ownTable(comptime DB: type, db: *DB, own_table_id: []const u8) context_re
         .own_table_id = own_table_id,
         .lookup_fn = Impl.lookupOwn,
         .query_fn = Impl.queryOwn,
+        .row_filter = row_filter,
         .frontier_fn = Impl.frontierOwn,
         .edges_fn = Impl.edgesOwn,
         .artifacts_fn = Impl.artifactsOwn,
@@ -264,12 +273,20 @@ pub fn Registry(comptime DB: type) type {
         own: *DB,
         own_table_id: []const u8,
         resolve_fn: *const fn (ptr: *anyopaque, table_id: []const u8) ?*DB,
+        /// Host query engine for snapshot sources declaring a full public
+        /// `QueryRequest` (parsing it needs the API layer).
+        request_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, db: *DB, request_json: []const u8, k: u32) anyerror!context_resolution.Page = null,
 
         const Self = @This();
         const Impl = Adapter(DB);
 
         pub fn reader(self: *Self) context_resolution.Reader {
-            return .{ .ptr = self, .own_table_id = self.own_table_id, .lookup_fn = lookupImpl, .query_fn = queryImpl, .frontier_fn = frontierImpl, .edges_fn = edgesImpl, .search_fn = searchImpl, .artifacts_fn = artifactsImpl };
+            return .{ .ptr = self, .own_table_id = self.own_table_id, .lookup_fn = lookupImpl, .query_fn = queryImpl, .row_filter = row_filter, .frontier_fn = frontierImpl, .edges_fn = edgesImpl, .search_fn = searchImpl, .artifacts_fn = artifactsImpl, .request_fn = if (self.request_fn != null) requestImpl else null };
+        }
+
+        fn requestImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, request_json: []const u8, k: u32) anyerror!context_resolution.Page {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.request_fn.?(self.ptr, alloc, try self.target(table_id), request_json, k);
         }
 
         fn target(self: *Self, table_id: []const u8) !*DB {

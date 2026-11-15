@@ -856,6 +856,28 @@ Code map (`zig/pkg/antfly-embedded/src/storage/db/`):
 
 ### Which queries can be tracked live
 
+A live `query` source takes Antfly's own `filter_query` shape: `bool`
+(`must`, `filter`, `should`, `must_not`, `minimum_should_match`, with the
+storage engine's filter-context semantics), `conjuncts`, `disjuncts`, and
+leaves, with `$source` bindings in place of literals. Native leaves (`term`,
+`terms`, ranges, `prefix`, `match`, `match_phrase`, `similar`) are evaluated
+by context resolution; the members of the top-level conjunction index
+subscriptions as described below. Every other row-decidable leaf (wildcard,
+regexp, fuzzy, date and IP ranges, geo, bool fields, `exists`, doc ids,
+`equals`/`contains`/`matches`) is lowered once at admission, by the same
+normalization queries use, into the storage engine's per-document filter.
+That filter is stored with the declaration and evaluated for every changed
+row on the dependent side (`PreparedPatternFilter`), and pushed into the
+resolution scan. Everything outside the top-level conjunction is a residual
+tree evaluated per subscriber, so negations and disjunctions stay exact. The
+public form of the declaration is kept verbatim for reads.
+
+Snapshot `search` sources take either the shorthands or a full public
+`QueryRequest` (`search.request`): scored full-text, semantic and hybrid
+search, rerankers, filters, and ordering, with `$source` bindings anywhere.
+The host's query engine runs the bound request; members render in rank order
+and publish `unverified`.
+
 A predicate is admitted for live tracking only when a single row's
 membership can be decided from that row alone, so a changed row's previous
 and next values determine exactly which dependents change:
@@ -869,7 +891,9 @@ and next values determine exactly which dependents change:
 | `order_by` top-N | yes | interval blocks from the recorded boundary; relevant only if the row ranks at or above it (ties by key) |
 | `graph`, depth 1-3 | yes | adjacency tuple per visited node plus document tuple per member; generated and field-derived edges with `include_generated` |
 | `_artifacts.<name>` fields and predicates | yes | logical rows include generated artifacts; generated records stage notices |
-| scored full-text, nearest-k, hybrid, reranked | snapshot only | membership is relative to the corpus |
+| `bool`/`should`/`must_not`/`disjuncts` | yes | residual tree evaluated per subscriber on the previous and next row |
+| wildcard, regexp, fuzzy, date/IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches` | yes | lowered at admission to the storage per-row filter; evaluated per subscriber and pushed into resolution scans |
+| scored full-text, `query_string`, `multi_match`, nearest-k, hybrid, reranked | snapshot only (`search.request`) | membership is relative to the corpus |
 
 Equality conjuncts build the tuple a dependent subscribes to. Every other
 conjunct is *residual*: the dependent's resolved parameters (range bounds,

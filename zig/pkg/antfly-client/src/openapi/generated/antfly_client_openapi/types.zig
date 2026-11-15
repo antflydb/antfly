@@ -15684,7 +15684,7 @@ pub const EnrichmentContextGraph = struct {
 pub const EnrichmentContextQuery = struct {
     /// Table queried; omitted means the enrichment's own table.
     table: ?[]const u8 = null,
-    /// `{"conjuncts":[...]}` (or one bare conjunct) of: `term`/`terms` (equality, indexed subscriptions; at most one bound `terms` set), `range` (`gt`/`gte`/`lt`/`lte`, numbers or strings such as ISO dates), `prefix`, `match` (filter-mode full-text with `operator` and|or, evaluated with the pinned `antfly.context.simple.v1` analyzer: lowercase ASCII words), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document field; `model` names the embedding space and is part of the declaration). Values are literals or typed bindings `{"$source":"/json/pointer"}` from the source document. Disjunctions, scored full-text, fuzzy/regex, and nearest-k are rejected for live tracking.
+    /// An Antfly `filter_query` (Query shape): `bool` (`must`/`filter`/`should`/`must_not`/`minimum_should_match`, filter-context semantics), `conjuncts`, `disjuncts` (`min`), `match_all`, `match_none`, and leaves. Leaves evaluated by context resolution itself: `term`/`terms` (equality; at the top of the conjunction they form indexed subscriptions, at most one bound `terms` set), `range` (`gt`/`gte`/`lt`/`lte`), `numeric_range`/`term_range` (`min`/`max`/`inclusive_*`), `prefix`, `match` and `match_phrase` (pinned `antfly.context.simple.v1` analyzer: lowercase ASCII words; `operator` and|or), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document field). Every other row-decidable leaf (wildcard, regexp, fuzzy, date and IP ranges, geo, bool fields, `exists`, doc ids, `equals`/`contains`/`matches`) is lowered at admission into the storage engine's per-row filter and evaluated per changed row. Values are literals or typed bindings `{"$source":"/json/pointer"}` from the source document (in storage-evaluated leaves, string-valued positions only). Corpus-relative text queries (`query_string`, `multi_match`, analyzer-specific `match`) are rejected for live tracking; use a snapshot `search.request`.
     filter_query: std.json.ArrayHashMap(std.json.Value),
     /// Top-N by a field (ties by key); `max_documents` is N. Invalidation tracks the current boundary.
     order_by: ?std.json.Value = null,
@@ -15720,9 +15720,11 @@ pub const EnrichmentContextQuery = struct {
     }
 };
 
-/// Ranked retrieval (requires `tracking: snapshot`): either full-text relevance (`text` + `text_field`) or dense k-NN (`vector` binding + `vector_index`). Members render in rank order.
+/// Ranked retrieval (requires `tracking: snapshot`): a full `request`, or the shorthands full-text relevance (`text` + `text_field`) or dense k-NN (`vector` binding + `vector_index`). Members render in rank order.
 pub const EnrichmentContextSearch = struct {
     table: ?[]const u8 = null,
+    /// A full public QueryRequest (`full_text_search`, `semantic_search` with `indexes`, hybrid `merge_config`, `reranker`, `filter_query`, `exclusion_query`, `order_by`, `graph_queries`, ...) with `{"$source":"/pointer"}` bindings anywhere, executed by the table's query engine. `limit` (at most 1000) is the member count. `table`, paging (`offset`, `search_after`, `search_before`), `count`, and `aggregations` are rejected.
+    request: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Query text literal or `{"$source":"/pointer"}`.
     text: OpenApiOptionalNullable(std.json.Value) = .absent,
     text_field: ?[]const u8 = null,
@@ -15734,6 +15736,7 @@ pub const EnrichmentContextSearch = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "table", "table", true },
+        .{ "request", "request", true },
         .{ "text", "text", false },
         .{ "text_field", "text_field", true },
         .{ "vector", "vector", true },
@@ -15753,6 +15756,10 @@ pub const EnrichmentContextSearch = struct {
         try jw.beginObject();
         if (self.table) |value| {
             try jw.objectField("table");
+            try jw.write(value);
+        }
+        if (self.request) |value| {
+            try jw.objectField("request");
             try jw.write(value);
         }
         switch (self.text) {

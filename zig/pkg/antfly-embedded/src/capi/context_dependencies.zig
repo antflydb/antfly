@@ -108,9 +108,45 @@ fn registryFor(root: *h.Handle, db: *db_mod.DB, identity: []const u8) !resolutio
         if (existing.registry.own == db and std.mem.eql(u8, existing.registry.own_table_id, identity)) return existing.registry.reader();
     }
     const host = try root.alloc.create(Host);
-    host.* = .{ .handle = root, .registry = .{ .ptr = root, .own = db, .own_table_id = try root.alloc.dupe(u8, identity), .resolve_fn = resolveDb } };
+    host.* = .{ .handle = root, .registry = .{ .ptr = root, .own = db, .own_table_id = try root.alloc.dupe(u8, identity), .resolve_fn = resolveDb, .request_fn = executeRequest } };
     try root.context_dependency_hosts.append(root.alloc, host);
     return host.registry.reader();
+}
+
+fn tableNameForDb(root: *h.Handle, db: *db_mod.DB) ?[]const u8 {
+    if (db == &root.db) return "default";
+    var it = root.embedded_tables.iterator();
+    while (it.next()) |entry| if (&entry.value_ptr.*.db == db) return entry.key_ptr.*;
+    return null;
+}
+
+/// Snapshot sources with a full public `QueryRequest`: parse it like
+/// `antfly_db_query` does and return the ranked hits with stored documents.
+fn executeRequest(ptr: *anyopaque, alloc: std.mem.Allocator, db: *db_mod.DB, request_json: []const u8, k: u32) anyerror!resolution.Page {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    const name = tableNameForDb(root, db) orelse return error.ContextSourceTableUnavailable;
+    var semantic = @import("db.zig").LiteSemanticResolver{ .handle = root };
+    var owned = try h.query_api.parsePublicQueryRequest(alloc, if (root.lite_profile == .native) semantic.resolver() else null, name, request_json);
+    defer owned.deinit(alloc);
+    owned.req.include_stored = true;
+    owned.req.include_all_fields = true;
+    if (owned.req.limit == 0 or owned.req.limit > k) owned.req.limit = k;
+    var result = try db.search(alloc, owned.req);
+    defer result.deinit();
+    var rows = std.ArrayListUnmanaged(resolution.Row).empty;
+    errdefer {
+        for (rows.items) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        rows.deinit(alloc);
+    }
+    for (result.hits) |hit| {
+        const value = if (hit.stored_data) |data| try alloc.dupe(u8, data) else (try db.get(alloc, hit.id)) orelse continue;
+        errdefer alloc.free(value);
+        try rows.append(alloc, .{ .key = try alloc.dupe(u8, hit.id), .value = value });
+    }
+    return .{ .rows = try rows.toOwnedSlice(alloc), .exhausted = true };
 }
 
 pub fn deinitHosts(handle: *h.Handle) void {
@@ -182,7 +218,7 @@ pub fn resolveEnrichment(handle: *h.Handle, alloc: std.mem.Allocator, raw_json: 
     defer parsed.deinit();
     if (parsed.value != .object) return;
     const resolved: ?[]u8 = if (parsed.value.object.get("context_sources")) |sources|
-        (if (sources == .null) null else try ctx.canonicalFromPublicAlloc(alloc, sources, parsed.value.object.get("refresh"), resolver(handle)))
+        (if (sources == .null) null else try ctx.canonicalFromPublicAlloc(alloc, sources, parsed.value.object.get("refresh"), resolver(handle), @import("../api/indexes.zig").contextFilterLowering()))
     else if (cfg.context_sources_json.len != 0)
         try ctx.reresolveStoredAlloc(alloc, cfg.context_sources_json, resolver(handle))
     else

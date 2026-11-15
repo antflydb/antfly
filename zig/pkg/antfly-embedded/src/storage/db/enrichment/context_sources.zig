@@ -134,7 +134,12 @@ pub const Conjunct = struct {
     match_operator: MatchOperator = .@"and",
     similarity: Similarity = .{},
 
-    pub const Op = enum { term, terms, range, prefix, match, similar };
+    pub const Op = enum { term, terms, range, prefix, match, phrase, similar };
+
+    /// Public operator key (`phrase` is spelled `match_phrase`).
+    pub fn opName(op: Op) []const u8 {
+        return if (op == .phrase) "match_phrase" else @tagName(op);
+    }
 
     pub fn isBound(self: Conjunct) bool {
         return self.source_pointer.len != 0;
@@ -173,6 +178,10 @@ pub const SearchSpec = struct {
     /// `$source` pointer to the query vector in the dependent row.
     vector_from: []const u8 = "",
     k: u32 = 10,
+    /// A full public `QueryRequest` (scored full-text, semantic, hybrid
+    /// merge, rerankers, filters, order) with `$source` bindings anywhere,
+    /// executed by the host's query engine. `limit` is `k`.
+    request: []const u8 = "",
 };
 
 pub const Source = struct {
@@ -188,6 +197,14 @@ pub const Source = struct {
     key_from: []const u8 = "",
     /// `query` only.
     conjuncts: []const Conjunct = &.{},
+    /// `query` only: canonical predicate tree for everything that is not a
+    /// top-level native conjunct (disjunctions, negations, nested clauses,
+    /// and storage-evaluated row filters), as a JSON array whose members must
+    /// all match. Empty when the filter is a plain conjunction.
+    tree: []const u8 = "",
+    /// `query` only: the declaration's public `filter_query` when `tree` is
+    /// non-empty (row-filter nodes are stored lowered, not in public shape).
+    public_filter: []const u8 = "",
     /// `query` only: top-N by a field (ties by key). `max_documents` is N.
     order_by: ?OrderBy = null,
     graph: GraphSpec = .{},
@@ -231,7 +248,7 @@ pub const Source = struct {
                 hashField(&h, @field(c.range, name).literal);
                 hashField(&h, @field(c.range, name).pointer);
             }
-            if (c.op == .match) {
+            if (c.op == .match or c.op == .phrase) {
                 hashField(&h, match_analyzer);
                 hashField(&h, @tagName(c.match_operator));
             }
@@ -242,6 +259,10 @@ pub const Source = struct {
                 hashField(&h, c.similarity.model);
             }
             hashField(&h, "|");
+        }
+        if (self.tree.len != 0) {
+            hashField(&h, "tree");
+            hashField(&h, self.tree);
         }
         if (self.order_by) |o| {
             hashField(&h, o.field);
@@ -260,6 +281,7 @@ pub const Source = struct {
             hashField(&h, self.search.text_field);
             hashField(&h, self.search.vector_index);
             hashField(&h, self.search.vector_from);
+            hashField(&h, self.search.request);
         }
         for (self.fields) |field| hashField(&h, field);
         var out: Digest = undefined;
@@ -278,7 +300,7 @@ pub const Source = struct {
     /// Whether invalidation needs per-subscriber evaluation of the changed
     /// row (residual predicates or a top-N boundary).
     pub fn hasResidual(self: Source) bool {
-        if (self.order_by != null) return true;
+        if (self.order_by != null or self.tree.len != 0) return true;
         for (self.conjuncts) |c| if (!c.isEquality()) return true;
         return false;
     }
@@ -398,6 +420,54 @@ fn appendOperand(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), operand: Op
     } else try out.appendSlice(alloc, operand.literal);
 }
 
+fn appendConjunctJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), c: Conjunct) !void {
+    try out.appendSlice(alloc, "{\"field\":");
+    try appendJsonString(alloc, out, c.field);
+    try out.append(alloc, ',');
+    switch (c.op) {
+        .term, .terms, .prefix, .match, .phrase => {
+            try appendJsonString(alloc, out, Conjunct.opName(c.op));
+            try out.append(alloc, ':');
+            if (c.isBound()) {
+                try appendOperand(alloc, out, .{ .pointer = c.source_pointer });
+            } else if (c.op == .terms) {
+                try out.append(alloc, '[');
+                for (c.literals, 0..) |lit, j| {
+                    if (j != 0) try out.append(alloc, ',');
+                    try out.appendSlice(alloc, lit);
+                }
+                try out.append(alloc, ']');
+            } else try out.appendSlice(alloc, c.literals[0]);
+            if (c.op == .match) {
+                try out.appendSlice(alloc, ",\"operator\":");
+                try appendJsonString(alloc, out, @tagName(c.match_operator));
+            }
+        },
+        .range => {
+            try out.appendSlice(alloc, "\"range\":{");
+            var first = true;
+            inline for (.{ "gt", "gte", "lt", "lte" }) |name| {
+                const operand = @field(c.range, name);
+                if (operand.present()) {
+                    if (!first) try out.append(alloc, ',');
+                    first = false;
+                    try out.appendSlice(alloc, "\"" ++ name ++ "\":");
+                    try appendOperand(alloc, out, operand);
+                }
+            }
+            try out.append(alloc, '}');
+        },
+        .similar => {
+            try out.appendSlice(alloc, "\"similar\":{\"vector\":");
+            try appendOperand(alloc, out, .{ .pointer = c.source_pointer });
+            try out.print(alloc, ",\"threshold\":{d},\"metric\":\"{s}\",\"dims\":{d},\"model\":", .{ c.similarity.threshold, @tagName(c.similarity.metric), c.similarity.dims });
+            try appendJsonString(alloc, out, c.similarity.model);
+            try out.append(alloc, '}');
+        },
+    }
+    try out.append(alloc, '}');
+}
+
 fn appendSourceJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), source: Source, with_identity: bool) !void {
     try out.append(alloc, '{');
     switch (source.kind) {
@@ -411,56 +481,23 @@ fn appendSourceJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), source: 
         .query => {
             try out.appendSlice(alloc, "\"query\":{");
             try appendTableJson(alloc, out, source, with_identity);
-            try out.appendSlice(alloc, "\"filter_query\":{\"conjuncts\":[");
-            for (source.conjuncts, 0..) |c, i| {
-                if (i != 0) try out.append(alloc, ',');
-                try out.appendSlice(alloc, "{\"field\":");
-                try appendJsonString(alloc, out, c.field);
-                try out.append(alloc, ',');
-                switch (c.op) {
-                    .term, .terms, .prefix, .match => {
-                        try appendJsonString(alloc, out, @tagName(c.op));
-                        try out.append(alloc, ':');
-                        if (c.isBound()) {
-                            try appendOperand(alloc, out, .{ .pointer = c.source_pointer });
-                        } else if (c.op == .terms) {
-                            try out.append(alloc, '[');
-                            for (c.literals, 0..) |lit, j| {
-                                if (j != 0) try out.append(alloc, ',');
-                                try out.appendSlice(alloc, lit);
-                            }
-                            try out.append(alloc, ']');
-                        } else try out.appendSlice(alloc, c.literals[0]);
-                        if (c.op == .match) {
-                            try out.appendSlice(alloc, ",\"operator\":");
-                            try appendJsonString(alloc, out, @tagName(c.match_operator));
-                        }
-                    },
-                    .range => {
-                        try out.appendSlice(alloc, "\"range\":{");
-                        var first = true;
-                        inline for (.{ "gt", "gte", "lt", "lte" }) |name| {
-                            const operand = @field(c.range, name);
-                            if (operand.present()) {
-                                if (!first) try out.append(alloc, ',');
-                                first = false;
-                                try out.appendSlice(alloc, "\"" ++ name ++ "\":");
-                                try appendOperand(alloc, out, operand);
-                            }
-                        }
-                        try out.append(alloc, '}');
-                    },
-                    .similar => {
-                        try out.appendSlice(alloc, "\"similar\":{\"vector\":");
-                        try appendOperand(alloc, out, .{ .pointer = c.source_pointer });
-                        try out.print(alloc, ",\"threshold\":{d},\"metric\":\"{s}\",\"dims\":{d},\"model\":", .{ c.similarity.threshold, @tagName(c.similarity.metric), c.similarity.dims });
-                        try appendJsonString(alloc, out, c.similarity.model);
-                        try out.append(alloc, '}');
-                    },
+            if (!with_identity and source.public_filter.len != 0) {
+                try out.appendSlice(alloc, "\"filter_query\":");
+                try out.appendSlice(alloc, source.public_filter);
+            } else {
+                try out.appendSlice(alloc, "\"filter_query\":{\"conjuncts\":[");
+                for (source.conjuncts, 0..) |c, i| {
+                    if (i != 0) try out.append(alloc, ',');
+                    try appendConjunctJson(alloc, out, c);
                 }
-                try out.append(alloc, '}');
+                try out.appendSlice(alloc, "]}");
             }
-            try out.appendSlice(alloc, "]}");
+            if (with_identity and source.tree.len != 0) {
+                try out.appendSlice(alloc, ",\"filter_tree\":");
+                try out.appendSlice(alloc, source.tree);
+                try out.appendSlice(alloc, ",\"public_filter\":");
+                try out.appendSlice(alloc, source.public_filter);
+            }
             if (source.order_by) |o| {
                 try out.appendSlice(alloc, ",\"order_by\":{\"field\":");
                 try appendJsonString(alloc, out, o.field);
@@ -492,6 +529,11 @@ fn appendSourceJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), source: 
             try out.appendSlice(alloc, "\"search\":{");
             try appendTableJson(alloc, out, source, with_identity);
             var first = true;
+            if (q.request.len != 0) {
+                first = false;
+                try out.appendSlice(alloc, "\"request\":");
+                try out.appendSlice(alloc, q.request);
+            }
             if (q.text.present()) {
                 first = false;
                 try out.appendSlice(alloc, "\"text\":");
@@ -569,6 +611,24 @@ pub fn parseStoredJson(alloc: Allocator, raw: []const u8) Error!Config {
 /// fields and unsupported predicates are rejected at admission so a typo can
 /// never silently widen or drop a dependency.
 pub fn parsePublicValue(alloc: Allocator, sources_value: std.json.Value, refresh_value: ?std.json.Value, allow_identity: bool) Error!Config {
+    return parsePublicValueWith(alloc, sources_value, refresh_value, .{ .allow_identity = allow_identity });
+}
+
+/// Lowers a public filter clause into the stored-row filter the storage
+/// engine evaluates per document (`PreparedPatternFilter`). Supplied by the
+/// API layer at declaration time; clauses it cannot lower are rejected.
+pub const FilterLowering = struct {
+    ptr: ?*anyopaque = null,
+    lower_fn: *const fn (ptr: ?*anyopaque, alloc: Allocator, public_filter: std.json.Value) anyerror![]u8,
+};
+
+pub const ParseOptions = struct {
+    /// Stored (canonical) form: identities and lowered trees are trusted.
+    allow_identity: bool = false,
+    lowering: ?FilterLowering = null,
+};
+
+pub fn parsePublicValueWith(alloc: Allocator, sources_value: std.json.Value, refresh_value: ?std.json.Value, opts: ParseOptions) Error!Config {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -579,7 +639,7 @@ pub fn parsePublicValue(alloc: Allocator, sources_value: std.json.Value, refresh
     var it = sources_value.object.iterator();
     var i: usize = 0;
     while (it.next()) |entry| : (i += 1) {
-        sources[i] = try parseSource(a, entry.key_ptr.*, entry.value_ptr.*, allow_identity);
+        sources[i] = try parseSource(a, entry.key_ptr.*, entry.value_ptr.*, opts);
     }
     std.mem.sort(Source, sources, {}, struct {
         fn lt(_: void, l: Source, r: Source) bool {
@@ -634,7 +694,7 @@ fn uintField(field: std.json.Value, min: u64, max: u64) Error!u64 {
     return v;
 }
 
-fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, allow_identity: bool) Error!Source {
+fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, opts: ParseOptions) Error!Source {
     if (!validName(name)) return error.InvalidContextSourcesConfig;
     if (value != .object) return error.InvalidContextSourcesConfig;
     var source = Source{ .name = try a.dupe(u8, name), .kind = .document };
@@ -653,7 +713,7 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, allow_iden
             seen_target = true;
             if (field != .object) return error.InvalidContextSourcesConfig;
             source.kind = k;
-            try parseTarget(a, &source, field.object, allow_identity);
+            try parseTarget(a, &source, field.object, opts);
         } else if (std.mem.eql(u8, key, "fields")) {
             if (field != .array or field.array.items.len == 0 or field.array.items.len > max_fields)
                 return error.InvalidContextSourcesConfig;
@@ -704,8 +764,10 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, allow_iden
         if (std.mem.eql(u8, field, fields.items[idx - 1])) return error.InvalidContextSourcesConfig;
     }
     source.fields = fields.items;
+    const tree_fields = try treeFieldsAlloc(a, source.tree);
     var relevant = std.ArrayListUnmanaged([]const u8).empty;
     try relevant.appendSlice(a, fields.items);
+    try relevant.appendSlice(a, tree_fields);
     for (source.conjuncts) |c| if (!c.isEquality()) try relevant.append(a, c.field);
     if (source.order_by) |o| try relevant.append(a, o.field);
     for (source.conjuncts) |c| if (c.isEquality()) try relevant.append(a, c.field);
@@ -718,6 +780,7 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, allow_iden
     // before; equality fields were only needed to collect artifact names.
     var trimmed = std.ArrayListUnmanaged([]const u8).empty;
     try trimmed.appendSlice(a, fields.items);
+    try trimmed.appendSlice(a, tree_fields);
     for (source.conjuncts) |c| if (!c.isEquality()) try trimmed.append(a, c.field);
     if (source.order_by) |o| try trimmed.append(a, o.field);
     sortUniqueStrings(&trimmed);
@@ -725,7 +788,8 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, allow_iden
     return source;
 }
 
-fn parseTarget(a: Allocator, source: *Source, object: std.json.ObjectMap, allow_identity: bool) Error!void {
+fn parseTarget(a: Allocator, source: *Source, object: std.json.ObjectMap, opts: ParseOptions) Error!void {
+    const allow_identity = opts.allow_identity;
     var it = object.iterator();
     var seen_filter = false;
     while (it.next()) |entry| {
@@ -744,7 +808,17 @@ fn parseTarget(a: Allocator, source: *Source, object: std.json.ObjectMap, allow_
             } else return error.InvalidContextSourcesConfig,
             .query => if (std.mem.eql(u8, key, "filter_query")) {
                 seen_filter = true;
-                source.conjuncts = try parseFilter(a, field);
+                const parsed = try parseFilter(a, field, opts);
+                source.conjuncts = parsed.conjuncts;
+                if (parsed.tree.len != 0) {
+                    source.tree = parsed.tree;
+                    source.public_filter = try stringifyAlloc(a, field);
+                }
+            } else if (allow_identity and std.mem.eql(u8, key, "filter_tree")) {
+                if (field != .array) return error.InvalidContextSourcesConfig;
+                source.tree = if (field.array.items.len == 0) "" else try stringifyAlloc(a, field);
+            } else if (allow_identity and std.mem.eql(u8, key, "public_filter")) {
+                source.public_filter = try stringifyAlloc(a, field);
             } else if (std.mem.eql(u8, key, "order_by")) {
                 source.order_by = try parseOrderBy(a, field);
             } else return error.InvalidContextSourcesConfig,
@@ -756,6 +830,8 @@ fn parseTarget(a: Allocator, source: *Source, object: std.json.ObjectMap, allow_
         .document => if (source.key_from.len == 0) return error.InvalidContextSourcesConfig,
         .query => {
             if (!seen_filter) return error.InvalidContextSourcesConfig;
+            if (source.conjuncts.len == 0 and source.tree.len == 0) return error.UnsupportedContextPredicate;
+            if (source.tree.len == 0) source.public_filter = "";
             var similar: usize = 0;
             for (source.conjuncts) |c| if (c.op == .similar) {
                 similar += 1;
@@ -767,6 +843,10 @@ fn parseTarget(a: Allocator, source: *Source, object: std.json.ObjectMap, allow_
             const s = source.search;
             const has_text = s.text.present();
             const has_vector = s.vector_from.len != 0;
+            if (s.request.len != 0) {
+                if (has_text or has_vector) return error.InvalidContextSourcesConfig;
+                return;
+            }
             if (has_text == has_vector) return error.InvalidContextSourcesConfig;
             if (has_text and s.text_field.len == 0) return error.InvalidContextSourcesConfig;
             if (has_vector and s.vector_index.len == 0) return error.InvalidContextSourcesConfig;
@@ -839,6 +919,15 @@ fn parseSearchField(a: Allocator, s: *SearchSpec, key: []const u8, field: std.js
         s.vector_index = try a.dupe(u8, field.string);
     } else if (std.mem.eql(u8, key, "k")) {
         s.k = @intCast(try uintField(field, 1, max_search_k));
+    } else if (std.mem.eql(u8, key, "request")) {
+        if (field != .object) return error.InvalidContextSourcesConfig;
+        // The source names the table; paging would make membership a window
+        // of a moving ranking.
+        inline for (.{ "table", "offset", "search_after", "search_before", "count", "aggregations" }) |forbidden| {
+            if (field.object.get(forbidden) != null) return error.UnsupportedContextPredicate;
+        }
+        if (field.object.get("limit")) |limit| s.k = @intCast(try uintField(limit, 1, max_search_k));
+        s.request = try stringifyAlloc(a, field);
     } else return error.InvalidContextSourcesConfig;
 }
 
@@ -849,20 +938,58 @@ fn parseOperand(a: Allocator, value: std.json.Value, allow_literal: bool) Error!
     return .{ .literal = lit };
 }
 
-/// Admitted grammar: `{"conjuncts":[...]}` or a single bare conjunct, where a
-/// conjunct is `term`, `terms`, `range`, `prefix`, `match` (filter-mode, no
-/// scoring), or `similar` (similarity threshold). Disjunctions, scored
-/// full-text, and nearest-k retrieval are rejected for live tracking.
-fn parseFilter(a: Allocator, value: std.json.Value) Error![]const Conjunct {
+const ParsedFilter = struct {
+    conjuncts: []const Conjunct,
+    tree: []const u8,
+};
+
+pub const max_tree_nodes: usize = 128;
+const max_tree_depth: usize = 16;
+/// `$source` bindings inside lowered row filters travel as this string
+/// prefix plus the pointer, replaced by the bound value at binding time.
+pub const row_binding_prefix = "$source:";
+
+/// Admitted grammar: Antfly's `filter_query` Query shape. `bool`
+/// (`must`/`filter`/`should`/`must_not`/`minimum_should_match`),
+/// `conjuncts`, `disjuncts` (`min`), `match_all`, and `match_none` compose
+/// clauses. Native clauses are evaluated by context resolution itself:
+/// `term`, `terms`, `range` (`gt`/`gte`/`lt`/`lte`), `numeric_range` and
+/// `term_range` (`min`/`max`/`inclusive_*`), `prefix`, `match` and
+/// `match_phrase` (pinned analyzer), and `similar`. Every other row-decidable
+/// clause (wildcard, regexp, fuzzy, date/IP ranges, geo, `bool` fields,
+/// `exists`, `doc_id`, `equals`/`contains`/`matches`) is lowered once by the
+/// API into a storage row filter and evaluated per row by the storage
+/// engine. Native clauses at the top level of the conjunction index
+/// subscriptions; everything else is a per-subscriber residual. Clauses whose
+/// membership depends on the corpus (scored full-text, `query_string`,
+/// `multi_match`, nearest-k) are rejected for live tracking.
+fn parseFilter(a: Allocator, value: std.json.Value, opts: ParseOptions) Error!ParsedFilter {
     if (value != .object) return error.UnsupportedContextPredicate;
+    var top = std.ArrayListUnmanaged(std.json.Value).empty;
+    try flattenAnd(a, value, &top);
     var list = std.ArrayListUnmanaged(Conjunct).empty;
-    if (value.object.get("conjuncts")) |conjuncts| {
-        if (value.object.count() != 1) return error.UnsupportedContextPredicate;
-        if (conjuncts != .array or conjuncts.array.items.len == 0 or conjuncts.array.items.len > max_conjuncts)
-            return error.UnsupportedContextPredicate;
-        for (conjuncts.array.items) |item| try list.append(a, try parseConjunct(a, item));
-    } else {
-        try list.append(a, try parseConjunct(a, value));
+    var rest = std.ArrayListUnmanaged(u8).empty;
+    var nodes: usize = 0;
+    for (top.items) |item| {
+        if (nativeConjunct(a, item)) |c| {
+            if (list.items.len < max_conjuncts) {
+                try list.append(a, c);
+                continue;
+            }
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidContextSourcesConfig => return error.InvalidContextSourcesConfig,
+            else => {},
+        }
+        try rest.append(a, if (rest.items.len == 0) '[' else ',');
+        try appendTreeNode(a, &rest, item, opts, 0, &nodes);
+    }
+    var tree: []const u8 = "";
+    if (rest.items.len != 0) {
+        try rest.append(a, ']');
+        // One canonical encoding, identical to the stored form's re-parse.
+        const value_tree = std.json.parseFromSliceLeaky(std.json.Value, a, rest.items, .{}) catch return error.InvalidContextSourcesConfig;
+        tree = try stringifyAlloc(a, value_tree);
     }
     // Canonical member order: conjunction is commutative, so sort by field
     // then operator so equivalent declarations share one identity.
@@ -882,11 +1009,296 @@ fn parseFilter(a: Allocator, value: std.json.Value) Error![]const Conjunct {
     // A dependent subscribes to the cartesian product of its bound sets; one
     // bound set keeps that linear in the bound values.
     if (bound_sets > 1) return error.UnsupportedContextPredicate;
-    return list.items;
+    return .{ .conjuncts = list.items, .tree = tree };
+}
+
+/// Top-level conjunction members (nested `conjuncts`, and `bool` with only
+/// `must`/`filter`, are flattened).
+fn flattenAnd(a: Allocator, value: std.json.Value, out: *std.ArrayListUnmanaged(std.json.Value)) Error!void {
+    if (value != .object) return error.UnsupportedContextPredicate;
+    const o = value.object;
+    if (o.get("conjuncts")) |items| {
+        if (items != .array) return error.UnsupportedContextPredicate;
+        for (items.array.items) |item| try flattenAnd(a, item, out);
+        return;
+    }
+    if (o.get("bool")) |body| if (body == .object) {
+        const b = body.object;
+        var required: usize = 0;
+        inline for (.{ "must", "filter" }) |name| if (b.get(name)) |items| {
+            if (items != .array) return error.UnsupportedContextPredicate;
+            required += items.array.items.len;
+        };
+        if (required != 0) {
+            for ([_][]const u8{ "must", "filter" }) |name| if (b.get(name)) |items| {
+                for (items.array.items) |item| try flattenAnd(a, item, out);
+            };
+            // The optional/negated part stays one residual clause, with the
+            // effective `should` minimum made explicit (the required members
+            // it was relative to are now separate conjuncts).
+            const should_len: usize = if (b.get("should")) |sv| (if (sv == .array) sv.array.items.len else return error.UnsupportedContextPredicate) else 0;
+            var min: usize = 0;
+            if (b.get("minimum_should_match") orelse b.get("min_should")) |m| min = @intCast(try uintField(m, 0, should_len));
+            var rest: std.json.ObjectMap = .empty;
+            if (min > 0) {
+                try rest.put(a, "should", b.get("should").?);
+                try rest.put(a, "minimum_should_match", .{ .integer = @intCast(min) });
+            }
+            if (b.get("must_not")) |mn| try rest.put(a, "must_not", mn);
+            if (rest.count() != 0) {
+                var wrapper: std.json.ObjectMap = .empty;
+                try wrapper.put(a, "bool", .{ .object = rest });
+                try out.append(a, .{ .object = wrapper });
+            }
+            return;
+        }
+    };
+    try out.append(a, value);
+}
+
+/// A native clause, or an error when the clause is not one.
+fn nativeConjunct(a: Allocator, value: std.json.Value) Error!Conjunct {
+    if (value != .object) return error.UnsupportedContextPredicate;
+    // `case_insensitive` term/prefix and fuzzy `term` queries are storage
+    // clauses, not native equality.
+    if (value.object.get("case_insensitive")) |ci| if (ci != .bool or ci.bool) return error.UnsupportedContextPredicate;
+    inline for (.{ "fuzziness", "prefix_length" }) |name| if (value.object.get(name) != null) return error.UnsupportedContextPredicate;
+    return parseConjunct(a, value);
+}
+
+fn isNativeTextClause(value: std.json.Value) bool {
+    if (value != .object) return false;
+    inline for (.{ "match", "match_phrase", "similar" }) |name| if (value.object.get(name) != null) return true;
+    return false;
+}
+
+fn appendTreeNode(a: Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value, opts: ParseOptions, depth: usize, nodes: *usize) Error!void {
+    nodes.* += 1;
+    if (nodes.* > max_tree_nodes or depth > max_tree_depth) return error.ContextBudgetExceeded;
+    if (value != .object) return error.UnsupportedContextPredicate;
+    const o = value.object;
+    // Already canonical (stored trees are re-validated through this path).
+    if (opts.allow_identity) {
+        if (o.get("row")) |row| {
+            if (o.count() != 1 or row != .object) return error.InvalidContextSourcesConfig;
+            try out.appendSlice(a, "{\"row\":");
+            try appendCanonicalValue(a, out, row);
+            try out.append(a, '}');
+            return;
+        }
+    }
+    if (o.get("match_all") != null and o.count() <= 2) return out.appendSlice(a, "{\"all\":true}");
+    if (o.get("match_none") != null and o.count() <= 2) return out.appendSlice(a, "{\"none\":true}");
+    if (o.get("conjuncts")) |items| {
+        if (items != .array or items.array.items.len == 0) return error.UnsupportedContextPredicate;
+        return appendTreeList(a, out, "and", items.array.items, null, opts, depth, nodes);
+    }
+    if (o.get("disjuncts")) |items| {
+        if (items != .array or items.array.items.len == 0) return error.UnsupportedContextPredicate;
+        const min: usize = if (o.get("min")) |m| @intCast(try uintField(m, 0, items.array.items.len)) else 1;
+        return appendTreeList(a, out, "or", items.array.items, @max(min, 1), opts, depth, nodes);
+    }
+    const bool_body: ?std.json.ObjectMap = if (o.get("bool")) |b| (if (b == .object) b.object else return error.UnsupportedContextPredicate) else if (o.get("must") != null or o.get("should") != null or o.get("must_not") != null or (o.get("filter") != null and o.get("field") == null)) o else null;
+    if (bool_body) |b| return appendBoolNode(a, out, b, opts, depth, nodes);
+    if (nativeConjunct(a, value)) |c| {
+        return appendConjunctJson(a, out, c);
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => if (isNativeTextClause(value)) return err,
+    }
+    return appendRowNode(a, out, value, opts);
+}
+
+fn appendTreeList(a: Allocator, out: *std.ArrayListUnmanaged(u8), op: []const u8, items: []const std.json.Value, min: ?usize, opts: ParseOptions, depth: usize, nodes: *usize) Error!void {
+    try out.appendSlice(a, "{\"");
+    try out.appendSlice(a, op);
+    try out.appendSlice(a, "\":[");
+    for (items, 0..) |item, i| {
+        if (i != 0) try out.append(a, ',');
+        try appendTreeNode(a, out, item, opts, depth + 1, nodes);
+    }
+    try out.append(a, ']');
+    if (min) |m| try out.print(a, ",\"min\":{d}", .{m});
+    try out.append(a, '}');
+}
+
+/// `bool` in filter context: `must` and `filter` are required; `should`
+/// needs `minimum_should_match` members (at least one when nothing else is
+/// required); `must_not` excludes. Mirrors the storage engine's semantics.
+fn appendBoolNode(a: Allocator, out: *std.ArrayListUnmanaged(u8), b: std.json.ObjectMap, opts: ParseOptions, depth: usize, nodes: *usize) Error!void {
+    var it = b.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const known = for ([_][]const u8{ "must", "filter", "should", "must_not", "minimum_should_match", "min_should", "boost" }) |k| {
+            if (std.mem.eql(u8, k, key)) break true;
+        } else false;
+        if (!known) return error.UnsupportedContextPredicate;
+    }
+    const Clause = struct {
+        fn items(v: ?std.json.Value) Error![]const std.json.Value {
+            const value = v orelse return &.{};
+            return switch (value) {
+                .array => |array| array.items,
+                .object => (&value)[0..1],
+                else => error.UnsupportedContextPredicate,
+            };
+        }
+        fn members(v: ?std.json.Value, comptime key: []const u8) Error![]const std.json.Value {
+            // BooleanQuery wraps clauses in `{"conjuncts":[..]}`/`{"disjuncts":[..]}`.
+            const value = v orelse return &.{};
+            if (value == .object) if (value.object.get(key)) |inner| return items(inner);
+            return items(value);
+        }
+    };
+    var required = std.ArrayListUnmanaged(std.json.Value).empty;
+    try required.appendSlice(a, try Clause.members(b.get("must"), "conjuncts"));
+    try required.appendSlice(a, try Clause.items(b.get("filter")));
+    const should = try Clause.members(b.get("should"), "disjuncts");
+    const must_not = try Clause.members(b.get("must_not"), "disjuncts");
+    const floor: usize = if (required.items.len == 0 and should.len > 0) 1 else 0;
+    var min = floor;
+    if (b.get("minimum_should_match") orelse b.get("min_should")) |m| min = @max(floor, @as(usize, @intCast(try uintField(m, 0, should.len))));
+    if (b.get("should")) |sv| if (sv == .object) if (sv.object.get("min")) |m| {
+        min = @max(floor, @as(usize, @intCast(try uintField(m, 0, should.len))));
+    };
+    var parts: usize = 0;
+    try out.appendSlice(a, "{\"and\":[");
+    for (required.items) |item| {
+        if (parts != 0) try out.append(a, ',');
+        parts += 1;
+        try appendTreeNode(a, out, item, opts, depth + 1, nodes);
+    }
+    if (min > 0) {
+        if (parts != 0) try out.append(a, ',');
+        parts += 1;
+        try appendTreeList(a, out, "or", should, min, opts, depth + 1, nodes);
+    }
+    if (must_not.len != 0) {
+        if (parts != 0) try out.append(a, ',');
+        parts += 1;
+        try appendTreeList(a, out, "not", must_not, null, opts, depth + 1, nodes);
+    }
+    if (parts == 0) try out.appendSlice(a, "{\"all\":true}");
+    try out.appendSlice(a, "]}");
+}
+
+/// Lower one storage-evaluated clause. `$source` bindings travel as
+/// `row_binding_prefix` strings that must survive lowering as whole values.
+fn appendRowNode(a: Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value, opts: ParseOptions) Error!void {
+    const lowering = opts.lowering orelse return error.UnsupportedContextPredicate;
+    var bindings = std.ArrayListUnmanaged([]const u8).empty;
+    const placeheld = try replaceBindingsAlloc(a, value, &bindings);
+    const lowered = lowering.lower_fn(lowering.ptr, a, placeheld) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnsupportedContextPredicate,
+    };
+    const row = std.json.parseFromSliceLeaky(std.json.Value, a, lowered, .{}) catch return error.UnsupportedContextPredicate;
+    if (row != .object) return error.UnsupportedContextPredicate;
+    var found = std.ArrayListUnmanaged([]const u8).empty;
+    try collectRowBindings(a, row, &found);
+    for (bindings.items) |pointer| {
+        const survived = for (found.items) |f| {
+            if (std.mem.eql(u8, f, pointer)) break true;
+        } else false;
+        // A binding the lowering transformed (case folding, escaping into a
+        // pattern) cannot be substituted safely.
+        if (!survived) return error.UnsupportedContextPredicate;
+    }
+    try out.appendSlice(a, "{\"row\":");
+    try appendCanonicalValue(a, out, row);
+    try out.append(a, '}');
+}
+
+fn replaceBindingsAlloc(a: Allocator, value: std.json.Value, bindings: *std.ArrayListUnmanaged([]const u8)) Error!std.json.Value {
+    switch (value) {
+        .object => |o| {
+            if (try sourceBinding(a, value)) |pointer| {
+                try bindings.append(a, pointer);
+                return .{ .string = try std.mem.concat(a, u8, &.{ row_binding_prefix, pointer }) };
+            }
+            var copy: std.json.ObjectMap = .empty;
+            var it = o.iterator();
+            while (it.next()) |entry| try copy.put(a, entry.key_ptr.*, try replaceBindingsAlloc(a, entry.value_ptr.*, bindings));
+            return .{ .object = copy };
+        },
+        .array => |array| {
+            var copy = std.json.Array.init(a);
+            for (array.items) |item| try copy.append(try replaceBindingsAlloc(a, item, bindings));
+            return .{ .array = copy };
+        },
+        .string => |text| {
+            if (std.mem.startsWith(u8, text, row_binding_prefix)) return error.UnsupportedContextPredicate;
+            return value;
+        },
+        else => return value,
+    }
+}
+
+fn collectRowBindings(a: Allocator, value: std.json.Value, out: *std.ArrayListUnmanaged([]const u8)) !void {
+    switch (value) {
+        .object => |o| {
+            var it = o.iterator();
+            while (it.next()) |entry| try collectRowBindings(a, entry.value_ptr.*, out);
+        },
+        .array => |array| for (array.items) |item| try collectRowBindings(a, item, out),
+        .string => |text| if (std.mem.startsWith(u8, text, row_binding_prefix)) try out.append(a, text[row_binding_prefix.len..]),
+        else => {},
+    }
+}
+
+fn stringifyAlloc(a: Allocator, value: std.json.Value) ![]const u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    try appendCanonicalValue(a, &out, value);
+    return out.items;
+}
+
+/// Field paths a canonical tree reads (native leaves and row filters).
+fn treeFieldsAlloc(a: Allocator, tree: []const u8) ![]const []const u8 {
+    if (tree.len == 0) return &.{};
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, tree, .{}) catch return error.InvalidContextSourcesConfig;
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    try collectTreeFields(a, value, false, &out);
+    sortUniqueStrings(&out);
+    return out.items;
+}
+
+fn collectTreeFields(a: Allocator, value: std.json.Value, in_row: bool, out: *std.ArrayListUnmanaged([]const u8)) !void {
+    switch (value) {
+        .object => |o| {
+            var it = o.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                const child = entry.value_ptr.*;
+                if (std.mem.eql(u8, key, "row")) {
+                    try collectTreeFields(a, child, true, out);
+                } else if ((std.mem.eql(u8, key, "field") or (in_row and std.mem.eql(u8, key, "path"))) and child == .string) {
+                    try out.append(a, try pointerToFieldPath(a, child.string));
+                } else try collectTreeFields(a, child, in_row, out);
+            }
+        },
+        .array => |array| for (array.items) |item| try collectTreeFields(a, item, in_row, out),
+        else => {},
+    }
+}
+
+/// `/a/b` (JSON pointer) or `a.b` (dotted) to the dotted form.
+fn pointerToFieldPath(a: Allocator, path: []const u8) ![]const u8 {
+    if (path.len == 0 or path[0] != '/') return a.dupe(u8, path);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    var it = std.mem.splitScalar(u8, path[1..], '/');
+    var first = true;
+    while (it.next()) |segment| {
+        if (!first) try out.append(a, '.');
+        first = false;
+        var buf: [max_pointer_bytes]u8 = undefined;
+        try out.appendSlice(a, unescapePointerToken(&buf, segment) orelse segment);
+    }
+    return out.items;
 }
 
 fn parseConjunct(a: Allocator, value: std.json.Value) Error!Conjunct {
     if (value != .object) return error.UnsupportedContextPredicate;
+    if (value.object.get("min") != null or value.object.get("max") != null) return parseMinMaxRange(a, value.object);
     var field_name: ?[]const u8 = null;
     var conjunct = Conjunct{ .field = "", .op = .term };
     var seen_value = false;
@@ -900,18 +1312,30 @@ fn parseConjunct(a: Allocator, value: std.json.Value) Error!Conjunct {
             field_name = try a.dupe(u8, field.string);
             continue;
         }
+        // Filter context has no scoring.
+        if (std.mem.eql(u8, key, "boost") or std.mem.eql(u8, key, "case_insensitive")) continue;
+        if (std.mem.eql(u8, key, "analyzer")) {
+            // Live `match` evaluates rows with the pinned analyzer only.
+            if (field != .string or !std.mem.eql(u8, field.string, match_analyzer)) return error.UnsupportedContextPredicate;
+            continue;
+        }
         if (std.mem.eql(u8, key, "operator")) {
             if (field != .string) return error.InvalidContextSourcesConfig;
             conjunct.match_operator = std.meta.stringToEnum(MatchOperator, field.string) orelse return error.InvalidContextSourcesConfig;
             seen_operator = true;
             continue;
         }
-        const op = std.meta.stringToEnum(Conjunct.Op, key) orelse return error.UnsupportedContextPredicate;
+        const op: Conjunct.Op = if (std.mem.eql(u8, key, "match_phrase"))
+            .phrase
+        else if (std.mem.eql(u8, key, "phrase"))
+            return error.UnsupportedContextPredicate
+        else
+            std.meta.stringToEnum(Conjunct.Op, key) orelse return error.UnsupportedContextPredicate;
         if (seen_value) return error.UnsupportedContextPredicate;
         seen_value = true;
         conjunct.op = op;
         switch (op) {
-            .term, .prefix, .match => {
+            .term, .prefix, .match, .phrase => {
                 if (try sourceBinding(a, field)) |pointer| {
                     conjunct.source_pointer = pointer;
                 } else {
@@ -991,6 +1415,43 @@ fn parseConjunct(a: Allocator, value: std.json.Value) Error!Conjunct {
     conjunct.field = field_name orelse return error.UnsupportedContextPredicate;
     if (!seen_value) return error.UnsupportedContextPredicate;
     if (seen_operator and conjunct.op != .match) return error.UnsupportedContextPredicate;
+    return conjunct;
+}
+
+/// `numeric_range`/`term_range`: `min` (inclusive by default) and `max`
+/// (exclusive by default), as the storage engine evaluates them.
+fn parseMinMaxRange(a: Allocator, o: std.json.ObjectMap) Error!Conjunct {
+    var conjunct = Conjunct{ .field = "", .op = .range };
+    var inclusive_min = true;
+    var inclusive_max = false;
+    var min: ?Operand = null;
+    var max: ?Operand = null;
+    var it = o.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const v = entry.value_ptr.*;
+        if (std.mem.eql(u8, key, "field")) {
+            if (v != .string or !validFieldPath(v.string)) return error.InvalidContextSourcesConfig;
+            conjunct.field = try a.dupe(u8, v.string);
+        } else if (std.mem.eql(u8, key, "min")) {
+            min = try parseOperand(a, v, true);
+        } else if (std.mem.eql(u8, key, "max")) {
+            max = try parseOperand(a, v, true);
+        } else if (std.mem.eql(u8, key, "inclusive_min")) {
+            if (v != .bool) return error.InvalidContextSourcesConfig;
+            inclusive_min = v.bool;
+        } else if (std.mem.eql(u8, key, "inclusive_max")) {
+            if (v != .bool) return error.InvalidContextSourcesConfig;
+            inclusive_max = v.bool;
+        } else if (!std.mem.eql(u8, key, "boost")) return error.UnsupportedContextPredicate;
+    }
+    if (conjunct.field.len == 0 or (min == null and max == null)) return error.UnsupportedContextPredicate;
+    if (min) |m| {
+        if (inclusive_min) conjunct.range.gte = m else conjunct.range.gt = m;
+    }
+    if (max) |m| {
+        if (inclusive_max) conjunct.range.lte = m else conjunct.range.lt = m;
+    }
     return conjunct;
 }
 
@@ -1098,8 +1559,8 @@ pub const TableResolver = struct {
 /// stored form, resolving every named table through `resolver`. Without a
 /// resolver, named tables stay unresolved and catalog admission rejects them;
 /// unnamed sources target the enrichment's own table.
-pub fn canonicalFromPublicAlloc(alloc: Allocator, sources_value: std.json.Value, refresh_value: ?std.json.Value, resolver: ?TableResolver) ![]u8 {
-    var config = try parsePublicValue(alloc, sources_value, refresh_value, false);
+pub fn canonicalFromPublicAlloc(alloc: Allocator, sources_value: std.json.Value, refresh_value: ?std.json.Value, resolver: ?TableResolver, lowering: ?FilterLowering) ![]u8 {
+    var config = try parsePublicValueWith(alloc, sources_value, refresh_value, .{ .lowering = lowering });
     defer config.deinit();
     try resolveTables(alloc, &config, resolver);
     return config.canonicalJsonAlloc(alloc);
@@ -1357,6 +1818,8 @@ pub const Bound = struct {
     pivot: ?PivotQuery = null,
     /// `search`: query text.
     search_text: []const u8 = "",
+    /// `search` with `request`: the bound `QueryRequest` JSON.
+    search_request: []const u8 = "",
 };
 
 pub const Bindings = struct {
@@ -1678,7 +2141,7 @@ const IndexPlan = struct { kind: IndexKind, conjunct: usize = 0 };
 fn indexPlan(source: *const Source) IndexPlan {
     if (intervalConjunct(source)) |i| return .{ .kind = .interval, .conjunct = i };
     if (source.order_by != null) return .{ .kind = .ordered };
-    for (source.conjuncts, 0..) |c, i| if (c.op == .match) return .{ .kind = .tokens, .conjunct = i };
+    for (source.conjuncts, 0..) |c, i| if (c.op == .match or c.op == .phrase) return .{ .kind = .tokens, .conjunct = i };
     for (source.conjuncts, 0..) |c, i| if (c.op == .similar and c.similarity.metric == .cosine) return .{ .kind = .vector, .conjunct = i };
     return .{ .kind = .equality };
 }
@@ -1874,7 +2337,13 @@ pub fn bindForKeyAlloc(alloc: Allocator, config: *const Config, doc_key: []const
             .query => try bindQuery(a, &bound, source_doc),
             .search => {
                 const s = source.search;
-                if (s.text.present()) {
+                if (s.request.len != 0) {
+                    const template = std.json.parseFromSliceLeaky(std.json.Value, a, s.request, .{}) catch return error.InvalidContextSourcesConfig;
+                    var missing = false;
+                    const bound_request = try substituteBindings(a, template, source_doc, &missing);
+                    if (missing) bound.unsatisfiable = true;
+                    bound.search_request = try stringifyAlloc(a, bound_request);
+                } else if (s.text.present()) {
                     const text = if (s.text.pointer.len != 0) resolvePointer(source_doc, s.text.pointer) else null;
                     bound.search_text = if (text) |t| (if (t == .string) try a.dupe(u8, t.string) else "") else if (s.text.literal.len != 0)
                         try literalString(a, s.text.literal)
@@ -1890,6 +2359,7 @@ pub fn bindForKeyAlloc(alloc: Allocator, config: *const Config, doc_key: []const
                 var h = Sha256.init(.{});
                 h.update(&bound.spec);
                 hashField(&h, bound.search_text);
+                hashField(&h, bound.search_request);
                 h.update(std.mem.sliceAsBytes(bound.query_vector));
                 h.final(&bound.query_identity);
             },
@@ -1998,10 +2468,10 @@ fn bindQuery(a: Allocator, bound: *Bound, source_doc: std.json.Value) !void {
                 try residual.appendSlice(a, if (v[0] == '"') v else "\"\"");
                 try residual.append(a, '}');
             },
-            .match => {
+            .match, .phrase => {
                 const v = (try resolveOperand(a, source_doc, .{ .literal = if (c.literals.len != 0) c.literals[0] else "", .pointer = c.source_pointer })) orelse "null";
                 const text = if (v[0] == '"') try literalString(a, v) else "";
-                const tokens = try tokenizeAlloc(a, text);
+                const tokens = if (c.op == .phrase) try tokenizeOrderedAlloc(a, text) else try tokenizeAlloc(a, text);
                 if (tokens.len == 0) bound.unsatisfiable = true;
                 if (plan.kind == .tokens and plan.conjunct == j) index_tokens = tokens;
                 try residual.appendSlice(a, "{\"t\":[");
@@ -2027,7 +2497,12 @@ fn bindQuery(a: Allocator, bound: *Bound, source_doc: std.json.Value) !void {
             },
         }
     }
-    try residual.appendSlice(a, "]}");
+    try residual.append(a, ']');
+    if (source.tree.len != 0) {
+        try residual.appendSlice(a, ",\"x\":");
+        try residual.appendSlice(a, try bindTreeAlloc(a, source.tree, source_doc));
+    }
+    try residual.append(a, '}');
     bound.values = values;
     if (source.hasResidual()) bound.residual = residual.items;
     var h = Sha256.init(.{});
@@ -2042,7 +2517,9 @@ fn bindQuery(a: Allocator, bound: *Bound, source_doc: std.json.Value) !void {
     if (!bound.unsatisfiable) {
         const bases = try expandTuplesAlloc(a, bound.spec, equality_sets.items, max_set_values);
         if (plan.kind == .tokens) {
-            bound.tuples = try tokenBoundTuplesAlloc(a, bases, index_tokens, source.conjuncts[plan.conjunct].match_operator);
+            const index_conjunct = source.conjuncts[plan.conjunct];
+            // Every token of a phrase must occur, as with `and`.
+            bound.tuples = try tokenBoundTuplesAlloc(a, bases, index_tokens, if (index_conjunct.op == .phrase) .@"and" else index_conjunct.match_operator);
         } else if (plan.kind == .vector) {
             // A zero (or missing) query vector has no cosine with anything.
             if (try unitVectorAlloc(a, index_vector orelse &.{})) |unit| {
@@ -2137,6 +2614,215 @@ pub fn tokenizeAlloc(a: Allocator, text: []const u8) ![]const []const u8 {
     return list.items;
 }
 
+/// Pinned analyzer without deduplication, in text order (phrases).
+pub fn tokenizeOrderedAlloc(a: Allocator, text: []const u8) ![]const []const u8 {
+    var list = std.ArrayListUnmanaged([]const u8).empty;
+    var start: ?usize = null;
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        const word = i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] >= 0x80);
+        if (word) {
+            if (start == null) start = i;
+        } else if (start) |st| {
+            const token = try a.alloc(u8, i - st);
+            for (text[st..i], token) |ch, *o| o.* = std.ascii.toLower(ch);
+            try list.append(a, token);
+            start = null;
+        }
+    }
+    return list.items;
+}
+
+fn phraseMatches(a: Allocator, value: std.json.Value, query: []const std.json.Value) !bool {
+    if (query.len == 0) return false;
+    const texts: []const std.json.Value = switch (value) {
+        .array => |array| array.items,
+        else => (&value)[0..1],
+    };
+    for (texts) |item| {
+        if (item != .string) continue;
+        const tokens = try tokenizeOrderedAlloc(a, item.string);
+        if (tokens.len < query.len) continue;
+        var start: usize = 0;
+        while (start + query.len <= tokens.len) : (start += 1) {
+            const hit = for (query, 0..) |q, k| {
+                if (q != .string or !std.mem.eql(u8, q.string, tokens[start + k])) break false;
+            } else true;
+            if (hit) return true;
+        }
+    }
+    return false;
+}
+
+/// Storage-engine evaluation of a lowered row filter on one row (projection).
+pub const RowFilter = struct {
+    ptr: ?*anyopaque = null,
+    matches_fn: *const fn (ptr: ?*anyopaque, alloc: Allocator, filter: std.json.Value, key: []const u8, row: std.json.Value) anyerror!bool,
+};
+
+/// Substitute a dependent's `$source` values into a canonical tree. A clause
+/// whose binding is missing can never match and becomes `{"none":true}`.
+fn bindTreeAlloc(a: Allocator, tree: []const u8, source_doc: std.json.Value) ![]const u8 {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, tree, .{}) catch return error.InvalidContextSourcesConfig;
+    const bound = try bindTreeNode(a, value, source_doc);
+    return stringifyAlloc(a, bound);
+}
+
+fn bindTreeNode(a: Allocator, node: std.json.Value, source_doc: std.json.Value) !std.json.Value {
+    switch (node) {
+        .array => |array| {
+            var copy = std.json.Array.init(a);
+            for (array.items) |item| try copy.append(try bindTreeNode(a, item, source_doc));
+            return .{ .array = copy };
+        },
+        .object => |o| {
+            if (o.get("field") != null or o.get("row") != null) {
+                var missing = false;
+                const bound = try substituteBindings(a, node, source_doc, &missing);
+                if (missing) {
+                    var none: std.json.ObjectMap = .empty;
+                    try none.put(a, "none", .{ .bool = true });
+                    return .{ .object = none };
+                }
+                return bound;
+            }
+            var copy: std.json.ObjectMap = .empty;
+            var it = o.iterator();
+            while (it.next()) |entry| try copy.put(a, entry.key_ptr.*, try bindTreeNode(a, entry.value_ptr.*, source_doc));
+            return .{ .object = copy };
+        },
+        else => return node,
+    }
+}
+
+fn substituteBindings(a: Allocator, value: std.json.Value, source_doc: std.json.Value, missing: *bool) !std.json.Value {
+    switch (value) {
+        .object => |o| {
+            if (o.count() == 1) if (o.get("$source")) |p| if (p == .string) {
+                const resolved = resolvePointer(source_doc, p.string) orelse {
+                    missing.* = true;
+                    return .null;
+                };
+                if (resolved == .null) missing.* = true;
+                return resolved;
+            };
+            var copy: std.json.ObjectMap = .empty;
+            var it = o.iterator();
+            while (it.next()) |entry| try copy.put(a, entry.key_ptr.*, try substituteBindings(a, entry.value_ptr.*, source_doc, missing));
+            return .{ .object = copy };
+        },
+        .array => |array| {
+            var copy = std.json.Array.init(a);
+            for (array.items) |item| try copy.append(try substituteBindings(a, item, source_doc, missing));
+            return .{ .array = copy };
+        },
+        .string => |text| {
+            if (!std.mem.startsWith(u8, text, row_binding_prefix)) return value;
+            const resolved = resolvePointer(source_doc, text[row_binding_prefix.len..]) orelse {
+                missing.* = true;
+                return .null;
+            };
+            if (resolved == .null) missing.* = true;
+            return resolved;
+        },
+        else => return value,
+    }
+}
+
+pub fn evalTreeNode(a: Allocator, node: std.json.Value, key: []const u8, row: std.json.Value, row_filter: ?RowFilter) anyerror!bool {
+    if (node != .object) return error.InvalidContextBinding;
+    const o = node.object;
+    if (o.get("and")) |items| {
+        for (items.array.items) |item| if (!try evalTreeNode(a, item, key, row, row_filter)) return false;
+        return true;
+    }
+    if (o.get("or")) |items| {
+        const min: usize = if (o.get("min")) |m| @intCast(m.integer) else 1;
+        var hits: usize = 0;
+        for (items.array.items) |item| {
+            if (try evalTreeNode(a, item, key, row, row_filter)) hits += 1;
+            if (hits >= min) return true;
+        }
+        return false;
+    }
+    if (o.get("not")) |items| {
+        for (items.array.items) |item| if (try evalTreeNode(a, item, key, row, row_filter)) return false;
+        return true;
+    }
+    if (o.get("all") != null) return true;
+    if (o.get("none") != null) return false;
+    if (o.get("row")) |filter| {
+        const rf = row_filter orelse return error.ContextRowFilterUnavailable;
+        return rf.matches_fn(rf.ptr, a, filter, key, row);
+    }
+    return leafMatches(a, o, row);
+}
+
+/// A bound native clause (literal operands) against one row.
+fn leafMatches(a: Allocator, o: std.json.ObjectMap, row: std.json.Value) !bool {
+    const field = o.get("field") orelse return error.InvalidContextBinding;
+    if (field != .string) return error.InvalidContextBinding;
+    const value = resolveFieldPath(row, field.string) orelse return false;
+    if (o.get("term")) |t| {
+        const canonical = (try canonicalScalarAlloc(a, t)) orelse return false;
+        return valueInSet(value, &.{canonical});
+    }
+    if (o.get("terms")) |t| {
+        if (t != .array) return false;
+        var set = std.ArrayListUnmanaged([]const u8).empty;
+        for (t.array.items) |item| if (try canonicalScalarAlloc(a, item)) |c| try set.append(a, c);
+        sortUniqueStrings(&set);
+        return valueInSet(value, set.items);
+    }
+    if (o.get("range")) |r| {
+        if (r != .object) return false;
+        return rangeMatches(a, r.object, value);
+    }
+    if (o.get("prefix")) |p| return p == .string and anyString(value, p.string, startsWith);
+    if (o.get("match")) |m| {
+        if (m != .string) return false;
+        const op: MatchOperator = if (o.get("operator")) |v| (if (v == .string) std.meta.stringToEnum(MatchOperator, v.string) orelse .@"and" else .@"and") else .@"and";
+        const tokens = try tokenizeAlloc(a, m.string);
+        const query = try a.alloc(std.json.Value, tokens.len);
+        for (tokens, query) |t, *q| q.* = .{ .string = t };
+        return matchTokens(a, value, query, op);
+    }
+    if (o.get("match_phrase")) |m| {
+        if (m != .string) return false;
+        const tokens = try tokenizeOrderedAlloc(a, m.string);
+        const query = try a.alloc(std.json.Value, tokens.len);
+        for (tokens, query) |t, *q| q.* = .{ .string = t };
+        return phraseMatches(a, value, query);
+    }
+    if (o.get("similar")) |sim| {
+        if (sim != .object) return false;
+        const v = sim.object.get("vector") orelse return false;
+        if (v != .array) return false;
+        const vector = try a.alloc(f32, v.array.items.len);
+        for (v.array.items, vector) |item, *x| x.* = switch (item) {
+            .float => |f| @floatCast(f),
+            .integer => |n| @floatFromInt(n),
+            else => return false,
+        };
+        const number = struct {
+            fn get(x: ?std.json.Value) f64 {
+                const n = x orelse return 0;
+                return switch (n) {
+                    .float => |f| f,
+                    .integer => |i| @floatFromInt(i),
+                    else => 0,
+                };
+            }
+        };
+        const metric: Metric = if (sim.object.get("metric")) |m| (if (m == .string) std.meta.stringToEnum(Metric, m.string) orelse .cosine else .cosine) else .cosine;
+        const threshold = number.get(sim.object.get("threshold"));
+        const c = Conjunct{ .field = field.string, .op = .similar, .similarity = .{ .threshold = threshold, .metric = metric, .dims = @intFromFloat(number.get(sim.object.get("dims"))) } };
+        const score = (try similarityScore(a, c, vector, row)) orelse return false;
+        return score >= threshold;
+    }
+    return error.InvalidContextBinding;
+}
+
 /// Equality conjuncts of a bound query against a row.
 fn equalityMatches(bound: *const Bound, row: std.json.Value) bool {
     if (bound.unsatisfiable) return false;
@@ -2150,9 +2836,13 @@ fn equalityMatches(bound: *const Bound, row: std.json.Value) bool {
 
 /// Full predicate of a bound query (equality and residual, no top-N bound).
 pub fn rowMatches(alloc: Allocator, bound: *const Bound, row: std.json.Value) !bool {
+    return rowMatchesKeyed(alloc, bound, "", row, null);
+}
+
+pub fn rowMatchesKeyed(alloc: Allocator, bound: *const Bound, key: []const u8, row: std.json.Value, row_filter: ?RowFilter) !bool {
     if (!equalityMatches(bound, row)) return false;
     if (bound.residual.len == 0) return true;
-    return residualMatches(alloc, bound.source, bound.residual, "", row, false);
+    return residualMatches(alloc, bound.source, bound.residual, key, row, false, row_filter);
 }
 
 /// Score of `similar` for a row (null when the row has no comparable vector).
@@ -2178,7 +2868,7 @@ pub fn similarityScore(alloc: Allocator, conjunct: Conjunct, query: []const f32,
 /// Evaluate a dependent's residual parameters (its subscription value) on
 /// one row. With `check_boundary`, a full top-N result additionally requires
 /// the row to rank at or above the recorded boundary (ties by key).
-pub fn residualMatches(alloc: Allocator, source: *const Source, residual_json: []const u8, key: []const u8, row: std.json.Value, check_boundary: bool) !bool {
+pub fn residualMatches(alloc: Allocator, source: *const Source, residual_json: []const u8, key: []const u8, row: std.json.Value, check_boundary: bool, row_filter: ?RowFilter) !bool {
     if (residual_json.len == 0) return true;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2200,6 +2890,11 @@ pub fn residualMatches(alloc: Allocator, source: *const Source, residual_json: [
                     if (tokens != .array) break :blk false;
                     break :blk try matchTokens(a, value, tokens.array.items, c.match_operator);
                 },
+                .phrase => blk: {
+                    const tokens = entry.object.get("t") orelse break :blk false;
+                    if (tokens != .array) break :blk false;
+                    break :blk try phraseMatches(a, value, tokens.array.items);
+                },
                 .similar => blk: {
                     const v = entry.object.get("v") orelse break :blk false;
                     if (v != .array) break :blk false;
@@ -2217,6 +2912,10 @@ pub fn residualMatches(alloc: Allocator, source: *const Source, residual_json: [
             if (!ok) return false;
         };
     };
+    if (parsed.object.get("x")) |tree| {
+        if (tree != .array) return false;
+        for (tree.array.items) |node| if (!try evalTreeNode(a, node, key, row, row_filter)) return false;
+    }
     if (!check_boundary) return true;
     const order = source.order_by orelse return true;
     const boundary = parsed.object.get("b") orelse return true;
@@ -2542,10 +3241,18 @@ pub fn touchedTuplesAlloc(
 /// Whether a notice about one row is relevant to one subscriber, given the
 /// subscriber's residual parameters and the row's previous/next relevant
 /// projections (`null`/empty when absent).
-pub fn subscriberRelevant(alloc: Allocator, source: *const Source, residual: []const u8, key: []const u8, previous: ?std.json.Value, next: ?std.json.Value) !bool {
+pub fn subscriberRelevant(alloc: Allocator, source: *const Source, residual: []const u8, key: []const u8, previous: ?std.json.Value, next: ?std.json.Value, row_filter: ?RowFilter) !bool {
     if (residual.len == 0 or !source.hasResidual()) return true;
-    if (previous) |row| if (try residualMatches(alloc, source, residual, key, row, true)) return true;
-    if (next) |row| if (try residualMatches(alloc, source, residual, key, row, true)) return true;
+    for ([_]?std.json.Value{ previous, next }) |candidate| {
+        const row = candidate orelse continue;
+        // Without the storage evaluator a row filter cannot be decided here:
+        // notifying is the recall-safe answer.
+        const hit = residualMatches(alloc, source, residual, key, row, true, row_filter) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => true,
+        };
+        if (hit) return true;
+    }
     return false;
 }
 
@@ -2967,7 +3674,7 @@ test "table names resolve to immutable identities and client identities are not 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const public = try parseValue(arena.allocator(), "{\"p\":{\"query\":{\"table\":\"policies\",\"filter_query\":{\"field\":\"org\",\"term\":{\"$source\":\"/org\"}}},\"fields\":[\"text\"]}}");
-    const stored = try canonicalFromPublicAlloc(alloc, public, null, resolver);
+    const stored = try canonicalFromPublicAlloc(alloc, public, null, resolver, null);
     defer alloc.free(stored);
     try testing.expect(std.mem.indexOf(u8, stored, "\"table_id\":\"tbl-42\"") != null);
     // A forged identity in a stored form is replaced by re-resolution.
@@ -2977,7 +3684,7 @@ test "table names resolve to immutable identities and client identities are not 
     defer alloc.free(fixed);
     try testing.expectEqualStrings(stored, fixed);
     const unknown = try parseValue(arena.allocator(), "{\"p\":{\"document\":{\"table\":\"nope\",\"key_from\":\"/k\"},\"fields\":[\"x\"]}}");
-    try testing.expectError(error.UnknownContextSourceTable, canonicalFromPublicAlloc(alloc, unknown, null, resolver));
+    try testing.expectError(error.UnknownContextSourceTable, canonicalFromPublicAlloc(alloc, unknown, null, resolver, null));
     var config = try parseStoredJson(alloc, stored);
     defer config.deinit();
     const foreign = try foreignTableIdsAlloc(alloc, &config, "tbl-1");
@@ -3034,9 +3741,9 @@ test "range, prefix, and filter-mode match are residual per-row predicates" {
     // moving into or out of the window is relevant.
     const outside_a = try parseValue(a, "{\"published\":\"2025-01-01\",\"sku\":\"EU-1\",\"body\":\"solar panels\"}");
     const outside_b = try parseValue(a, "{\"published\":\"2025-02-01\",\"sku\":\"EU-1\",\"body\":\"solar panels\"}");
-    try testing.expect(!try subscriberRelevant(alloc, source, bound.residual, "k", outside_a, outside_b));
-    try testing.expect(try subscriberRelevant(alloc, source, bound.residual, "k", outside_a, hit));
-    try testing.expect(try subscriberRelevant(alloc, source, bound.residual, "k", hit, null));
+    try testing.expect(!try subscriberRelevant(alloc, source, bound.residual, "k", outside_a, outside_b, null));
+    try testing.expect(try subscriberRelevant(alloc, source, bound.residual, "k", outside_a, hit, null));
+    try testing.expect(try subscriberRelevant(alloc, source, bound.residual, "k", hit, null, null));
     // Residual-field changes are relevant to touched tuples; unprojected ones are not.
     var touched = try touchedTuplesAlloc(alloc, source, "k", hit, try parseValue(a, "{\"org\":\"o1\",\"published\":\"2026-07-05\",\"sku\":\"EU-12\",\"body\":\"New solar panels, cheaper.\",\"title\":\"t\"}"));
     defer touched.deinit(alloc);
@@ -3091,13 +3798,13 @@ test "ordered top-N relevance follows the recorded boundary" {
     const older = try parseValue(a, "{\"org\":\"o\",\"at\":10}");
     const older2 = try parseValue(a, "{\"org\":\"o\",\"at\":11}");
     const newer = try parseValue(a, "{\"org\":\"o\",\"at\":90}");
-    try testing.expect(!try subscriberRelevant(alloc, source, residual, "k9", older, older2));
-    try testing.expect(try subscriberRelevant(alloc, source, residual, "k9", null, newer));
-    try testing.expect(try subscriberRelevant(alloc, source, residual, "k1", newer, older));
+    try testing.expect(!try subscriberRelevant(alloc, source, residual, "k9", older, older2, null));
+    try testing.expect(try subscriberRelevant(alloc, source, residual, "k9", null, newer, null));
+    try testing.expect(try subscriberRelevant(alloc, source, residual, "k1", newer, older, null));
     // Not yet full: every match is relevant.
     const partial = try withBoundaryAlloc(alloc, bindings.items[0].residual, std.json.Value{ .integer = 50 }, "k5", false);
     defer alloc.free(partial);
-    try testing.expect(try subscriberRelevant(alloc, source, partial, "k9", older, older2));
+    try testing.expect(try subscriberRelevant(alloc, source, partial, "k9", older, older2, null));
 }
 
 test "graph and snapshot search sources bind and validate" {
@@ -3396,4 +4103,104 @@ test "cosine similarity subscriptions bucket by pivot distance with exact recall
     var far = try rowTuplesAlloc(alloc, &dot.sources[0], dot.sources[0].specDigest(), try parseValue(a, "{\"vec\":[-5,3]}"));
     defer far.deinit(alloc);
     try testing.expect(anyTupleShared(db.items[0].tuples, far.tuples));
+}
+
+test "antfly filter_query shape: bool trees, ranges, phrases, and storage row filters" {
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Fake lowering/evaluator standing in for the API and storage engine:
+    // `wildcard` lowers to a storage-shaped `{"wildcard":{"path","pattern"}}`
+    // and the evaluator does suffix-`*` matching.
+    const Fake = struct {
+        fn lower(_: ?*anyopaque, la: Allocator, v: std.json.Value) anyerror![]u8 {
+            const pattern = v.object.get("wildcard") orelse return error.UnsupportedQueryRequest;
+            const field = v.object.get("field").?.string;
+            var out = std.ArrayListUnmanaged(u8).empty;
+            try out.appendSlice(la, "{\"wildcard\":{\"path\":");
+            try appendJsonString(la, &out, field);
+            try out.appendSlice(la, ",\"pattern\":");
+            try appendCanonicalValue(la, &out, pattern);
+            try out.appendSlice(la, "}}");
+            return out.items;
+        }
+        fn matches(_: ?*anyopaque, ma: Allocator, filter: std.json.Value, _: []const u8, row: std.json.Value) anyerror!bool {
+            _ = ma;
+            const w = filter.object.get("wildcard").?.object;
+            const value = resolveFieldPath(row, w.get("path").?.string) orelse return false;
+            if (value != .string) return false;
+            const pattern = w.get("pattern").?.string;
+            const stem = if (std.mem.endsWith(u8, pattern, "*")) pattern[0 .. pattern.len - 1] else pattern;
+            return std.mem.startsWith(u8, value.string, stem);
+        }
+    };
+    const lowering = FilterLowering{ .lower_fn = Fake.lower };
+    const row_filter = RowFilter{ .matches_fn = Fake.matches };
+    const declaration =
+        \\{"q":{"query":{"filter_query":{"bool":{
+        \\  "filter":[{"field":"org","term":{"$source":"/org"}},{"field":"n","min":10,"max":20}],
+        \\  "should":[{"field":"body","match_phrase":"solar panel"},{"field":"sku","wildcard":{"$source":"/sku"}}],
+        \\  "must_not":[{"field":"state","term":"archived"}],"minimum_should_match":1}}},"fields":["t"]}}
+    ;
+    var sources = try std.json.parseFromSlice(std.json.Value, alloc, declaration, .{});
+    defer sources.deinit();
+    // Without the API's lowering, storage-evaluated clauses are rejected.
+    try testing.expectError(error.UnsupportedContextPredicate, parsePublicValueWith(alloc, sources.value, null, .{}));
+    var config = try parsePublicValueWith(alloc, sources.value, null, .{ .lowering = lowering });
+    defer config.deinit();
+    const source = &config.sources[0];
+    // Top-level conjunction members index; the rest is a residual tree.
+    try testing.expectEqual(@as(usize, 2), source.conjuncts.len);
+    try testing.expect(source.tree.len != 0);
+    for ([_][]const u8{ "body", "sku", "state", "n" }) |f| {
+        const found = for (source.relevant_fields) |r| {
+            if (std.mem.eql(u8, r, f)) break true;
+        } else false;
+        try testing.expect(found);
+    }
+    // Stored form round trips without the lowering hook.
+    const stored = try config.canonicalJsonAlloc(alloc);
+    defer alloc.free(stored);
+    var reparsed = try parseStoredJson(alloc, stored);
+    defer reparsed.deinit();
+    try testing.expectEqualSlices(u8, &config.digest(), &reparsed.digest());
+    // The public form keeps the declaration's own shape.
+    const public = try config.publicSourcesJsonAlloc(alloc);
+    defer alloc.free(public);
+    try testing.expect(std.mem.indexOf(u8, public, "match_phrase") != null and std.mem.indexOf(u8, public, "\"row\"") == null);
+
+    var bindings = try bindTest(alloc, &reparsed, "{\"org\":\"o\",\"sku\":\"EU-*\"}");
+    defer bindings.deinit();
+    const bound = &bindings.items[0];
+    for ([_]struct { row: []const u8, want: bool }{
+        .{ .row = "{\"org\":\"o\",\"n\":15,\"body\":\"a solar panel here\"}", .want = true },
+        .{ .row = "{\"org\":\"o\",\"n\":15,\"body\":\"panel solar\",\"sku\":\"EU-1\"}", .want = true },
+        .{ .row = "{\"org\":\"o\",\"n\":15,\"body\":\"panel solar\",\"sku\":\"US-1\"}", .want = false },
+        .{ .row = "{\"org\":\"o\",\"n\":20,\"body\":\"solar panel\"}", .want = false },
+        .{ .row = "{\"org\":\"o\",\"n\":10,\"body\":\"solar panel\",\"state\":\"archived\"}", .want = false },
+        .{ .row = "{\"org\":\"x\",\"n\":15,\"body\":\"solar panel\"}", .want = false },
+    }) |case| {
+        try testing.expectEqual(case.want, try rowMatchesKeyed(alloc, bound, "k", try parseValue(a, case.row), row_filter));
+    }
+    // Without the storage evaluator: resolution refuses, relevance notifies.
+    try testing.expectError(error.ContextRowFilterUnavailable, rowMatchesKeyed(alloc, bound, "k", try parseValue(a, "{\"org\":\"o\",\"n\":15,\"body\":\"x\",\"sku\":\"US-1\"}"), null));
+    try testing.expect(try subscriberRelevant(alloc, source, bound.residual, "k", try parseValue(a, "{\"org\":\"o\",\"n\":15,\"body\":\"x\",\"sku\":\"US-1\"}"), null, null));
+
+    // Disjunctions of native clauses need no storage evaluator at all.
+    var native = try parsePublicJson(alloc,
+        \\{"q":{"query":{"filter_query":{"disjuncts":[{"field":"a","term":1},{"field":"b","prefix":"x"}],"min":1}},"fields":["t"]}}
+    , "");
+    defer native.deinit();
+    var nb = try bindTest(alloc, &native, "{}");
+    defer nb.deinit();
+    try testing.expect(try rowMatches(alloc, &nb.items[0], try parseValue(a, "{\"b\":\"xy\"}")));
+    try testing.expect(!try rowMatches(alloc, &nb.items[0], try parseValue(a, "{\"a\":2,\"b\":\"y\"}")));
+    // Corpus-relative text queries stay snapshot-only.
+    try testing.expectError(error.UnsupportedContextPredicate, parsePublicJson(alloc,
+        \\{"q":{"query":{"filter_query":{"query":"title:solar"}},"fields":["t"]}}
+    , ""));
+    try testing.expectError(error.UnsupportedContextPredicate, parsePublicJson(alloc,
+        \\{"q":{"query":{"filter_query":{"field":"t","match":"x","analyzer":"standard"}},"fields":["t"]}}
+    , ""));
 }

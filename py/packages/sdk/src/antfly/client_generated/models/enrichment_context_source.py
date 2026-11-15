@@ -42,9 +42,9 @@ class EnrichmentContextSource:
                 enrichment-generated edges, whose changes invalidate dependents when their edge artifacts are written or
                 removed. Generated edges must not depend on the consuming enrichment. Members render with depth, edge type, and
                 direction.
-            search (EnrichmentContextSearch | Unset): Ranked retrieval (requires `tracking: snapshot`): either full-text
-                relevance (`text` + `text_field`) or dense k-NN (`vector` binding + `vector_index`). Members render in rank
-                order.
+            search (EnrichmentContextSearch | Unset): Ranked retrieval (requires `tracking: snapshot`): a full `request`, or
+                the shorthands full-text relevance (`text` + `text_field`) or dense k-NN (`vector` binding + `vector_index`).
+                Members render in rank order.
             required (bool | Unset): Document sources only: a missing referenced document fails the rebuild explicitly
                 instead of rendering null. Default: False.
             max_documents (int | Unset): Query and graph sources: maximum members. Exceeding it fails explicitly; with

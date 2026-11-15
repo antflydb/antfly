@@ -454,6 +454,7 @@ from .enrichment_context_query_filter_query import EnrichmentContextQueryFilterQ
 from .enrichment_context_query_order_by import EnrichmentContextQueryOrderBy
 from .enrichment_context_query_order_by_order import EnrichmentContextQueryOrderByOrder
 from .enrichment_context_search import EnrichmentContextSearch
+from .enrichment_context_search_request import EnrichmentContextSearchRequest
 from .enrichment_context_search_vector import EnrichmentContextSearchVector
 from .enrichment_context_source import EnrichmentContextSource
 from .enrichment_context_source_overflow import EnrichmentContextSourceOverflow
@@ -3165,6 +3166,7 @@ __all__ = (
     "EnrichmentContextQueryOrderBy",
     "EnrichmentContextQueryOrderByOrder",
     "EnrichmentContextSearch",
+    "EnrichmentContextSearchRequest",
     "EnrichmentContextSearchVector",
     "EnrichmentContextSource",
     "EnrichmentContextSourceOverflow",

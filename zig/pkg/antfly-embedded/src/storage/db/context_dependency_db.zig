@@ -520,7 +520,7 @@ fn SourceCache(comptime Manager: type) type {
         }
 
         fn sources(self: *@This()) notices.SourceLookup {
-            return .{ .ptr = self, .lookup_fn = lookupFn };
+            return .{ .ptr = self, .lookup_fn = lookupFn, .row_filter = @import("context_source_db_reader.zig").row_filter };
         }
 
         fn lookupFn(p: *anyopaque, artifact: []const u8, spec: ctx.Digest) ?*const ctx.Source {
