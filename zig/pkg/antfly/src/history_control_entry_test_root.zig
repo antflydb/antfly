@@ -15,6 +15,7 @@
 
 test {
     _ = @import("data/history_control_entry.zig");
+    _ = @import("data/history_control_wire.zig");
     _ = @import("data/raft_batch.zig").consumer_tests;
 }
 pub const antfly_sources = @import("source_owner_physical.zig");

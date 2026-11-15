@@ -1391,6 +1391,33 @@ coherent bootstrap, retained topology/recovery semantics and qualification of
 actual pgoutput with a pinned existing CDC client. The private native control
 milestones do not replace that scope.
 
+## In progress: private remote control wire contract
+
+`data/history_control_wire.zig` defines a bounded version-1 request/response
+contract for node-to-node retention control. Submit and recover are distinct
+operations; submit cannot carry a receipt, and recovery must carry the exact
+original nonzero term/index. The decoder binds the command namespace to the
+already-validated catalog route. Unknown/duplicate fields, missing versions,
+unsupported versions and oversized payloads fail closed.
+
+Responses distinguish an unconfirmed result without a receipt, an accepted but
+unconfirmed receipt, superseded history and known applied/rejected results.
+Known rejection is not successful ACK permission. Recovery replies must echo
+the original receipt. Applied results must match the requested consumer/epoch,
+include valid lease metadata and sufficient ACK/renew progress, and stay within
+the requested reclamation bound. Both codecs return value-owned fixed fields;
+no parse-arena bytes escape. Full-width receipt values retain integer precision.
+
+`history-control-entry-test` passes 19 checks, including the existing dedicated
+entry/legacy-envelope regressions, strict remote parsing, result binding,
+reclamation bounds and every allocation-failure point. Log:
+`zig/history-control-wire-qualification.log`.
+
+This is a private codec, not a mounted remote API or an authorization boundary.
+The HTTP surface must be specified/generated before registration, require service
+authority and catalog fencing, and preserve unknown outcomes without automatic
+re-proposal. Remote routing and feed-root registration remain pending.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
