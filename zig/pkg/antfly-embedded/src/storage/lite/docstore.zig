@@ -6680,6 +6680,26 @@ pub const Txn = struct {
     read_pin: ?*ReadPin = null,
     borrowed_read_generation: bool = false,
     checkpoint: native.CheckpointSlot = .{},
+    /// §9.7c (ReadView)/perf/lwa-restore-open-txn: set only by
+    /// `openReadWithPrefix`'s `store.read_only` short-circuit, which --
+    /// unlike the ordinary path below it, protected for its whole
+    /// lifetime by `store.read_generation`'s own `ReadPin` -- used to
+    /// capture `store.file.activeCheckpoint()` directly into
+    /// `self.checkpoint` with no pin at all. A `query_readonly`
+    /// connection opened while a redo-log-only (unfolded) commit's
+    /// version was still the newest thing in the shared overlay could
+    /// have that exact version reclaimed by a concurrent fold before
+    /// this transaction ever read it: the read then silently fell
+    /// through a now-missing overlay entry to the real tree, which did
+    /// not have it either (nothing had folded it there before the
+    /// version vanished) -- a fully committed document read back as
+    /// absent. `native.ReadView.open` is design doc §9.8's one read
+    /// primitive: it pins conservatively, catches this handle up to the
+    /// latest published (checkpoint, mark) for the inode, and re-pins at
+    /// whatever that finds, so a concurrent fold's own `reclaim` can
+    /// never see a gap. `abort()` releases the view it owns here, not
+    /// `self.checkpoint` alone (which carries no pin of its own).
+    redo_read_view: ?native.ReadView = null,
     /// Set by beginBatchWithOptions() from BatchOptions.durability ==
     /// .ride_along. commit() reads this to pick commitWithDurability's
     /// argument, so callers that go through the generic backend_adapter
@@ -6714,7 +6734,17 @@ pub const Txn = struct {
 
     pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
         try validatePrefix(prefix);
-        if (store.read_only and !store.file.externally_locked) return .{ .allocator = store.allocator, .store = store, .prefix = prefix, .checkpoint = store.file.activeCheckpoint() };
+        if (store.read_only and !store.file.externally_locked) {
+            // §9.7c (ReadView)/perf/lwa-restore-open-txn: route through
+            // the one read primitive instead of capturing
+            // `store.file.activeCheckpoint()` bare -- see
+            // `redo_read_view`'s own doc comment for the gap this
+            // closes. `ReadView.open` already no-ops into the equivalent
+            // of the old bare capture when `store.file.redo == null` (no
+            // redo log on this file at all, nothing to pin against).
+            const view = try native.ReadView.open(&store.file, store.file.runtime());
+            return .{ .allocator = store.allocator, .store = store, .prefix = prefix, .checkpoint = view.checkpoint, .redo_read_view = view };
+        }
         const io = store.file.runtime();
         store.generation_lock.lockSharedUncancelable(io);
         defer store.generation_lock.unlockShared(io);
@@ -6863,9 +6893,21 @@ pub const Txn = struct {
         self.freePending();
         self.freeIndexCatalogPending();
         self.freeOwnedReads();
+        self.releaseRedoReadView();
         self.releaseGenerationReadLock();
         self.releaseWriterSlot();
         self.* = undefined;
+    }
+
+    /// Releases the `ReadView` `openReadWithPrefix`'s `store.read_only`
+    /// short-circuit opened, if any -- see `redo_read_view`'s own doc
+    /// comment. A no-op for every other `Txn` (including a
+    /// `forkBorrowedRead` fork, which never copies this field: the
+    /// original owns the pin for as long as the fork borrows its
+    /// checkpoint, matching `borrowed_read_generation`'s own contract).
+    fn releaseRedoReadView(self: *Txn) void {
+        if (self.redo_read_view) |*view| view.release(self.store.?.file.runtime());
+        self.redo_read_view = null;
     }
 
     /// `durable = false` commits through `Store.stageRideAlong` instead of

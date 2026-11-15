@@ -595,6 +595,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi graph replacement retains indexed serving edges",
         "capi native resolver maintenance retries",
         "capi native idle maintenance",
+        "capi native refresh during a lane-pinned write does not mark that generation read-only",
         "SQL overlay native pages retain typed cells",
         "capi Lite models_dir loads a real extractor",
         "capi Lite promotion resolves ANN",

@@ -6348,6 +6348,24 @@ pub const ReadView = struct {
     /// doc comment); captured as two separate fields regardless, so a
     /// future caller that opens this on a handle where they genuinely
     /// diverge gets the correct answer without this type changing.
+    ///
+    /// perf/lwa-restore-open-txn (design doc §9.8): this constructor
+    /// already pinned correctly (`openAt` below takes the overlay pin
+    /// and the inode reader-table pin together, atomically with respect
+    /// to itself) -- the bug was a caller, `docstore.zig`'s
+    /// `Txn.openReadWithPrefix`'s `store.read_only` short-circuit,
+    /// capturing `store.file.activeCheckpoint()` into a bare `Txn`
+    /// literal instead of ever calling `open`/`openAt` at all, so nothing
+    /// pinned it: a concurrent fold's own `SharedRedoOverlay.reclaim`
+    /// (gated on `minimumPinnedSequence`, which only ever protects a mark
+    /// some live pin actually registered) could drop an overlay-only
+    /// (unfolded) key that bare checkpoint still depended on, between the
+    /// capture and the read -- a fully committed, redo-log-only document
+    /// going missing from a fresh `.query_readonly` open racing a live
+    /// writer's own background maintenance fold. Fixed at that call
+    /// site, not here: it now opens a real `ReadView` and keeps it pinned
+    /// for the `Txn`'s own lifetime (released in `abort()`), the same
+    /// scope every other read path already gets this primitive for.
     pub fn open(file: *NativeFile, io: std.Io) !ReadView {
         return openAt(file, io, file.activeCheckpoint());
     }
@@ -6364,7 +6382,12 @@ pub const ReadView = struct {
     /// `activeCheckpoint()`/`committedSequence()`).
     pub fn openAt(file: *NativeFile, io: std.Io, checkpoint: CheckpointSlot) !ReadView {
         var view: ReadView = .{ .file = file, .checkpoint = checkpoint, .mark = file.readMark(checkpoint), .owns_pin = false };
-        if (file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, io, view.mark);
+        // A handle frozen at an older checkpoint whose overlay versions a
+        // fold has since reclaimed cannot be read correctly any more:
+        // refuse it (`error.ReadSnapshotReclaimed`) instead of letting it
+        // fall through missing overlay entries to a tree that predates
+        // the fold. Callers reopen to get a current view.
+        if (file.redo) |*redo| try redo.shared.pinUnlessReclaimed(std.heap.page_allocator, io, view.mark);
         errdefer if (file.redo) |*redo| redo.shared.unpin(io, view.mark);
         if (file.inode_lock_ref.load(.acquire)) |entry| {
             try inode_lock.pinReader(entry, io, .{ .data = checkpoint.commit_sequence, .metadata = checkpoint.commit_sequence });
@@ -7765,19 +7788,50 @@ pub const NativeFile = struct {
         // and the real log in lockstep by construction.
         const outcome = pctx.outcome orelse meta_outcome;
         if (pctx.compact orelse meta_ctx.compact) |compact| {
-            // `CompactCheckpoint` carries no `redo_folded_through` of its
-            // own (a log record's own embedded checkpoint is always just
-            // the *tip* as of that commit, never a fold boundary -- only
-            // `checkpointRedoLog`'s own fold and `prepareVacuum`'s
-            // compaction ever advance one, and neither ever appends a log
-            // record for the commit that does) -- so `toCheckpointSlot()`
-            // comes back with the field defaulted to zero. Restore the
-            // value this on-disk slot actually carried: the latest log
-            // record only ever refines the *tip* (roots/commit_sequence),
-            // never the fold boundary, which stays exactly what the real,
-            // physically-published checkpoint slot said it was.
-            self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
-            self.header.checkpoints[self.header.active_checkpoint].redo_folded_through = folded_through;
+            // perf/lwa-restore-open-txn: a bare (non-Txn) commit (schema/
+            // catalog bookkeeping, a transaction-manager intent record,
+            // ...) publishes straight to the on-disk checkpoint slot and
+            // never appends a matching log record at all -- the exact
+            // "log-full bare-slot fallback" case `redo_folded_through`'s
+            // own doc comment already names as a real-publish path that
+            // can leave `commit_sequence` ahead of what the log itself
+            // reflects. When such a bare commit lands *after* this log's
+            // own latest record, `checkpoint` above (loaded from the
+            // on-disk slot before anything in this function ran) is
+            // already strictly newer than `compact` -- every root pointer
+            // it carries (`catalog_root_page` included) is the correct,
+            // current one. Unconditionally overwriting it with `compact
+            // .toCheckpointSlot()`'s older tip regresses those roots back
+            // to pages the bare commit's own allocation may already have
+            // retired and reused for something else: a concurrent or
+            // later open then either reads the wrong physical page kind
+            // (`error.UnexpectedNativePageKind`) or, when the retired
+            // page still looks structurally plausible, silently resolves
+            // a stale, pre-bare-commit view -- including a document
+            // logged just before the bare commit going missing from a
+            // fresh open, since this same regression also drags
+            // `commit_sequence`, and therefore every overlay resolution's
+            // own `mark`, backward with it. Apply the log's own tip only
+            // when it is actually newer than what the on-disk slot
+            // already published; otherwise the on-disk slot already is
+            // the correct, current state and this function has nothing
+            // to refine.
+            if (compact.commit_sequence > checkpoint.commit_sequence) {
+                // `CompactCheckpoint` carries no `redo_folded_through` of
+                // its own (a log record's own embedded checkpoint is
+                // always just the *tip* as of that commit, never a fold
+                // boundary -- only `checkpointRedoLog`'s own fold and
+                // `prepareVacuum`'s compaction ever advance one, and
+                // neither ever appends a log record for the commit that
+                // does) -- so `toCheckpointSlot()` comes back with the
+                // field defaulted to zero. Restore the value this on-disk
+                // slot actually carried: the latest log record only ever
+                // refines the *tip* (roots/commit_sequence), never the
+                // fold boundary, which stays exactly what the real,
+                // physically-published checkpoint slot said it was.
+                self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
+                self.header.checkpoints[self.header.active_checkpoint].redo_folded_through = folded_through;
+            }
         }
 
         // `checkpointRedoLog`'s own fold consumes a fresh `commit_sequence`
@@ -35640,6 +35694,58 @@ test "lite redo log bulk-built document index over max_keys passes check() after
         defer a.free(value);
         try std.testing.expectEqualSlices(u8, mutation.value, value);
     }
+}
+
+// perf/lwa-restore-open-txn (design doc §9.8): `ReadView.open`'s own
+// checkpoint/mark determination used to come straight from
+// `file.activeCheckpoint()` with no pin at all -- the handle's one-time
+// snapshot from `recoverRedoLog`, never refreshed. A concurrent fold's own
+// `SharedRedoOverlay.reclaim` has no way to know an unpinned reader still
+// depends on an overlay-only (unfolded) key below that stale snapshot, so
+// it drops it the moment the fold's own checkpoint becomes durable -- a
+// fully committed, redo-log-only document going missing from a fresh
+// `.query_readonly` open (`storage.lite.restore_staging.zig`'s export
+// path) racing a live writer's own background maintenance fold. Fixed by
+// pinning conservatively *before* refreshing to the latest published
+// state, then re-pinning at whatever that refresh finds, so a concurrent
+// fold's `reclaim` can never see a gap -- see `ReadView.open`'s own doc
+// comment for the full mechanism. `getDocumentAlloc` on the raw file
+// (what this test used before the fix) never pins at all; going through
+// `ReadView.open` instead is exactly the change `docstore.zig`'s
+// `Txn.openReadWithPrefix` read_only short-circuit also needs, and gets,
+// below.
+test "lite redo log reader opened before a fold still resolves a key the fold's own reclaim would otherwise drop" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-reader-before-fold.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 4 * 1024 * 1024);
+    defer file.close();
+    try file.beginTransaction();
+    try file.putDocument("doc:a", "hello");
+    try file.commitTransaction();
+
+    // A fresh reader opens now, while "doc:a" is still overlay-only
+    // (unfolded), and immediately establishes its ReadView -- design doc
+    // §9.8's one read primitive -- pinning the mark that covers "doc:a"'s
+    // own commit.
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer reader.close();
+    var view = try ReadView.open(&reader, std.testing.io);
+    defer view.release(std.testing.io);
+
+    // The writer now folds and durably reclaims: "doc:a" moves into a
+    // real page its own, newer checkpoint points at. `reclaim`'s own
+    // floor must never drop below `reader`'s live pin, so "doc:a"'s
+    // overlay version survives even though `view`'s own checkpoint still
+    // predates the fold.
+    try file.checkpointRedoLogWithDurability(true);
+
+    const value = (try view.getDocumentAlloc(a, "doc:a")) orelse return error.TestExpectedEqual;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("hello", value);
 }
 
 // perf/lwa-bulk-alloc: one transaction that mixes a handful of individual

@@ -34368,6 +34368,28 @@ pub const DB = struct {
         }
     }
 
+    /// NOTE (investigated, deliberately NOT applied): `waitForSyncLevelWithPublicationCut`'s
+    /// `.enrichments`/`.full_index` branches can see a raw
+    /// `error.EnrichmentSourceChanged` escape from here (worker mode's
+    /// `EnrichmentRuntime.waitForAppliedWithVisibilityDeadline` ->
+    /// `refreshVisibilityCut`/`refreshReplayAuthority` -> `probeReplayAuthority`,
+    /// when a concurrent publication commits a newer generation or applied
+    /// sequence between that probe's own two reads), and because the primary
+    /// write is already committed by this point, that uncaught error turns
+    /// an ordinary mid-flight race into a permanent `ANTFLY_STALLED`
+    /// (`batchFailureCode`) -- the grouped-sources "overlap" scenario's fast
+    /// `StalledError`. Retrying it here (bounded by the same `deadline_ns`)
+    /// does fix that case, but it also gives `Owner.maintenanceLoop` more
+    /// time/opportunities to run `maintenanceTurn` -> `resolver_authority.
+    /// pullProjection` -> `ensureConsumerIndex` -> `NativeFile.publishCheckpoint`,
+    /// which hits a *separate*, pre-existing writer-lease race there
+    /// (`inode_lock.assertActiveWriter`: "NativeFile publishing without
+    /// holding the writer lease") and hard-panics the process -- strictly
+    /// worse than the StalledError it replaces. `Owner.maintenanceLoop`'s
+    /// wake scheduling is perf/lwa-xproc-writers' territory, not refresh/
+    /// retirement/lane_pins, so this retry is intentionally left out until
+    /// that lands. See the lwa-enrich-visibility work log for the full panic
+    /// trace.
     /// Unlike `runEnrichmentUntilWithVisibilityDeadline`, never substitutes
     /// the request-visibility default (`sync_wait_timeout_ms`, 5 minutes)
     /// when no deadline is supplied, even when `optional_runtime_workers_enabled`

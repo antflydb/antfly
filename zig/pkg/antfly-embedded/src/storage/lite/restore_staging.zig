@@ -434,26 +434,36 @@ fn stageAfliteRestoreBackupWithOptions(
     var source = try openInputFile(io, path);
     defer source.close(io);
     try checkInputLimit(io, source, options.max_input_bytes);
-    var lite = try LiteDb.open(allocator, path, .query_readonly);
-    defer lite.close();
+    // A live writer's fold can reclaim overlay versions between this
+    // read-only open and its first read; the read then reports
+    // `error.ReadSnapshotReclaimed` rather than export a snapshot with
+    // committed documents missing. Reopen at the current checkpoint and
+    // export again.
+    const max_attempts = 8;
+    var attempt: usize = 1;
+    while (true) : (attempt += 1) {
+        var lite = try LiteDb.open(allocator, path, .query_readonly);
+        defer lite.close();
 
-    const scratch = try temporaryPortablePath(allocator, io);
-    defer allocator.free(scratch);
-    defer std.Io.Dir.cwd().deleteFile(io, scratch) catch {};
-    var output = try fs_paths.createFilePortable(io, scratch, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
-    defer output.close(io);
-    var buffer: [64 * 1024]u8 = undefined;
-    var writer = output.writer(io, &buffer);
-    var limited = LimitedWriter.init(&writer.interface, options.max_prepared_bytes);
-    portable_backup.exportPortableToWriter(allocator, lite.db.core.store, &limited.interface) catch |err| {
-        if (limited.exceeded) return error.BackupExpansionLimitExceeded;
-        return err;
-    };
-    try writer.end();
-    try output.sync(io);
-    // Read metadata from the exported snapshot, not a separate live DB read.
-    // Both metadata and records must describe the same pinned read transaction.
-    return stagePortableFile(allocator, io, output, scratch, table_name, backup_id, location_uri, options.max_prepared_bytes, options.max_prepared_bytes);
+        const scratch = try temporaryPortablePath(allocator, io);
+        defer allocator.free(scratch);
+        defer std.Io.Dir.cwd().deleteFile(io, scratch) catch {};
+        var output = try fs_paths.createFilePortable(io, scratch, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        defer output.close(io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = output.writer(io, &buffer);
+        var limited = LimitedWriter.init(&writer.interface, options.max_prepared_bytes);
+        portable_backup.exportPortableToWriter(allocator, lite.db.core.store, &limited.interface) catch |err| {
+            if (limited.exceeded) return error.BackupExpansionLimitExceeded;
+            if (err == error.ReadSnapshotReclaimed and attempt < max_attempts) continue;
+            return err;
+        };
+        try writer.end();
+        try output.sync(io);
+        // Read metadata from the exported snapshot, not a separate live DB read.
+        // Both metadata and records must describe the same pinned read transaction.
+        return stagePortableFile(allocator, io, output, scratch, table_name, backup_id, location_uri, options.max_prepared_bytes, options.max_prepared_bytes);
+    }
 }
 
 fn temporaryPortablePath(allocator: Allocator, io: std.Io) ![]u8 {
