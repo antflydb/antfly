@@ -1244,6 +1244,28 @@ the live route/root identity and preserve those fences across owner borrowing.
 This ABI operation is private and does not register a public feed or permit
 stale fallback when a leader barrier fails.
 
+## In progress: fenced routed history reads
+
+`ProvisionedKernelOwnerSource.orderedHistoryPageRouted` now performs the private
+Raft history read through the compiled owner. It requires Raft authority and
+frozen-proof support; validates the catalog route and retained namespace;
+normalizes the remaining deadline budget to the platform clock; waits for
+ReadIndex without stale fallback; and captures/validates leader incarnation,
+term and applied cut. The borrowed owner's namespace must match the route.
+After fetching the bounded page, it validates leader and route again before
+returning bytes. Any final failure releases the page rather than returning it.
+
+Qualification includes an actual compiled-owner enrollment and retained ordered
+row, plus injected leader loss and route replacement after page acquisition.
+Separate rejection checks prove unsupported barriers, namespace mismatch and
+ReadIndex leader loss fail before opening an owner. Log:
+`zig/ordered-history-routed-read-qualification.log`.
+
+This provides the native group-local read adapter. Feed root binding, owner-routed
+control submission/result recovery, remote transport, topology/history lineage
+transfer and production provider registration remain required. This method does
+not advertise public feed capability or replace the coherent bootstrap work.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

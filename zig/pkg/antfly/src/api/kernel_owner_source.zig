@@ -260,6 +260,55 @@ test "source owner fenced descriptor disappearance is availability not absence" 
     try std.testing.expectError(error.TableNotFound, ProvisionedKernelOwnerSource.lookupGroupLocal(&source, std.testing.allocator, 7, "rows", "a", .{}, .read_index));
 }
 
+test "ordered history routed read rejects unsupported barriers and leader loss before owner acquisition" {
+    const Fixture = struct {
+        waits: usize = 0,
+        captures: usize = 0,
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+            const groups = try alloc.alloc(table_catalog.CatalogGroupRoute, 1);
+            groups[0] = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } };
+            return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .groups = groups } };
+        }
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedOwnerAcquisition;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn wait(ptr: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.waits += 1;
+            return error.NotLeader;
+        }
+        fn capture(ptr: *anyopaque, _: u64) !read_gate.ReadSafetyBarrier.FrozenProof {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+            return error.UnexpectedCapture;
+        }
+        fn validate(_: *anyopaque, _: u64, _: read_gate.ReadSafetyBarrier.FrozenProof, _: ?u64, _: @import("antfly_cancellation").CancellationToken) !void {
+            return error.UnexpectedValidation;
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{};
+    var source = ProvisionedKernelOwnerSource.init(a, "unused", .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.resolve } }, read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .route = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } } };
+    const history = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 1, .big);
+    std.mem.writeInt(u64, namespace[8..16], 7, .big);
+    std.mem.writeInt(u64, namespace[16..24], 7, .big);
+    var request: history.history_page.Request = .{ .reference = .{ .namespace = namespace, .authority = @splat(1), .consumer = @splat(2), .epoch = 1, .grant = 1, .definition = @splat(3) }, .after = .{}, .now_seconds = 100 };
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, source.orderedHistoryPageRouted(a, fence, "docs", request));
+    source.read_safety_barrier = .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait, .capture_frozen = Fixture.capture, .validate_frozen = Fixture.validate } };
+    request.reference.namespace[0] ^= 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, source.orderedHistoryPageRouted(a, fence, "docs", request));
+    request.reference.namespace[0] ^= 1;
+    try std.testing.expectError(error.NotLeader, source.orderedHistoryPageRouted(a, fence, "docs", request));
+    try std.testing.expectEqual(@as(usize, 1), fixture.waits);
+    try std.testing.expectEqual(@as(usize, 0), fixture.captures);
+    try std.testing.expectEqual(@as(usize, 0), source.ownerCountForTest());
+}
+
 pub const ProvisionedKernelOwnerSource = struct {
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
@@ -1737,6 +1786,38 @@ pub const ProvisionedKernelOwnerSource = struct {
         var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome, alloc, response.bytes(), .{});
         defer parsed.deinit();
         return parsed.value;
+    }
+
+    /// Private retained-history read. Never weaken a failed quorum barrier to
+    /// stale consistency, and never return bytes after route/leader replacement.
+    pub fn orderedHistoryPageRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.Request) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.Page {
+        if (self.online_source_authority != .raft) return error.ChangefeedCapabilityUnsupported;
+        const barrier = self.read_safety_barrier;
+        const capture = barrier.vtable.capture_frozen orelse return error.ChangefeedCapabilityUnsupported;
+        const validate = barrier.vtable.validate_frozen orelse return error.ChangefeedCapabilityUnsupported;
+        const group = fence.route.group_id;
+        try self.validateRoutedRead(alloc, fence, group, table_name);
+        const identity = fence.route.identity_namespace;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
+        if (!std.mem.eql(u8, &namespace, &request.reference.namespace)) return error.HistoryResynchronizationRequired;
+        const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+        const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
+        try self.prepareRetainedScanRead(group, "", "", opts, .read_index);
+        const proof = try capture(barrier.ptr, group);
+        if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
+        try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
+        var lease = try self.acquireWithControls(group, table_name, .from(opts));
+        defer lease.deinit();
+        if (lease.entry.identity.table_id != identity.table_id or lease.entry.identity.shard_id != identity.shard_id or lease.entry.identity.range_id != identity.range_id) return error.HistoryResynchronizationRequired;
+        try self.validateRoutedRead(alloc, fence, group, table_name);
+        var page = try lease.owner().orderedHistoryPage(alloc, table_name, request, proof.applied_index);
+        errdefer page.deinit();
+        try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
+        try self.validateRoutedRead(alloc, fence, group, table_name);
+        return page;
     }
 
     pub fn waitForCurrentSyncGroupLocal(

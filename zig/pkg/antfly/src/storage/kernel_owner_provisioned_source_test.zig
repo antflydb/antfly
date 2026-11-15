@@ -31,6 +31,88 @@ const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
+test "ordered history routed pages retain real images and discard failed final fences" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 1, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" }},
+        ranges: [1]metadata_table_manager.RangeRecord = .{.{ .group_id = 7, .table_id = 1, .range_id = 7, .start_key = "", .end_key = null }},
+        mode: enum { normal, leader_loss, route_change } = .normal,
+        validations: usize = 0,
+        waits: usize = 0,
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.tables, .ranges = &self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn catalog(self: *@This()) table_catalog.CatalogSource {
+            const Routes = table_catalog.TestAdminRoutingAdapter(snapshot, free);
+            return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = Routes.routingSnapshot, .linearizable_routing_snapshot = Routes.linearizableSnapshot, .free_routing_snapshot = Routes.freeRoutingSnapshot } };
+        }
+        fn wait(ptr: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.waits += 1;
+        }
+        fn capture(_: *anyopaque, _: u64) !read_gate.ReadSafetyBarrier.FrozenProof {
+            return .{ .incarnation = 1, .term = 1, .applied_index = 2 };
+        }
+        fn validate(ptr: *anyopaque, _: u64, _: read_gate.ReadSafetyBarrier.FrozenProof, _: ?u64, _: @import("antfly_cancellation").CancellationToken) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.validations += 1;
+            if (self.validations == 2) switch (self.mode) {
+                .normal => {},
+                .leader_loss => return error.NotLeader,
+                .route_change => self.ranges[0].range_id = 8,
+            };
+        }
+    };
+    var fixture: Fixture = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(a, root, fixture.catalog(), .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait, .capture_frozen = Fixture.capture, .validate_frozen = Fixture.validate } });
+    defer owners.deinit();
+    const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = 0, .identity = .{ .table_id = 1, .shard_id = 7, .range_id = 7 }, .schema_json = "{}", .indexes_json = "{}" };
+    const history = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 1, .big);
+    std.mem.writeInt(u64, namespace[8..16], 7, .big);
+    std.mem.writeInt(u64, namespace[16..24], 7, .big);
+    const grant: history.history_consumer.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+    const enrolled = try owners.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 7, "docs", descriptor, .{ .enroll = grant }, 1, 1);
+    // Row apply needs graph replay preparation after the control-only owner.
+    // The progress lane deliberately yields once while replacing that owner.
+    var applied = false;
+    for (0..100) |_| {
+        owners.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(a, 7, "docs", descriptor, .{ .writes = &.{.{ .key = "one", .value = "{\"v\":1}" }} }, 1, 2) catch |err| switch (err) {
+            error.StorageBusy, error.WriterLocked => {
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        applied = true;
+        break;
+    }
+    try std.testing.expect(applied);
+    const snapshot = try table_catalog.routedGroupIdSnapshotUntil(a, fixture.catalog(), "docs", 7, null);
+    const fence = snapshot.fence().?;
+    const request: history.history_page.Request = .{ .reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.applied.consumer.?.epoch, .grant = grant.sequence, .definition = grant.definition }, .after = .{}, .now_seconds = 100 };
+    var page = try owners.orderedHistoryPageRouted(a, fence, "docs", request);
+    defer page.deinit();
+    try std.testing.expectEqualStrings("{\"v\":1}", page.events[0].after.?);
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    fixture.mode = .leader_loss;
+    try std.testing.expectError(error.NotLeader, owners.orderedHistoryPageRouted(a, fence, "docs", request));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    fixture.mode = .route_change;
+    try std.testing.expectError(error.TopologyChanged, owners.orderedHistoryPageRouted(a, fence, "docs", request));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    try std.testing.expectEqual(@as(usize, 3), fixture.waits);
+}
+
 test "compiled ordered history control retains native outcomes without catalog reads" {
     const a = std.testing.allocator;
     const NoCatalog = struct {
