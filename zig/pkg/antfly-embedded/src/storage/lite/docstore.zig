@@ -3324,6 +3324,13 @@ pub const Store = struct {
             .wait_for_reader_lock = opts.read_only,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
+            // See `native.OpenOptions.pin_read_checkpoint`'s own doc
+            // comment: this top-level open is exactly the "fresh,
+            // standalone, read immediately after open" case it exists
+            // for, unlike `initializeReadGenerationAssumeLocked`'s own
+            // direct `native.NativeFile.openWithIo` call below, which
+            // never sets it.
+            .pin_read_checkpoint = opts.read_only,
         };
         const file = if (opts.io) |io|
             try native.NativeFile.openWithIo(allocator, io, path, native_opts)
