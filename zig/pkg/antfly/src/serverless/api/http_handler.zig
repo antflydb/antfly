@@ -6048,6 +6048,14 @@ pub const HttpHandler = struct {
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
         try self.preflightPublicTableBatchSyncLevel(req.sync_level, status);
 
+        if (gated) validateDirectBatchBounds(req) catch return error.InvalidBatchRequest;
+        // Retain every transform read, including a transform that resolves to
+        // no mutation. Blind replacements/deletes have no source dependency.
+        const read_documents = self.alloc.alloc([]const u8, if (gated) req.transforms.len else 0) catch return error.InternalFailure;
+        defer self.alloc.free(read_documents);
+        if (gated) {
+            for (req.transforms, read_documents) |transform, *document| document.* = transform.key;
+        }
         const mutations = (if (gated)
             self.resolveDirectTableBatchMutationsAlloc(namespace, req, request)
         else
@@ -6082,10 +6090,11 @@ pub const HttpHandler = struct {
         defer if (prepared) |values| freeDocumentMutations(self.alloc, values);
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else error.Canceled;
         var result = (if (prepared) |values|
-            self.api.ingestPreparedBatch(.{ .namespace = namespace, .timestamp_ns = timestamp, .operation_id = operation_id, .mutations = values }, catalog_fence)
+            self.api.ingestPreparedBatchWithReadSet(.{ .namespace = namespace, .timestamp_ns = timestamp, .operation_id = operation_id, .mutations = values }, catalog_fence, read_documents)
         else
             self.api.ingestBatch(.{ .namespace = namespace, .timestamp_ns = timestamp, .mutations = mutations })) catch |err| {
             if (err == error.VersionConflict) return error.Conflict;
+            if (err == error.CommitRequirementUnavailable) return error.Unavailable;
             if (err == error.CommitRequirementTooLarge or err == error.InvalidDocumentBody or err == error.InvalidDocumentMutation) return error.InvalidBatchRequest;
             std.log.err("serverless public table batch ingest failed table={s} namespace={s} err={}", .{ table_name, namespace, err });
             return error.InternalFailure;

@@ -26,7 +26,7 @@ pub const WalStore = struct {
         catalog_fence: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!wal_types.CatalogTransition = null,
         begin_catalog_update: ?*const fn (*anyopaque, []const u8, []const u8, u64) anyerror!u64 = null,
         complete_catalog_update: ?*const fn (*anyopaque, []const u8, u64) anyerror!void = null,
-        append_prepared: ?*const fn (*anyopaque, []const u8, u64, []const []const u8, []const u8, wal_types.CatalogFence) anyerror!wal_types.BatchResult = null,
+        append_prepared: ?*const fn (*anyopaque, []const u8, u64, []const []const u8, []const u8, wal_types.CatalogFence, []const []const u8) anyerror!wal_types.BatchResult = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         append: *const fn (*anyopaque, []const u8, u64, []const u8) anyerror!u64,
         append_batch: ?*const fn (*anyopaque, []const u8, u64, []const []const u8) anyerror!wal_types.BatchResult = null,
@@ -113,7 +113,10 @@ pub const WalStore = struct {
         return (self.vtable.complete_catalog_update orelse return error.AtomicCatalogAdmissionUnsupported)(self.ptr, namespace, epoch);
     }
     pub fn appendPrepared(self: *WalStore, namespace: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, fence: wal_types.CatalogFence) !wal_types.BatchResult {
-        return (self.vtable.append_prepared orelse return error.AtomicCatalogAdmissionUnsupported)(self.ptr, namespace, timestamp, payloads, id, fence);
+        return self.appendPreparedWithReadSet(namespace, timestamp, payloads, id, fence, &.{});
+    }
+    pub fn appendPreparedWithReadSet(self: *WalStore, namespace: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, fence: wal_types.CatalogFence, documents: []const []const u8) !wal_types.BatchResult {
+        return (self.vtable.append_prepared orelse return error.AtomicCatalogAdmissionUnsupported)(self.ptr, namespace, timestamp, payloads, id, fence, documents);
     }
 
     pub fn supportsConditionalBatchAppend(self: *const WalStore) bool {

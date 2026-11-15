@@ -164,6 +164,11 @@ validation so concurrent changes cannot turn an authorized preparation into an
 unauthorized commit. Serverless dense preparation resolves one immutable model
 lease for the entire request, shares it across documents and bounded provider
 partitions, and revalidates the current generation before admission.
+Dense text and grouped-parts execution require a planned callback whenever a
+model revision is known. Scalar calls on a pinned provider use the same leased
+batch path. Revision-bearing legacy callbacks reject before inference because
+alias checks cannot detect A -> B -> A during execution; unversioned providers
+retain their legacy execution contract.
 
 Preparation dispatches bounded windows of at most 32 documents and 256 KiB of
 source bytes, preserving native dense/sparse and asset provider batching. The
@@ -234,9 +239,22 @@ and replay receives the work hint. Obsolete outputs never certify the new plan.
 Serverless uses private WAL mutation kind 5 for a self-contained primary postimage
 and its direct pipeline outputs, preserving logical source-byte accounting. One
 conditional atomic WAL batch admits all writes and deletes against the captured
-namespace cut and catalog epoch, with an operation receipt for exact replay and
-collision checks. WAL HEAD format 8 and private mutation kind 6 publish a durable
-catalog-change intent before metadata changes. Catalog intents use the same
+catalog epoch, with an operation receipt for exact replay and collision checks.
+Blind replacements and deletes have no source read dependency. Transform keys,
+including terminal no-op transforms and absent reads, form a bounded read set
+against the pre-read WAL cut. At admission, document-index lookups in windows of at most 512 unique keys
+and a bounded deferred-tail check reject any change to those keys, including
+insert/delete or delete/recreate ABA. Collected or pre-index history fails closed.
+Every catalog-fenced WAL writer maintains this index, including tombstones;
+unrelated source and background writes do not invalidate prepared inference.
+The check uses the immutable HEAD selected for the append CAS. CAS retries
+recheck the read set and catalog without recomputing outputs. Validation uses a
+reclaimable 64 MiB allocation quota; traversal pages and each window’s results
+are released as validation advances. Quota exhaustion fails closed as an oversized
+commit requirement.
+
+WAL HEAD format 8 and private mutation kind 6 publish a durable catalog-change
+intent before metadata changes. Catalog intents use the same
 8 MiB payload limit as batch admission, with a separate recovery allowance for
 the complete encoded record/descriptor and decoded-record overhead. Pending intents block fresh gated
 admission and recover on the next catalog read; per-record epochs make delayed

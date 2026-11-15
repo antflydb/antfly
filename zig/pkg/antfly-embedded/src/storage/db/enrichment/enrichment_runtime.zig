@@ -2944,6 +2944,8 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.OcrPromptEcho,
         error.TrivialOcrOutput,
         error.UnsupportedEmbeddingProvider,
+        error.CommitRequirementUnavailable,
+        error.UncancellableInferenceProvider,
         error.UnsupportedExtractionProvider,
         error.UnsupportedReaderProvider,
         error.InvalidAppleReaderConfig,
@@ -6700,8 +6702,21 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.revision) };
         }
 
+        fn requireLease(raw: *anyopaque, lease: inference_work.CapabilityLease) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, &lease.capabilities.?.model_revision.?, &@as([32]u8, @splat(self.revision)))) return error.EnrichmentSourceChanged;
+        }
+        fn plannedBatch(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?inference_request_context.RequestContext, lease: inference_work.CapabilityLease) ![]const []const f32 {
+            try requireLease(raw, lease);
+            return if (context) |control| controlledBatch(raw, a, name, texts, dims, control) else embedDenseBatch(raw, a, name, texts, dims);
+        }
+        fn plannedParts(raw: *anyopaque, a: Allocator, name: []const u8, input: []const template.ContentPart, dims: u32, context: ?inference_request_context.RequestContext, lease: inference_work.CapabilityLease) ![]f32 {
+            try requireLease(raw, lease);
+            return if (context) |control| controlledParts(raw, a, name, input, dims, control) else parts(raw, a, name, input, dims);
+        }
+
         fn interface(self: *@This()) embedder_mod.DenseEmbedder {
-            return .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_parts_fn = parts, .dense_embed_parts_with_context_fn = controlledParts, .dense_embed_batch_fn = embedDenseBatch, .dense_embed_batch_with_context_fn = controlledBatch, .capabilities_fn = caps, .deinit_fn = null };
+            return .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_parts_fn = parts, .dense_embed_parts_with_context_fn = controlledParts, .dense_embed_batch_fn = embedDenseBatch, .dense_embed_batch_planned_fn = plannedBatch, .dense_embed_parts_planned_fn = plannedParts, .dense_embed_batch_with_context_fn = controlledBatch, .capabilities_fn = caps, .deinit_fn = null };
         }
     };
     var probe = Probe{};
@@ -47342,7 +47357,7 @@ test "model aware media terminal scalar output acknowledges failure without mode
     }
 }
 
-test "model aware media text batches reject a deployment after inference" {
+test "commit requirements dense text batches reject a deployment after inference" {
     const Fake = struct {
         generation: u8 = 0x11,
         fn embed(raw: *anyopaque, a: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
@@ -47353,6 +47368,16 @@ test "model aware media text batches reject a deployment after inference" {
             self.generation = 0x22;
             return vector;
         }
+        fn planned(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?inference_request_context.RequestContext, lease: inference_work.CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), texts.len);
+            try std.testing.expectEqual(@as([32]u8, @splat(self.generation)), lease.capabilities.?.model_revision.?);
+            const rows = try a.alloc([]const f32, 1);
+            errdefer a.free(rows);
+            rows[0] = try embed(raw, a, name, texts[0], dims);
+            return rows;
+        }
         fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @as([32]u8, @splat(self.generation)) };
@@ -47360,7 +47385,7 @@ test "model aware media text batches reject a deployment after inference" {
     };
     const a = std.testing.allocator;
     var fake = Fake{};
-    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .capabilities_fn = Fake.caps };
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .dense_embed_batch_planned_fn = Fake.planned, .capabilities_fn = Fake.caps };
     const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .dense_embedding, .index_name = "idx", .artifact_name = "chunks", .embedding_name = "model", .doc_key = "doc", .source_field = "body", .producer_json = "{\"provider\":\"antfly\",\"model\":\"model\"}", .expected_dims = 2 };
     const old_hash = try retainedTextEmbeddingHash(a, provider, request, "retained text");
     const generation = try provider.captureTextGeneration(a, "model");
@@ -48000,6 +48025,10 @@ test "dense text planning forwards request control to capability discovery" {
             self.resolutions += 1;
             return .{ .capabilities = try discover(ptr, a, name, context orelse return error.MissingDiscoveryContext) };
         }
+        fn planned(ptr: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?inference_request_context.RequestContext, lease: inference_work.CapabilityLease) ![]const []const f32 {
+            try std.testing.expectEqual(@as([32]u8, @splat(1)), lease.capabilities.?.model_revision.?);
+            return batch(ptr, a, name, texts, dims, context orelse return error.MissingExecutionContext);
+        }
         fn synchronous(ptr: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
             return batch(ptr, a, name, texts, dims, .{ .io = std.testing.io, .deadline_ns = null });
         }
@@ -48023,13 +48052,13 @@ test "dense text planning forwards request control to capability discovery" {
     for ([_]bool{ false, true }) |synchronous| {
         for ([_]bool{ false, true }) |resolve_lease| {
             var p = P{};
-            const provider = embedder_mod.DenseEmbedder{ .ptr = &p, .dense_embed_fn = P.single, .dense_embed_batch_fn = P.synchronous, .dense_embed_batch_with_context_fn = if (synchronous) null else P.batch, .capabilities_fn = P.uncontrolled, .capabilities_with_context_fn = P.discover, .resolve_part_lease_fn = if (resolve_lease) P.resolve else null };
+            const provider = embedder_mod.DenseEmbedder{ .ptr = &p, .dense_embed_fn = P.single, .dense_embed_batch_fn = P.synchronous, .dense_embed_batch_planned_fn = P.planned, .dense_embed_batch_with_context_fn = if (synchronous) null else P.batch, .capabilities_fn = P.uncontrolled, .capabilities_with_context_fn = P.discover, .resolve_part_lease_fn = if (resolve_lease) P.resolve else null };
             const context = inference_request_context.RequestContext{ .io = std.testing.io, .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s };
             const rows = try plannedDenseBatches(std.testing.allocator, std.testing.io, provider, "model", &.{ "a", "b" }, 1, context, .{ .items = 2, .bytes = 10 });
             defer embedder_mod.freeDenseEmbeddingBatch(std.testing.allocator, rows);
-            try std.testing.expectEqual(@as(usize, 2), p.discoveries);
+            try std.testing.expectEqual(@as(usize, 1), p.discoveries);
             try std.testing.expectEqual(@as(usize, 1), p.invocations);
-            try std.testing.expectEqual(@as(usize, if (resolve_lease) 2 else 0), p.resolutions);
+            try std.testing.expectEqual(@as(usize, if (resolve_lease) 1 else 0), p.resolutions);
         }
     }
 }
@@ -50320,4 +50349,11 @@ test "sparse cleanup guards coverage routing owns allocation failures and produc
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "commit requirements revision binding rejection is permanent" {
+    for ([_]anyerror{ error.CommitRequirementUnavailable, error.UncancellableInferenceProvider }) |err| {
+        try std.testing.expect(!isRetryableEnrichmentError(err));
+        try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
+    }
 }
