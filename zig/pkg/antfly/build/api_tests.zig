@@ -1097,6 +1097,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "compiled table write boundary transports cancellation and committed failure identity",
             "pre-decision context deadline has typed admission provenance",
             "bound stable single-group transaction retry does not reapply transforms",
+            "bound source admission survives receipt eviction and restart without repeating transforms",
             "bound single-group batch reports prepared intent conflicts",
             "provisioned predicate-only batch validates matching and stale versions",
             "provisioned single-group commit preserves transaction graph transform contract",
@@ -2075,6 +2076,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     }, write_implementation_tests);
     const run_api_table_writes_production_regression_tests = api_table_writes_production_regression_tests.run(b);
+    const source_admission_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-source-admission-tests",
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{ "bound source admission", "bound stable single-group transaction retry" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }, write_implementation_tests);
+    b.step("source-admission-test", "Verify durable source receipts through native transaction admission").dependOn(&source_admission_tests.run(b).step);
     const restore_provisioning_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-restore-provisioning-tests",
         .root_module = api_table_writes_docid_test_mod,

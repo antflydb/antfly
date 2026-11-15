@@ -6195,6 +6195,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     }) });
     const run_committed_frame_tests = b.addRunArtifact(committed_frame_tests);
+    const source_admission_codec_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_admission.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_source_admission_codec_tests = b.addRunArtifact(source_admission_codec_tests);
+    b.step("source-admission-codec-test", "Verify bounded durable source receipts and pending replay fencing").dependOn(&run_source_admission_codec_tests.step);
+    unit_test_step.dependOn(&run_source_admission_codec_tests.step);
     const committed_history_step = b.step("docstore-history-test", "Verify atomic committed before/after images, prepared credits and retention");
     committed_history_step.dependOn(&run_committed_history_tests.step);
     committed_history_step.dependOn(&run_committed_frame_tests.step);

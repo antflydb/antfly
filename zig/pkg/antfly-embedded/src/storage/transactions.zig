@@ -137,7 +137,7 @@ pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
 /// derived index/vector writes. AROW metadata replacement preserves length.
 /// Document numbers retain their exact source spelling. Only special-field
 /// stripping serializes JSON; count its exact output with a bounded writer.
-const isRawMetadataIntentKey = @import("transaction_intent_value.zig").isRawMetadataKey;
+const isRawMetadataIntentKey = @import("transaction_metadata_keys.zig").isRawMetadataKey;
 
 fn isRawMetadataPredicateKey(key: []const u8) bool {
     return isRawMetadataIntentKey(key) or

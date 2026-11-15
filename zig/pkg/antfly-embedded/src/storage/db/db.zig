@@ -25796,6 +25796,21 @@ pub const DB = struct {
         });
     }
 
+    pub fn sourceAdmissionReceipt(self: *DB, command: @import("../source_admission.zig").Command) !?@import("../source_admission.zig").Receipt {
+        return switch (try self.sourceAdmissionStatus(command)) {
+            .committed => |receipt| receipt,
+            .absent, .prepared => null,
+        };
+    }
+
+    pub fn sourceAdmissionStatus(self: *DB, command: @import("../source_admission.zig").Command) !@import("../source_admission.zig").Status {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourceAdmissionStatus", .{ self, command });
+        if (self.isClosed()) return error.StorageUnavailable;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return try @import("../source_admission.zig").lookupStatus(&read, self.core.identity_namespace.table_id, command);
+    }
+
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("writeTransaction", .{ self, txn_id, req });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
@@ -25877,11 +25892,18 @@ pub const DB = struct {
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !void {
+        const source_admission_mod = @import("../source_admission.zig");
+        if (req.source_admission) |command| {
+            try command.validate();
+            if (!std.mem.eql(u8, &command.participant_digest, &source_admission_mod.operationsDigest(req))) return error.SourcePayloadConflict;
+        }
+        var source_arena = std.heap.ArenaAllocator.init(preparation_alloc);
+        defer source_arena.deinit();
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
                 req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or
                 req.relational_activation != null or req.relational_retirement != null or
-                req.relational_repair or req.restore_staging_scope != null)) return error.InvalidBatchRequest;
+                req.relational_repair or req.restore_staging_scope != null or req.source_admission != null)) return error.InvalidBatchRequest;
         const schema_namespace = self.core.schemaNamespaceGeneration();
         // Parse and expand transforms from one optimistic read snapshot before
         // entering the serialized commit section. The commit fence below
@@ -26088,6 +26110,14 @@ pub const DB = struct {
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
+        if (req.source_admission) |command| {
+            var source_read = try self.core.store.beginProbeTxn();
+            defer source_read.abort();
+            const source_plan = try source_admission_mod.prepare(source_arena.allocator(), &source_read, self.core.identity_namespace.table_id, txn_id, command);
+            for (source_plan.writes) |write| try intents.append(preparation_alloc, .{ .key = write.key, .value = write.value });
+            for (source_plan.deletes) |key| try intents.append(preparation_alloc, .{ .key = key, .value = null });
+            try predicates.append(preparation_alloc, .{ .key = source_plan.head_key, .comparison = .exact_value, .expected_value = source_plan.head_before });
+        }
         if (row_policy_principal) |principal| {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
             try self.enforceRowPolicyIntentsLocked(view, intents.items, graph_sources, principal, graph_alloc, &predicates, preparation_alloc);
@@ -26200,7 +26230,21 @@ pub const DB = struct {
                 if (operation.kind != .guard) try intents.append(preparation_alloc, .{ .key = operation.key, .value = operation.value });
             }
         }
-        try self.validateTransformReadSnapshot(transform_snapshot);
+        // A concurrent exact retry may find this transaction's own prepared
+        // intents. They are not competing writers; validate the committed read
+        // versions while excluding only this durable transaction identity.
+        if (transform_snapshot.entries.len != 0) {
+            const transform_predicates = try preparation_alloc.alloc(transactions_mod.VersionPredicate, transform_snapshot.entries.len);
+            defer preparation_alloc.free(transform_predicates);
+            for (transform_snapshot.entries, transform_predicates) |entry, *predicate| predicate.* = .{
+                .key = entry.key,
+                .expected_version = entry.expected_version,
+            };
+            self.core.checkVersionPredicates(transform_predicates, txn_id) catch |err| switch (err) {
+                error.VersionConflict => return error.PreparedReadSetChanged,
+                else => return err,
+            };
+        }
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         const index_spans = try self.collectIndexSpanReservations(preparation_alloc, intents.items, prepared_schema_view);
         defer if (index_spans.len != 0) preparation_alloc.free(index_spans);

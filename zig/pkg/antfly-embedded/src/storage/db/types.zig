@@ -1753,6 +1753,8 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    /// Trusted source transaction metadata; public mutation JSON never sets it.
+    source_admission: ?@import("../source_admission.zig").Command = null,
     document_version_scheme: DocumentVersionScheme = .admit_current,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",

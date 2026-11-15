@@ -43761,6 +43761,130 @@ fn implementationTests() type {
             try std.testing.expect(!try db.hasTopologySensitiveTransactions());
         }
 
+        test "bound source admission survives receipt eviction and restart without repeating transforms" {
+            const admission = @import("antfly_local_sources").api_local_table_writes.source_admission;
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-source-admission", .{tmp.sub_path});
+            defer alloc.free(path);
+            const options: db_mod.OpenOptions = .{
+                .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+                .online_source_authority = .native,
+            };
+            var db = try db_mod.DB.open(alloc, path, options);
+            defer db.close();
+            try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"count\":0}" }}, .sync_level = .write });
+            var source = BoundTableWriteSource.init("docs", &db);
+            var request: distributed_txn.TableCommitRequest = .{
+                .table_name = "docs",
+                .transforms = &.{.{
+                    .key = "counter",
+                    .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+                }},
+            };
+            var command: admission.Command = .{
+                .table_id = 7,
+                .generation = 1,
+                .source = "postgres",
+                .epoch = "slot",
+                .definition_digest = @splat(1),
+                .batch_id = "one",
+                .source_sequence = 10,
+                .checkpoint = "cp1",
+                .payload_digest = @splat(2),
+                .participant_digest = admission.operationsDigest(request),
+                .accepted_at_ns = 20_000,
+                .receipt_window = 2,
+            };
+            const first_command = command;
+            for (0..3) |i| {
+                if (i == 1) {
+                    command.batch_id = "two";
+                    command.source_sequence = 20;
+                    command.expected_checkpoint = "cp1";
+                    command.checkpoint = "cp2";
+                    command.accepted_at_ns += 1;
+                } else if (i == 2) {
+                    command.batch_id = "three";
+                    command.source_sequence = 30;
+                    command.expected_checkpoint = "cp2";
+                    command.checkpoint = "cp1";
+                    command.accepted_at_ns += 1;
+                }
+                request.source_admission = command;
+                const first = (try source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{request}, .write)).?;
+                try std.testing.expect(first == .committed);
+                const retry = (try source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{request}, .write)).?;
+                try std.testing.expect(retry == .committed);
+                var altered = request;
+                altered.source_admission.?.payload_digest = @splat(3);
+                try std.testing.expectError(error.SourcePayloadConflict, source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{altered}, .write));
+                _ = try source.source().acknowledgeTransactionCommit(alloc, command.transactionId(), 0, "docs");
+            }
+            request.source_admission = first_command;
+            try std.testing.expectError(error.SourceReceiptExpired, source.source().commitTransactionWithId(alloc, first_command.transactionId(), first_command.accepted_at_ns, &.{request}, .write));
+            try std.testing.expectError(error.InvalidIntegrityOperation, db.batch(.{ .writes = &.{.{ .key = &admission.headKey(command), .value = "forged" }} }));
+            db.close();
+            db = try db_mod.DB.open(alloc, path, options);
+            source = BoundTableWriteSource.init("docs", &db);
+            request.source_admission = command;
+            const recovered = (try source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{request}, .write)).?;
+            try std.testing.expect(recovered == .committed);
+            var result = (try db.lookup(alloc, "counter", .{})).?;
+            defer result.deinit(alloc);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("count").?.integer);
+
+            command.batch_id = "prepared-before-restart";
+            command.source_sequence = 40;
+            command.expected_checkpoint = "cp1";
+            command.checkpoint = "cp3";
+            command.accepted_at_ns += 1;
+            request.source_admission = command;
+            const participant = try distributed_txn.participantIdForGroup(alloc, "docs", 0);
+            defer alloc.free(participant);
+            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+                command.transactionId(),
+                command.accepted_at_ns,
+                command.accepted_at_ns,
+                &.{participant},
+                true,
+                true,
+            );
+            try db.writeTransaction(command.transactionId(), .{
+                .source_admission = command,
+                .transforms = request.transforms,
+            });
+            // Repeated prepare validates committed versions without treating
+            // this same transaction's own intents as another writer.
+            try db.writeTransaction(command.transactionId(), .{
+                .source_admission = command,
+                .transforms = request.transforms,
+            });
+            try std.testing.expect((try db.sourceAdmissionReceipt(command)) == null);
+            db.close();
+            db = try db_mod.DB.open(alloc, path, options);
+            source = BoundTableWriteSource.init("docs", &db);
+            var altered_pending = command;
+            altered_pending.payload_digest = @splat(4);
+            try std.testing.expectError(error.SourcePayloadConflict, db.sourceAdmissionReceipt(altered_pending));
+            var altered_request = request;
+            altered_request.source_admission = altered_pending;
+            try std.testing.expectError(error.SourcePayloadConflict, source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{altered_request}, .write));
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try db.getTransactionStatus(command.transactionId()));
+            const resolved = (try source.source().commitTransactionWithId(alloc, command.transactionId(), command.accepted_at_ns, &.{request}, .write)).?;
+            try std.testing.expect(resolved == .committed);
+            try std.testing.expect((try db.sourceAdmissionReceipt(command)) != null);
+            var final = (try db.lookup(alloc, "counter", .{})).?;
+            defer final.deinit(alloc);
+            var final_parsed = try std.json.parseFromSlice(std.json.Value, alloc, final.json, .{});
+            defer final_parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 4), final_parsed.value.object.get("count").?.integer);
+            _ = try source.source().acknowledgeTransactionCommit(alloc, command.transactionId(), 0, "docs");
+        }
+
         test "bound single-group batch reports prepared intent conflicts" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});

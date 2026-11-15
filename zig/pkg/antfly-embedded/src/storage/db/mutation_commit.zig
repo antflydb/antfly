@@ -3793,6 +3793,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn isProtectedIntegrityKey(key: []const u8) bool {
+            if (@import("../source_admission.zig").isProtectedKey(key)) return true;
             if (@import("../artifact_footprint.zig").isKey(key)) return true;
             if (@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(key)) return true;
             if (@import("retirement_set_summary.zig").isKey(key)) return true;

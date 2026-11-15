@@ -65,6 +65,41 @@ Important next checks before exposure:
 - Root history is private storage infrastructure. Authentication, live policies,
   expiration, snapshots, slot LSN ordering and public cursors are still separate.
 
+## In progress: durable native source admission
+
+- Private `storage/source_admission.zig` defines source binding, immutable
+  batch identity, a monotonic source sequence separate from provider checkpoints,
+  canonical participant-effect digests, and bounded durable receipt windows.
+  Progress heads and receipt rings are isolated by table/source identity; epoch
+  or generation changes cannot implicitly abandon the previous binding.
+- Source head, receipts, and ring eviction compile to ordinary native transaction
+  intents with an exact source-head predicate. Rows and source progress commit
+  together; a receipt is never a best-effort second write.
+- Retried committed batches resolve before current-schema validation or transform
+  expansion. Pending intent receipts also fence changed payloads before recovery.
+  Expired receipts reject old source sequences even when opaque checkpoints cycle.
+- Metadata writes are protected from ordinary batches and excluded from row
+  preparation and row history; trusted source admission is the only compiler.
+- Native engine and runtime error boundaries preserve source/history outcomes.
+  All 56 runtime error ABI tests and the bounded receipt/pending-replay test pass.
+  The new `zig build source-admission-test -j2` target exercises the bound
+  destination through native transaction callbacks. The expanded native run
+  passes receipt eviction, acknowledgment, reopen, exact retry, conflicting-payload
+  rejection, private-key protection, repeated prepare, and a real prepared
+  transaction across reopen. Prepared source retries resolve the existing vote
+  rather than expanding transforms again; a conflicting retry cannot abort it.
+  Transaction read validation excludes the transaction's own pending intents,
+  while retaining version checks and conflicts with other writers.
+- `zig build source-admission-test source-admission-codec-test
+  docstore-history-test docstore-transaction-reservations-test -j2` passes:
+  two bound native integration tests, bounded codec/replay tests, four retained
+  history tests, and all 56 transaction/reservation regressions. Final local log:
+  `zig/source-admission-final-recovery.log`. `make gc` completed safely.
+
+The source command is currently private. Distributed routing/anchor ownership,
+replicated transport, managed connector invocation, and writable-Iceberg adapters
+still require integration; this does not advertise those destination capabilities.
+
 ## Remaining implementation phases
 
 1. Finish root history tests, prepared credit accounting and native integration.
@@ -120,3 +155,23 @@ local artifacts. Keep draft PR scope/status honest as implementation grows.
   Add recoverable committed-history references tied to actual catalog commits;
   accepted WAL entries alone are not committed outbound events. Existing external
   snapshot attachment remains a separately qualified capability.
+
+## Source routing integration constraints
+
+Do not copy one root-local command into every distributed participant unchanged.
+A routed transaction needs an explicit, topology-fenced source-head anchor plus
+payload-fenced data participants and a durable coordinator outcome. The anchor
+owns the global predecessor checkpoint and receipt; individual data groups may
+not have seen the preceding source transaction. Per-participant effect digests
+must bind the routed effects while the source payload digest binds the entire
+original transaction. Resolve recent retries through the anchor before routing
+against a newer schema/topology; retain enough original participant authority to
+finish recovery after lost responses. Source receipts cannot authorize early
+global completion while participant resolution is incomplete.
+
+Source progress also needs a persisted monotonic sequence and stable accepted
+timestamp/transaction identity, including checkpoint-only polls. Do not order
+opaque checkpoints, encode snapshot/LSN phases into numeric ranges, or advance
+destination progress only for polls containing rows. Preserve old key/row and
+unchanged-TOAST information from pgoutput; source transforms and route
+enter/leave/key changes must use source images with declared completeness.

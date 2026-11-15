@@ -323,7 +323,7 @@ pub const Capture = struct {
         const id = key[intents_prefix.len..][0..16].*;
         const logical = key[intents_prefix.len + 17 ..];
         // Metadata/integrity intents have no public tuple image.
-        if (intent_value.isRawMetadataKey(logical)) return;
+        if (@import("transaction_metadata_keys.zig").isRawMetadataKey(logical)) return;
         const item = try self.members.getOrPut(a, key);
         if (!item.found_existing) {
             item.key_ptr.* = a.dupe(u8, key) catch |err| {

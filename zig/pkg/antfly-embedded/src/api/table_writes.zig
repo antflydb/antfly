@@ -15,6 +15,7 @@
 
 pub const physical_local_write = if (@import("storage_source_options").control_only) struct {} else @import("antfly_source_root").antfly_sources.local_write;
 pub const std = @import("std");
+pub const source_admission = @import("../storage/source_admission.zig");
 pub const storage_source_options = @import("storage_source_options");
 pub const control_only_storage_sources = storage_source_options.control_only;
 pub const backups_api = @import("backups.zig");
@@ -724,7 +725,7 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null) {
+        if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null and tables[0].source_admission == null) {
             const table = tables[0];
             const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
@@ -796,6 +797,69 @@ pub const BoundTableWriteSource = struct {
         retain_terminal: bool,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const admission = @import("../storage/source_admission.zig");
+        if (tables.len != 1 or tables[0].source_admission == null)
+            return commitBoundTransactionInner(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, retain_terminal, cancellation, false);
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        const table = tables[0];
+        if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
+        const command = table.source_admission.?;
+        try command.validate();
+        if (command.accepted_at_ns != begin_timestamp or !std.mem.eql(u8, &txn_id, &command.transactionId())) return error.SourceTransactionIdentityConflict;
+        if (!std.mem.eql(u8, &command.participant_digest, &admission.operationsDigest(table))) return error.SourcePayloadConflict;
+        const db = try self.activeDb();
+        // Resolve acknowledged source retries before validating against a newer
+        // schema or expanding transforms against a later row image.
+        const source_status = try db.sourceAdmissionStatus(command);
+        if (source_status == .committed)
+            return try sourceCommittedOutcome(db, txn_id, table.table_name, sync_level, retain_terminal, cancellation);
+        const outcome = commitBoundTransactionInner(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, retain_terminal, cancellation, source_status == .prepared) catch |err| {
+            if (err == error.SourceAlreadyCommitted and try db.sourceAdmissionReceipt(command) != null)
+                return try sourceCommittedOutcome(db, txn_id, table.table_name, sync_level, retain_terminal, cancellation);
+            return err;
+        };
+        if (outcome) |value| if (value == .committed) {
+            if (try db.sourceAdmissionReceipt(command) == null) return error.SourceOutcomeUnresolved;
+        };
+        return outcome;
+    }
+
+    fn sourceCommittedOutcome(
+        db: *db_mod.DB,
+        txn_id: db_mod.types.TxnId,
+        table_name: []const u8,
+        sync_level: db_mod.types.SyncLevel,
+        retain_terminal: bool,
+        cancellation: db_mod.types.CancellationToken,
+    ) !distributed_txn.CommitOutcome {
+        const retained = if (retain_terminal) blk: {
+            const status = db.getTransactionStatus(txn_id) catch |err| if (err == error.TxnNotFound) break :blk false else return err;
+            break :blk status == .committed;
+        } else false;
+        var result: @FieldType(distributed_txn.CommitOutcome, "committed") = .{
+            .participant_count = 1,
+            .coordinator_group_id = if (retained) 0 else null,
+            .coordinator_table_name = if (retained) table_name else null,
+        };
+        db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation) catch |err| {
+            result.visibility_pending = true;
+            result.visibility_retry_pending = err != error.EnrichmentWorkerFailed;
+            result.visibility_repair_required = err == error.EnrichmentWorkerFailed;
+        };
+        return .{ .committed = result };
+    }
+
+    fn commitBoundTransactionInner(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        retain_terminal: bool,
+        cancellation: db_mod.types.CancellationToken,
+        source_prepared: bool,
+    ) !?distributed_txn.CommitOutcome {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (tables.len != 1) return error.UnsupportedOperation;
         const table = tables[0];
@@ -804,7 +868,7 @@ pub const BoundTableWriteSource = struct {
         if (table.relational_index_maintenance) |command| if (command.owner_group_id != (self.owner_group_id orelse return error.UnsupportedOperation)) return error.PreparedGenerationChanged;
         const db = try self.activeDb();
         if (table.range_guards.len != 0) return error.SqlStatementSnapshotRequired;
-        try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
+        if (!source_prepared) try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
         const commit_version = begin_timestamp + 1;
         const local_participant = try distributed_txn.participantIdForGroup(alloc, table.table_name, 0);
         defer alloc.free(local_participant);
@@ -865,10 +929,21 @@ pub const BoundTableWriteSource = struct {
             },
             else => return err,
         };
-        db.writeTransaction(txn_id, .{
+        // A durable source receipt intent proves the original effects were
+        // atomically prepared. Resume that vote without re-expanding transforms
+        // or validating an old request against a newer schema. BEGIN above still
+        // fences participant/coordinator/retention identity before resolution.
+        if (!source_prepared) db.writeTransaction(txn_id, .{
+            .source_admission = table.source_admission,
+            .row_policy_principal_proof = table.row_policy_principal_proof,
+            .row_policy_database = table.row_policy_database,
+            .row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds,
+            .normalized_graph_rows = table.normalized_graph_rows,
             .writes = table.writes,
             .deletes = table.deletes,
             .transforms = table.transforms,
+            .graph_writes = table.graph_writes,
+            .graph_deletes = table.graph_deletes,
             .predicates = table.predicates,
             .integrity = table.integrity,
             .integrity_commands = table.integrity_commands,
@@ -882,6 +957,14 @@ pub const BoundTableWriteSource = struct {
             .restore_staging_plan_id = table.restore_staging_plan_id,
             .relational_repair = table.relational_repair,
         }) catch |err| {
+            if (table.source_admission != null) switch (err) {
+                // Another exact attempt can finish after our receipt lookup.
+                error.SourceAlreadyCommitted => return try sourceCommittedOutcome(db, txn_id, table.table_name, sync_level, retain_terminal, cancellation),
+                // A different payload under the same identity cannot abort the
+                // original attempt whose durable receipt owns that identity.
+                error.SourcePayloadConflict, error.SourceTransactionIdentityConflict => return err,
+                else => {},
+            };
             // A begun local transaction must reach a terminal state on every
             // rejected write. In particular, graph transform validation is
             // performed by DB.writeTransaction after begin, so returning the

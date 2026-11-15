@@ -51,14 +51,3 @@ pub fn documentImageBytes(alloc: std.mem.Allocator, value: []const u8) !u64 {
     try std.json.Stringify.value(parsed.value, .{}, &counter.writer);
     return @max(value.len, counter.fullCount());
 }
-
-pub fn isRawMetadataKey(key: []const u8) bool {
-    return @import("range_protection.zig").counterBucket(key) != null or
-        @import("range_protection.zig").indexCounterDigest(key) != null or
-        std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_generation_retirement") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
-        @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
-}

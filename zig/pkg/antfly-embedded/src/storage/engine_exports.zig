@@ -1134,6 +1134,10 @@ fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntent
     return .{ .value = self.writeTransaction(txn_id, req) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn sourceAdmissionStatus(self: *DB, command: @import("source_admission.zig").Command) engine.Outcome(@import("source_admission.zig").Status) {
+    return .{ .value = self.sourceAdmissionStatus(command) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn resolveTransactionIntentsWithSyncLevelAndCancellation(self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, sync_level: types.SyncLevel, visibility_cancellation: types.CancellationToken) engine.Outcome(void) {
     return .{ .value = self.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, visibility_cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
