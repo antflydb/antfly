@@ -655,6 +655,9 @@ fn validateGgufCompanionForBackend(
             .message = "a required companion GGUF is missing or unreadable",
         };
     };
+    // Compatibility checks inspect metadata; they do not own the companion's
+    // weight residency. Preserve pages used by an already-loaded projector.
+    mapped.preserveFileCacheOnDeinit();
     defer mapped.deinit();
 
     var file = gguf_format.parseStructure(allocator, mapped.data) catch |err| {
@@ -7957,8 +7960,12 @@ pub const ModelManager = struct {
     }
 
     pub fn acquireCachedFromDirWithControl(self: *ModelManager, model_dir: []const u8, control: InferenceExecutionControl) !?ModelHandle {
+        return self.acquireCachedWithLoadOverrides(model_dir, .{}, control);
+    }
+
+    fn acquireCachedWithLoadOverrides(self: *ModelManager, model_dir: []const u8, overrides: ModelLoadOverrides, control: InferenceExecutionControl) !?ModelHandle {
         const publication = try self.publicationForRequest(model_dir, control);
-        const defaults = self.defaultModelLoadPolicy(model_dir);
+        const defaults = self.resolveModelLoadPolicy(model_dir, overrides);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try self.session_manager.requiredBackendCandidates(
             defaults.preferred_backends,
@@ -8061,6 +8068,16 @@ pub const ModelManager = struct {
                 return man.model_type == .generator;
             }
         }.matches);
+    }
+
+    /// Explicit placement uses the same policy keys and publication fence as
+    /// execution. In particular, a default alias on another backend is not a hit.
+    pub fn copyCachedGenerationManifestForBackendWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, backend: backends.BackendType, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedWithLoadOverrides(model_dir, .{ .preferred_backends = &.{backend} }, control)) orelse return null;
+        defer handle.release();
+        const model = handle.get();
+        if (model.session.backend() != backend or model.manifest.model_type != .generator) return null;
+        return try model.manifest.clone(allocator);
     }
 
     /// Pin one handle for every currently published model. Callers may release
@@ -17270,11 +17287,19 @@ test "warm generator admission metadata releases pins on OOM and survives retire
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, manager.copyCachedGenerationManifest(failing.allocator(), "teardown-fixture"));
     try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    try std.testing.expect((try manager.copyCachedGenerationManifestForBackendWithControl(a, "teardown-fixture", .cuda, .{})) == null);
+    var explicit_failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, manager.copyCachedGenerationManifestForBackendWithControl(explicit_failing.allocator(), "teardown-fixture", .metal, .{}));
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    var explicit_copy = (try manager.copyCachedGenerationManifestForBackendWithControl(a, "teardown-fixture", .metal, .{})).?;
+    defer explicit_copy.deinit();
     var copy = (try manager.copyCachedGenerationManifest(a, "teardown-fixture")).?;
     defer copy.deinit();
     try std.testing.expectEqual(@as(usize, 1), model.active_handles);
     inference.retire();
     try std.testing.expect(probe.closed);
+    try std.testing.expectEqualStrings("text", explicit_copy.inputs[0]);
+    try std.testing.expect((try manager.copyCachedGenerationManifestForBackendWithControl(a, "teardown-fixture", .metal, .{})) == null);
     try std.testing.expectEqualStrings("text", copy.inputs[0]);
     try std.testing.expectEqualStrings("inference.max_input_tokens_per_item=4096", copy.capabilities[0]);
     try std.testing.expect((try manager.copyCachedGenerationManifest(a, "teardown-fixture")) == null);
@@ -17284,7 +17309,7 @@ test "warm generator admission metadata releases pins on OOM and survives retire
     replacement_model.manifest.hidden_size = 2048;
     var replacement = try manager.publishLoadedModel(replacement_model, true, null, null, 0);
     defer replacement.release();
-    var fresh = (try manager.copyCachedGenerationManifest(a, "teardown-fixture")).?;
+    var fresh = (try manager.copyCachedGenerationManifestForBackendWithControl(a, "teardown-fixture", .metal, .{})).?;
     defer fresh.deinit();
     try std.testing.expectEqual(@as(u32, 2048), fresh.hidden_size);
     try std.testing.expectEqual(@as(usize, 0), fresh.capabilities.len);
@@ -17452,6 +17477,7 @@ test "explicit load policy placement preserves configured A4B variants with and 
     const override_request = backend_contracts.A4bInferenceRequest{ .residency_mode = .resident, .memory_budget_mb = 24576, .load_workers = 4 };
     try manager.setStartupLoadPolicy("model", .{ .backend = .cuda, .a4b_request = configured_request });
     var configured = loadPolicySelectionTestModel(1);
+    configured.manifest = .{ .allocator = a, .model_type = .generator, .hidden_size = 1234 };
     var unqualified = loadPolicySelectionTestModel(2);
     var overridden = loadPolicySelectionTestModel(3);
     try manager.loaded.put(a, try backendVariantCacheKey(a, "model", .cuda, configured_request), &configured);
@@ -17468,6 +17494,10 @@ test "explicit load policy placement preserves configured A4B variants with and 
         try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackends("model", &.{.cuda}, false), 1);
         try expectLoadPolicySelection(try manager.acquireFromDirWithPreferredBackendsAndControl("model", &.{.cuda}, false, .{}), 1);
         try expectLoadPolicySelection((try manager.acquireCachedFromDir("model")).?, 1);
+        var metadata = (try manager.copyCachedGenerationManifestForBackendWithControl(a, "model", .cuda, .{})).?;
+        defer metadata.deinit();
+        try std.testing.expectEqual(@as(u32, 1234), metadata.hidden_size);
+        try std.testing.expectEqual(@as(usize, 0), configured.active_handles);
         // A real policy override remains exact, regardless of the default alias.
         try expectLoadPolicySelection(try manager.acquireFromDirWithA4bRequest("model", override_request), 3);
         try expectLoadPolicySelection(try manager.acquireFromDirWithA4bRequestAndControl("model", override_request, .{}), 3);
@@ -17550,6 +17580,7 @@ test "model selection resident sessions and load flights fence receipt generatio
     a.free(old.model_dir);
     old.model_dir = try a.dupe(u8, directory);
     old.managed_publication = first_publication;
+    old.manifest.model_type = .generator;
     var original = try manager.publishLoadedModel(old, true, null, null, 0);
     defer original.release();
     const old_runtime = original.get().runtime_id;
@@ -17557,7 +17588,7 @@ test "model selection resident sessions and load flights fence receipt generatio
     reused.release();
     try tmp.dir.writeFile(io, .{ .sub_path = "model/.antfly-download-complete.json", .data = "{\"version\":2,\"source\":{\"owner\":\"acme\",\"name\":\"model\",\"variant\":\"gguf:Q4_0\",\"resolved_revision\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}" });
     const next_publication = try managed_receipt.publicationGeneration(a, io, directory);
-    try std.testing.expectError(error.ModelArtifactsChanging, manager.acquireFromDirWithControl(directory, .{}));
+    try std.testing.expectError(error.ModelArtifactsChanging, manager.copyCachedGenerationManifestForBackendWithControl(a, directory, .metal, .{}));
     try std.testing.expect(original.get().retired);
     const first_flight = try manager.loadFlightKey(directory, &.{.metal}, true, .{ .managed_publication = first_publication });
     defer a.free(first_flight);

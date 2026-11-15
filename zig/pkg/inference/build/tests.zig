@@ -191,6 +191,17 @@ pub fn create(ctx: Context) Suite {
         run_cli_tests.addArgs(&.{ "--test-filter", filter });
     }
     build_test_filters.addRuntimeControls(run_cli_tests, ctx.args orelse &.{});
+    // Keep the Gemma CUDA upload/dispatch regression loop independent of
+    // unrelated library suites, while retaining the normal runtime imports.
+    const gemma_cuda_tests = b.addTest(.{
+        .root_module = tests.root_module,
+        .filters = &.{ "Gemma4 CUDA", "embeddinggemma2 CUDA model constants", "embeddinggemma2 CUDA constant snapshots", "generated CUDA tiled64", "generated CUDA score prework", "generated CUDA paged score prework", "E4B shared KV prefill", "detect clip gemma4", "warm generator admission metadata", "explicit load policy placement", "model selection resident sessions and load flights", "compatibility signature", "compatibility backend candidates", "CUDA greedy graph output", "CUDA suppressed argmax", "CUDA graph", "clearing CUDA graph capture", "CUDA persistent buffer reallocation", "split-K replay rejection", "uncompressed CUDA KV capacity", "CUDA capture defaults", "CUDA temp arena" },
+        .test_runner = runtime_filter_test_runner,
+        .max_rss = 7 * 1024 * 1024 * 1024,
+    });
+    ctx.step("test-gemma4-cuda", "Verify Gemma CUDA raw weights, compact projector and attention dispatch")
+        .dependOn(&ctx.addRunArtifact(gemma_cuda_tests).step);
+
     const run_tests = ctx.addRunArtifact(tests);
     const evidence_module = b.createModule(.{
         .root_source_file = ctx.path("src/pipelines/grammar.zig"),
