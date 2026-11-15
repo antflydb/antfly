@@ -33,6 +33,11 @@ pub const PolicySnapshot = struct {
 /// The caller owns the allocator (normally a request arena). Do not retain
 /// borrowed enrichment catalog pointers after dropping the catalog lock.
 pub fn capture(db: anytype, a: A) !?PolicySnapshot {
+    return captureWithBudget(db, a, null);
+}
+
+pub fn captureWithBudget(db: anytype, a: A, budget: ?*@import("artifact_scan_budget.zig").Budget) !?PolicySnapshot {
+    if (budget) |b| try b.check();
     const manager = db.core.index_manager;
     manager.catalog_mutex.lockShared();
     const guard = manager.getEnrichment(.asset, document.state_artifact_name);
@@ -41,6 +46,10 @@ pub fn capture(db: anytype, a: A) !?PolicySnapshot {
     } else {
         manager.catalog_mutex.unlockShared();
         return null;
+    };
+    if (budget) |b| b.consume(cfg.name.len +| cfg.producer_json.len) catch |err| {
+        manager.catalog_mutex.unlockShared();
+        return err;
     };
     const artifact_name = a.dupe(u8, cfg.name) catch |err| {
         manager.catalog_mutex.unlockShared();
@@ -201,10 +210,15 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
 /// settle them. Bind those summaries and physical consumer checkpoints to the
 /// same apply-shared cut before candidates, statistics or totals are read.
 pub fn requirePublished(db: anytype, a: A, req: @import("types.zig").SearchRequest) !bool {
+    return requirePublishedWithBudget(db, a, req, null);
+}
+
+pub fn requirePublishedWithBudget(db: anytype, a: A, req: @import("types.zig").SearchRequest, budget: ?*@import("artifact_scan_budget.zig").Budget) !bool {
+    if (budget) |b| try b.check();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const captured = try capture(db, scratch);
+    const captured = try captureWithBudget(db, scratch, budget);
     try requireExpected(scratch, req.privacy_policy_version, captured);
     const policy = captured orelse return false;
     if (policy.prepared.policy.mode == .monitor) return false;
@@ -225,18 +239,19 @@ pub fn requirePublished(db: anytype, a: A, req: @import("types.zig").SearchReque
         const count = try @import("range_cardinality.zig").loadOrProveEmptyFromTxn(&read);
         break :blk count != null and count.? == 0;
     };
+    if (!local and !try @import("artifact_producer_readiness.zig").allSourcesComplete(scratch, &read, plan.plan(), db.root_incarnation, inputs_empty, budget)) return error.IndexRebuilding;
     var root_found = false;
     for (requirements.nodes) |node| {
+        if (budget) |b| try b.consume(node.artifact.len +| node.embedding.len +| @sizeOf(@TypeOf(node)));
         if (node.kind != .generated and node.kind != .unit_children) continue;
         if (std.mem.eql(u8, node.artifact, policy.artifact_name)) root_found = true;
-        if (!local and node.artifact.len != 0 and !try @import("artifact_producer_readiness.zig").sourceComplete(scratch, &read, plan.plan(), db.root_incarnation, node.artifact, inputs_empty)) return error.IndexRebuilding;
-        if (!local and node.embedding.len != 0 and !try @import("artifact_producer_readiness.zig").sourceComplete(scratch, &read, plan.plan(), db.root_incarnation, node.embedding, inputs_empty)) return error.IndexRebuilding;
     }
     if (!root_found) return error.IndexRebuilding;
     inline for (.{ "text_indexes", "dense_indexes", "sparse_indexes" }) |collection| {
         for (@field(db.core.index_manager, collection).items) |*entry| {
             const name = entry.config.name;
-            if (local and !try db.privacyLocalIndexSourcesComplete(scratch, &read, name, entry.config.kind, plan.plan())) return error.IndexRebuilding;
+            if (budget) |b| try b.consume(name.len +| entry.config.config_json.len);
+            if (local and !try db.privacyLocalIndexSourcesCompleteWithBudget(scratch, &read, name, entry.config.kind, plan.plan(), budget)) return error.IndexRebuilding;
             if (db.core.index_manager.loadFailure(name) != null) return error.IndexRebuilding;
             var applied = try db.core.loadAppliedSequence(scratch, name);
             if (db.executor.appliedSequence(name)) |live| applied = @max(applied, live);
@@ -246,5 +261,6 @@ pub fn requirePublished(db: anytype, a: A, req: @import("types.zig").SearchReque
             if (checkpoint.status != .clean or checkpoint.config_hash != @import("types.zig").indexConfigHash(entry.config)) return error.IndexRebuilding;
         }
     }
+    if (budget) |b| try b.check();
     return true;
 }

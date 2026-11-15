@@ -9,6 +9,7 @@ from ...client import AuthenticatedClient, Client
 from ...models.document_artifact_manifest import DocumentArtifactManifest
 from ...models.error import Error
 from ...models.get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
+from ...models.get_document_artifact_manifest_response_413 import GetDocumentArtifactManifestResponse413
 from ...types import UNSET, Response, Unset
 
 
@@ -45,7 +46,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> DocumentArtifactManifest | Error | None:
+) -> DocumentArtifactManifest | Error | GetDocumentArtifactManifestResponse413 | None:
     if response.status_code == 200:
         response_200 = DocumentArtifactManifest.from_dict(response.json())
 
@@ -60,6 +61,11 @@ def _parse_response(
         response_405 = Error.from_dict(response.json())
 
         return response_405
+
+    if response.status_code == 413:
+        response_413 = GetDocumentArtifactManifestResponse413.from_dict(response.json())
+
+        return response_413
 
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
@@ -79,7 +85,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[DocumentArtifactManifest | Error]:
+) -> Response[DocumentArtifactManifest | Error | GetDocumentArtifactManifestResponse413]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -95,13 +101,25 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     detail: GetDocumentArtifactManifestDetail | Unset = UNSET,
-) -> Response[DocumentArtifactManifest | Error]:
+) -> Response[DocumentArtifactManifest | Error | GetDocumentArtifactManifestResponse413]:
     """Inspect a derived document artifact manifest
 
      Returns manifest and processing state for a derived document artifact,
     such as the document-unit hierarchy extracted from a PDF, HTML page, or
     text field. The route is shard-aware; hosted deployments route the
     request to the data group that owns the source document key.
+
+    On a privacy-protected table, a dense index name without a same-named
+    asset also selects its stored text-chunk vectors for administrator
+    inspection. The response uses route_type `dense_index_inspection` and
+    manifest_version 1; raw manifest_json carries the versioned
+    `antfly.dense-index-inspection.v1` snapshot. Its current flag, policy,
+    index recipe, sanitized source and vector publication evidence belong
+    to one publication-fenced storage cut. The top-level artifact_id is empty;
+    member artifact IDs are included in the raw snapshot. This bounded
+    inspection does not re-embed missing vectors and does not alter normal
+    protected search projection permissions. See the table privacy guide
+    for the raw payload and supported recipe limits.
 
     Args:
         table_name (str):
@@ -114,7 +132,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[DocumentArtifactManifest | Error]
+        Response[DocumentArtifactManifest | Error | GetDocumentArtifactManifestResponse413]
     """
 
     kwargs = _get_kwargs(
@@ -138,13 +156,25 @@ def sync(
     *,
     client: AuthenticatedClient,
     detail: GetDocumentArtifactManifestDetail | Unset = UNSET,
-) -> DocumentArtifactManifest | Error | None:
+) -> DocumentArtifactManifest | Error | GetDocumentArtifactManifestResponse413 | None:
     """Inspect a derived document artifact manifest
 
      Returns manifest and processing state for a derived document artifact,
     such as the document-unit hierarchy extracted from a PDF, HTML page, or
     text field. The route is shard-aware; hosted deployments route the
     request to the data group that owns the source document key.
+
+    On a privacy-protected table, a dense index name without a same-named
+    asset also selects its stored text-chunk vectors for administrator
+    inspection. The response uses route_type `dense_index_inspection` and
+    manifest_version 1; raw manifest_json carries the versioned
+    `antfly.dense-index-inspection.v1` snapshot. Its current flag, policy,
+    index recipe, sanitized source and vector publication evidence belong
+    to one publication-fenced storage cut. The top-level artifact_id is empty;
+    member artifact IDs are included in the raw snapshot. This bounded
+    inspection does not re-embed missing vectors and does not alter normal
+    protected search projection permissions. See the table privacy guide
+    for the raw payload and supported recipe limits.
 
     Args:
         table_name (str):
@@ -157,7 +187,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        DocumentArtifactManifest | Error
+        DocumentArtifactManifest | Error | GetDocumentArtifactManifestResponse413
     """
 
     return sync_detailed(
@@ -176,13 +206,25 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     detail: GetDocumentArtifactManifestDetail | Unset = UNSET,
-) -> Response[DocumentArtifactManifest | Error]:
+) -> Response[DocumentArtifactManifest | Error | GetDocumentArtifactManifestResponse413]:
     """Inspect a derived document artifact manifest
 
      Returns manifest and processing state for a derived document artifact,
     such as the document-unit hierarchy extracted from a PDF, HTML page, or
     text field. The route is shard-aware; hosted deployments route the
     request to the data group that owns the source document key.
+
+    On a privacy-protected table, a dense index name without a same-named
+    asset also selects its stored text-chunk vectors for administrator
+    inspection. The response uses route_type `dense_index_inspection` and
+    manifest_version 1; raw manifest_json carries the versioned
+    `antfly.dense-index-inspection.v1` snapshot. Its current flag, policy,
+    index recipe, sanitized source and vector publication evidence belong
+    to one publication-fenced storage cut. The top-level artifact_id is empty;
+    member artifact IDs are included in the raw snapshot. This bounded
+    inspection does not re-embed missing vectors and does not alter normal
+    protected search projection permissions. See the table privacy guide
+    for the raw payload and supported recipe limits.
 
     Args:
         table_name (str):
@@ -195,7 +237,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[DocumentArtifactManifest | Error]
+        Response[DocumentArtifactManifest | Error | GetDocumentArtifactManifestResponse413]
     """
 
     kwargs = _get_kwargs(
@@ -217,13 +259,25 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     detail: GetDocumentArtifactManifestDetail | Unset = UNSET,
-) -> DocumentArtifactManifest | Error | None:
+) -> DocumentArtifactManifest | Error | GetDocumentArtifactManifestResponse413 | None:
     """Inspect a derived document artifact manifest
 
      Returns manifest and processing state for a derived document artifact,
     such as the document-unit hierarchy extracted from a PDF, HTML page, or
     text field. The route is shard-aware; hosted deployments route the
     request to the data group that owns the source document key.
+
+    On a privacy-protected table, a dense index name without a same-named
+    asset also selects its stored text-chunk vectors for administrator
+    inspection. The response uses route_type `dense_index_inspection` and
+    manifest_version 1; raw manifest_json carries the versioned
+    `antfly.dense-index-inspection.v1` snapshot. Its current flag, policy,
+    index recipe, sanitized source and vector publication evidence belong
+    to one publication-fenced storage cut. The top-level artifact_id is empty;
+    member artifact IDs are included in the raw snapshot. This bounded
+    inspection does not re-embed missing vectors and does not alter normal
+    protected search projection permissions. See the table privacy guide
+    for the raw payload and supported recipe limits.
 
     Args:
         table_name (str):
@@ -236,7 +290,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        DocumentArtifactManifest | Error
+        DocumentArtifactManifest | Error | GetDocumentArtifactManifestResponse413
     """
 
     return (

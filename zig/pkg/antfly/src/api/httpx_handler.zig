@@ -2672,6 +2672,7 @@ pub const AntflyApiHandler = struct {
         return switch (err) {
             error.IndexRebuilding => .{ .status = 503, .message = "IndexRebuilding" },
             error.IncompletePublishedSnapshot => .{ .status = 503, .message = "IncompletePublishedSnapshot" },
+            error.ResourceBudgetExceeded => .{ .status = 413, .message = "inspection limit exceeded" },
             error.IndexGenerationMismatch => .{
                 .status = 409,
                 .message = "IndexGenerationMismatch",
@@ -12356,6 +12357,8 @@ test "typed internal HTTP errors preserve conflict semantics" {
         try std.testing.expectEqual(@as(u16, 503), availability.status);
         try std.testing.expectEqualStrings(@errorName(failure), availability.message);
     }
+    const limit = AntflyApiHandler.sharedInternalHttpErrorSpec(error.ResourceBudgetExceeded).?;
+    try std.testing.expectEqual(@as(u16, 413), limit.status);
     const transition = AntflyApiHandler.sharedInternalHttpErrorSpec(error.GenerationTransitionActive).?;
     try std.testing.expectEqual(@as(u16, 503), transition.status);
     try std.testing.expectEqualStrings("GenerationTransitionActive", transition.message);

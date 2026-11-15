@@ -17697,6 +17697,18 @@ paths:
         such as the document-unit hierarchy extracted from a PDF, HTML page, or
         text field. The route is shard-aware; hosted deployments route the
         request to the data group that owns the source document key.
+
+        On a privacy-protected table, a dense index name without a same-named
+        asset also selects its stored text-chunk vectors for administrator
+        inspection. The response uses route_type `dense_index_inspection` and
+        manifest_version 1; raw manifest_json carries the versioned
+        `antfly.dense-index-inspection.v1` snapshot. Its current flag, policy,
+        index recipe, sanitized source and vector publication evidence belong
+        to one publication-fenced storage cut. The top-level artifact_id is empty;
+        member artifact IDs are included in the raw snapshot. This bounded
+        inspection does not re-embed missing vectors and does not alter normal
+        protected search projection permissions. See the table privacy guide
+        for the raw payload and supported recipe limits.
       parameters:
         - name: detail
           in: query
@@ -17722,6 +17734,29 @@ paths:
           $ref: "#/components/responses/NotFound"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
+        "413":
+          description: |
+            Dense inspection exceeds fixed payload or traversal limits. The JSON
+            response has code `inspection_limit_exceeded`, retryable `false`,
+            and a `limits` object. Reduce the source or selected index recipe.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [code, retryable, message, limits]
+                properties:
+                  code:
+                    type: string
+                    enum: [inspection_limit_exceeded]
+                  retryable:
+                    type: boolean
+                    enum: [false]
+                  message:
+                    type: string
+                  limits:
+                    type: object
+                    additionalProperties:
+                      type: integer
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
         "500":

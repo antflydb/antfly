@@ -455,6 +455,37 @@ pub fn sourceComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manag
     return true; // Authored sources have no asynchronous producer dependency.
 }
 
+/// Conjunction of sourceComplete for every generated requirement. Global
+/// serving/inspection needs every producer, so no per-source dependency
+/// closure is necessary: validate the shared authority once and each counter
+/// once. Keep sourceComplete for consumers needing only one producer closure.
+pub fn allSourcesComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manager.WritePlanSnapshot, root: u128, inputs_empty: bool, budget: ?*@import("artifact_scan_budget.zig").Budget) !bool {
+    const requirements = if (plan.completion_plan) |*value| value else return false;
+    if (budget) |b| {
+        try b.check();
+        if (requirements.nodes.len > b.max_visits -| b.visits) return error.ResourceBudgetExceeded;
+    }
+    const state = try loadAt(alloc, txn, enrollment_key);
+    defer if (state) |value| value.deinit(alloc);
+    if (state == null and inputs_empty) return true;
+    var authority_checked = false;
+    for (requirements.nodes) |node| {
+        if (budget) |b| try b.consume(node.artifact.len +| node.embedding.len +| node.upstream.len +| @sizeOf(@TypeOf(node)));
+        if (node.kind != .generated and node.kind != .unit_children) continue;
+        if (node.artifact.len == 0 and node.embedding.len == 0) continue;
+        const current = state orelse return false;
+        if (!authority_checked) {
+            if (!current.baseline or current.root != root) return false;
+            if (!try matchesDurableCatalog(txn, plan, current.authority)) return false;
+            if (!std.meta.eql((try publication.authority(txn)), @as(?publication.Authority, current.authority))) return false;
+            authority_checked = true;
+        }
+        if (try count(txn, &counterKey(current.authority, current.root, node.id)) != 0) return false;
+    }
+    if (budget) |b| try b.check();
+    return true;
+}
+
 // Local producers use the existing generation-fenced outcome writer, but
 // each direct source needs its own tuple: an upstream or sibling outcome
 // cannot discharge the final consumer's work.
@@ -580,6 +611,20 @@ test "privacy ordered artifact inventory producer readiness isolates streams and
     var plan: Manager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{}, .artifact_catalogs = .{}, .catalog_empty = @splat(true), .completion_plan = .{ .arena = std.heap.ArenaAllocator.init(a), .catalog = authority.catalog_digest, .digest = authority.catalog_digest, .nodes = &nodes, .providers = &.{}, .definitions = .empty } };
     defer plan.completion_plan.?.deinit();
     try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text", false));
+    try std.testing.expect(!try allSourcesComplete(a, &memory, &plan, 1, false, null));
+    try std.testing.expect(try settle(&memory, authority, 1, graph, current));
+    try std.testing.expect(try allSourcesComplete(a, &memory, &plan, 1, false, null));
+    try std.testing.expect(!try allSourcesComplete(a, &memory, &plan, 2, false, null));
+    try publication.stageAuthority(&memory, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch + 1, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+    try std.testing.expect(!try allSourcesComplete(a, &memory, &plan, 1, false, null));
+    try publication.stageAuthority(&memory, .{ .mode = .activate, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+    var expired: @import("artifact_scan_budget.zig").Budget = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, allSourcesComplete(a, &memory, &plan, 1, false, &expired));
+    var limited: @import("artifact_scan_budget.zig").Budget = .{ .max_visits = 1, .max_bytes = 4096 };
+    try std.testing.expectError(error.ResourceBudgetExceeded, allSourcesComplete(a, &memory, &plan, 1, false, &limited));
+    // Restore sibling debt for the original source-isolation assertions.
+    try putNumber(&memory, &counterKey(authority, 1, ids[1]), 1);
+    try putNumber(&memory, graph, current);
     try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "relations", false));
     try std.testing.expect(!try sourceComplete(a, &memory, &plan, 2, "text", false));
     try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "authored", false));
@@ -599,6 +644,8 @@ test "privacy ordered artifact inventory producer readiness isolates streams and
     try memory.delete(enrollment_key);
     try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text", false));
     try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text", true));
+    try std.testing.expect(!try allSourcesComplete(a, &memory, &plan, 1, false, null));
+    try std.testing.expect(try allSourcesComplete(a, &memory, &plan, 1, true, null));
 }
 
 test "privacy producer readiness local source receipts exclude upstream and sibling graph outputs" {
