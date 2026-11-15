@@ -124,8 +124,7 @@ pub const BackendType = enum {
     /// Whether SessionManager.loadModel can create a Session directly for this backend.
     pub fn supportsDirectSessionLoad(self: BackendType) bool {
         return switch (self) {
-            .native, .metal, .cuda, .wasm => true,
-            .pjrt => false,
+            .native, .metal, .cuda, .wasm, .pjrt => true,
         };
     }
 };
@@ -325,8 +324,8 @@ pub const SessionManager = struct {
     /// Validate the process-level required backend before a server publishes
     /// readiness or an artifact path begins execution. Required backends must
     /// be compiled into this binary and support the direct session-loading
-    /// contract used by the inference runtime. PJRT is intentionally rejected
-    /// until the runtime has a consistent compiled-only loading path.
+    /// contract used by the inference runtime. Explicit compiled targets retain
+    /// their own provider and model capability errors instead of falling back.
     pub fn validateRequiredBackendPolicy(self: *const SessionManager) !void {
         try validateBackendEnvironment();
         if (self.required_backend_invalid) return error.InvalidRequiredBackend;
@@ -522,7 +521,16 @@ pub const SessionManager = struct {
                     }
                 else
                     continue,
-                .pjrt => continue,
+                .pjrt => if (!imported_onnx)
+                    self.createDirectSession(source, .pjrt) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        first_err = first_err orelse err;
+                        continue;
+                    }
+                else {
+                    first_err = first_err orelse error.UnsupportedPjrtArtifact;
+                    continue;
+                },
             };
             // For sessions produced by session_factory (native/Metal
             // direct loads -- not the imported_onnx path which already
@@ -591,6 +599,7 @@ pub const SessionManager = struct {
         if (source.manifest) |manifest| return session_factory.createSessionFromManifest(self.allocator, source.path, manifest, backend, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request, self.gliner_cuda_precision, if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false);
         return switch (backend) {
             .native => session_factory.createNativeSession(self.allocator, source.path),
+            .pjrt => session_factory.createPjrtSession(self.allocator, source.path),
             .metal => session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(self.allocator, source.path, self.kernel_jit, self.kernel_jit_load_context, self.a4b_inference_request),
             .cuda => if (self.gliner_cuda_precision) |precision|
                 if (if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false)
@@ -1063,7 +1072,7 @@ test "required backend gates backend-specific fast paths" {
     try std.testing.expectError(error.InvalidRequiredBackend, manager.allowsDirectBackend(.native));
 }
 
-test "required backend policy rejects unavailable and compiled-only backends" {
+test "required backend policy admits compiled loading and rejects unavailable builds" {
     var manager = SessionManager.init(std.testing.allocator);
     manager.required_backend = null;
     manager.required_backend_invalid = false;
@@ -1077,10 +1086,10 @@ test "required backend policy rejects unavailable and compiled-only backends" {
 
     manager.required_backend_invalid = false;
     manager.required_backend = .pjrt;
-    try std.testing.expectError(
-        error.RequiredBackendUnavailable,
-        manager.validateRequiredBackendPolicy(),
-    );
+    manager.native_call_policy = .in_process;
+    if (BackendType.pjrt.available()) {
+        try manager.validateRequiredBackendPolicy();
+    } else try std.testing.expectError(error.RequiredBackendUnavailable, manager.validateRequiredBackendPolicy());
 
     manager.required_backend = .native;
     if (BackendType.native.available()) {
@@ -1101,6 +1110,7 @@ test "invalid required backend fails before model loading" {
 }
 
 test "unavailable required backend does not fall back" {
+    if (comptime build_options.enable_pjrt) return error.SkipZigTest;
     var manager = SessionManager.init(std.testing.allocator);
     manager.required_backend = .pjrt;
     manager.required_backend_invalid = false;

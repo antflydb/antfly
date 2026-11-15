@@ -31,7 +31,14 @@ test "model program real EG2 PJRT public embedding outputs match native across c
             initialized += 1;
         }
     }
-    const session = try factory.createPjrtSession(a, model);
+    var manager = @import("../backends/backends.zig").SessionManager.init(a);
+    manager.required_backend = .pjrt;
+    manager.required_backend_invalid = false;
+    manager.native_call_policy = .in_process;
+    manager.preferred_backends = &.{.pjrt};
+    try manager.validateRequiredBackendPolicy();
+    const session = try manager.loadModel(model);
+    try std.testing.expectEqual(@import("../backends/backends.zig").BackendType.pjrt, session.backend());
     defer session.close();
     for (ids, expected) |values, want| {
         var input = try Tensor.initInt64(a, "input_ids", &.{ 1, values.len }, &values);

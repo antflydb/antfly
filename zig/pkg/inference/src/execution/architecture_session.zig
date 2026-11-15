@@ -387,15 +387,25 @@ fn openHostSession(allocator: std.mem.Allocator, model_path: []const u8, overrid
     return prepareLoadedHostSession(allocator, loaded_model.manifest.source_root orelse model_path, &loaded_model, override, preparation);
 }
 
-fn openHostSessionFromManifest(allocator: std.mem.Allocator, model_path: []const u8, manifest: *const manifest_mod.ModelManifest) !Session {
+fn openHostSessionFromManifest(allocator: std.mem.Allocator, model_path: []const u8, manifest: *const manifest_mod.ModelManifest, preparation: HostPreparation) !Session {
     var loaded_model = try model_definition.LoadedModel.fromManifest(allocator, model_path, manifest);
     defer loaded_model.deinit();
-    return prepareLoadedHostSession(allocator, loaded_model.manifest.source_root orelse model_path, &loaded_model, null, .{});
+    return prepareLoadedHostSession(allocator, loaded_model.manifest.source_root orelse model_path, &loaded_model, null, preparation);
 }
 
 /// Consumes the loaded source's weights, retaining its metadata until return.
 /// Both host backends use the same normalization, residency and cleanup path.
 fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8, loaded_model: *model_definition.LoadedModel, override: ?TaskOverride, preparation: HostPreparation) !Session {
+    if (preparation.backend == .pjrt) {
+        if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
+        // Do not publish a compiled target whose production forward has no
+        // semantic frontend. Loading may fall back only before publication.
+        if (sessionTaskForModelType(loaded_model.manifest.model_type, override) != .generic or loaded_model.manifest.glide_declared) return error.UnsupportedModelProgram;
+        switch (loaded_model.architecture) {
+            .bert, .modern_bert, .nomic_bert, .embedding_gemma2, .whisper, .gpt => {},
+            else => return error.UnsupportedModelProgram,
+        }
+    }
     var prepared = try host_weights.prepare(allocator, model_path, loaded_model, preparation);
     defer prepared.deinit();
     const mf = loaded_model.manifest;
@@ -7807,7 +7817,7 @@ fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig")
     if (self.task != .generic or self.glide_head != null) return null;
     if (self.arch_config == .whisper) return @import("whisper_frontend.zig").resolve(&self.arch_config.whisper, stage);
     const encoder = switch (self.arch_config) {
-        .bert, .modern_bert, .nomic_bert, .embedding_gemma2 => true,
+        .bert, .modern_bert, .nomic_bert, .embedding_gemma2, .gpt => true,
         else => false,
     };
     return switch (stage) {
@@ -7815,6 +7825,28 @@ fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig")
         .embedding => if (self.arch_config == .embedding_gemma2) .{ .context = self, .fingerprint = 1, .output_names = &.{"sentence_embedding"}, .validate = archValidateProgramInputs, .run = archEmbeddingProgramForward } else null,
         else => null,
     };
+}
+
+fn programDecoderInputs(inputs: []const @import("capture.zig").Input, cfg: gpt_mod.Config) !Tensor {
+    var ids: ?Tensor = null;
+    var mask: ?Tensor = null;
+    for (inputs) |input| {
+        const slot = if (std.mem.eql(u8, input.tensor.name, "input_ids")) &ids else if (std.mem.eql(u8, input.tensor.name, "attention_mask")) &mask else return error.UnexpectedModelProgramInput;
+        if (slot.* != null) return error.DuplicateInputs;
+        slot.* = input.tensor;
+    }
+    const value = ids orelse return error.MissingInputs;
+    _ = try @import("capture.zig").inputShape(value);
+    if (value.dtype != .i64 or value.shape.len != 2 or value.shape[0] <= 0 or value.shape[1] <= 0 or value.shape[1] > cfg.max_position_embeddings or !value.isAlignedFor(i64)) return error.InvalidInputShape;
+    for (value.asInt64()) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidTokenId;
+    if (mask) |visibility| {
+        _ = try @import("capture.zig").inputShape(visibility);
+        if (visibility.dtype != .i64 or !std.mem.eql(i64, value.shape, visibility.shape) or !visibility.isAlignedFor(i64)) return error.InvalidInputShape;
+        // This ordinary decoder hidden forward has no padding-mask operand.
+        // A padded request requires the packed/masked frontend contract.
+        for (visibility.asInt64()) |bit| if (bit != 1) return error.UnsupportedDecoderPadding;
+    }
+    return value;
 }
 
 const ProgramTextInputs = struct { text: BertRunInputs, dimensions: ?usize };
@@ -7838,6 +7870,10 @@ fn programTextInputs(inputs: []const @import("capture.zig").Input) !ProgramTextI
 }
 fn archValidateProgramInputs(ptr: *anyopaque, inputs: []const @import("capture.zig").Input) anyerror!void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.arch_config == .gpt) {
+        _ = try programDecoderInputs(inputs, self.arch_config.gpt);
+        return;
+    }
     const parsed = try programTextInputs(inputs);
     const bi = parsed.text;
     switch (self.arch_config) {
@@ -7871,6 +7907,17 @@ fn archValidateProgramInputs(ptr: *anyopaque, inputs: []const @import("capture.z
 
 fn archProgramForward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const @import("capture.zig").Input) anyerror![]@import("capture.zig").Output {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.arch_config == .gpt) {
+        const cfg = self.arch_config.gpt;
+        const ids = try programDecoderInputs(inputs, cfg);
+        const hidden = try gpt_arch.hiddenForwardResident(cb, allocator, cfg, ids.asInt64(), @intCast(ids.shape[0]), @intCast(ids.shape[1]), null);
+        defer cb.free(hidden);
+        const shaped = try cb.primReshape(hidden, &.{ ids.shape[0], ids.shape[1], cfg.hidden_size });
+        errdefer cb.free(shaped);
+        const result = try allocator.alloc(@import("capture.zig").Output, 1);
+        result[0] = .{ .name = "last_hidden_state", .value = shaped };
+        return result;
+    }
     const bi = (try programTextInputs(inputs)).text;
     const hidden = switch (self.arch_config) {
         .bert => |cfg| try bert_arch.forwardCtWithControl(cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.token_type_ids, bi.batch, bi.seq_len, cb.execution_control),
@@ -7954,7 +8001,7 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("arch-run: start backend={s}", .{@tagName(self.backend_type)});
 
-    if (self.backend_type == .pjrt and self.arch_config != .gpt) return runCapturedProgram(self, inputs, allocator, control);
+    if (self.backend_type == .pjrt) return runCapturedProgram(self, inputs, allocator, control);
 
     // One actual receiving header. Its Context remains local through all
     // callbacks and closes BEFORE backend destruction/host output export.
@@ -21075,7 +21122,8 @@ pub fn createSessionFromManifest(
     allow_unqualified_precision: bool,
 ) !Session {
     return switch (backend) {
-        .native => openHostSessionFromManifest(allocator, model_path, manifest),
+        .native => openHostSessionFromManifest(allocator, model_path, manifest, .{}),
+        .pjrt => openHostSessionFromManifest(allocator, model_path, manifest, .{ .backend = .pjrt }),
         .metal => createGpuHostedSessionWithTaskOverride(allocator, model_path, null, .metal, jit, load_context, a4b, manifest),
         .cuda => blk: {
             if (precision) |value| {
@@ -21489,5 +21537,47 @@ test "model program frontend captures the complete official EG2 encoder and pool
         if (pooled) {
             try std.testing.expectEqualSlices(i64, &.{ 1, 128 }, output.dims[0..output.rank()]);
         } else try std.testing.expectEqualSlices(i64, &.{ 1, 3, 768 }, output.dims[0..output.rank()]);
+    }
+}
+
+test "model program Llama and Qwen3 hidden frontends execute through PJRT with dynamic IDs" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const fixture = @import("testing/decoder.zig");
+    for ([_]gpt_mod.ModelFamily{ .llama, .qwen3 }) |family| {
+        var cfg = fixture.config();
+        cfg.family = family;
+        cfg.activation = .silu;
+        var owner = ArchSession{ .allocator = a, .arch_config = .{ .gpt = cfg }, .backend_type = .pjrt, .backend_data = .{ .pjrt = .{ .native = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } } } };
+        defer owner.backend_data.pjrt.native.deinitOwned();
+        owner.backend_data.pjrt.client = pjrt_lib.pjrt.Client.initFromEnv(a) catch |err| switch (err) {
+            error.PjrtPluginNotFound => return error.SkipZigTest,
+            else => return err,
+        };
+        defer owner.backend_data.pjrt.client.?.deinit();
+        defer owner.captured_programs.deinit(a);
+        try fixture.populate(&owner.backend_data.pjrt.native);
+        if (family == .qwen3) for ([_][]const u8{ "model.layers.0.self_attn.q_norm.weight", "model.layers.0.self_attn.k_norm.weight" }) |name| {
+            const key = try a.dupe(u8, name);
+            errdefer a.free(key);
+            var tensor = try Tensor.initFloat32(a, key, &.{64}, &@as([64]f32, @splat(1)));
+            errdefer tensor.deinit();
+            try owner.backend_data.pjrt.native.resident_weights.put(a, key, .{ .tensor = tensor });
+        };
+        var native = try makeComputeBackend(&owner, a, null);
+        defer native.deinit();
+        for ([_][3]i64{ .{ 0, 1, 0 }, .{ 1, 0, 1 } }) |values| {
+            const want = try gpt_arch.hiddenForward(&native, a, cfg, &values, 1, values.len, null);
+            defer a.free(want);
+            var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 3 }, &values);
+            defer ids.deinit();
+            const actual = try runCapturedProgram(&owner, &.{ids}, a, null);
+            defer a.free(actual);
+            defer for (actual) |*value| value.deinit();
+            try std.testing.expectEqualStrings("last_hidden_state", actual[0].name);
+            try std.testing.expectEqualSlices(i64, &.{ 1, 3, 64 }, actual[0].shape);
+            try std.testing.expectEqual(want.len, actual[0].asFloat32().len);
+            for (want, actual[0].asFloat32()) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-5);
+        }
     }
 }

@@ -52,7 +52,6 @@ pub fn artifactCandidateForBackend(
     man: manifest_mod.ModelManifest,
     backend: backends.BackendType,
 ) ?ArtifactCandidateKind {
-    if (backend == .pjrt) return null;
     if (backend == .wasm) return if (man.onnx_path != null) .onnx else null;
     if (man.nativeWeightArtifactKind()) |artifact| {
         return switch (artifact) {
@@ -60,6 +59,7 @@ pub fn artifactCandidateForBackend(
             .safetensors, .sharded_safetensors => .safetensors,
         };
     }
+    if (backend == .pjrt) return null;
     if (man.onnx_path != null) return .onnx;
     if (man.visual_model_path != null or
         man.audio_model_path != null or
@@ -1187,8 +1187,7 @@ pub fn ggufTensorTypeSupportsBackend(
             metal_runtime.isMetalNativeSupported(tensor_type)
         else
             true,
-        .native, .cuda, .wasm => true,
-        .pjrt => false,
+        .native, .cuda, .wasm, .pjrt => true,
     };
 }
 
@@ -1205,7 +1204,6 @@ pub fn ggufInspectionSupportsBackend(report: GgufInspectionReport, backend: Back
         return false;
     return switch (backend) {
         .metal => metalGgufIncompatibleTensorType(report) == null,
-        .native, .cuda, .wasm => true,
-        .pjrt => false,
+        .native, .cuda, .wasm, .pjrt => true,
     };
 }
