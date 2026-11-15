@@ -1138,6 +1138,9 @@ fn resolveSourceTransaction(self: *DB, command: @import("source_admission.zig").
     self.resolveSourceTransaction(command, status, sync_level, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) };
     return .{ .value = {} };
 }
+fn retireSourceAttempt(self: *DB, command: @import("source_admission.zig").Command) engine.Outcome([@import("source_admission.zig").fence_size]u8) {
+    return .{ .value = self.retireSourceAttempt(command) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn beginSourceTransaction(self: *DB, command: @import("source_admission.zig").Command, created_at_ns: u64, participants: []const []const u8) engine.Outcome(types.TxnId) {
     return .{ .value = self.beginSourceTransaction(command, created_at_ns, participants) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

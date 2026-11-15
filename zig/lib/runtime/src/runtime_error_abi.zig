@@ -1148,6 +1148,7 @@ pub const Detail = enum(c_int) {
     source_admission_backpressure,
     source_pending_work,
     replication_projection_incomplete,
+    source_attempt_retired,
 };
 
 pub const Status = extern struct {
@@ -2210,6 +2211,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.SourceAdmissionBackpressure => status(.unavailable, .source_admission_backpressure),
         error.SourcePendingWork => status(.conflict, .source_pending_work),
         error.ReplicationProjectionIncomplete => status(.unsupported, .replication_projection_incomplete),
+        error.SourceAttemptRetired => status(.conflict, .source_attempt_retired),
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
             // the owning side's name in diagnostics instead of leaving an
@@ -3286,6 +3288,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .source_admission_backpressure => "SourceAdmissionBackpressure",
         .source_pending_work => "SourcePendingWork",
         .replication_projection_incomplete => "ReplicationProjectionIncomplete",
+        .source_attempt_retired => "SourceAttemptRetired",
     };
 }
 
@@ -3954,7 +3957,7 @@ test "positional IO errors preserve identity without becoming retryable pressure
 }
 
 test "source admission and history failures retain exact native boundary identities" {
-    for ([_]anyerror{ error.InvalidSourceAdmission, error.SourceAdmissionCorrupt, error.SourceBindingConflict, error.SourceReceiptExpired, error.SourceCheckpointConflict, error.SourcePayloadConflict, error.SourceTableMismatch, error.SourceTransactionIdentityConflict, error.SourceAlreadyCommitted, error.SourceOutcomeUnresolved, error.InvalidHistoryAdmission, error.HistoryCorrupt, error.HistoryResynchronizationRequired, error.HistoryCheckpointConflict, error.HistoryConsumerConflict, error.HistoryPreparedTransactionsPresent, error.HistoryConsumerLimit, error.HistoryMixedControl, error.HistoryTransactionFailed, error.HistoryTooLarge, error.HistorySchemaTooLarge, error.HistoryFull, error.HistoryMultipleTransactions, error.HistoryAuthorityRequired, error.InvalidCommittedFrame, error.InvalidReplicationCheckpoint, error.InvalidReplicationTransaction, error.IncompleteReplicationTransaction, error.UnsupportedReplicationTruncate, error.UnsupportedReplicationMessage, error.InvalidSourceControl, error.SourceControlCorrupt, error.SourceControlConflict, error.SourceAdmissionBackpressure, error.SourcePendingWork, error.ReplicationProjectionIncomplete }) |err| {
+    for ([_]anyerror{ error.InvalidSourceAdmission, error.SourceAdmissionCorrupt, error.SourceBindingConflict, error.SourceReceiptExpired, error.SourceCheckpointConflict, error.SourcePayloadConflict, error.SourceTableMismatch, error.SourceTransactionIdentityConflict, error.SourceAlreadyCommitted, error.SourceOutcomeUnresolved, error.InvalidHistoryAdmission, error.HistoryCorrupt, error.HistoryResynchronizationRequired, error.HistoryCheckpointConflict, error.HistoryConsumerConflict, error.HistoryPreparedTransactionsPresent, error.HistoryConsumerLimit, error.HistoryMixedControl, error.HistoryTransactionFailed, error.HistoryTooLarge, error.HistorySchemaTooLarge, error.HistoryFull, error.HistoryMultipleTransactions, error.HistoryAuthorityRequired, error.InvalidCommittedFrame, error.InvalidReplicationCheckpoint, error.InvalidReplicationTransaction, error.IncompleteReplicationTransaction, error.UnsupportedReplicationTruncate, error.UnsupportedReplicationMessage, error.InvalidSourceControl, error.SourceControlCorrupt, error.SourceControlConflict, error.SourceAdmissionBackpressure, error.SourcePendingWork, error.ReplicationProjectionIncomplete, error.SourceAttemptRetired }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
 }

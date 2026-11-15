@@ -103,6 +103,7 @@ pub const BoundTableWriteSource = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .retire_source_attempt = retireSourceAttempt,
                 .admit_source_transaction = admitSourceTransaction,
                 .native_source_admission_namespace = nativeSourceAdmissionNamespace,
                 .resolve_source_admission = resolveSourceAdmissionCallback,
@@ -801,6 +802,11 @@ pub const BoundTableWriteSource = struct {
         var original = self.*;
         original.table_name = table.table_name;
         return (try commitBoundTransaction(&original, alloc, command.transactionId(), command.accepted_at_ns, &.{table}, .write, true, cancellation)) orelse error.SourceOutcomeUnresolved;
+    }
+
+    fn retireSourceAttempt(ptr: *anyopaque, command: source_admission.Command) ![source_admission.fence_size]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        return (try self.activeDb()).retireSourceAttempt(command);
     }
 
     fn nativeSourceAdmissionNamespace(ptr: *anyopaque) ![24]u8 {

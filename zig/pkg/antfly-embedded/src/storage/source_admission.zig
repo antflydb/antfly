@@ -23,6 +23,8 @@ pub const prefix = "\x00\x00__metadata__:source_admission:";
 const head_prefix = prefix ++ "head:";
 const receipt_prefix = prefix ++ "receipt:";
 const slot_prefix = prefix ++ "slot:";
+const fence_prefix = prefix ++ "fence:";
+pub const fence_size = 156;
 pub const default_receipt_window: u32 = 1024;
 pub const max_receipt_window: u32 = 65536;
 
@@ -32,7 +34,8 @@ pub fn isProtectedKey(key: []const u8) bool {
 pub fn isKey(key: []const u8) bool {
     return (key.len == head_prefix.len + 32 and std.mem.startsWith(u8, key, head_prefix)) or
         (key.len == receipt_prefix.len + 32 and std.mem.startsWith(u8, key, receipt_prefix)) or
-        (key.len == slot_prefix.len + 36 and std.mem.startsWith(u8, key, slot_prefix));
+        (key.len == slot_prefix.len + 36 and std.mem.startsWith(u8, key, slot_prefix)) or
+        (key.len == fence_prefix.len + 32 and std.mem.startsWith(u8, key, fence_prefix));
 }
 fn digest(bytes: []const u8) Digest {
     var result: Digest = undefined;
@@ -62,6 +65,7 @@ pub const Command = struct {
     participant_digest: Digest,
     accepted_at_ns: u64,
     receipt_window: u32 = default_receipt_window,
+    attempt: u64 = 0,
 
     pub fn validate(self: Command) !void {
         if (self.table_id == 0 or self.generation == 0 or self.source_sequence == 0 or
@@ -83,12 +87,27 @@ pub const Command = struct {
         number(&hash, self.receipt_window);
         return hash.finalResult();
     }
-    pub fn identity(self: Command) Digest {
+    pub fn logicalIdentity(self: Command) Digest {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly:source-batch:v1:");
         hash.update(&self.binding());
         field(&hash, self.batch_id);
         return hash.finalResult();
+    }
+    /// Attempt zero preserves the existing native command/receipt identity.
+    pub fn identity(self: Command) Digest {
+        if (self.attempt == 0) return self.logicalIdentity();
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly:source-delivery-attempt:v1:");
+        hash.update(&self.logicalIdentity());
+        number(&hash, self.attempt);
+        return hash.finalResult();
+    }
+    pub fn inputFingerprint(self: Command) Digest {
+        var logical = self;
+        logical.attempt = 0;
+        logical.participant_digest = @splat(0);
+        return logical.fingerprint();
     }
     pub fn transactionId(self: Command) [16]u8 {
         return self.identity()[0..16].*;
@@ -257,6 +276,7 @@ pub fn lookupStatus(txn: anytype, table_id: u64, command: Command) !Status {
         try requireReceipt(receipt, table_id, command);
         return .{ .committed = receipt };
     }
+    try requireAttemptAllowed(txn, command);
     // A prepared source transaction owns its exact payload before its receipt
     // is visible in primary state. Never allow retries to replace that vote
     // with another set of rows under the same durable transaction identity.
@@ -270,6 +290,83 @@ pub fn lookupStatus(txn: anytype, table_id: u64, command: Command) !Status {
     const raw = try optional(txn, &headKey(command));
     try requireNext(command, if (raw) |bytes| try Head.decode(bytes) else null);
     return if (prepared) |receipt| .{ .prepared = receipt } else .absent;
+}
+
+/// One bounded fence per immutable table/source, independent of journal GC.
+/// It closes delivery attempts without advancing the source checkpoint.
+pub const AttemptFence = struct {
+    table_id: u64,
+    binding: Digest,
+    logical_identity: Digest,
+    input_digest: Digest,
+    sequence: u64,
+    closed_through: u64,
+    pub fn encode(self: AttemptFence) [fence_size]u8 {
+        var bytes: [fence_size]u8 = undefined;
+        @memcpy(bytes[0..4], "ASF1");
+        std.mem.writeInt(u64, bytes[4..12], self.table_id, .little);
+        @memcpy(bytes[12..44], &self.binding);
+        @memcpy(bytes[44..76], &self.logical_identity);
+        @memcpy(bytes[76..108], &self.input_digest);
+        std.mem.writeInt(u64, bytes[108..116], self.sequence, .little);
+        std.mem.writeInt(u64, bytes[116..124], self.closed_through, .little);
+        std.crypto.hash.sha2.Sha256.hash(bytes[0..124], bytes[124..156], .{});
+        return bytes;
+    }
+    pub fn decode(bytes: []const u8) !AttemptFence {
+        if (bytes.len != fence_size or !std.mem.eql(u8, bytes[0..4], "ASF1") or !std.mem.eql(u8, &digest(bytes[0..124]), bytes[124..156])) return error.SourceAdmissionCorrupt;
+        const result: AttemptFence = .{ .table_id = std.mem.readInt(u64, bytes[4..12], .little), .binding = bytes[12..44].*, .logical_identity = bytes[44..76].*, .input_digest = bytes[76..108].*, .sequence = std.mem.readInt(u64, bytes[108..116], .little), .closed_through = std.mem.readInt(u64, bytes[116..124], .little) };
+        if (result.table_id == 0 or result.sequence == 0) return error.SourceAdmissionCorrupt;
+        return result;
+    }
+    fn requireInput(self: AttemptFence, command: Command) !void {
+        if (self.table_id != command.table_id or !std.mem.eql(u8, &self.binding, &command.binding())) return error.SourceBindingConflict;
+        if (command.source_sequence < self.sequence) return error.SourceReceiptExpired;
+        if (command.source_sequence == self.sequence and (!std.mem.eql(u8, &self.logical_identity, &command.logicalIdentity()) or !std.mem.eql(u8, &self.input_digest, &command.inputFingerprint()))) return error.SourcePayloadConflict;
+    }
+};
+pub fn fenceKey(command: Command) [fence_prefix.len + 32]u8 {
+    return fence_prefix.* ++ sourceScope(command);
+}
+pub fn loadFence(txn: anytype, command: Command) !?AttemptFence {
+    return if (try optional(txn, &fenceKey(command))) |bytes| try AttemptFence.decode(bytes) else null;
+}
+pub fn requireAttemptAllowed(txn: anytype, command: Command) !void {
+    if (try loadFence(txn, command)) |fence| {
+        try fence.requireInput(command);
+        if (command.source_sequence == fence.sequence) {
+            if (command.attempt <= fence.closed_through) return error.SourceAttemptRetired;
+            if (fence.closed_through == std.math.maxInt(u64) or command.attempt != fence.closed_through + 1) return error.SourceTransactionIdentityConflict;
+        } else if (command.attempt != 0) return error.SourceTransactionIdentityConflict;
+    } else if (command.attempt != 0) return error.SourceTransactionIdentityConflict;
+}
+/// Called under the native apply fence. The caller also proves no prepared or
+/// committed source record exists and atomically aborts any unprepared BEGIN.
+pub fn planAttemptRetirement(txn: anytype, table_id: u64, command: Command) !AttemptFence {
+    try command.validate();
+    if (table_id != command.table_id) return error.SourceTableMismatch;
+    if (try optional(txn, &receiptKey(command.identity()))) |raw| {
+        try requireReceipt(try Receipt.decode(raw), table_id, command);
+        return error.SourceAlreadyCommitted;
+    }
+    const head = if (try optional(txn, &headKey(command))) |bytes| try Head.decode(bytes) else null;
+    // A different attempt may already have committed this logical sequence.
+    // Never turn that restored/ahead state into a not-admitted certificate.
+    try requireNext(command, head);
+    if (try optional(txn, &pendingReceiptKey(command))) |raw| {
+        const pending = try @import("transaction_intent_value.zig").Value.decode(raw);
+        if (pending.value == null or pending.prepared_row != null) return error.SourceAdmissionCorrupt;
+        try requireReceipt(try Receipt.decode(pending.value.?), table_id, command);
+        return error.SourcePendingWork;
+    }
+    if (try loadFence(txn, command)) |existing| {
+        try existing.requireInput(command);
+        if (command.source_sequence == existing.sequence) {
+            if (command.attempt <= existing.closed_through) return existing;
+            if (existing.closed_through == std.math.maxInt(u64) or command.attempt != existing.closed_through + 1) return error.SourceTransactionIdentityConflict;
+        } else if (command.attempt != 0) return error.SourceTransactionIdentityConflict;
+    } else if (command.attempt != 0) return error.SourceTransactionIdentityConflict;
+    return .{ .table_id = table_id, .binding = command.binding(), .logical_identity = command.logicalIdentity(), .input_digest = command.inputFingerprint(), .sequence = command.source_sequence, .closed_through = command.attempt };
 }
 
 pub const Pair = struct { key: []const u8, value: []const u8 };
@@ -375,4 +472,59 @@ test "source admission bounds receipts and fences altered retries and cyclic opa
     var corrupt = next.receipt.encode();
     corrupt[76] ^= 1;
     try std.testing.expectError(error.SourceAdmissionCorrupt, Receipt.decode(&corrupt));
+}
+
+test "source admission attempt fences survive journal absence and preserve logical source progress" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const Store = struct {
+        values: std.StringHashMap([]const u8),
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.values.get(key) orelse error.NotFound;
+        }
+    };
+    var store: Store = .{ .values = .init(scratch) };
+    const original: Command = .{ .table_id = 7, .generation = 1, .source = "source", .epoch = "epoch", .definition_digest = @splat(1), .batch_id = "one", .source_sequence = 1, .checkpoint = "cp1", .payload_digest = @splat(2), .participant_digest = @splat(3), .accepted_at_ns = 100 };
+    try std.testing.expectEqual(original.logicalIdentity(), original.identity());
+    var next = original;
+    next.attempt = 1;
+    next.participant_digest = @splat(4);
+    try std.testing.expect(!std.mem.eql(u8, &next.transactionId(), &original.transactionId()));
+    try std.testing.expectEqual(original.logicalIdentity(), next.logicalIdentity());
+    try std.testing.expectEqual(original.inputFingerprint(), next.inputFingerprint());
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, lookupStatus(&store, 7, next));
+    const first_fence = try planAttemptRetirement(&store, 7, original);
+    const key = try scratch.dupe(u8, &fenceKey(original));
+    try store.values.put(key, try scratch.dupe(u8, &first_fence.encode()));
+    try std.testing.expectError(error.SourceAttemptRetired, lookupStatus(&store, 7, original));
+    try std.testing.expectError(error.SourceAttemptRetired, prepare(scratch, &store, 7, original.transactionId(), original));
+    try std.testing.expect((try lookupStatus(&store, 7, next)) == .absent);
+    var altered = next;
+    altered.payload_digest = @splat(9);
+    try std.testing.expectError(error.SourcePayloadConflict, lookupStatus(&store, 7, altered));
+    var skipped = next;
+    skipped.attempt = 2;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, lookupStatus(&store, 7, skipped));
+    const second_fence = try planAttemptRetirement(&store, 7, next);
+    try store.values.put(key, try scratch.dupe(u8, &second_fence.encode()));
+    try std.testing.expectError(error.SourceAttemptRetired, lookupStatus(&store, 7, next));
+    try std.testing.expect((try lookupStatus(&store, 7, skipped)) == .absent);
+    const final = try prepare(scratch, &store, 7, skipped.transactionId(), skipped);
+    for (final.writes) |write| try store.values.put(write.key, write.value);
+    try std.testing.expect((try lookupStatus(&store, 7, skipped)) == .committed);
+    try std.testing.expectError(error.SourceReceiptExpired, planAttemptRetirement(&store, 7, original));
+    try std.testing.expectError(error.SourceAlreadyCommitted, planAttemptRetirement(&store, 7, skipped));
+    var following = original;
+    following.batch_id = "two";
+    following.source_sequence = 2;
+    following.expected_checkpoint = "cp1";
+    following.checkpoint = "cp2";
+    try std.testing.expectEqual(fenceKey(original), fenceKey(following));
+    try std.testing.expect((try lookupStatus(&store, 7, following)) == .absent);
+    try std.testing.expectEqual(@as(usize, 4), store.values.count());
+    var corrupt = second_fence.encode();
+    corrupt[80] ^= 1;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, AttemptFence.decode(&corrupt));
 }

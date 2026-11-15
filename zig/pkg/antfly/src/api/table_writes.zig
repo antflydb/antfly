@@ -43899,6 +43899,7 @@ fn implementationTests() type {
         test "bound source admission actor recovers real native and metadata stores after lost replies" {
             const delivery = @import("../metadata/source_delivery.zig");
             const native = @import("../metadata/native_source_delivery.zig");
+            const admission = @import("antfly_local_sources").api_local_table_writes.source_admission;
             const control = @import("../metadata/source_control.zig");
             const Store = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
             const Context = struct {
@@ -43910,6 +43911,8 @@ fn implementationTests() type {
                 metadata_group_id: u64 = @import("antfly_local_sources").common_group_ids.main_metadata_group_id,
                 revision: u64 = 0,
                 lose_accept_ack: bool = false,
+                lose_reserve_ack: bool = false,
+                lose_replan_ack: bool = false,
                 lost: bool = false,
                 pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, version: u16) !void {
                     try std.testing.expectEqual(control.protocol_version, version);
@@ -43922,9 +43925,16 @@ fn implementationTests() type {
                     try self.store.applyStandaloneCommand(self.metadata_group_id, .{ .apply_source_control = command.apply_source_control });
                     var write = try control.parseWrite(std.testing.allocator, command.apply_source_control);
                     defer write.deinit();
-                    self.lost = self.lose_accept_ack and write.value.mutation == .accept;
+                    self.lost = (self.lose_accept_ack and write.value.mutation == .accept) or
+                        (self.lose_reserve_ack and write.value.mutation == .reserve) or
+                        (self.lose_replan_ack and write.value.mutation == .replan);
                     self.revision += 1;
                     return self.revision;
+                }
+                fn state(self: *@This(), allocator: std.mem.Allocator, source_scope: control.Scope) !std.json.Parsed(control.State) {
+                    const bytes = try self.store.getSourceControl(allocator, self.metadata_group_id, source_scope.table_id, source_scope.source_id);
+                    defer allocator.free(bytes);
+                    return control.parse(allocator, bytes);
                 }
                 pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: Context) !void {
                     if (self.lost) return error.TestLostMetadataReply;
@@ -43935,6 +43945,7 @@ fn implementationTests() type {
                 lose_reply: bool = true,
                 block_release: bool = false,
                 admissions: usize = 0,
+                replans: usize = 0,
                 pub fn validateScope(self: *@This(), scope: control.Scope) !void {
                     return self.inner.validateScope(scope);
                 }
@@ -43949,6 +43960,10 @@ fn implementationTests() type {
                     const result = try self.inner.admit(a, scope, pending, table, request);
                     if (self.lose_reply) return error.TestLostDestinationReply;
                     return result;
+                }
+                pub fn replan(self: *@This(), allocator: std.mem.Allocator, source_scope: control.Scope, pending: control.Reservation, request_table: distributed_txn.TableCommitRequest, context: Context) !delivery.Replan {
+                    self.replans += 1;
+                    return self.inner.replan(allocator, source_scope, pending, request_table, context);
                 }
                 pub fn inspect(self: *@This(), a: std.mem.Allocator, scope: control.Scope, receipt: []const u8) !delivery.ReceiptIdentity {
                     return self.inner.inspect(a, scope, receipt);
@@ -44043,6 +44058,139 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(u64, 3), relocated.value.committed.sequence);
             try std.testing.expectEqualStrings("cp3", relocated.value.committed.checkpoint);
             try std.testing.expectEqual(@as(usize, 3), adapter.admissions);
+            var recovery_arena = std.heap.ArenaAllocator.init(a);
+            defer recovery_arena.deinit();
+            const recovery_alloc = recovery_arena.allocator();
+            const Fixture = struct {
+                fn command(allocator: std.mem.Allocator, source_scope: control.Scope, pending: control.Reservation, request_table: distributed_txn.TableCommitRequest) !admission.Command {
+                    return .{
+                        .table_id = source_scope.table_id,
+                        .generation = source_scope.generation,
+                        .source = try allocator.dupe(u8, &std.fmt.bytesToHex(source_scope.source_id, .lower)),
+                        .epoch = try allocator.dupe(u8, &std.fmt.bytesToHex(source_scope.identity(), .lower)),
+                        .definition_digest = source_scope.definition,
+                        .batch_id = pending.batch_id,
+                        .source_sequence = pending.sequence,
+                        .checkpoint = pending.checkpoint,
+                        .expected_checkpoint = pending.expected_checkpoint,
+                        .payload_digest = pending.payload_digest,
+                        .participant_digest = admission.operationsDigest(request_table),
+                        .accepted_at_ns = pending.accepted_at_ns,
+                    };
+                }
+            };
+            // Lose the reservation reply before destination admission. An empty
+            // source BEGIN may then be fenced atomically with its abort.
+            input.batch_id = "replan-me";
+            input.expected_checkpoint = "cp3";
+            input.checkpoint = "cp4";
+            input.payload_digest = @splat(7);
+            input.accepted_at_ns += 1;
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "100" }} }};
+            svc.lose_reserve_ack = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, delivery.deliver(&svc, &adapter, a, moved, catalog, input, table, Context{}));
+            svc.lose_reserve_ack = false;
+            var reserved = try svc.state(a, moved);
+            defer reserved.deinit();
+            const original_pending = reserved.value.pending.?;
+            const expected_reservation = original_pending.identity(moved);
+            // The catalog can reorder between reserve and replan. Locator
+            // refresh must not require a successful ordinary recovery first.
+            try metadata_store.applyStandaloneCommand(svc.metadata_group_id, .{ .upsert_table = .{ .table_id = 7, .name = "renamed-docs", .schema_json = "{}", .replication_sources_json = config } });
+            moved.source_ordinal = 0;
+            std.crypto.hash.sha2.Sha256.hash(config, &catalog, .{});
+            try std.testing.expectError(error.SourceControlConflict, delivery.replan(&svc, &adapter, a, moved, catalog, @splat(0), input, table, Context{}));
+            const old_command = try Fixture.command(recovery_alloc, moved, original_pending, table);
+            try std.testing.expectEqual(original_pending.transaction_id, old_command.transactionId());
+            const participant = try distributed_txn.participantIdForGroup(a, "renamed-docs", 0);
+            defer a.free(participant);
+            _ = try db.beginSourceTransaction(old_command, input.accepted_at_ns, &.{participant});
+            var stale_table = table;
+            stale_table.source_admission = old_command;
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }};
+            svc.lose_replan_ack = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, delivery.replan(&svc, &adapter, a, moved, catalog, expected_reservation, input, table, Context{}));
+            svc.lose_replan_ack = false;
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(old_command.transactionId()));
+            var replacement = try delivery.replan(&svc, &adapter, a, moved, catalog, expected_reservation, input, table, Context{});
+            defer replacement.deinit();
+            try std.testing.expectEqual(@as(usize, 1), adapter.replans);
+            try std.testing.expectEqual(@as(u32, 0), replacement.value.scope.?.source_ordinal);
+            try std.testing.expectEqual(original_pending.sequence, replacement.value.pending.?.sequence);
+            try std.testing.expectEqual(original_pending.accepted_at_ns, replacement.value.pending.?.accepted_at_ns);
+            try std.testing.expect(!std.mem.eql(u8, &old_command.transactionId(), &replacement.value.pending.?.transaction_id));
+            // The fence, not a retained transaction record, rejects late RPCs.
+            db.close();
+            metadata_store.deinit();
+            db = try db_mod.DB.open(a, path, options);
+            metadata_store = try Store.init(a, .{ .root_dir = meta_path });
+            bound = BoundTableWriteSource.init("renamed-docs", &db);
+            adapter.inner = try native.Adapter.init(bound.source(), "renamed-docs");
+            try std.testing.expectError(error.SourceAttemptRetired, db.beginSourceTransaction(old_command, input.accepted_at_ns, &.{participant}));
+            try std.testing.expectError(error.SourceAttemptRetired, bound.source().admitSourceTransaction(a, stale_table, .none));
+            input.accepted_at_ns += 100;
+            var replanned_commit = try delivery.deliver(&svc, &adapter, a, moved, catalog, input, table, Context{});
+            defer replanned_commit.deinit();
+            try std.testing.expectEqual(@as(u64, 4), replanned_commit.value.committed.sequence);
+            try std.testing.expectEqualStrings("cp4", replanned_commit.value.committed.checkpoint);
+            try std.testing.expectError(error.SourceReceiptExpired, db.retireSourceAttempt(old_command));
+            var completed_replan = try delivery.replan(&svc, &adapter, a, moved, catalog, expected_reservation, input, table, Context{});
+            defer completed_replan.deinit();
+            try std.testing.expectEqual(@as(usize, 1), adapter.replans);
+            // A prepared original plan resolves its own rows; replanning must
+            // never replace a durable vote with the newly proposed payload.
+            input.batch_id = "prepared-must-resolve";
+            input.expected_checkpoint = "cp4";
+            input.checkpoint = "cp5";
+            input.payload_digest = @splat(8);
+            input.accepted_at_ns += 1;
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "2" }} }};
+            svc.lose_reserve_ack = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, delivery.deliver(&svc, &adapter, a, moved, catalog, input, table, Context{}));
+            svc.lose_reserve_ack = false;
+            var prepared_reservation = try svc.state(a, moved);
+            defer prepared_reservation.deinit();
+            const prepared_pending = prepared_reservation.value.pending.?;
+            const prepared_command = try Fixture.command(recovery_alloc, moved, prepared_pending, table);
+            _ = try db.beginSourceTransaction(prepared_command, input.accepted_at_ns, &.{participant});
+            try db.writeTransaction(prepared_command.transactionId(), .{ .source_admission = prepared_command, .transforms = table.transforms });
+            try std.testing.expectError(error.SourcePendingWork, db.retireSourceAttempt(prepared_command));
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "200" }} }};
+            var original_commit = try delivery.replan(&svc, &adapter, a, moved, catalog, prepared_pending.identity(moved), input, table, Context{});
+            defer original_commit.deinit();
+            try std.testing.expectEqual(@as(u64, 5), original_commit.value.committed.sequence);
+            try std.testing.expect(original_commit.value.pending == null);
+            try std.testing.expectEqual(@as(usize, 1), adapter.replans);
+            // An ordinary BEGIN with the same ID is not source admission and
+            // cannot be aborted as collateral when closing the source grant.
+            input.batch_id = "ordinary-id-collision";
+            input.expected_checkpoint = "cp5";
+            input.checkpoint = "cp6";
+            input.payload_digest = @splat(9);
+            input.accepted_at_ns += 1;
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "100" }} }};
+            svc.lose_reserve_ack = true;
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, delivery.deliver(&svc, &adapter, a, moved, catalog, input, table, Context{}));
+            svc.lose_reserve_ack = false;
+            var collision = try svc.state(a, moved);
+            defer collision.deinit();
+            const collision_pending = collision.value.pending.?;
+            const collision_command = try Fixture.command(recovery_alloc, moved, collision_pending, table);
+            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(collision_command.transactionId(), input.accepted_at_ns, input.accepted_at_ns, &.{participant}, true, true);
+            table.transforms = &.{.{ .key = "counter", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }};
+            var collision_replan = try delivery.replan(&svc, &adapter, a, moved, catalog, collision_pending.identity(moved), input, table, Context{});
+            defer collision_replan.deinit();
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try db.getTransactionStatus(collision_command.transactionId()));
+            var collision_commit = try delivery.deliver(&svc, &adapter, a, moved, catalog, input, table, Context{});
+            defer collision_commit.deinit();
+            try std.testing.expectEqual(@as(u64, 6), collision_commit.value.committed.sequence);
+            try std.testing.expectEqual(@as(usize, 2), adapter.replans);
+            try db.resolveTransactionIntents(collision_command.transactionId(), .aborted, input.accepted_at_ns + 1);
+            var final_row = (try db.lookup(a, "counter", .{})).?;
+            defer final_row.deinit(a);
+            var final_value = try std.json.parseFromSlice(std.json.Value, a, final_row.json, .{});
+            defer final_value.deinit();
+            try std.testing.expectEqual(@as(i64, 6), final_value.value.object.get("count").?.integer);
             // Namespace capability rejects a stale/recreated immutable target.
             var wrong = scope;
             wrong.table_id = 8;

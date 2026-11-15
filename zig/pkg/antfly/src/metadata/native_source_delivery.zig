@@ -31,6 +31,7 @@ const Manifest = struct {
     namespace: [24]u8,
     original_table_name: []const u8,
     effects: Digest,
+    attempt: u64 = 0,
 };
 const Receipt = struct {
     version: u32 = 1,
@@ -46,6 +47,7 @@ const Receipt = struct {
     payload: Digest,
     sequence: u64,
     accepted_at_ns: u64,
+    attempt: u64 = 0,
 };
 fn encode64(a: A, bytes: []const u8) ![]const u8 {
     return std.base64.standard.Encoder.encode(try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len)), bytes);
@@ -89,7 +91,7 @@ pub const Adapter = struct {
         if (scope.destination != .native or scope.table_id != std.mem.readInt(u64, self.namespace[0..8], .big) or
             !std.mem.eql(u8, &actual, &self.namespace) or !std.mem.eql(u8, &scope.destination_binding, &binding(actual))) return error.SourceBindingConflict;
         if (self.source.vtable.resolve_source_admission == null or self.source.vtable.release_source_admission == null or
-            self.source.vtable.admit_source_transaction == null) return error.UnsupportedOperation;
+            self.source.vtable.admit_source_transaction == null or self.source.vtable.retire_source_attempt == null) return error.UnsupportedOperation;
     }
     fn manifest(self: *Adapter, a: A, scope: control.Scope, pending: control.Reservation) !Manifest {
         try self.validateScope(scope);
@@ -121,7 +123,8 @@ pub const Adapter = struct {
         return result;
     }
     fn pendingCommand(a: A, scope: control.Scope, pending: control.Reservation, original: Manifest) !admission.Command {
-        const result = try command(a, scope, pending.batch_id, pending.checkpoint, pending.expected_checkpoint, pending.payload_digest, original.effects, pending.sequence, pending.accepted_at_ns);
+        var result = try command(a, scope, pending.batch_id, pending.checkpoint, pending.expected_checkpoint, pending.payload_digest, original.effects, pending.sequence, pending.accepted_at_ns);
+        result.attempt = original.attempt;
         if (!std.mem.eql(u8, &result.transactionId(), &pending.transaction_id)) return error.SourceTransactionIdentityConflict;
         return result;
     }
@@ -147,6 +150,7 @@ pub const Adapter = struct {
             .payload = cmd.payload_digest,
             .sequence = cmd.source_sequence,
             .accepted_at_ns = cmd.accepted_at_ns,
+            .attempt = cmd.attempt,
         };
         const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
         // Base64 provider strings bound expansion even for control characters.
@@ -175,6 +179,28 @@ pub const Adapter = struct {
         if (outcome != .committed) return error.SourceOutcomeUnresolved;
         return accepted(a, scope, pending, original, cmd);
     }
+    pub fn replan(self: *Adapter, a: A, scope: control.Scope, pending: control.Reservation, table: Table, request: anytype) !delivery.Replan {
+        try request.ensureActive();
+        const original = try self.manifest(a, scope, pending);
+        if (table.source_admission != null or table.range_guards.len != 0 or !std.mem.eql(u8, table.table_name, self.table_name)) return error.UnsupportedReplicationRoute;
+        const old_command = try pendingCommand(a, scope, pending, original);
+        if (old_command.attempt == std.math.maxInt(u64)) return error.SourceReceiptExpired;
+        const proof = try self.source.retireSourceAttempt(old_command);
+        const fence = try admission.AttemptFence.decode(&proof);
+        if (fence.table_id != scope.table_id or fence.sequence != pending.sequence or fence.closed_through < original.attempt or
+            !std.mem.eql(u8, &fence.binding, &old_command.binding()) or !std.mem.eql(u8, &fence.logical_identity, &old_command.logicalIdentity()) or
+            !std.mem.eql(u8, &fence.input_digest, &old_command.inputFingerprint())) return error.SourcePayloadConflict;
+        const next_attempt = std.math.add(u64, fence.closed_through, 1) catch return error.SourceReceiptExpired;
+        const next: Manifest = .{ .namespace = self.namespace, .original_table_name = self.table_name, .effects = admission.operationsDigest(table), .attempt = next_attempt };
+        const bytes = try std.json.Stringify.valueAlloc(a, next, .{});
+        var cmd = try command(a, scope, pending.batch_id, pending.checkpoint, pending.expected_checkpoint, pending.payload_digest, next.effects, pending.sequence, pending.accepted_at_ns);
+        cmd.attempt = next_attempt;
+        return .{
+            .plan = .{ .digest = planDigest(scope, bytes), .transaction_id = cmd.transactionId(), .manifest = bytes },
+            .not_admitted_receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 1), .namespace = self.namespace, .reservation = pending.identity(scope), .command = old_command.fingerprint(), .fence = proof }, .{}),
+        };
+    }
+
     fn receipt(self: *Adapter, a: A, scope: control.Scope, bytes: []const u8) !Receipt {
         try self.validateScope(scope);
         if (bytes.len == 0 or bytes.len > 8192) return error.SourceAdmissionCorrupt;
@@ -187,7 +213,8 @@ pub const Adapter = struct {
         return value;
     }
     fn receiptCommand(a: A, scope: control.Scope, value: Receipt) !admission.Command {
-        const cmd = try command(a, scope, try decode64(a, value.batch, 256), try decode64(a, value.checkpoint, 1024), if (value.previous) |previous| try decode64(a, previous, 1024) else null, value.payload, value.effects, value.sequence, value.accepted_at_ns);
+        var cmd = try command(a, scope, try decode64(a, value.batch, 256), try decode64(a, value.checkpoint, 1024), if (value.previous) |previous| try decode64(a, previous, 1024) else null, value.payload, value.effects, value.sequence, value.accepted_at_ns);
+        cmd.attempt = value.attempt;
         if (!std.mem.eql(u8, &cmd.transactionId(), &value.transaction_id)) return error.SourceTransactionIdentityConflict;
         return cmd;
     }

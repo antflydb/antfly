@@ -651,6 +651,7 @@ pub const TableWriteSource = struct {
         native_source_admission_namespace: ?*const fn (*anyopaque) anyerror![24]u8 = null,
         resolve_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command, db_mod.types.SyncLevel, db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome = null,
         release_source_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("../storage/source_admission.zig").Command) anyerror!void = null,
+        retire_source_attempt: ?*const fn (*anyopaque, @import("../storage/source_admission.zig").Command) anyerror![@import("../storage/source_admission.zig").fence_size]u8 = null,
     };
 
     pub fn activateRangeTracking(self: TableWriteSource, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
@@ -662,6 +663,11 @@ pub const TableWriteSource = struct {
     pub fn admitSourceTransaction(self: TableWriteSource, alloc: std.mem.Allocator, table: distributed_txn.TableCommitRequest, cancellation: db_mod.types.CancellationToken) !distributed_txn.CommitOutcome {
         const callback = self.vtable.admit_source_transaction orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("admit_source_transaction", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, cancellation });
+    }
+
+    pub fn retireSourceAttempt(self: TableWriteSource, command: @import("../storage/source_admission.zig").Command) ![@import("../storage/source_admission.zig").fence_size]u8 {
+        const callback = self.vtable.retire_source_attempt orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("retire_source_attempt", self.boundary_dispatch, callback, .{ self.ptr, command });
     }
 
     pub fn nativeSourceAdmissionNamespace(self: TableWriteSource) ![24]u8 {

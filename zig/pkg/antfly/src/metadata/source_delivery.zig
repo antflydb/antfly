@@ -35,6 +35,10 @@ pub const Plan = struct {
     transaction_id: [16]u8,
     manifest: []const u8,
 };
+pub const Replan = struct {
+    plan: Plan,
+    not_admitted_receipt: []const u8,
+};
 pub const Acceptance = struct {
     reservation_digest: control.Digest,
     receipt: []const u8,
@@ -181,6 +185,56 @@ pub fn deliver(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
     state = next;
     if (!std.mem.eql(u8, &state.value.accepted.reservation_digest, &result.reservation_digest)) return error.SourceControlConflict;
     try adapter.release(a, scope, state.value.accepted.reference, request);
+    return state;
+}
+
+/// Replan only a proven-unadmitted original attempt. The expected reservation
+/// makes a lost metadata reply retryable without closing the newly chosen plan.
+/// Prepared/committed work resolves through the original manifest instead.
+pub fn replan(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catalog: control.Digest, expected_reservation: control.Digest, input: Input, payload: anytype, request: anytype) !std.json.Parsed(control.State) {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    try request.ensureActive();
+    try adapter.validateScope(scope);
+    var state = try load(svc, a, scope, request);
+    errdefer state.deinit();
+    if (state.value.scope) |bound| if (bound.source_ordinal != scope.source_ordinal) {
+        try mutate(svc, a, scope, catalog, state.value, .{ .configure = scope }, request);
+        const next = try load(svc, a, scope, request);
+        state.deinit();
+        state = next;
+    };
+    if (state.value.accepted.sequence != 0) {
+        try adapter.release(a, scope, state.value.accepted.reference, request);
+        if (state.value.pending == null and matches(input, try adapter.inspect(scratch, scope, state.value.accepted.reference))) return state;
+    }
+    const pending = state.value.pending orelse return error.SourcePendingWork;
+    if (!matches(input, .{ .batch_id = pending.batch_id, .checkpoint = pending.checkpoint, .expected_checkpoint = pending.expected_checkpoint, .payload_digest = pending.payload_digest })) return error.SourcePayloadConflict;
+    if (!std.mem.allEqual(u8, &pending.previous_reservation_digest, 0) and std.mem.eql(u8, &pending.previous_reservation_digest, &expected_reservation)) return state;
+    if (!std.mem.eql(u8, &pending.identity(scope), &expected_reservation)) return error.SourceControlConflict;
+    const resolved = adapter.resolve(scratch, scope, pending, request) catch |err| switch (err) {
+        error.SourceAttemptRetired => null,
+        else => return err,
+    };
+    if (resolved) |result| {
+        try accept(svc, a, scope, catalog, state.value, result, request);
+        const next = try recover(svc, adapter, a, scope, catalog, request);
+        state.deinit();
+        return next;
+    }
+    const replacement: Replan = try adapter.replan(scratch, scope, pending, payload, request);
+    try mutate(svc, a, scope, catalog, state.value, .{ .replan = .{
+        .reservation_digest = expected_reservation,
+        .plan_digest = replacement.plan.digest,
+        .transaction_id = replacement.plan.transaction_id,
+        .delivery_manifest = replacement.plan.manifest,
+        .not_admitted_receipt = replacement.not_admitted_receipt,
+    } }, request);
+    const next = try load(svc, a, scope, request);
+    state.deinit();
+    state = next;
+    if (state.value.pending == null or !std.mem.eql(u8, &state.value.pending.?.previous_reservation_digest, &expected_reservation)) return error.SourceControlConflict;
     return state;
 }
 

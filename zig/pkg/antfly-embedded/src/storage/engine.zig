@@ -336,6 +336,7 @@ pub const VTable = struct {
     writeIntents: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, intents: []const @import("transactions.zig").WriteIntent, predicates: []const @import("transactions.zig").VersionPredicate) Outcome(void),
     writeTransaction: *const fn (self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) Outcome(void),
     resolveSourceTransaction: *const fn (self: *DB, command: @import("source_admission.zig").Command, status: @import("transactions.zig").TxnStatus, sync_level: types.SyncLevel, cancellation: types.CancellationToken) Outcome(void),
+    retireSourceAttempt: *const fn (self: *DB, command: @import("source_admission.zig").Command) Outcome([@import("source_admission.zig").fence_size]u8),
     beginSourceTransaction: *const fn (self: *DB, command: @import("source_admission.zig").Command, created_at_ns: u64, participants: []const []const u8) Outcome(types.TxnId),
     nativeSourceAdmissionNamespace: *const fn (self: *DB) Outcome([24]u8),
     sourceAdmissionStatus: *const fn (self: *DB, command: @import("source_admission.zig").Command) Outcome(@import("source_admission.zig").Status),

@@ -25820,9 +25820,59 @@ pub const DB = struct {
             defer read.abort();
             _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
             if (self.core.identity_namespace.table_id != command.table_id) return error.SourceTableMismatch;
+            if (try @import("../source_admission.zig").lookupStatus(&read, self.core.identity_namespace.table_id, command) == .committed) return error.SourceAlreadyCommitted;
             if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, null);
         }
         return self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(command.transactionId(), command.accepted_at_ns, created_at_ns, participants, true, true, .{ .source_purpose = command.fingerprint() });
+    }
+
+    /// Irrevocably close an unadmitted attempt without advancing its checkpoint.
+    /// The fence survives journal GC. A prepared vote must resolve positively;
+    /// only an empty source BEGIN may be aborted as part of this operation.
+    pub fn retireSourceAttempt(self: *DB, command: @import("../source_admission.zig").Command) ![@import("../source_admission.zig").fence_size]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("retireSourceAttempt", .{ self, command });
+        const admission = @import("../source_admission.zig");
+        try command.validate();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        const fence = blk: {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, null);
+            break :blk try admission.planAttemptRetirement(&read, self.core.identity_namespace.table_id, command);
+        };
+        const bytes = fence.encode();
+        const key = admission.fenceKey(command);
+        const writes = [_]docstore_mod.KVPair{.{ .key = &key, .value = &bytes }};
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        const status = manager.getTransactionStatus(command.transactionId()) catch |err| switch (err) {
+            error.TxnNotFound => null,
+            else => return err,
+        };
+        if (status) |known| {
+            if (try manager.getSourcePurpose(command.transactionId())) |purpose| {
+                if (!std.mem.eql(u8, &purpose, &command.fingerprint())) return error.SourceTransactionIdentityConflict;
+                if (known == .committed) return error.SourceOutcomeUnresolved;
+                if (known == .pending) try manager.requireUnpreparedSource(command.transactionId(), purpose);
+                if (try manager.hasIntents(command.transactionId())) return error.SourcePendingWork;
+                const participants = try manager.getParticipants(self.alloc, command.transactionId());
+                defer transactions_mod.freeParticipantList(self.alloc, participants);
+                if (participants.len != 1) return error.SourceAdmissionCorrupt;
+                _ = try manager.resolveIntentsWithExtraBatch(command.transactionId(), .aborted, command.accepted_at_ns + 1, .{ .source_purpose = purpose, .completion_writes = &writes, .resolved_participant = participants[0] });
+                if (!try manager.cleanupRetiredSourceAttempt(command)) return error.SourcePendingWork;
+                return bytes;
+            }
+            // An ordinary transaction-ID collision is not source admission.
+            // Fence the source grant without aborting unrelated session work.
+        }
+        try self.core.store.putBatch(&writes, &.{});
+        return bytes;
     }
 
     /// Capability probe for the single-root native destination adapter. Raft

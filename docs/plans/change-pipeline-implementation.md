@@ -260,8 +260,48 @@ of commit before prepare, and source-owned timeout recovery while ordinary stale
 transactions still abort. Log: `zig/source-purpose-complete-qualification.log`.
 Distributed admission still must
 carry source purpose and original participant authority through its private RPCs;
-current distributed source markers remain rejected. Durable not-admitted proofs,
-replan attempt fences and explicit destination retirement/reseed remain required.
+current distributed source markers remain rejected. Explicit destination
+scope retirement/reseed remains required.
+
+## In progress: proven native replanning
+
+- Native commands distinguish logical batch identity from delivery attempt.
+  Attempt zero preserves existing IDs/fingerprints; subsequent attempts keep the
+  source sequence, payload, checkpoint/predecessor and accepted timestamp.
+- One checksummed 156-byte fence per immutable native table/source closes failed
+  attempts independently of journal retention. BEGIN and PREPARE reject delayed
+  closed attempts, including after journal cleanup/reopen. A later logical
+  source sequence can begin at attempt zero again.
+- Native retirement proves no committed receipt or prepared vote exists. It
+  atomically aborts and fences an empty source BEGIN, or fences an absent/aborted
+  attempt. It cannot certify absence after another attempt committed the logical
+  sequence. An ordinary transaction-ID collision is preserved as ordinary work.
+- Replanning first resolves original prepared/committed work. Only a verified
+  not-admitted outcome can replace delivery authority. The original reservation
+  digest makes a lost metadata reply retryable without closing its replacement.
+  Both ordinary recovery and replan refresh same-binding catalog ordinals.
+- A persistent fence permits immediate cleanup of the aborted source journal
+  after intent/outbox/participant debt drains. Ordinary records and ordinary
+  retry-window retention keep their previous rules. Cleanup refuses pending or
+  mismatched-purpose records and requires the durable fence.
+- Final qualification passes: two source-admission codec tests, 58 journal
+  tests, five native admission/recovery tests, metadata recovery/snapshot/decoder
+  checks, all 18 CDC parser/stream regressions and all 56 runtime error ABI tests.
+  The real-store scenario covers an empty source BEGIN, lost replan reply,
+  immediate journal pruning, reopen, rejected delayed old calls, catalog reorder
+  between reserve/replan, immutable prepared votes, and ordinary ID collisions.
+  The counter reflects each accepted logical batch once, preserving original
+  sequence/checkpoint/time across replacement plans. Commands:
+  `zig build source-admission-test source-control-test source-transaction-test
+  source-admission-codec-test docstore-transaction-reservations-test -j2` and
+  the standalone runtime error ABI tests. Logs:
+  `zig/source-replan-final-qualification.log`,
+  `zig/source-attempt-fence-codec-test.log`, and
+  `zig/source-attempt-error-abi-test.log`.
+
+Managed runner integration, destination generation retirement/reseed,
+distributed native authority and writable-Iceberg adapters remain required;
+this private path does not advertise a public ingestion/feed capability.
 Managed
 runner wiring, distributed source authority and writable-Iceberg adapters remain
 required. The callbacks and actor do not yet

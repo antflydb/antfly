@@ -2326,6 +2326,16 @@ pub const TxnManager = struct {
         return key;
     }
 
+    pub fn requireUnpreparedSource(self: *TxnManager, txn_id: TxnId, purpose: [32]u8) !void {
+        const record = try self.loadTransactionRecord(txn_id);
+        if (!samePurpose(record.source_purpose, purpose)) return error.SourceTransactionIdentityConflict;
+        if (record.status != .pending or !record.prepared_known or record.prepared or record.intent_revision != 0) return error.SourcePendingWork;
+    }
+
+    pub fn getSourcePurpose(self: *TxnManager, txn_id: TxnId) !?[32]u8 {
+        return (try self.loadTransactionRecord(txn_id)).source_purpose;
+    }
+
     pub fn requireSourcePurpose(self: *TxnManager, txn_id: TxnId, purpose: [32]u8) !void {
         const record = try self.loadTransactionRecord(txn_id);
         if (!samePurpose(record.source_purpose, purpose)) return error.SourceTransactionIdentityConflict;
@@ -2409,6 +2419,35 @@ pub const TxnManager = struct {
         retained_cutoff_timestamp: u64,
         extra_batch: MutationExtraBatch,
     ) !bool {
+        return self.cleanupTransactionMetadataWithRetirement(txn_id, cutoff_timestamp, retained_cutoff_timestamp, extra_batch, null);
+    }
+
+    /// A closed source grant has its own persistent retry fence. Its aborted
+    /// journal can be pruned immediately, after all intents/outboxes/ACK debt
+    /// drain, instead of accumulating one retained record per replan attempt.
+    pub fn cleanupRetiredSourceAttempt(self: *TxnManager, command: @import("source_admission.zig").Command) !bool {
+        try command.validate();
+        {
+            var probe = try self.store.beginProbe();
+            defer probe.abort();
+            const fence = (try @import("source_admission.zig").loadFence(&probe, command)) orelse return error.SourcePendingWork;
+            if (fence.table_id != command.table_id or !std.mem.eql(u8, &fence.binding, &command.binding())) return error.SourceBindingConflict;
+            if (fence.sequence < command.source_sequence) return error.SourcePendingWork;
+            if (fence.sequence == command.source_sequence and (fence.closed_through < command.attempt or
+                !std.mem.eql(u8, &fence.logical_identity, &command.logicalIdentity()) or
+                !std.mem.eql(u8, &fence.input_digest, &command.inputFingerprint()))) return error.SourcePendingWork;
+        }
+        return self.cleanupTransactionMetadataWithRetirement(command.transactionId(), 0, 0, .{}, command.fingerprint());
+    }
+
+    fn cleanupTransactionMetadataWithRetirement(
+        self: *TxnManager,
+        txn_id: TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+        extra_batch: MutationExtraBatch,
+        retired_source: ?[32]u8,
+    ) !bool {
         const record = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
             TxnError.TxnNotFound => {
                 try self.applyMutationExtraBatch(extra_batch);
@@ -2416,6 +2455,10 @@ pub const TxnManager = struct {
             },
             else => return err,
         };
+        if (retired_source) |purpose| {
+            if (!samePurpose(record.source_purpose, purpose)) return error.SourceTransactionIdentityConflict;
+            if (record.status != .aborted) return error.SourcePendingWork;
+        }
         const has_intents = if (record.intents_resolved_known and record.intents_resolved)
             false
         else
@@ -2425,7 +2468,7 @@ pub const TxnManager = struct {
             return false;
         }
         const cutoff = if (record.retain_terminal) retained_cutoff_timestamp else cutoff_timestamp;
-        if (record.finalized_at >= cutoff) {
+        if (retired_source == null and record.finalized_at >= cutoff) {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
@@ -4014,6 +4057,44 @@ test "transaction source purpose fences sessions freezes prepared intents and su
     defer a.free(legacy);
     try std.testing.expectEqual(@as(usize, txn_record_v6_size), legacy.len);
     try std.testing.expect((try decodeRecord(legacy)).source_purpose == null);
+}
+
+test "transaction retired source cleanup requires a permanent fence and preserves ordinary records" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-retired-source-cleanup");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var mgr = try TxnManager.init(a, &store);
+    defer mgr.deinit();
+    const admission = @import("source_admission.zig");
+    const command: admission.Command = .{ .table_id = 7, .generation = 1, .source = "source", .epoch = "epoch", .definition_digest = @splat(1), .batch_id = "batch", .source_sequence = 1, .checkpoint = "cp", .payload_digest = @splat(2), .participant_digest = @splat(3), .accepted_at_ns = std.math.maxInt(u64) - 1 };
+    const id = command.transactionId();
+    try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, command.accepted_at_ns, 1_000, &.{"docs:0"}, true, true, .{ .source_purpose = command.fingerprint() });
+    try std.testing.expectError(error.SourcePendingWork, mgr.cleanupRetiredSourceAttempt(command));
+    const fence = blk: {
+        var probe = try mgr.store.beginProbe();
+        defer probe.abort();
+        break :blk try admission.planAttemptRetirement(&probe, 7, command);
+    };
+    const fence_key = admission.fenceKey(command);
+    try mgr.putValue(&fence_key, &fence.encode());
+    try std.testing.expectError(error.SourcePendingWork, mgr.cleanupRetiredSourceAttempt(command));
+    _ = try mgr.resolveIntentsWithExtraBatch(id, .aborted, std.math.maxInt(u64), .{ .source_purpose = command.fingerprint(), .resolved_participant = "docs:0" });
+    // Ordinary retry retention cannot collect this maximum-timestamp record.
+    try std.testing.expect(!try mgr.cleanupTransactionMetadataIfEligible(id, std.math.maxInt(u64), std.math.maxInt(u64)));
+    try std.testing.expect(try mgr.cleanupRetiredSourceAttempt(command));
+    try std.testing.expectError(error.TxnNotFound, mgr.getTransactionStatus(id));
+    {
+        var probe = try mgr.store.beginProbe();
+        defer probe.abort();
+        try std.testing.expectError(error.SourceAttemptRetired, admission.requireAttemptAllowed(&probe, command));
+    }
+    try mgr.initTransaction(id, 100);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.cleanupRetiredSourceAttempt(command));
+    try std.testing.expectEqual(TxnStatus.pending, try mgr.getTransactionStatus(id));
 }
 
 test "transaction protocol fences begin prepare snapshot and idempotent resolution" {
