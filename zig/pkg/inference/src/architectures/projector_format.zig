@@ -45,6 +45,10 @@ pub const Contract = struct {
 
 pub fn detectPath(allocator: std.mem.Allocator, projector_path: []const u8) !Kind {
     var mapped = try c_file.MmapRegion.init(allocator, projector_path);
+    // This short-lived reader owns only metadata, not model residency. A
+    // whole-file eviction here invalidates a loaded projector's warm pages
+    // on every media request. Its owning store still evicts on model unload.
+    mapped.preserveFileCacheOnDeinit();
     defer mapped.deinit();
 
     var parsed = try gguf_format.parse(allocator, mapped.data);

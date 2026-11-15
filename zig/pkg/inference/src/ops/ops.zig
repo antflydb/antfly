@@ -1884,6 +1884,14 @@ pub const ComputeBackend = struct {
         return op(self.ptr, tensor, target);
     }
 
+    /// Request-local replay intent. Other backend implementations and
+    /// interleaved execution owners keep the ordinary eager dispatch order.
+    pub fn debugCudaGraphReplayRequested(self: *const ComputeBackend) bool {
+        if (self.kind() != .cuda or self.execution_owner != 0) return false;
+        const op = self.vtable.debugCudaGraphReplayRequested orelse return false;
+        return op(self.ptr);
+    }
+
     pub fn debugCudaGraphCaptureBegin(self: *const ComputeBackend, label: []const u8) !bool {
         const op = self.vtable.debugCudaGraphCaptureBegin orelse return false;
         return op(self.ptr, label);
@@ -2001,6 +2009,7 @@ pub const ComputeBackend = struct {
         elementwiseLossGradient: ?*const fn (ctx: *anyopaque, request: *const elementwise_loss_math.Request) anyerror!void = null,
         glinerBoundaryDownload: ?*const fn (ctx: *anyopaque, tensor: CT, output: []f32) anyerror!void = null,
 
+        debugCudaGraphReplayRequested: ?*const fn (ctx: *anyopaque) bool = null,
         debugCudaGraphCaptureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
         debugCudaGraphPrepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) anyerror!bool = null,
         debugCudaTraceTensor: ?*const fn (ctx: *anyopaque, label: []const u8, tensor: CT) anyerror!void = null,
