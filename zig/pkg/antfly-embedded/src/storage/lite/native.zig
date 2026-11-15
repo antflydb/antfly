@@ -9629,7 +9629,32 @@ pub const NativeFile = struct {
         next.page_count = pages.next_page_id;
         try self.persistAllocator(&pages, &next);
         var published = original;
-        published.active_checkpoint = 1 - original.active_checkpoint;
+        // perf/lwa-peer-cert: the `self.commitTransaction()` call this
+        // function's own caller (`certifyAllocator`) makes right after it
+        // returns only flips `active_checkpoint` to the *other* physical
+        // slot when that commit reaches the real v8/v9 slot write
+        // (`self.redo == null`, a checkpointing fold, or a last-second
+        // log-full fallback `publishCheckpoint` itself discovers) -- the
+        // same "will this be a real, physically-written checkpoint"
+        // condition `redo_folded_through` above already has to predict,
+        // for the identical reason (see that stamp's comment just
+        // above). Otherwise -- by far the common case, since the redo
+        // log is the default and this commit has nothing forcing a fold
+        // -- the real publish diverts into an in-place redo-log append:
+        // `self.header.checkpoints[self.header.active_checkpoint]` is
+        // simply overwritten with `next` and `active_checkpoint` never
+        // moves (`publishCheckpoint`'s own ride-along/fresh-append
+        // branches). `fingerprintHeader` hashes both slots in fixed
+        // physical-index order, independent of which one is active (its
+        // own doc comment), so which physical slot ends up holding
+        // `next`'s content is exactly what `published` must predict
+        // correctly: unconditionally flipping here fingerprinted a
+        // header the real diverted commit never produces, so every
+        // later `inheritAllocatorCertificate` byte-for-byte replay of
+        // this formula disagreed with what was actually on disk/in
+        // `self.header`, for a reason that has nothing to do with the
+        // ownership the certificate exists to attest.
+        if (self.redo == null or self.redo.?.checkpointing) published.active_checkpoint = 1 - original.active_checkpoint;
         published.checkpoints[published.active_checkpoint] = next;
         var certificate: [allocator_certificate_size]u8 = undefined;
         @memcpy(certificate[0..8], if (root == .index) allocator_certificate_live_magic else allocator_certificate_magic);
@@ -19423,7 +19448,17 @@ pub const NativeFile = struct {
         for (previous.checkpoints) |slot| if (slot.free_map_root_page == next.free_map_root_page) return;
         const state = try self.loadLedgerForDigest(next, self.allocator_cancel_token, true);
         var published = previous;
-        published.active_checkpoint = 1 - previous.active_checkpoint;
+        // perf/lwa-peer-cert: same prediction `stageAllocatorCertificate`
+        // makes for the identical reason (see its own doc comment) --
+        // this caller's own `next.redo_folded_through` stamp just above
+        // already uses this exact condition to decide whether the
+        // imminent publish is a real physical slot write (flips
+        // `active_checkpoint`) or an in-place redo-log append (does
+        // not); `published` must predict the same outcome, or this
+        // fingerprint disagrees with the real `self.header` on every
+        // later `inheritAllocatorCertificate` replay whenever the commit
+        // diverts.
+        if (self.redo == null or self.redo.?.checkpointing) published.active_checkpoint = 1 - previous.active_checkpoint;
         published.checkpoints[published.active_checkpoint] = next;
         var root: [192]u8 = @splat(0);
         allocator_v4.State.encodeRoot(state.root, root[0..128]);
