@@ -89,7 +89,7 @@ pub fn scopeDomain(table: u64, identity: [32]u8) [32]u8 {
     return result;
 }
 fn cutDigest(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay) ![32]u8 {
-    const bytes = try std.json.Stringify.valueAlloc(a, .{ .table = table.table_id, .generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .publication = publication.generation, .source = publication.signature.source, .format = "partitioned-recent-vectors-v3", .cut = overlay.contentIdentity() }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .table = table.table_id, .generation = table.object_storage_generation, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table), .publication = publication.generation, .source = publication.signature.source, .format = "partitioned-recent-vectors-v3", .cut = overlay.contentIdentity() }, .{});
     defer a.free(bytes);
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(bytes, &digest, .{});
@@ -349,8 +349,8 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
         else => return err,
     };
     defer if (saved) |*value| value.deinit(client.allocator);
-    var job: Job = if (saved) |value| try std.json.parseFromSliceLeaky(Job, scratch, value.body, .{ .allocate = .alloc_always }) else .{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = overlay.pending.lsn, .archive_generation = publication.generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .cut = cut };
-    if (job.version != 1 or !std.mem.eql(u8, &job.cut, &cut) or job.table_id != table.table_id or job.object_generation != table.object_storage_generation or job.wal_lsn != overlay.pending.lsn or job.archive_generation != publication.generation or !std.mem.eql(u8, &job.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
+    var job: Job = if (saved) |value| try std.json.parseFromSliceLeaky(Job, scratch, value.body, .{ .allocate = .alloc_always }) else .{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = overlay.pending.lsn, .archive_generation = publication.generation, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table), .cut = cut };
+    if (job.version != 1 or !std.mem.eql(u8, &job.cut, &cut) or job.table_id != table.table_id or job.object_generation != table.object_storage_generation or job.wal_lsn != overlay.pending.lsn or job.archive_generation != publication.generation or !std.mem.eql(u8, &job.desired, &(try local.metadata_lake_index_catalog.desiredFingerprint(a, table)))) return error.CatalogGenerationChanged;
     if (job.state == .failed) {
         aggregate.last_error = if (job.last_error) |value| try a.dupe(u8, value) else "EnrichmentFailed";
         aggregate.next_retry_ms = job.next_retry_ms;
@@ -500,7 +500,7 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
     return std.json.parseFromSliceLeaky(Prepared, a, encoded, .{ .allocate = .alloc_always });
 }
 fn statusKey(a: A, store: *Store, table: local.common_topology_records.TableRecord, namespace: ?[32]u8) ![]u8 {
-    const authority = @import("lake_wal_image.zig").digest(.{ .format = "recent-vector-status-authority-v1", .namespace = namespace, .store = store.identity, .incarnation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table) });
+    const authority = @import("lake_wal_image.zig").digest(.{ .format = "recent-vector-status-authority-v1", .namespace = namespace, .store = store.identity, .incarnation = table.object_storage_generation, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table) });
     return std.fmt.allocPrint(a, "{s}{s}recent-search/{d}/status-{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table.table_id, std.fmt.bytesToHex(authority, .lower) });
 }
 
@@ -518,7 +518,7 @@ fn publishStatus(a: A, table: local.common_topology_records.TableRecord, publica
     const scratch = arena.allocator();
     const status_key = try statusKey(scratch, store, table, publication.namespace);
     var client = store.opened.client;
-    const job: Status = .{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = overlay.pending.lsn, .archive_generation = publication.generation, .namespace = publication.namespace, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .cut = try cutDigest(scratch, table, publication, overlay), .state = state_, .partition_count = aggregate.required, .ready_partitions = aggregate.ready, .coverage_until_ms = if (state_ == .ready) aggregate.until_ms else 0, .last_error = if (state_ == .failed) aggregate.last_error else null, .next_retry_ms = if (state_ == .failed) aggregate.next_retry_ms else 0, .expires_ms = @max(expiry +| 1, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms +| retention_ms) };
+    const job: Status = .{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = overlay.pending.lsn, .archive_generation = publication.generation, .namespace = publication.namespace, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table), .cut = try cutDigest(scratch, table, publication, overlay), .state = state_, .partition_count = aggregate.required, .ready_partitions = aggregate.ready, .coverage_until_ms = if (state_ == .ready) aggregate.until_ms else 0, .last_error = if (state_ == .failed) aggregate.last_error else null, .next_retry_ms = if (state_ == .failed) aggregate.next_retry_ms else 0, .expires_ms = @max(expiry +| 1, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms +| retention_ms) };
     // Status is an observation, not commit authority. Fence it with both the
     // WAL position and an ETag so a delayed older completion cannot regress it.
     // A ready composer that loses CAS to an incomplete observer must retry.
@@ -706,7 +706,7 @@ fn buildSegments(a: A, out: A, table: local.common_topology_records.TableRecord,
         const config = configs.object.get(declaration.name) orelse return error.InvalidTableIndexMetadata;
         var producer = try @import("lake_vector_enrichment.zig").Producer.init(a, declaration.name, declaration.binding.column_bindings[0], config, options);
         defer producer.deinit();
-        producer.memo = .{ .store = wrapper, .table_id = table.table_id, .recipe = local.metadata_lake_index_catalog.desiredFingerprint(table), .context = context };
+        producer.memo = .{ .store = wrapper, .table_id = table.table_id, .recipe = try local.metadata_lake_index_catalog.desiredFingerprint(a, table), .context = context };
         var budget: local.sql_memory_budget = .{ .backing = a, .limit = 256 * 1024 * 1024 };
         var output_bytes: u64 = 512 * 1024 * 1024;
         const bytes = if (declaration.artifact.kind == .vector_segment) dense_build: {
@@ -843,7 +843,7 @@ pub fn status(a: A, store: *Store, table: local.common_topology_records.TableRec
     defer metadata.deinit();
     const publication = metadata.value.published;
     const namespace = if (publication) |value| value.namespace else metadata.value.namespace;
-    const recipe_changed = if (publication) |value| !std.mem.eql(u8, &value.signature.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table)) else false;
+    const recipe_changed = if (publication) |value| !std.mem.eql(u8, &value.signature.desired, &(try local.metadata_lake_index_catalog.desiredFingerprint(a, table))) else false;
     const key = try statusKey(a, store, table, namespace);
     defer a.free(key);
     var client = store.opened.client;
@@ -860,7 +860,7 @@ pub fn status(a: A, store: *Store, table: local.common_topology_records.TableRec
         job.state = .building;
         job.last_error = "artifact_lease_expired";
     }
-    if (job.table_id != table.table_id or job.object_generation != table.object_storage_generation or !std.mem.eql(u8, &job.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table))) return std.json.Stringify.valueAlloc(a, .{ .state = "recipe_changed", .table_id = table.table_id }, .{});
+    if (job.table_id != table.table_id or job.object_generation != table.object_storage_generation or !std.mem.eql(u8, &job.desired, &(try local.metadata_lake_index_catalog.desiredFingerprint(a, table)))) return std.json.Stringify.valueAlloc(a, .{ .state = "recipe_changed", .table_id = table.table_id }, .{});
     return std.json.Stringify.valueAlloc(a, job, .{ .emit_null_optional_fields = false });
 }
 pub fn collect(store: *Store, table: u64, context: Context) !void {
@@ -938,7 +938,7 @@ test "external lake bounded WAL recent vectors require retention through the ent
     const cut = try cutDigest(a, table, publication, &overlay);
     const key = try jobKey(a, &store, table.table_id, cut);
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
-    const job: Job = .{ .state = .ready, .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = 8, .archive_generation = publication.generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .cut = cut, .expires_ms = now + 600_000 };
+    const job: Job = .{ .state = .ready, .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = 8, .archive_generation = publication.generation, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table), .cut = cut, .expires_ms = now + 600_000 };
     var client = store.opened.client;
     var saved = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(a, job, .{}), .{});
     defer saved.deinit(client.allocator);
@@ -1086,7 +1086,7 @@ test "external lake bounded WAL recipe readiness is durable selected and cannot 
     var store = try Store.open(a, &config, null, false);
     defer store.deinit();
     const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "history", .schema_json = "{}", .indexes_json = "{\"manual\":{\"type\":\"embeddings\",\"external\":true},\"managed\":{\"type\":\"embeddings\"}}" };
-    const publication: local.metadata_lake_index_catalog.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
+    const publication: local.metadata_lake_index_catalog.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
     const overlay = try overlay_api.Overlay.init(work, .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{} });
     const manual: Declared = .{ .name = "manual", .binding = .{ .sidecar_kind = .vector, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "history", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .column_bindings = &.{"vector"}, .index_config_hash = "manual-config" }, .artifact = .{ .kind = .vector_segment, .metadata_version = 2, .artifact_id = "manual-root", .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .byte_len = 1 } };
     var managed = manual;
@@ -1096,7 +1096,7 @@ test "external lake bounded WAL recipe readiness is durable selected and cannot 
     try std.testing.expect(!std.mem.eql(u8, &cut, &managed_cut));
     const key = try jobKey(work, &store, table.table_id, cut);
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
-    const job: Job = .{ .state = .ready, .table_id = table.table_id, .object_generation = 0, .wal_lsn = 8, .archive_generation = 1, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .cut = cut, .expires_ms = now + 600_000, .declarations = &.{manual} };
+    const job: Job = .{ .state = .ready, .table_id = table.table_id, .object_generation = 0, .wal_lsn = 8, .archive_generation = 1, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table), .cut = cut, .expires_ms = now + 600_000, .declarations = &.{manual} };
     var client = store.opened.client;
     var saved = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, job, .{}), .{});
     saved.deinit(client.allocator);

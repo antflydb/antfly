@@ -59,3 +59,8 @@ test "selected owner readiness transition index discovery" {
 test "catalog projection cancellation and publication discovery" {
     _ = @import("metadata/catalog_projection_reader.zig");
 }
+
+test "index alias metadata HTTP discovery" {
+    _ = http_server;
+    _ = http_client;
+}

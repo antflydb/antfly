@@ -38,3 +38,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 test "system catalog native memory ownership storage root" {
     _ = storage.raft_apply_store;
 }
+
+test "metadata alias persistence discovery" {
+    _ = storage.raft_apply_store;
+}

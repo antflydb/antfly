@@ -51,7 +51,7 @@ pub fn signatureFor(a: A, table: records.TableRecord, source: *serving.ServingSo
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return error.InvalidExternalTableBinding;
     defer binding.deinit(a);
     const resolved = try coverage.pin(source, context);
-    return .{ .desired = catalog.desiredFingerprint(table), .source = resolved.source, .credentials = try source.credentialIdentity(binding.binding), .store = store_identity };
+    return .{ .desired = try catalog.desiredFingerprint(a, table), .source = resolved.source, .credentials = try source.credentialIdentity(binding.binding), .store = store_identity };
 }
 pub fn begin(a: A, io: std.Io, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, now_ms: u64, lease_ms: u64) ![]u8 {
     return beginWithLocator(a, io, table, source, store_identity, context, now_ms, lease_ms, null);
@@ -615,7 +615,7 @@ test "external lake definition refresh retains evidence and publishes added rena
             try std.testing.expectEqual(old.current.by_id, rebound.current.by_id);
             try std.testing.expectEqual(old.current.input_versions, rebound.current.input_versions);
             try std.testing.expectEqualSlices(u8, &old.values_recipe, &rebound.values_recipe);
-            try std.testing.expectEqualSlices(u8, &catalog.desiredFingerprint(table), &rebound.definition.?);
+            try std.testing.expectEqualSlices(u8, &(try catalog.desiredFingerprint(a, table)), &rebound.definition.?);
         }
         const pending = try begin(a, std.testing.io, table, &source, @splat(4), .{}, time.now - 1, 100000);
         defer a.free(pending);
