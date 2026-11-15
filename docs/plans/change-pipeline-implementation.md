@@ -880,11 +880,61 @@ case now also transfers strict wire identity and build grants. Relevant logs:
 `zig/pg-spool-upload-control-test.log` and
 `zig/pg-spool-upload-metadata-qualification.log`.
 
-The next runtime integration must connect published spools to the stream owner,
-implement real historical relational production and coherent bootstrap cuts,
-and register production source/storage/authorization capabilities. Public APIs,
+The retained stream owner below now reads published spools. Runtime integration
+still must implement real historical relational production and coherent bootstrap
+cuts and register production source/storage/authorization capabilities. Public APIs,
 client qualification and the remaining inbound/destination/lifecycle work are
 still part of the full objective.
+
+## In progress: retained stream owner and CopyBoth bridge
+
+`metadata/pg_spool_stream.zig` connects durable slots to published immutable
+spools. Opening validates current policy and the requested database/slot scope,
+qualifies storage, acquires a fenced connection actor and observes an immutable
+publication binding. Publication names are canonical, unique UTF-8 identifiers;
+reordering the same set is equivalent, while changing the set or projection
+requires resynchronization. The binding precedes strict wire capture, including
+when the slot has no visible transactions yet. Protocol 97 gates publication
+binding and atomic feedback renewal/confirmation.
+
+Poll seeks one complete message through the recorded namespace and authenticated
+manifest. It verifies the original plan, serialization identity and message
+count, then rechecks authorization/ownership after storage I/O. The actor retains
+no transaction buffer and never reconstructs from current rows. Frontiers are
+contiguous; server end cannot regress. An interior reconnect rewinds to Begin
+while retaining the validated requested frontier for old feedback. New feedback
+is bounded by returned bytes or that reconnect frontier, not arbitrary later
+server publication. Polling and outgoing data do not renew consumer ownership.
+
+Valid feedback atomically renews the same actor lease and confirms only complete
+mapped transactions, advancing native metadata acknowledgement in that same
+write. Partial flushes retain the entire transaction; storage reservations remain
+charged through physical cleanup. Unknown confirmation responses are recovered
+from durable metadata. Closing releases only the matching connection lease,
+never an acknowledgement or the durable slot's history. A private actor finalizer
+also recovers ambiguous opens after connection work drains.
+
+`pgwire/retained_stream.zig` implements the typed `ReplicationStream` bridge. Each
+returned payload has an explicit release owner; another poll or close cannot
+retain an outstanding payload. The host supplies real credentials, metadata,
+namespace routing, publication authorization and independent close/recovery
+contexts. This bridge does not itself register the native production factory.
+
+`zig build pg-spool-stream-test -j2` runs a real loopback CopyBoth connection over
+actual spools and metadata. It checks complete B/I/C delivery and CopyDone without
+acknowledgement, publication mismatch, storage qualification, ambiguous-open
+lease cleanup, interior replay, future feedback rejection, authorization before
+cursor use, partial/full confirmation, lost confirmation replies and charged
+post-ACK cleanup debt. Existing upload/cleanup tests continue to pass. Reducer
+checks cover canonical binding, pre-capture binding and atomic lease/ACK state.
+Relevant logs: `zig/pg-spool-stream-runtime-qualification.log`,
+`zig/pg-spool-stream-control-test.log` and
+`zig/pg-spool-stream-metadata-qualification.log`.
+
+The loopback client is a transport qualification fixture, not the required
+existing PostgreSQL CDC client. Production relational capture, coherent cuts,
+credential lineage, namespace registration, public endpoints, inbound/destination
+and lifecycle integration, and existing-client qualification remain outstanding.
 
 ## Working constraints
 

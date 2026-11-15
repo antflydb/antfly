@@ -38,10 +38,10 @@ pub const Service = struct {
     proposals: u64 = 0,
     lose_ack: bool = false,
     lose_ack_at: ?u64 = null,
-    pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Request, version: u16) !void {
+    pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: anytype, version: u16) !void {
         try std.testing.expectEqual(control.protocol_version, version);
     }
-    pub fn ensureLinearizableReadWithContext(_: *@This(), _: Request) !void {}
+    pub fn ensureLinearizableReadWithContext(_: *@This(), _: anytype) !void {}
     pub fn projectedStore(self: *@This()) ?*Store {
         return self.store;
     }
@@ -50,7 +50,7 @@ pub const Service = struct {
         self.proposals += 1;
         return self.proposals;
     }
-    pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: Request) !void {
+    pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: anytype) !void {
         if (self.lose_ack or self.lose_ack_at == self.proposals) return error.TestLostAcknowledgment;
     }
     pub fn load(self: *@This(), a: A) !control.Parsed {

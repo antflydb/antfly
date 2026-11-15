@@ -43,12 +43,49 @@ pub fn feedId(database: Digest, name: []const u8) Id {
     sha.update(name);
     return sha.finalResult()[0..16].*;
 }
+pub const Binding = struct {
+    publications: []const []const u8,
+    projection: Digest,
+    pub fn validate(self: Binding) !void {
+        if (self.publications.len == 0 or self.publications.len > 64 or !nz(self.projection)) return error.InvalidChangefeed;
+        for (self.publications, 0..) |name, index| {
+            if (name.len == 0 or name.len > 63 or !std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidChangefeed;
+            if (index != 0 and std.mem.order(u8, self.publications[index - 1], name) != .lt) return error.InvalidChangefeed;
+        }
+    }
+    pub fn identity(self: Binding) Digest {
+        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        sha.update("antfly:pg-slot-publication-binding:v1:pgoutput-text-1");
+        sha.update(&self.projection);
+        for (self.publications) |name| {
+            const length: [1]u8 = .{@intCast(name.len)};
+            sha.update(&length);
+            sha.update(name);
+        }
+        return sha.finalResult();
+    }
+};
+pub fn bindingAlloc(a: A, names: []const []const u8, projection: Digest) !Binding {
+    if (names.len == 0 or names.len > 64) return error.InvalidChangefeed;
+    const owned = try a.dupe([]const u8, names);
+    errdefer a.free(owned);
+    std.mem.sort([]const u8, owned, {}, struct {
+        fn less(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.less);
+    const value: Binding = .{ .publications = owned, .projection = projection };
+    try value.validate();
+    return value;
+}
 pub const Mutation = union(enum) {
     configure: struct { database: Digest, name: []const u8, byte_limit: u64 = max_pending_bytes },
     acquire: struct { actor: Id, expected: u64, now: u64, expires: u64 },
     release: struct { session: Session, now: u64 },
     issue: struct { session: Session, now: u64, transaction: Prepared },
     confirm: struct { session: Session, now: u64, flushed: u64 },
+    bind: struct { session: Session, now: u64, binding: Binding },
+    feedback: struct { session: Session, now: u64, expires: u64, flushed: u64 },
     reserve_spool: struct { session: Session, now: u64, id: u64, scope: spool_control.Scope, spec: spool_control.Spec },
     begin_spool: struct { session: Session, now: u64, id: u64, token: Id },
     publish_spool: struct { session: Session, now: u64, id: u64, manifest: Digest, content: Digest },
@@ -88,6 +125,14 @@ pub const Mutation = union(enum) {
                 try v.progress.validate();
             },
             .reclaim_spool => |v| if (v.id == 0 or !nz(v.storage) or !nz(v.proof)) return error.InvalidChangefeed,
+            .bind => |v| {
+                try validSession(v.session, v.now);
+                try v.binding.validate();
+            },
+            .feedback => |v| {
+                try validSession(v.session, v.now);
+                if (v.expires <= v.now or v.expires - v.now > max_session_seconds) return error.InvalidChangefeed;
+            },
             .release => |v| try validSession(v.session, v.now),
             .confirm => |v| try validSession(v.session, v.now),
         }
@@ -145,6 +190,7 @@ pub const State = struct {
     spool: spool_control.Ledger = .{},
     spool_epoch: u64 = 0,
     spool_retired: bool = false,
+    binding: ?Binding = null,
     pub fn validate(self: State) !void {
         if (!nz(self.database) or !validName(self.name) or self.consistent_lsn != 1 or self.confirmed_lsn < self.consistent_lsn or self.next_lsn < self.confirmed_lsn or !nz(self.acknowledged_cursor) or !nz(self.mapped_cursor) or self.byte_limit < 47 or self.byte_limit > max_pending_bytes or self.entries.len > max_entries or self.pending_bytes > self.byte_limit) return error.InvalidChangefeed;
         if ((self.fence == 0) != (self.observed_at == 0)) return error.InvalidChangefeed;
@@ -163,6 +209,10 @@ pub const State = struct {
         }
         if (position != self.next_lsn or !equal(cursor, self.mapped_cursor) or count != self.pending_bytes) return error.InvalidChangefeed;
         try self.spool.validate();
+        if (self.binding) |bound| {
+            try bound.validate();
+            if (self.spool.projection) |projection| if (!equal(bound.projection, projection)) return error.InvalidChangefeed;
+        }
         if ((self.spool.next_id == 1) != (self.spool_epoch == 0) or (self.spool_retired and self.session != null)) return error.InvalidChangefeed;
         for (self.spool.records) |record| {
             if (!equal(record.spec.feed, feedId(self.database, self.name)) or record.spec.epoch != self.spool_epoch) return error.InvalidChangefeed;
@@ -288,9 +338,32 @@ pub const State = struct {
     fn prepared(spec: spool_control.Spec, content: Digest) Prepared {
         return .{ .before = spec.before, .after = spec.after, .content = content, .completion = spec.completion, .bytes = spec.bytes, .commit_offset = spec.commit_offset, .xid = spec.xid, .commit_time = spec.commit_time };
     }
+    pub fn bind(self: State, session: Session, now: u64, value: Binding) !State {
+        try self.verifySession(session, now);
+        try value.validate();
+        if (self.binding) |old| {
+            if (!equal(old.identity(), value.identity())) return error.ChangefeedResynchronizationRequired;
+            return self;
+        }
+        if (self.spool.next_id != 1 or self.entries.len != 0) return error.ChangefeedCapabilityUnsupported;
+        var next = self;
+        next.binding = value;
+        next.observed_at = now;
+        return next;
+    }
+    pub fn feedback(self: State, a: A, session: Session, now: u64, expires: u64, flushed: u64) !State {
+        try self.verifySession(session, now);
+        if (expires < self.session_expires_at or expires <= now or expires - now > max_session_seconds) return error.InvalidChangefeed;
+        var next = try self.confirm(a, session, now, flushed);
+        next.session_expires_at = expires;
+        next.observed_at = now;
+        return next;
+    }
     pub fn reserveSpool(self: State, a: A, session: Session, now: u64, id: u64, scope: spool_control.Scope, spec: spool_control.Spec) !State {
         try self.validate();
         try self.check(session, now);
+        if (nz(spec.wire) and self.binding == null) return error.ChangefeedCapabilityUnsupported;
+        if (self.binding) |bound| if (!equal(bound.projection, spec.projection)) return error.ChangefeedConflict;
         if (!equal(spec.feed, feedId(self.database, self.name)) or (self.spool_epoch != 0 and self.spool_epoch != spec.epoch)) return error.ChangefeedConflict;
         if (self.spool.find(id) == null) {
             if (spec.start_lsn != self.next_lsn or !equal(spec.before, self.mapped_cursor)) return error.ChangefeedConflict;
@@ -648,6 +721,7 @@ test "logical slot strict wire plans require a single immutable build grant" {
     var spec = testSpoolSpec(state, 1, 100);
     spec.wire = @splat(8);
     spec.messages = 5;
+    state = try state.bind(session, 100, .{ .publications = &.{"rows_pub"}, .projection = spec.projection });
     state = try state.reserveSpool(a, session, 101, 1, testSpoolScope(state, 1), spec);
     try std.testing.expectError(error.ChangefeedConflict, state.publishSpool(a, session, 102, 1, @splat(6), @splat(7)));
     state = try state.beginSpool(a, session, 102, 1, @splat(3));
@@ -657,4 +731,45 @@ test "logical slot strict wire plans require a single immutable build grant" {
     state = try state.publishSpool(a, session, 103, 1, @splat(6), @splat(7));
     try state.validate();
     try std.testing.expectEqual(@as(Id, @splat(3)), state.spool.records[0].build.?);
+}
+
+test "logical slot publication selection is canonical immutable and bound before wire capture" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const selected = try bindingAlloc(a, &.{ "z", "a" }, @splat(8));
+    const replay = try bindingAlloc(a, &.{ "a", "z" }, @splat(8));
+    try std.testing.expectEqual(selected.identity(), replay.identity());
+    try std.testing.expectError(error.InvalidChangefeed, bindingAlloc(a, &.{ "a", "a" }, @splat(8)));
+    try std.testing.expectError(error.InvalidChangefeed, bindingAlloc(a, &.{"bad\x00name"}, @splat(8)));
+    var state = try State.initialize(@splat(1), "slot", @splat(1), 1024);
+    state = try state.acquire(@splat(2), 0, 100, 150);
+    const session = state.session.?;
+    var spec = testSpoolSpec(state, 1, 100);
+    spec.wire = @splat(9);
+    spec.messages = 5;
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, state.reserveSpool(a, session, 101, 1, testSpoolScope(state, 1), spec));
+    state = try state.bind(session, 101, selected);
+    state = try state.bind(session, 101, replay);
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, state.bind(session, 102, try bindingAlloc(a, &.{"other"}, @splat(8))));
+    state = try state.reserveSpool(a, session, 102, 1, testSpoolScope(state, 1), spec);
+    var wrong = testSpoolSpec(state, 2, 100);
+    wrong.projection = @splat(7);
+    try std.testing.expectError(error.ChangefeedConflict, state.reserveSpool(a, session, 103, 2, testSpoolScope(state, 2), wrong));
+}
+test "logical slot feedback renews valid ownership and confirms only complete boundaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try State.initialize(@splat(1), "slot", @splat(1), 1024);
+    state = try state.acquire(@splat(2), 0, 100, 150);
+    const session = state.session.?;
+    state = try state.issue(a, session, 101, testTransaction(1, 2, 100));
+    state = try state.feedback(a, session, 110, 170, 100);
+    try std.testing.expectEqual(@as(u64, 170), state.session_expires_at);
+    try std.testing.expectEqual(@as(u64, 1), state.confirmed_lsn);
+    state = try state.feedback(a, session, 120, 180, 101);
+    try std.testing.expectEqual(@as(u64, 101), state.confirmed_lsn);
+    try std.testing.expectEqual(@as(u64, 180), state.session_expires_at);
+    try std.testing.expectError(error.ChangefeedLeaseExpired, state.feedback(a, session, 180, 230, 101));
 }

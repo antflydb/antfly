@@ -88,7 +88,9 @@ fn active(producer: anytype, state: control.State, session: control.pg_slot.Sess
     try producer.authorize(state, request);
     const now = try producer.nowSeconds(request);
     if (state.phase != .streaming or now >= state.expires_at) return error.ChangefeedResynchronizationRequired;
-    try (state.slot orelse return error.ChangefeedCapabilityUnsupported).verifySession(session, now);
+    const slot = state.slot orelse return error.ChangefeedCapabilityUnsupported;
+    if (slot.binding == null) return error.ChangefeedCapabilityUnsupported;
+    try slot.verifySession(session, now);
     return now;
 }
 fn mutate(svc: anytype, a: A, state: control.State, mutation: control.Mutation, request: anytype) !void {

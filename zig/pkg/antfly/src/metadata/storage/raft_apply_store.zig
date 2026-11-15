@@ -45741,6 +45741,7 @@ test "metadata changefeed control logical slot survives reopen snapshot failover
     var scope: slot.spool_control.Scope = .{ .namespace = @splat(9), .domain = slot.spool_control.Scope.domainFor(id, 1), .attempt = @splat(7) };
     std.mem.writeInt(u64, scope.attempt[0..8], 1, .big);
     const spec: slot.spool_control.Spec = .{ .feed = id, .epoch = 1, .definition = definition.identity(), .projection = @splat(8), .storage = scope.storageIdentity(), .before = delivery.before, .after = delivery.cursor, .completion = @splat(4), .start_lsn = 1, .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1, .wire = @splat(8), .messages = 5 };
+    try h.mutate(.{ .slot = .{ .bind = .{ .session = session, .now = 101, .binding = .{ .publications = &.{"rows_pub"}, .projection = @splat(8) } } } });
     try h.mutate(.{ .slot = .{ .reserve_spool = .{ .session = session, .now = 102, .id = 1, .scope = scope, .spec = spec } } });
     // A crash after admission but before any verified manifest publication must
     // retain the charge and frozen scope without advancing the wire frontier.

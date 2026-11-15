@@ -41,10 +41,13 @@ const Registry = struct {
         std.testing.io.random(&token);
         return token;
     }
-    pub fn artifactStore(self: *@This(), _: anytype, _: Request) !artifacts.ArtifactStore {
+    pub fn artifactStore(self: *@This(), _: anytype, _: anytype) !artifacts.ArtifactStore {
         var store = self.fs.artifactStore();
         store.namespace_identity = @splat(9);
         return store;
+    }
+    pub fn qualify(_: *@This(), _: control.State, shared: bool, _: anytype) !void {
+        if (shared) return error.PgSpoolStorageUnsupported;
     }
     pub fn protect(_: *@This(), _: control.State, _: anytype, seal: spool.Seal, writer: *adapter.Adapter, _: Request) !void {
         _ = try writer.recordClosure(seal);
@@ -127,6 +130,12 @@ const Producer = struct {
     }
 };
 pub fn run() !void {
+    return runImpl(false);
+}
+pub fn runStream() !void {
+    return runImpl(true);
+}
+fn runImpl(with_stream: bool) !void {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -155,6 +164,7 @@ pub fn run() !void {
     try svc.mutate(a, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "upload_slot" } } });
     try svc.mutate(a, .{ .slot = .{ .acquire = .{ .actor = @splat(2), .expected = 0, .now = 100, .expires = 150 } } });
     const session: control.pg_slot.Session = .{ .actor = @splat(2), .fence = 1 };
+    try svc.mutate(a, .{ .slot = .{ .bind = .{ .session = session, .now = 101, .binding = .{ .publications = &.{"rows_pub"}, .projection = @splat(8) } } } });
     const config: upload.Config = .{ .require_shared = false }; // explicitly local fixture
     try std.testing.expectEqual(.staged, (try upload.drive(&svc, &registry, &producer, a, id, session, config, Request{})).status);
     try std.testing.expectError(error.PgSpoolStorageUnsupported, upload.drive(&svc, &registry, &producer, a, id, session, .{}, Request{}));
@@ -226,4 +236,5 @@ pub fn run() !void {
     defer collected.deinit();
     try std.testing.expectEqual(@as(u64, 2), collected.value.slot.?.spool.collected_through);
     try std.testing.expectEqual(try control.pg_slot.spool_control.reservationBytes(104), collected.value.slot.?.spool.charged_bytes);
+    if (with_stream) try @import("pg_spool_stream_test.zig").run(&svc, &registry, producer.clock);
 }

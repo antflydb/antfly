@@ -484,6 +484,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     pg_spool_step.dependOn(&run_pg_spool_codec_tests.step);
     pg_spool_step.dependOn(&run_pg_spool_artifact_tests.step);
 
+    const pg_spool_stream_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/pg_spool_stream_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, pg_spool_stream_mod, true, true);
+    pg_spool_stream_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const pg_spool_stream_tests = b.addTest(.{ .root_module = pg_spool_stream_mod, .filters = &.{"pg spool stream"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_pg_spool_stream_tests = addFilteredTestRunArtifact(b, pg_spool_stream_tests);
+    b.step("pg-spool-stream-test", "Verify retained spool delivery and metadata feedback over CopyBoth").dependOn(&run_pg_spool_stream_tests.step);
+
     const pgoutput_step = b.step("pgoutput-test", "Verify pgoutput v1 encoding, feedback framing and replication command negotiation");
     pgoutput_step.dependOn(&run_pgoutput_tests.step);
 
@@ -3301,6 +3308,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_pgoutput_tests.step);
     unit_test_step.dependOn(&run_pg_spool_codec_tests.step);
     unit_test_step.dependOn(&run_pg_spool_artifact_tests.step);
+    unit_test_step.dependOn(&run_pg_spool_stream_tests.step);
     unit_test_step.dependOn(&run_changefeed_storage_tests.step);
     unit_test_step.dependOn(&run_changefeed_service_tests.step);
     unit_test_step.dependOn(&remote_content_adapter_run.step);

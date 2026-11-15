@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 96;
+pub const protocol_version: u16 = 97;
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
 pub const max_roots = 4096;
@@ -444,6 +444,17 @@ pub const Mutation = union(enum) {
                         defer a.free(roots);
                         for (roots) |root| if (root.delivered.event != 0) return error.ChangefeedConflict;
                         next.slot = try (state.slot orelse return error.ChangefeedConflict).reserveSpool(a, reservation.session, reservation.now, reservation.id, reservation.scope, reservation.spec);
+                    },
+                    .bind => |binding| {
+                        if (state.phase != .streaming or binding.now >= state.expires_at) return error.ChangefeedLeaseExpired;
+                        next.slot = try (state.slot orelse return error.ChangefeedConflict).bind(binding.session, binding.now, binding.binding);
+                    },
+                    .feedback => |feedback| {
+                        if (state.phase != .streaming or feedback.now >= state.expires_at or feedback.expires > state.expires_at) return error.ChangefeedLeaseExpired;
+                        const slot = state.slot orelse return error.ChangefeedConflict;
+                        const confirmed = try slot.feedback(a, feedback.session, feedback.now, feedback.expires, feedback.flushed);
+                        if (!equal(confirmed.acknowledged_cursor, slot.acknowledged_cursor)) try acknowledge(a, state, &next, confirmed.acknowledged_cursor);
+                        next.slot = confirmed;
                     },
                     .begin_spool => |build| {
                         if (state.phase != .streaming) return error.ChangefeedConflict;
