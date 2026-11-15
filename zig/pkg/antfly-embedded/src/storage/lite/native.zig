@@ -6382,7 +6382,12 @@ pub const ReadView = struct {
     /// `activeCheckpoint()`/`committedSequence()`).
     pub fn openAt(file: *NativeFile, io: std.Io, checkpoint: CheckpointSlot) !ReadView {
         var view: ReadView = .{ .file = file, .checkpoint = checkpoint, .mark = file.readMark(checkpoint), .owns_pin = false };
-        if (file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, io, view.mark);
+        // A handle frozen at an older checkpoint whose overlay versions a
+        // fold has since reclaimed cannot be read correctly any more:
+        // refuse it (`error.ReadSnapshotReclaimed`) instead of letting it
+        // fall through missing overlay entries to a tree that predates
+        // the fold. Callers reopen to get a current view.
+        if (file.redo) |*redo| try redo.shared.pinUnlessReclaimed(std.heap.page_allocator, io, view.mark);
         errdefer if (file.redo) |*redo| redo.shared.unpin(io, view.mark);
         if (file.inode_lock_ref.load(.acquire)) |entry| {
             try inode_lock.pinReader(entry, io, .{ .data = checkpoint.commit_sequence, .metadata = checkpoint.commit_sequence });
@@ -7320,43 +7325,6 @@ pub const NativeFile = struct {
         // anything else touches `result.header`/`result.manifest_commits_enabled`
         // below. Every production opener of a redo-log file reaches this.
         if (header.redo_log_capacity != 0) try result.recoverRedoLog(allocator, io);
-        // perf/lwa-restore-open-txn (design doc §9.8): settle a read-only
-        // handle's checkpoint/overlay mark to the latest actually-durable
-        // state *once*, here, at open -- before anything else can pin or
-        // read against it. `recoverRedoLog` just above already replayed
-        // the physical log, but that scan itself races a live writer's
-        // own concurrent commit/fold on the same inode with no exclusion
-        // at all (this open never takes any lock a writer's commit also
-        // takes): a `.query_readonly` connection opening while a
-        // background maintenance fold is mid-flight could settle on a
-        // checkpoint/mark pair that is internally inconsistent with
-        // what the fold is about to publish. Pin conservatively at
-        // whatever the scan above found, call the one primitive that
-        // walks past this process's own last-applied sequence via the
-        // shared lock region's published watermark and decodes anything
-        // new directly into the shared overlay (`refreshCrossProcessRedoOverlay`,
-        // the exact same call a cross-process reopen already uses,
-        // §9.3b -- works identically for a same-process fold's own
-        // publish), then drop the pin: once settled, a read-only
-        // handle's own checkpoint never changes again on its own (it
-        // never commits), so nothing further needs protecting until the
-        // next actual read pins it afresh (`ReadView.open`/`openAt`,
-        // already correct -- see that function's own doc comment). This
-        // keeps the read-only "frozen at open" contract several existing
-        // tests depend on (a later write on a *different* handle must
-        // never retroactively change what this one already settled on)
-        // while still closing the race window during settling itself.
-        if (opts.read_only and !opts.externally_locked and header.redo_log_capacity != 0) {
-            if (result.redo) |*redo| {
-                const settle_mark = result.readMark(result.activeCheckpoint());
-                try redo.shared.pin(std.heap.page_allocator, io, settle_mark);
-                defer redo.shared.unpin(io, settle_mark);
-                result.refreshCrossProcessRedoOverlay() catch |err| switch (err) {
-                    error.InvalidTransactionState => {},
-                    else => return err,
-                };
-            }
-        }
         if (plain_reader) {
             // Register with the coordinator *before* acquiring the
             // registry grant below, so `blocks_exclusive` reflects whether

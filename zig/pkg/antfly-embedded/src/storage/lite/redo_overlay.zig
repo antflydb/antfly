@@ -119,6 +119,11 @@ pub const SharedRedoOverlay = struct {
     /// overlay only for as long as some pin still needs it as its own
     /// resolved value (see `reclaim`).
     durable_checkpoint_sequence: u64 = 0,
+    /// The highest floor `reclaim` has collapsed versions against. A view
+    /// whose mark is below it may already have lost versions it needed
+    /// (they were dropped or folded into a checkpoint it cannot see), so
+    /// `pinUnlessReclaimed` refuses it rather than let it read a gap.
+    reclaimed_through: u64 = 0,
     /// Every currently live reader's pinned sequence, across every
     /// `NativeFile`/`ReadGeneration` referencing this overlay -- the
     /// in-process half of `minimumPinnedSequence`, unified here so an
@@ -418,6 +423,16 @@ pub const SharedRedoOverlay = struct {
         try self.pins.append(allocator, sequence);
     }
 
+    /// `pin`, but refuses a mark `reclaim` has already collapsed past:
+    /// the check and the pin share one lock, so no reclaim can slip
+    /// between them.
+    pub fn pinUnlessReclaimed(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, sequence: u64) !void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (sequence < self.reclaimed_through) return error.ReadSnapshotReclaimed;
+        try self.pins.append(allocator, sequence);
+    }
+
     /// The number of distinct keys currently holding at least one version
     /// for `root` (a key count, not a version count -- matches
     /// `std.HashMap.count`'s own meaning). Used by `check()`'s
@@ -633,6 +648,7 @@ pub const SharedRedoOverlay = struct {
         self.durable_checkpoint_sequence = @max(self.durable_checkpoint_sequence, durable_sequence);
         const min_pin = self.minPinLocked();
         const floor = @min(self.durable_checkpoint_sequence, min_pin orelse self.durable_checkpoint_sequence);
+        self.reclaimed_through = @max(self.reclaimed_through, floor);
         for (&self.maps) |*map| {
             // Collected rather than removed mid-iteration: this map's
             // iterator does not tolerate a concurrent `remove`/
