@@ -70,6 +70,24 @@ pub const Effect = union(enum) {
         }
     }
 };
+/// Bounded audit identity of an unresolved control displaced by an irreversible
+/// retirement fence. This does not claim that the displaced control succeeded.
+pub const Displaced = struct {
+    sequence: u64,
+    actor: Actor,
+    request_digest: Digest,
+    receipt: ?Receipt = null,
+    pub fn validate(self: Displaced) !void {
+        if (self.sequence == 0 or std.mem.allEqual(u8, &self.request_digest, 0)) return error.InvalidChangefeed;
+        if (self.receipt) |receipt| {
+            try receipt.validate();
+            if (std.mem.allEqual(u8, &self.actor, 0)) return error.InvalidChangefeed;
+        }
+    }
+    pub fn from(state: State) Displaced {
+        return state.displaced orelse .{ .sequence = state.sequence, .actor = state.actor, .request_digest = state.digest, .receipt = state.receipt };
+    }
+};
 pub const Settlement = struct {
     sequence: u64,
     actor: Actor,
@@ -77,9 +95,14 @@ pub const Settlement = struct {
     request_digest: Digest,
     proof: Digest,
     effect: Effect,
+    displaced: ?Displaced = null,
     pub fn validate(self: Settlement) !void {
         try self.receipt.validate();
         try self.effect.validate();
+        if (self.displaced) |original| {
+            try original.validate();
+            if (original.sequence >= self.sequence) return error.InvalidChangefeed;
+        }
         if (self.sequence == 0 or std.mem.allEqual(u8, &self.actor, 0) or std.mem.allEqual(u8, &self.request_digest, 0) or std.mem.allEqual(u8, &self.proof, 0)) return error.InvalidChangefeed;
     }
 };
@@ -92,9 +115,14 @@ pub const Reconciliation = struct {
     original_receipt: ?Receipt = null,
     proof: Digest,
     effect: union(enum) { progress: Effect, released },
+    displaced: ?Displaced = null,
     pub fn validate(self: Reconciliation) !void {
         if (self.sequence == 0 or std.mem.allEqual(u8, &self.actor, 0) or std.mem.allEqual(u8, &self.request_digest, 0) or std.mem.allEqual(u8, &self.proof, 0)) return error.InvalidChangefeed;
         if (self.original_receipt) |receipt| try receipt.validate();
+        if (self.displaced) |original| {
+            try original.validate();
+            if (original.sequence >= self.sequence) return error.InvalidChangefeed;
+        }
         switch (self.effect) {
             .progress => |effect| {
                 try effect.validate();
@@ -114,6 +142,8 @@ pub const State = struct {
     /// Unique to the dispatching process attempt. Never reuse after restart.
     actor: Actor = @splat(0),
     receipt: ?Receipt = null,
+    retirement_fence: bool = false,
+    displaced: ?Displaced = null,
     pub fn init(sequence: u64, ownership_epoch: u64, grant_sequence: u64, payload: Payload) !State {
         const result: State = .{ .sequence = sequence, .ownership_epoch = ownership_epoch, .grant_sequence = grant_sequence, .payload = payload, .digest = payload.identity() };
         try result.validate();
@@ -122,6 +152,11 @@ pub const State = struct {
     pub fn validate(self: State) !void {
         try self.payload.validate();
         if (self.sequence == 0 or self.ownership_epoch == 0 or self.grant_sequence == 0 or self.sequence <= self.grant_sequence or !std.mem.eql(u8, &self.digest, &self.payload.identity())) return error.InvalidChangefeed;
+        if (self.retirement_fence != (self.displaced != null)) return error.InvalidChangefeed;
+        if (self.displaced) |original| {
+            try original.validate();
+            if (original.sequence >= self.sequence) return error.InvalidChangefeed;
+        }
         switch (self.stage) {
             .prepared => if (!std.mem.allEqual(u8, &self.actor, 0) or self.receipt != null) return error.InvalidChangefeed,
             .dispatching => if (std.mem.allEqual(u8, &self.actor, 0) or self.receipt != null) return error.InvalidChangefeed,
@@ -134,7 +169,7 @@ pub const State = struct {
     pub fn verifyReconciliation(self: State, observed: Reconciliation) !void {
         try self.validate();
         try observed.validate();
-        if (self.stage == .prepared or self.sequence != observed.sequence or !std.mem.eql(u8, &self.actor, &observed.actor) or !std.mem.eql(u8, &self.digest, &observed.request_digest) or !std.meta.eql(self.receipt, observed.original_receipt)) return error.ChangefeedConflict;
+        if (self.stage == .prepared or self.sequence != observed.sequence or !std.mem.eql(u8, &self.actor, &observed.actor) or !std.mem.eql(u8, &self.digest, &observed.request_digest) or !std.meta.eql(self.receipt, observed.original_receipt) or !std.meta.eql(self.displaced, observed.displaced)) return error.ChangefeedConflict;
     }
     pub fn verifySettlement(self: State, settlement: Settlement) !void {
         try self.validate();
@@ -142,7 +177,7 @@ pub const State = struct {
         if (self.stage != .accepted or self.sequence != settlement.sequence or
             !std.mem.eql(u8, &self.actor, &settlement.actor) or
             !std.mem.eql(u8, &self.digest, &settlement.request_digest) or
-            !std.meta.eql(self.receipt.?, settlement.receipt)) return error.ChangefeedConflict;
+            !std.meta.eql(self.receipt.?, settlement.receipt) or !std.meta.eql(self.displaced, settlement.displaced)) return error.ChangefeedConflict;
     }
     pub fn begin(self: State, actor: Actor) !State {
         try self.validate();

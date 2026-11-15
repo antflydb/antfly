@@ -77,6 +77,27 @@ pub fn prepare(svc: anytype, policy: anytype, a: A, id: control.Id, namespace: c
     const item = state.roots[try state.rootIndex(namespace)];
     try mutate(svc, a, state, namespace, .{ .prepare = .{ .ownership_epoch = item.ownership_epoch, .grant_sequence = item.grant_sequence, .payload = payload } }, request);
 }
+/// Begin a distinct irreversible cleanup attempt, never a retry of the old
+/// command. The old request identity/known receipt remains in bounded metadata.
+/// This does not submit anything; drive must acquire a fresh begin permission.
+pub fn prepareRetirementFence(svc: anytype, policy: anytype, a: A, id: control.Id, namespace: control.Namespace, request: anytype) !void {
+    var current = try load(svc, a, id, request);
+    defer current.deinit();
+    const state = current.value;
+    try policy.authorizeRoot(state, namespace, request);
+    if (state.phase != .closing and state.phase != .reset_required) return error.ChangefeedConflict;
+    const item = state.roots[try state.rootIndex(namespace)];
+    const previous = item.pending_control orelse return error.ChangefeedConflict;
+    const input: wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .retire = .{ .namespace = namespace, .authority = state.authority, .consumer = state.consumerId(), .definition = state.definition.?.identity(), .grant = item.grant_sequence, .sequence = state.authority_sequence } } };
+    const body = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(body);
+    const payload: intent.Payload = .{ .command = body, .fence = previous.payload.fence, .table = previous.payload.table };
+    _ = try outcome.validateNewRequest(a, state, namespace, payload);
+    var route = try fence(a, payload);
+    defer route.deinit();
+    try policy.validateRoot(state, namespace, route.value, payload.table, request);
+    try mutate(svc, a, state, namespace, .{ .prepare_fence = .{ .previous_sequence = previous.sequence, .retirement_sequence = state.authority_sequence, .payload = payload } }, request);
+}
 /// Attach a receipt retained by the owner after a metadata write/ACK failure.
 /// This never dispatches or settles anything. Stale attempts cannot overwrite a
 /// newer pending request. The caller supplies only a trusted transport result.

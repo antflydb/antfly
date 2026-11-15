@@ -35,11 +35,21 @@ pub const ValidatedRequest = struct { input: wire.Request, policy_revision: u64 
 /// command. Success is not dispatch permission; the journal begin CAS is still
 /// required. The same validation runs again during outcome settlement.
 pub fn validateRequest(a: std.mem.Allocator, state: control.State, namespace: control.Namespace, payload: intent.Payload) !ValidatedRequest {
+    const item = state.roots[try state.rootIndex(namespace)];
+    const ceiling = if (item.pending_control) |pending| pending.sequence else std.math.add(u64, state.authority_sequence, 1) catch return error.ChangefeedConflict;
+    return validateRequestWithCeiling(a, state, namespace, payload, ceiling);
+}
+/// A distinct new intent is stamped after the current metadata state, rather
+/// than inheriting the older unresolved attempt's retirement-sequence ceiling.
+pub fn validateNewRequest(a: std.mem.Allocator, state: control.State, namespace: control.Namespace, payload: intent.Payload) !ValidatedRequest {
+    const ceiling = std.math.add(u64, state.authority_sequence, 1) catch return error.ChangefeedConflict;
+    return validateRequestWithCeiling(a, state, namespace, payload, ceiling);
+}
+fn validateRequestWithCeiling(a: std.mem.Allocator, state: control.State, namespace: control.Namespace, payload: intent.Payload, ceiling: u64) !ValidatedRequest {
     try state.validate();
     try payload.validate();
     const item = state.roots[try state.rootIndex(namespace)];
     if (item.released or state.phase == .empty or state.phase == .deleted) return error.ChangefeedConflict;
-    const ceiling = if (item.pending_control) |pending| pending.sequence else std.math.add(u64, state.authority_sequence, 1) catch return error.ChangefeedConflict;
     const input = wire.decodeRequest(a, payload.command, namespace) catch |err| return if (err == error.OutOfMemory) err else error.ChangefeedCorrupt;
     if (input.operation != .submit) return error.ChangefeedConflict;
     var route = std.json.parseFromSlice(metadata.CatalogRouteFence, a, payload.fence, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.ChangefeedCorrupt;
@@ -51,6 +61,7 @@ pub fn validateRequest(a: std.mem.Allocator, state: control.State, namespace: co
     std.mem.writeInt(u64, expected_namespace[8..16], identity.shard_id, .big);
     std.mem.writeInt(u64, expected_namespace[16..24], identity.range_id, .big);
     if (!same(namespace, expected_namespace)) return error.ChangefeedConflict;
+    if (item.pending_control) |pending| if (pending.retirement_fence and input.command != .retire) return error.ChangefeedConflict;
     const table = for (state.definition.?.tables) |table| {
         if (table.table_id == identity.table_id) break table;
     } else return error.ChangefeedConflict;
@@ -114,6 +125,7 @@ pub fn settle(a: std.mem.Allocator, state: control.State, namespace: control.Nam
         .request_digest = pending.digest,
         .proof = control.hash(.{ .domain = "antfly:root-control-settlement:v1", .feed = state.id, .epoch = state.epoch, .namespace = namespace, .intent = pending.sequence, .request = pending.digest, .receipt = entry, .outcome = response.outcome.? }),
         .effect = effect,
+        .displaced = pending.displaced,
     };
     try pending.verifySettlement(result);
     return result;

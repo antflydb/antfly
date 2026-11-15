@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 100;
+pub const protocol_version: u16 = 101;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -352,6 +352,7 @@ fn validateAdvances(state: State, advances: []const Advance) !void {
 }
 pub const RootControlMutation = union(enum) {
     prepare: struct { ownership_epoch: u64, grant_sequence: u64, payload: root_intent.Payload },
+    prepare_fence: struct { previous_sequence: u64, retirement_sequence: u64, payload: root_intent.Payload },
     begin: struct { sequence: u64, actor: root_intent.Actor },
     accepted: struct { sequence: u64, actor: root_intent.Actor, receipt: root_intent.Receipt },
     settled: root_intent.Settlement,
@@ -361,6 +362,10 @@ pub const RootControlMutation = union(enum) {
         switch (self) {
             .prepare => |v| {
                 if (v.ownership_epoch == 0 or v.grant_sequence == 0) return error.InvalidChangefeed;
+                try v.payload.validate();
+            },
+            .prepare_fence => |v| {
+                if (v.previous_sequence == 0 or v.retirement_sequence == 0) return error.InvalidChangefeed;
                 try v.payload.validate();
             },
             .begin => |v| if (v.sequence == 0 or !nz(v.actor)) return error.InvalidChangefeed,
@@ -478,6 +483,16 @@ pub const Mutation = union(enum) {
                     .prepare => |v| {
                         if (root.pending_control != null or v.ownership_epoch != root.ownership_epoch or v.grant_sequence != root.grant_sequence) return error.ChangefeedConflict;
                         roots[index].pending_control = try root_intent.State.init(stamp.sequence, v.ownership_epoch, v.grant_sequence, v.payload);
+                    },
+                    .prepare_fence => |v| {
+                        if (state.phase != .closing and state.phase != .reset_required) return error.ChangefeedConflict;
+                        const previous = root.pending_control orelse return error.ChangefeedConflict;
+                        if (v.previous_sequence != previous.sequence or v.retirement_sequence != state.authority_sequence or v.retirement_sequence <= root.grant_sequence or !std.mem.eql(u8, v.payload.table, previous.payload.table) or !std.mem.eql(u8, v.payload.fence, previous.payload.fence)) return error.ChangefeedConflict;
+                        var replacement = try root_intent.State.init(stamp.sequence, root.ownership_epoch, root.grant_sequence, v.payload);
+                        replacement.retirement_fence = true;
+                        replacement.displaced = root_intent.Displaced.from(previous);
+                        try replacement.validate();
+                        roots[index].pending_control = replacement;
                     },
                     .begin => |v| {
                         const pending = root.pending_control orelse return error.ChangefeedConflict;
@@ -1610,4 +1625,43 @@ test "changefeed accepted control settlement atomically folds authorized effects
     var changed_receipt = retired;
     changed_receipt.root_control.operation.settled.receipt.index += 1;
     try std.testing.expectError(error.ChangefeedConflict, step(a, state, changed_receipt));
+}
+
+test "changefeed retirement fence displaces only irrevocable cleanup and retains bounded original identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ns = testNamespace(7);
+    var state = try step(a, .{}, .{ .create = .{ .id = @splat(4), .definition = testDefinition(.now), .now = 100, .expires_at = 1000 } });
+    state = try step(a, state, .{ .plan_roots = &.{.{ .namespace = ns, .ownership_epoch = 1 }} });
+    state = try testPendingControl(a, state);
+    const original = state.roots[0].pending_control.?;
+    var operation: Mutation = .{ .root_control = .{ .namespace = ns, .operation = .{ .prepare_fence = .{ .previous_sequence = original.sequence, .retirement_sequence = state.authority_sequence, .payload = original.payload } } } };
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, operation));
+    state = try step(a, state, .close);
+    operation.root_control.operation.prepare_fence.retirement_sequence = state.authority_sequence;
+    state = try step(a, state, operation);
+    const first = state.roots[0].pending_control.?;
+    try std.testing.expect(first.retirement_fence);
+    try std.testing.expectEqual(.prepared, first.stage);
+    try std.testing.expectEqualDeep(root_intent.Displaced.from(original), first.displaced.?);
+    try std.testing.expect(first.sequence > original.sequence);
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, operation));
+    state = try step(a, state, .{ .root_control = .{ .namespace = ns, .operation = .{ .begin = .{ .sequence = first.sequence, .actor = @splat(8) } } } });
+    operation.root_control.operation.prepare_fence.previous_sequence = first.sequence;
+    operation.root_control.operation.prepare_fence.retirement_sequence = state.authority_sequence;
+    state = try step(a, state, operation);
+    const second = state.roots[0].pending_control.?;
+    try std.testing.expect(second.sequence > first.sequence);
+    try std.testing.expectEqualDeep(first.displaced, second.displaced);
+    const bytes = try encode(std.testing.allocator, state);
+    defer std.testing.allocator.free(bytes);
+    var restored = try parse(std.testing.allocator, bytes);
+    defer restored.deinit();
+    try std.testing.expectEqualDeep(second, restored.value.roots[0].pending_control.?);
+    var forged = operation;
+    forged.root_control.operation.prepare_fence.previous_sequence = second.sequence;
+    forged.root_control.operation.prepare_fence.retirement_sequence = state.authority_sequence;
+    forged.root_control.operation.prepare_fence.payload.table = "other";
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, forged));
 }

@@ -1800,6 +1800,37 @@ old grant is unbound/absent without such a floor; production factory registratio
 standalone native outcomes, topology/bootstrap and the complete issue contracts
 remain required.
 
+## In progress: durable retirement fencing for unresolved controls
+
+Metadata protocol 101 adds a distinct retirement-fence intent that can displace
+an unresolved control only after irreversible close/reset. It keeps the original
+root locator and grant, records the displaced request identity and any known
+receipt, and assigns a new metadata sequence and fresh dispatch actor. Repeated
+fence attempts retain the first displaced identity in constant space rather than
+building a chain. Active feeds cannot use this transition, and stale expected
+sequences or changed locators conflict.
+
+The fence planner builds and validates an explicit retirement command from the
+current closing authority stamp. It is a new cleanup obligation, not a replay
+or claimed outcome of the displaced command. The normal driver must acquire a
+new confirmed begin before dispatch. Accepted fence results recover by their own
+receipt; if a fence reply is lost, a current absent-consumer/retirement-floor
+proof can release the root. Completion records retain the bounded displaced
+identity, including when completion is semantic rather than an original reply.
+
+Qualification passed: `zig build history-control-entry-test
+history-control-apply-test changefeed-control-test -j2`. The real native fixture
+exercises a never-sent original enrollment, a never-sent first fence, a distinct
+fence whose entire reply is lost, metadata reopen, read-only release
+reconciliation, and a delayed original packet rejected by the durable floor.
+Predicate/core checks cover active-feed rejection, repeated fencing, stale
+mutations and locator binding; the standalone metadata suite passes 33 checks.
+Authoritative logs: `root-retirement-fence-qualification.log` (all five native
+Raft checks, no leaks), `root-retirement-fence-metadata-test.log`.
+Production registration, standalone native outcome qualification, retired-root
+handoff/bootstrap, destination/public transports and pinned client qualification
+remain required by the full goal.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

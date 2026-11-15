@@ -43613,6 +43613,43 @@ fn consumerTests() type {
                         break :blk host.raftStatus(601).?.last_index;
                     };
                     try std.testing.expectEqual(before_observation, after_observation);
+                    if (mode == .not_sent) {
+                        var original_state = try recovery_svc.load(a);
+                        defer original_state.deinit();
+                        const original_intent = original_state.value.roots[0].pending_control.?;
+                        const original = try ingress.wire.decodeRequest(a, original_intent.payload.command, namespace);
+                        // An active feed cannot discard an unresolved attempt.
+                        try std.testing.expectError(error.ChangefeedConflict, feed_driver.prepareRetirementFence(&recovery_svc, &driver_policy, a, recovery_id, namespace, feed_fixture.Request{}));
+                        try recovery_svc.mutate(a, .close);
+                        try feed_driver.prepareRetirementFence(&recovery_svc, &driver_policy, a, recovery_id, namespace, feed_fixture.Request{});
+                        // This first, distinct fence is itself lost before send.
+                        const missing_fence = try feed_driver.drive(&recovery_svc, &driver_policy, .{ .ptr = &drop, .execute_fn = DropReply.execute }, a, recovery_id, namespace, feed_fixture.Request{});
+                        try std.testing.expectEqual(.ambiguous, missing_fence.status);
+                        const still_absent = try feed_driver.reconcile(&recovery_svc, &driver_policy, origin.historyGrantPort(), a, recovery_id, namespace, feed_fixture.Request{});
+                        try std.testing.expectEqual(.unproven, still_absent.status);
+                        // A new metadata-owned fence keeps the original audit
+                        // identity; it does not redispatch either old attempt.
+                        try feed_driver.prepareRetirementFence(&recovery_svc, &driver_policy, a, recovery_id, namespace, feed_fixture.Request{});
+                        drop.mode = .lost_receipt;
+                        const fence_reply_lost = try feed_driver.drive(&recovery_svc, &driver_policy, .{ .ptr = &drop, .execute_fn = DropReply.execute }, a, recovery_id, namespace, feed_fixture.Request{});
+                        try std.testing.expectEqual(.ambiguous, fence_reply_lost.status);
+                        meta_store.deinit();
+                        meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
+                        const fenced = try feed_driver.reconcile(&recovery_svc, &driver_policy, origin.historyGrantPort(), a, recovery_id, namespace, feed_fixture.Request{});
+                        try std.testing.expectEqual(.reconciled, fenced.status);
+                        try std.testing.expect(fenced.reconciliation.?.effect == .released);
+                        try std.testing.expectEqual(original_intent.sequence, fenced.reconciliation.?.displaced.?.sequence);
+                        try std.testing.expectEqual(original_intent.digest, fenced.reconciliation.?.displaced.?.request_digest);
+                        try std.testing.expect(fenced.reconciliation.?.original_receipt == null);
+                        // Simulate the original packet arriving after cleanup.
+                        // The durable native floor rejects its old grant.
+                        const late_original = try server.submitHistoryControlLocal(a, route.fence().?, "docs", original.command);
+                        try std.testing.expectEqual(.resynchronization, late_original.outcome.?.rejected);
+                        try recovery_svc.mutate(a, .finish_close);
+                        var deleted = try recovery_svc.load(a);
+                        defer deleted.deinit();
+                        try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
+                    }
                 }
                 // Closing must dispatch retirement cleanup rather than cancel
                 // every prepared command solely because the feed is closed.

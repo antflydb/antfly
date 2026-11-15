@@ -70,7 +70,7 @@ pub fn resolve(a: std.mem.Allocator, state: control.State, namespace: control.Na
             .collect => unreachable,
         }
     };
-    const result: intent.Reconciliation = .{ .sequence = pending.sequence, .actor = pending.actor, .request_digest = pending.digest, .original_receipt = pending.receipt, .effect = effect, .proof = control.hash(.{ .domain = "antfly:root-control-observation:v1", .feed = state.id, .epoch = state.epoch, .intent = pending.sequence, .request = pending.digest, .read = input.binding(), .observed = observed }) };
+    const result: intent.Reconciliation = .{ .sequence = pending.sequence, .actor = pending.actor, .request_digest = pending.digest, .original_receipt = pending.receipt, .displaced = pending.displaced, .effect = effect, .proof = control.hash(.{ .domain = "antfly:root-control-observation:v1", .feed = state.id, .epoch = state.epoch, .intent = pending.sequence, .request = pending.digest, .read = input.binding(), .observed = observed }) };
     try pending.verifyReconciliation(result);
     return result;
 }
