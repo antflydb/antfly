@@ -1079,14 +1079,52 @@ not a decision explanation.
 | --- | --- |
 | Embedded single DB | own-table document, query (all live predicates, top-N), graph, and snapshot sources |
 | Embedded Lite (multi-table) | cross-table sources, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
-| Ordered (replicated serverless) publication | rejected explicitly at runtime |
-| Distributed server tables | rejected explicitly at admission |
+| Ordered (Raft) publication | dependency state commits with the artifact through replicated publish intents |
+| Distributed server tables | document, query (all live predicates, top-N), and snapshot `search.request` sources, own table and across tables; graph sources, `_artifacts` fields, and the search shorthands are rejected at admission (they need shard-local indexes) |
+
+### Distributed tables
+
+A distributed table is many Raft groups, each a replicated embedded DB, so
+context dependencies follow two rules: every replica holds byte-identical
+dependency state, and only a group's leader plans changes to it.
+
+- Table identities are `srv:<table_id>`, the immutable metadata incarnation;
+  the enrichment endpoint resolves names, lowers storage-evaluated filters,
+  and rejects generated-input cycles across tables against the catalog.
+- The leader plans each dependency-store change against a recording reader
+  and proposes a private `context_dependency` command (data Raft batch
+  protocol 31) with the exact effects and a digest of everything it read.
+  Every replica validates the read set at the same log position and applies
+  the effects verbatim, or applies nothing (the leader re-plans). Replicas
+  never plan, so planning needs no determinism.
+- Source rows stage notices in the commit itself, on every replica, from a
+  replicated topology (the table's identity and its inbound dependents).
+  The leader fetches the topology from the host and proposes it when it
+  changes; a newly inbound dependent receives one spec-wide notice in the
+  same commit, so a dependent that read the table before its declaration was
+  live is rebuilt.
+- Only the leader delivers outbox notices, to every group of the dependent
+  table (own table included), as idempotent inbox appends keyed by notice
+  digest; it acknowledges by content so every replica deletes the same
+  entries whatever their local keys. The leader applies its inbox through a
+  plan that consumes the entries it applied.
+- Enrichments publish through ordered artifact publication; the dependency
+  publication (freshness, subscriptions, lineage) is recorded as a
+  replicated intent for the exact output digest and promoted inside the
+  publication's commit on every replica.
+- Automatic post-commit drains are disabled on replicated owners (they would
+  run on the apply path); the data server runs one bounded, leader-only
+  maintenance job per control round instead.
+- Resolution reads every table, the own one included, through the routed
+  read path: point lookups, filtered scans (with the storage filter pushed
+  down), and full `QueryRequest` execution for snapshot sources.
 
 ### Remaining work
 
-- Distributed tables: replicate dependent-side notice application through the
-  owning raft group (leader-gated drain, `TableWriteSource` dispatch to every
-  group of the dependent table) and resolve table identities from metadata.
+- Distributed tables: graph sources and generated-artifact (`_artifacts`)
+  values need a routed, cross-shard read of graph adjacency and artifacts;
+  until then they are rejected at admission. Context sources are declared
+  through the enrichment endpoint, not inline at table creation.
 - HTTP surface: artifact `freshness`, the per-artifact dependency manifest,
   `POST /dependencies/impact`, and `freshness=require_current&wait_timeout=`
   reads (the storage and C ABI primitives exist).

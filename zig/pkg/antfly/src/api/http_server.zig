@@ -18558,6 +18558,33 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    fn admitContextSources(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, enrichment_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return enrichment_json;
+        const sources = parsed.value.object.get("context_sources") orelse return enrichment_json;
+        const refresh = parsed.value.object.get("refresh");
+        _ = parsed.value.object.orderedRemove("context_sources");
+        _ = parsed.value.object.orderedRemove("refresh");
+        if (sources != .null) {
+            var snapshot = (try self.source.adminSnapshot()) orelse return error.MetadataUnavailable;
+            defer self.source.freeAdminSnapshot(&snapshot);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const context_host = @import("context_host.zig");
+            const tables = try a.alloc(context_host.TableInfo, snapshot.tables.len);
+            for (snapshot.tables, tables) |t, *o| o.* = .{ .table_id = t.table_id, .name = t.name, .indexes_json = t.indexes_json };
+            const stored = try context_host.admitAlloc(a, tables, .{ .collect_fn = collectContextEnrichments }, table_name, artifact_name, sources, if (refresh) |r| (if (r == .null) null else r) else null, @import("antfly_local_sources").api_local_indexes.contextFilterLowering());
+            try parsed.value.object.put(parsed.arena.allocator(), "context_sources_json", .{ .string = try parsed.arena.allocator().dupe(u8, stored) });
+        }
+        return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    }
+
+    fn collectContextEnrichments(a: std.mem.Allocator, indexes_json: []const u8) anyerror![]const db_mod.types.EnrichmentConfig {
+        return indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(a, indexes_json);
+    }
+
     fn executePublicPutArtifactEnrichment(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -18573,11 +18600,19 @@ pub const ApiHttpServer = struct {
             return metadataAccessFailure(err);
         }) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
-        const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch |err| {
+        const request_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch |err| {
             std.log.warn("artifact enrichment validation failed stage=request table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
             return error.InvalidEnrichmentRequest;
         };
-        defer alloc.free(enrichment_json);
+        defer alloc.free(request_json);
+        // Context sources resolve table names to immutable identities, lower
+        // storage-evaluated filters, and reject cross-table cycles against
+        // the catalog; the stored form replaces the public declaration.
+        const enrichment_json = self.admitContextSources(alloc, table_name, artifact_name, request_json) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=context_sources table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            return error.InvalidEnrichmentRequest;
+        };
+        defer if (enrichment_json.ptr != request_json.ptr) alloc.free(enrichment_json);
         managed_embedder.validateEmbeddingEnrichmentProducerJsonWithOptions(
             alloc,
             enrichment_json,

@@ -282,6 +282,8 @@ pub const ProvisionedKernelOwnerSource = struct {
     runtime_status_change_hook: ?table_writes.ProvisionedTableWriteSource.LocalChangeHook = null,
     native_migration_policy: ?runtime_callbacks.DenseNativeMigrationPolicySource = null,
     promotion_leadership_source: ?table_writes.PromotionLeadershipSource = null,
+    /// Context-source host (#1634); outlives every opened owner.
+    context_host: ?*@import("context_host.zig").Host = null,
     replication_write_gate: ?replication_contract.WriteGate = null,
     hot_standby_async_mirror: ?replication_contract.AsyncEffectMirror = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -3382,7 +3384,25 @@ pub const ProvisionedKernelOwnerSource = struct {
             } else .{},
             .promotion_owner_ctx = if (self.promotion_leadership_source != null) self else null,
             .promotion_owner_fn = if (self.promotion_leadership_source != null) promotionOwner else null,
+            .context = if (self.context_host != null) .{ .callback_ctx = self, .call_fn = contextCall } else .{},
         };
+    }
+
+    pub fn withContextHost(self: *ProvisionedKernelOwnerSource, host: ?*@import("context_host.zig").Host) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0);
+        self.context_host = host;
+        return self;
+    }
+
+    fn contextCall(ptr: ?*anyopaque, op: u32, group_id: u64, table_name: abi.BorrowedBytes, request: abi.BorrowedBytes, consume_ctx: ?*anyopaque, consume: abi.ContextConsumeFn) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const host = self.context_host orelse return .invalid_argument;
+        const out = host.call(self.alloc, op, group_id, table_name.slice(), request.slice()) catch |err| {
+            std.log.debug("context host call deferred op={d} group_id={d} error={s}", .{ op, group_id, @errorName(err) });
+            return kernel_error_identity.statusFromError(err);
+        };
+        defer self.alloc.free(out);
+        return consume(consume_ctx, .fromSlice(out));
     }
 
     pub fn withCoordinatedTtl(self: *ProvisionedKernelOwnerSource, port: server_coordinated_ttl.Port) *ProvisionedKernelOwnerSource {

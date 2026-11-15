@@ -685,6 +685,7 @@ fn appendNormalizedInlineEnrichmentsField(
         if (item != .object) return error.InvalidCreateIndexRequest;
         const name = item.object.get("name") orelse return error.InvalidCreateIndexRequest;
         if (name != .string or name.string.len == 0) return error.InvalidCreateIndexRequest;
+        try rejectInlineContextSources(item.object);
         const normalized = normalizeArtifactEnrichmentConfigJson(alloc, item.object, name.string) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidCreateIndexRequest,
@@ -924,6 +925,7 @@ fn validatePublicInlineArtifactEnrichments(object: anytype) !void {
         if (!public_index_contract.createdValueMatchesShape(.enrichment, item))
             return error.InvalidCreateIndexRequest;
         if (item != .object) return error.InvalidCreateIndexRequest;
+        try rejectInlineContextSources(item.object);
         validatePublicArtifactEnrichmentObject(item.object) catch
             return error.InvalidCreateIndexRequest;
     }
@@ -1034,6 +1036,15 @@ fn normalizeArtifactEnrichmentConfigJson(
     return try out.toOwnedSlice(alloc);
 }
 
+/// Context sources need the table's catalog identity to resolve and check;
+/// declare them through the enrichment endpoint once the table exists.
+fn rejectInlineContextSources(object: std.json.ObjectMap) !void {
+    inline for (.{ "context_sources", "refresh" }) |field| if (object.get(field)) |value| if (value != .null) {
+        std.log.warn("inline enrichment rejected: field={s} is declared through PUT /tables/{{table}}/enrichments/{{name}}", .{field});
+        return error.InvalidCreateIndexRequest;
+    };
+}
+
 fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
     const Object = @TypeOf(object);
     if (@hasField(Object, "map")) {
@@ -1055,13 +1066,13 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
 }
 
 fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Value) !void {
-    // Context-source dependencies (#1634) are implemented by the embedded
-    // engine (single DB and multi-table Lite). Distributed tables reject the
-    // declaration explicitly until notice delivery between raft groups is
-    // replicated; accepting it would advertise invalidation they cannot keep.
-    if (std.mem.eql(u8, field, "context_sources") or std.mem.eql(u8, field, "context_sources_json") or std.mem.eql(u8, field, "refresh")) {
-        std.log.warn("artifact enrichment rejected: field={s} is not supported by distributed tables (embedded runtimes only)", .{field});
-        return error.InvalidArtifactEnrichmentRequest;
+    // Context-source dependencies (#1634): the public declaration is
+    // admitted by the enrichment endpoint, which resolves table identities
+    // and checks cycles against the catalog; the stored form is internal.
+    if (std.mem.eql(u8, field, "context_sources_json")) return error.InvalidArtifactEnrichmentRequest;
+    if (std.mem.eql(u8, field, "context_sources") or std.mem.eql(u8, field, "refresh")) {
+        if (value != .null and value != .object) return error.InvalidArtifactEnrichmentRequest;
+        return;
     }
     if (!public_index_contract.isAllowedEnrichmentRequestField(field)) return error.InvalidArtifactEnrichmentRequest;
     if (value == .null) return;
