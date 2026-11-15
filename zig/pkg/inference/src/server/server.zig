@@ -37201,39 +37201,47 @@ test "model listing reports an unreadable model per entry and keeps the others" 
     var node = try Node.init(allocator, .{ .models_dir = models_path });
     defer node.deinit();
 
-    const body = try node.listModelsJsonAlloc(allocator, io);
-    defer allocator.free(body);
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-    defer parsed.deinit();
-    const root = parsed.value.object;
-    try std.testing.expect(root.get("generators").?.object.get("acme/demo") != null);
-    const broken = root.get("extractors").?.object.get("acme/broken-gliner").?.object;
-    try std.testing.expectEqualStrings("incompatible", broken.get("compatibility").?.string);
-    try std.testing.expectEqualStrings("MissingGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
+    // Exercise discovery and both HTTP versions with missing and malformed
+    // sidecars. A fresh inventory read must preserve each specific diagnosis.
+    for ([_]?[]const u8{ null, "{not valid JSON", "{}" }) |encoder_config| {
+        if (encoder_config) |bytes| {
+            try tmp.dir.createDirPath(io, "extractors/acme/broken-gliner/encoder_config");
+            try tmp.dir.writeFile(io, .{ .sub_path = "extractors/acme/broken-gliner/encoder_config/config.json", .data = bytes });
+        }
+        const body = try node.listModelsJsonAlloc(allocator, io);
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expect(root.get("generators").?.object.get("acme/demo") != null);
+        const broken = root.get("extractors").?.object.get("acme/broken-gliner").?.object;
+        try std.testing.expectEqualStrings("incompatible", broken.get("compatibility").?.string);
+        try std.testing.expectEqualStrings(if (encoder_config == null) "MissingGlinerSpanEncoderConfig" else "InvalidGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
 
-    // Both the legacy request from #1678 and explicit v2 must preserve the
-    // discovery diagnosis rather than inventing a request resource limit.
-    const diagnostic = broken.get("error").?.object;
-    try std.testing.expect(std.mem.indexOf(u8, diagnostic.get("message").?.string, "encoder_config/config.json") != null);
-    for ([_][]const u8{
-        "{\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
-        "{\"schema_version\":2,\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
-    }) |json| {
-        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
-        defer request.deinit();
-        request.body = json;
-        var ctx = httpx.Context.init(allocator, io, &request);
-        defer ctx.deinit();
-        var response = try node.extractJSON(&ctx);
-        defer response.deinit();
-        try std.testing.expectEqual(@as(u16, 400), response.status.code);
-        var payload = try std.json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
-        defer payload.deinit();
-        const failure = payload.value.object;
-        try std.testing.expectEqualStrings("INVALID_MODEL", failure.get("error").?.string);
-        try std.testing.expectEqualStrings(diagnostic.get("code").?.string, failure.get("reason").?.string);
-        try std.testing.expectEqualStrings(diagnostic.get("message").?.string, failure.get("message").?.string);
-        try std.testing.expect(!failure.get("retryable").?.bool);
+        // Both the legacy request from #1678 and explicit v2 must preserve the
+        // discovery diagnosis rather than inventing a request resource limit.
+        const diagnostic = broken.get("error").?.object;
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.get("message").?.string, "encoder_config/config.json") != null);
+        for ([_][]const u8{
+            "{\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
+            "{\"schema_version\":2,\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
+        }) |json| {
+            var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+            defer request.deinit();
+            request.body = json;
+            var ctx = httpx.Context.init(allocator, io, &request);
+            defer ctx.deinit();
+            var response = try node.extractJSON(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 400), response.status.code);
+            var payload = try std.json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+            defer payload.deinit();
+            const failure = payload.value.object;
+            try std.testing.expectEqualStrings("INVALID_MODEL", failure.get("error").?.string);
+            try std.testing.expectEqualStrings(diagnostic.get("code").?.string, failure.get("reason").?.string);
+            try std.testing.expectEqualStrings(diagnostic.get("message").?.string, failure.get("message").?.string);
+            try std.testing.expect(!failure.get("retryable").?.bool);
+        }
     }
 
     // Readiness counts the usable model instead of collapsing to zero.
