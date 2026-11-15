@@ -73,7 +73,7 @@ const magic: [8]u8 = "AFLLOCK1".*;
 // rebuilt on open the same way a v1 region was when v2 landed (see the
 // comment above this constant's previous value) -- same
 // magic/version-mismatch policy as always, not a migrated format.
-// v4 (this bump): adds `db_inode`, the data file's own inode number at
+// v4: adds `db_inode`, the data file's own inode number at
 // the moment this region was created, to the immutable/checksummed span
 // (`header_checksum`'s slice grows from 16..32 to 16..48). `openSized`
 // compares it against the current data file's inode on every open, so a
@@ -89,7 +89,36 @@ const magic: [8]u8 = "AFLLOCK1".*;
 // `_reserved`/`_log_reserved` already do for 8-byte alignment elsewhere
 // in this header. A v3 (or earlier) region is rebuilt the same way any
 // earlier version mismatch always was.
-const format_version: u32 = 4;
+// v5 (this bump): closes the liveness-slot *reuse* race `claimLivenessSlot`'s
+// own doc comment used to describe as "a mitigation, not a closed race".
+// Dead-writer recovery proves a holder dead by probing its recorded
+// liveness slot's `fcntl` byte; the gap was that slot *index* alone is
+// not a stable identity -- once the original holder is gone, a different
+// process can claim that exact same index, and the stale `writer_holder`/
+// `ReaderSlot.generation`/ticket-ring-owner word naming it then reads
+// "alive" forever (the new claimant's own lock, not the original's).
+// The real fix is a per-slot claim-generation counter (`claimLivenessSlot`
+// bumps the matching slot of the new `liveness_generations` array -- see
+// its own doc comment -- on every claim, reused slot or not): a
+// `(slot, generation)` reference is provably dead the instant the slot's
+// current generation has moved past the value it was recorded with,
+// regardless of who -- if anyone -- has since reclaimed the index itself.
+// `writer_holder` and `ReaderSlot.generation` each widen from a 64-bit
+// `(pid, slot)` word to a 128-bit `(pid, slot, generation)` one
+// (`packHolderGen`) with 32 bits left spare for future use; the ticket
+// ring's own `(tag, owner)` word has no room left to grow (already a full
+// 128 bits), so its claimant's generation lives in a new parallel
+// `ticket_generations` array instead, keyed the same way as the ring
+// itself (see its own doc comment for why the narrow publish-after-CAS
+// window that creates is benign). Both new per-slot arrays sit between
+// the ticket ring and the liveness/abandonment byte rings in the region's
+// layout (see `livenessGenerationOffset`/`ticketGenerationOffset`).
+// `header_bytes` grows from 112 to 128: `writer_holder` alone adds 16
+// bytes (64 -> 128 bits), and `_log_reserved` widens from 4 to 12 bytes to
+// keep the multiple-of-16 invariant `ticketOwnerOffset`'s own comment
+// requires. A v4 (or earlier) region is rebuilt the same way any earlier
+// version mismatch always was -- including this one.
+const format_version: u32 = 5;
 
 /// Fixed size of the header itself. The header's own `region_bytes` and
 /// `max_readers` fields (not this constant) are the source of truth for
@@ -97,7 +126,7 @@ const format_version: u32 = 4;
 /// header -- but `max_readers` itself is fixed forever at a region's
 /// first creation; see `max_readers`'s own doc comment for why this
 /// module deliberately does not support growing it later.
-const header_bytes = 112;
+const header_bytes = 128;
 
 /// `Header` is the first `header_bytes` of the region, native-endian (the
 /// region is only ever read by the same machine that wrote it -- unlike
@@ -156,10 +185,14 @@ const Header = extern struct {
 
     // -- Live, mutable state: touched by every acquire/release/claim/pin,
     // deliberately *not* covered by `header_checksum` (see above).
-    /// §8.2: 0 when free, else the holder's packed `(pid, generation)`.
-    /// `generation` is reserved for step 3 (liveness/recovery); step 1
-    /// writes 0 there and holder identity is the pid alone.
-    writer_holder: std.atomic.Value(u64),
+    /// §8.2/v5: 0 when free, else `packHolderGen(pid, liveness_slot,
+    /// claim_generation)` -- 128 bits, widened from v4's 64-bit
+    /// `(pid, liveness_slot)`-only word to also carry the liveness slot's
+    /// own claim generation at the moment this word was written (see
+    /// `format_version`'s own v5 comment for why: a slot index alone is
+    /// not a stable identity once its original holder is gone). 32 bits
+    /// are left spare for future use.
+    writer_holder: std.atomic.Value(u128),
     /// §8.2: next ticket to issue (fetch-add on every contended acquirer;
     /// the uncontended fast path never touches this).
     writer_ticket_tail: std.atomic.Value(u64),
@@ -234,10 +267,13 @@ const Header = extern struct {
     /// (a reader retries instead of blocking -- the window it could ever
     /// observe odd is three plain stores long).
     log_generation: std.atomic.Value(u32),
-    /// Pads the WAL-index fields to a multiple of 8, mirroring
-    /// `_immutable_reserved`/`_reserved`'s own reasoning: no implicit
-    /// compiler-inserted padding anywhere in this struct.
-    _log_reserved: [4]u8 = @splat(0),
+    /// Pads the WAL-index fields out to keep `header_bytes` a multiple of
+    /// 16 (`ticketOwnerOffset`'s own comment explains why that invariant
+    /// matters), mirroring `_immutable_reserved`/`_reserved`'s own
+    /// reasoning: no implicit compiler-inserted padding anywhere in this
+    /// struct. Widened from 4 to 12 bytes by v5's `writer_holder` growing
+    /// 64 -> 128 bits (see `format_version`'s own v5 comment).
+    _log_reserved: [12]u8 = @splat(0),
 };
 
 comptime {
@@ -252,12 +288,19 @@ const ReaderSlot = extern struct {
     /// acceptable here because claiming happens once per reader lifetime,
     /// not once per commit.
     owner: std.atomic.Value(u32),
-    /// Packed `(pid, open-generation)` pair, same encoding as the writer
-    /// word's holder. Step 3's liveness probe (not just `owner != 0`)
-    /// uses this to tell a slot a dead reader never cleared apart from
-    /// one a new process with the same pid legitimately claimed; step 2
-    /// writes a zero generation and nothing yet reads this field back.
-    generation: u64,
+    /// `packHolderGen(pid, liveness_slot, claim_generation)` -- same
+    /// 128-bit encoding as the writer word's holder (v5; see
+    /// `format_version`'s own comment), widened from a 64-bit
+    /// `(pid, liveness_slot)`-only pair. Step 3's liveness probe (not just
+    /// `owner != 0`) uses this to tell a slot a dead reader never cleared
+    /// apart from one a new process with the same pid legitimately
+    /// claimed -- and, since v5, apart from one a new process claimed via
+    /// a *different* pid that happened to land on the same now-reused
+    /// liveness slot index too. `releaseReaderSlot` writes this back to 0
+    /// on release; a plain (non-atomic) field like before v5, not an
+    /// `std.atomic.Value` -- this slot's own owner CAS is what readers
+    /// actually synchronize on.
+    generation: u128,
     /// The `commit_sequence` this reader will not let the writer reclaim
     /// pages behind. 0 means "not currently pinned" (sequence numbers
     /// start above 0), written once per pin by the slot's own owner,
@@ -276,7 +319,15 @@ const ReaderSlot = extern struct {
     metadata_pinned_sequence: std.atomic.Value(u64),
 };
 
-const reader_slot_bytes = 32;
+/// v5: grows from 32 to 48 bytes -- `generation` widening from a 64-bit
+/// `(pid, liveness_slot)` word to the 128-bit `(pid, liveness_slot,
+/// claim_generation)` one adds 16 bytes (8 of them real, 8 of them the
+/// extern struct's own implicit alignment padding before a 16-byte-aligned
+/// field, same shape `owner`'s existing 4 bytes of implicit padding before
+/// `generation` already had). Still a multiple of 16, keeping
+/// `ticketOwnerOffset`'s own alignment invariant intact for every
+/// `max_readers` value.
+const reader_slot_bytes = 48;
 
 comptime {
     std.debug.assert(@sizeOf(ReaderSlot) == reader_slot_bytes);
@@ -322,38 +373,73 @@ fn headerChecksum(header: *const Header) u32 {
     return Crc32c.hash(bytes[16..48]);
 }
 
-/// Packs a pid with a *liveness slot index* into a holder/generation word
-/// (not a counter-style "generation", despite the name kept for
-/// `Header`'s own field comments written before this existed): §8.4's
-/// per-process liveness byte-range lock lives at a fixed index, claimed
-/// once by a process the first time it opens the region (`openSized`'s
-/// `claimLivenessSlot`) and held for that `Region` handle's whole
-/// lifetime -- not re-taken on every `acquireWriter`/`claimReaderSlot`
-/// call, which is what keeps this design's "0 syscalls on a warm,
-/// uncontended write" property intact even with liveness tracking in
-/// place. `holderPid`/`holderLivenessSlot` unpack this word to answer "is
-/// the process that wrote this word still alive" by probing *that*
-/// index's liveness byte (`probeDead`), not by re-deriving anything from
-/// the pid itself -- no PID-reuse heuristic anywhere in this design.
+/// Packs a pid with a *liveness slot index* into a narrow 64-bit holder
+/// word, with no room for a claim generation (see `packHolderGen` for the
+/// wide, generation-carrying peer `writer_holder`/`ReaderSlot.generation`
+/// use since v5). Used only for the ticket ring's own `(tag, owner)` word
+/// (`packTicketSlot`), which is already a full 128 bits and has no spare
+/// room to also carry a generation inline -- see `ticket_generations`'s
+/// own doc comment for where that ring's own claim generations live
+/// instead. §8.4's per-process liveness byte-range lock lives at a fixed
+/// index, claimed once by a process the first time it opens the region
+/// (`openSized`'s `claimLivenessSlot`) and held for that `Region` handle's
+/// whole lifetime -- not re-taken on every `acquireWriter`/
+/// `claimReaderSlot` call, which is what keeps this design's "0 syscalls
+/// on a warm, uncontended write" property intact even with liveness
+/// tracking in place. `narrowHolderPid`/`narrowHolderLivenessSlot` unpack
+/// this word to answer "is the process that wrote this word still alive"
+/// by probing *that* index's liveness byte (`probeDead`, via
+/// `isReferenceDead`), not by re-deriving anything from the pid itself --
+/// no PID-reuse heuristic anywhere in this design.
 fn packHolder(pid: u32, liveness_slot: u32) u64 {
     return (@as(u64, liveness_slot) << 32) | @as(u64, pid);
 }
 
-fn holderPid(word: u64) u32 {
+fn narrowHolderPid(word: u64) u32 {
     return @truncate(word);
 }
 
-fn holderLivenessSlot(word: u64) u32 {
+fn narrowHolderLivenessSlot(word: u64) u32 {
     return @truncate(word >> 32);
+}
+
+/// The wide peer of `packHolder`, used wherever the reference's own word
+/// has room for it: `writer_holder` and `ReaderSlot.generation`, both 128
+/// bits wide since v5 (see `format_version`'s own v5 comment). Packs
+/// `pid` (bits 0..32), `liveness_slot` (32..64), and `claim_generation`
+/// (64..96) -- the value `liveness_generations()[liveness_slot]` held at
+/// the moment this word was written, captured once per `Region` handle at
+/// `claimLivenessSlot` time (`own_liveness_generation`), not recomputed on
+/// every call -- with 32 bits (96..128) left spare for future use. A
+/// `(liveness_slot, claim_generation)` pair unpacked back out of this word
+/// is dead the instant `liveness_generations()[liveness_slot]` no longer
+/// equals `claim_generation` -- see `isReferenceDead`'s own doc comment.
+fn packHolderGen(pid: u32, liveness_slot: u32, claim_generation: u32) u128 {
+    return (@as(u128, claim_generation) << 64) | (@as(u128, liveness_slot) << 32) | @as(u128, pid);
+}
+
+fn holderPid(word: u128) u32 {
+    return @truncate(word);
+}
+
+fn holderLivenessSlot(word: u128) u32 {
+    return @truncate(word >> 32);
+}
+
+fn holderClaimGeneration(word: u128) u32 {
+    return @truncate(word >> 64);
 }
 
 /// Packs a ticket ring slot: `tag` (the claiming ticket's own absolute
 /// number, offset by one -- see `ticketSlots`'s own doc comment for why
 /// zero must stay reserved for "nobody has ever claimed this slot") in
-/// the upper 64 bits, `owner` (`packHolder`'s own pid/liveness-slot
+/// the upper 64 bits, `owner` (`packHolder`'s own narrow pid/liveness-slot
 /// encoding) in the lower 64. A 128-bit word so claiming a ticket number
 /// and publishing its owner is one atomic CAS, not two separate writes
-/// with a window between them.
+/// with a window between them -- already the maximum atomic width this
+/// module uses anywhere, which is why `owner` stays the narrow encoding
+/// rather than also widening to carry a claim generation inline; see
+/// `ticket_generations`'s own doc comment for where that lives instead.
 fn packTicketSlot(tag: u64, owner: u64) u128 {
     return (@as(u128, tag) << 64) | @as(u128, owner);
 }
@@ -689,6 +775,15 @@ pub const Region = struct {
     /// taken once, here, which is what keeps acquire/claim/pin/unpin at
     /// zero additional syscalls even with liveness tracking in place.
     own_liveness_slot: u32,
+    /// v5: the claim generation `claimLivenessSlot` recorded for
+    /// `own_liveness_slot` at the moment it claimed it -- i.e.
+    /// `liveness_generations()[own_liveness_slot]`'s value right after
+    /// that claim's own bump. Packed alongside `own_liveness_slot`
+    /// wherever that is (`packHolderGen`), so a reference recorded through
+    /// this handle is provably stale the instant some *later* claim of
+    /// the same slot index bumps the shared counter past this value --
+    /// see `format_version`'s own v5 comment and `isReferenceDead`.
+    own_liveness_generation: u32,
     /// The `Io` this handle was opened with, kept so `close`,
     /// `claimReaderSlot`, `minimumPinnedSequence`, `writerHolderDead`,
     /// and `recoverDeadWriter` don't need it threaded through their own
@@ -716,12 +811,36 @@ pub const Region = struct {
         return header_bytes + @as(usize, max_readers) * reader_slot_bytes;
     }
 
+    /// v5: byte offset of liveness slot `slot_index`'s own claim-generation
+    /// word (`std.atomic.Value(u32)`), immediately after the ticket ring --
+    /// 4-byte aligned for any `max_readers` since `ticketOwnerOffset` is
+    /// itself 16-byte aligned. This is the *source of truth* `isReferenceDead`
+    /// compares a captured `(slot, generation)` reference against: bumped by
+    /// `claimLivenessSlot` on every claim of this slot, reused index or not,
+    /// which is the real fix `format_version`'s own v5 comment describes for
+    /// the race `claimLivenessSlot`'s hash-seeded scan start used to only
+    /// mitigate.
+    fn livenessGenerationOffset(max_readers: u32, slot_index: u32) i64 {
+        return @as(i64, @intCast(ticketOwnerOffset(max_readers))) + @as(i64, max_readers) * 16 + @as(i64, slot_index) * 4;
+    }
+
+    /// v5: byte offset of ticket ring slot `slot_index`'s own captured
+    /// claimant liveness-slot generation (`std.atomic.Value(u32)`),
+    /// immediately after `liveness_generations` -- see `ticket_generations`'s
+    /// own doc comment for why this lives in its own parallel array instead
+    /// of packed into the ticket ring's `(tag, owner)` word itself.
+    fn ticketGenerationOffset(max_readers: u32, slot_index: u32) i64 {
+        return livenessGenerationOffset(max_readers, 0) + @as(i64, max_readers) * 4 + @as(i64, slot_index) * 4;
+    }
+
     /// Byte offset of liveness slot `slot_index`'s dedicated byte,
-    /// immediately after the ticket ring (§8.1's "M*1 process liveness
-    /// bytes, one per slot"). Content is never read or written; the
+    /// immediately after `ticket_generations` (§8.1's "M*1 process liveness
+    /// bytes, one per slot"; v5 inserts `liveness_generations` and
+    /// `ticket_generations` between the ticket ring and this byte ring --
+    /// see their own doc comments). Content is never read or written; the
     /// byte exists purely as an `fcntl` lock target.
     fn livenessByteOffset(max_readers: u32, slot_index: u32) i64 {
-        return @as(i64, @intCast(ticketOwnerOffset(max_readers))) + @as(i64, max_readers) * 16 + @as(i64, slot_index);
+        return ticketGenerationOffset(max_readers, 0) + @as(i64, max_readers) * 4 + @as(i64, slot_index);
     }
 
     /// Byte offset of ticket `ticket`'s abandonment flag, in a fixed ring
@@ -739,6 +858,55 @@ pub const Region = struct {
     /// this bound -- see their own "ring full" backoff).
     fn ticketAbandonedOffset(max_readers: u32, ticket: u32) i64 {
         return @as(i64, livenessByteOffset(max_readers, 0)) + @as(i64, max_readers) + @as(i64, ticket % max_readers);
+    }
+
+    /// Total region size for `max_readers` slots: the header plus every
+    /// per-slot array that follows it (reader slots, the ticket ring,
+    /// `liveness_generations`, `ticket_generations`, the liveness bytes,
+    /// and the abandonment-flag ring). Factored out so `openSized`'s own
+    /// rebuild-from-scratch sizing and `ensureNoLivePeer`'s own "does the
+    /// claimed slot count even fit the file" sanity check can't drift
+    /// apart from each other or from the real per-array offsets above.
+    fn regionBytesFor(max_readers: u32) u64 {
+        return @as(u64, @intCast(ticketAbandonedOffset(max_readers, 0))) + @as(u64, max_readers);
+    }
+
+    /// v5: the per-liveness-slot claim-generation array immediately after
+    /// the ticket ring -- the authoritative "how many times has this
+    /// index been claimed" counter `claimLivenessSlot` bumps on every
+    /// claim (see its own doc comment) and `isReferenceDead` compares a
+    /// captured `(slot, generation)` reference against. Takes the mapping
+    /// directly (not `self`) so `claimLivenessSlot` -- called before the
+    /// `Region` value it will become even exists -- can reach it too.
+    fn livenessGenerationsFromMapping(mapping: []align(std.heap.page_size_min) u8, max_readers: u32) []std.atomic.Value(u32) {
+        const base: [*]std.atomic.Value(u32) = @ptrCast(@alignCast(mapping.ptr + @as(usize, @intCast(livenessGenerationOffset(max_readers, 0)))));
+        return base[0..max_readers];
+    }
+
+    fn livenessGenerations(self: *const Region) []std.atomic.Value(u32) {
+        return livenessGenerationsFromMapping(self.mapping, self.header().max_readers);
+    }
+
+    /// v5: one claim-generation slot per ticket ring index, immediately
+    /// after `liveness_generations` -- the ticket ring's own parallel peer
+    /// to `writer_holder`/`ReaderSlot.generation`'s inline
+    /// `packHolderGen`, kept separate because the ring's own `(tag,
+    /// owner)` word (`packTicketSlot`) is already the maximum atomic width
+    /// this module uses (128 bits) with no room left to also carry a
+    /// generation. Written by `tryClaimTicket` right after it wins a ring
+    /// slot's `(tag, owner)` CAS -- a few instructions after `owner`
+    /// itself becomes visible, not atomically with it. That narrow window
+    /// is benign: every reader of this array already gates on `owner !=
+    /// 0` first, and the only possible outcome of racing it is a stale
+    /// *previous* occupant's generation being compared against the new
+    /// occupant's (live, by construction, since it just won the CAS)
+    /// liveness slot -- at worst one spurious extra `fcntl` probe that a
+    /// microsecond-later re-check would avoid, never a false "dead"
+    /// result that persists.
+    fn ticketGenerations(self: *const Region) []std.atomic.Value(u32) {
+        const max_readers = self.header().max_readers;
+        const base: [*]std.atomic.Value(u32) = @ptrCast(@alignCast(self.mapping.ptr + @as(usize, @intCast(ticketGenerationOffset(max_readers, 0)))));
+        return base[0..max_readers];
     }
 
     /// `probeDead`, but for *this process's own* liveness slot index
@@ -771,6 +939,34 @@ pub const Region = struct {
         return probeDead(self.fd_entry.fd, livenessByteOffset(self.header().max_readers, slot_index));
     }
 
+    /// v5: the real liveness check every reference to a liveness slot
+    /// should use (`isSlotDead` alone stays available for
+    /// `ensureNoLivePeer`'s own scan, which has no captured generation to
+    /// compare against -- it is asking "is *anything* live at this index
+    /// right now", not "is the specific claim I recorded still the one
+    /// holding it"). `claim_generation` is whatever was packed alongside
+    /// `slot_index` when the reference being checked was recorded
+    /// (`holderClaimGeneration`/`ticket_generations`, captured from the
+    /// claimant's own `own_liveness_generation` at the time).
+    ///
+    /// A generation mismatch alone proves the reference dead, with no
+    /// `fcntl` call at all: once `liveness_generations()[slot_index]` has
+    /// moved past `claim_generation`, nothing can ever again be the claim
+    /// that recorded it, regardless of whether the index itself currently
+    /// sits empty, is held by a live process, or was reclaimed by a dead
+    /// one in turn -- the exact slot-reuse race `format_version`'s own v5
+    /// comment describes, now closed structurally rather than merely made
+    /// unlikely. Only a *matching* generation falls through to the real
+    /// `fcntl` probe, to tell "the original claimant is still alive" apart
+    /// from "the original claimant simply hasn't been superseded yet" --
+    /// both read the same generation, and only one of them is actually
+    /// dead.
+    fn isReferenceDead(self: *const Region, slot_index: u32, claim_generation: u32) bool {
+        const current = self.livenessGenerations()[slot_index].load(.acquire);
+        if (current != claim_generation) return true;
+        return self.isSlotDead(slot_index);
+    }
+
     /// Scans liveness slots `[0, max_readers)`, starting from a per-process
     /// offset (see below), for the first one this process can claim,
     /// holding it for the rest of this `Region` handle's lifetime. Called
@@ -789,52 +985,38 @@ pub const Region = struct {
     ///
     /// §8.4's liveness probe identifies a holder purely by slot *index*
     /// (`writer_holder`/a reader slot's `generation`/a ticket's own owner
-    /// word all pack `(pid, liveness_slot)`, never anything that
-    /// survives the slot being reused) -- deliberately, since there is no
-    /// kernel primitive tying a slot index to the process that last held
-    /// it once that process is gone. A scan that always starts at index 0
-    /// turns that into a real hazard: the *very call* checking whether
-    /// some other holder is dead (§8.4's own `recoverDeadWriter` path,
-    /// `native.zig`'s `fairWriterLockWithIo`) itself opens a fresh
-    /// `Region` and claims a fresh liveness slot to do so -- and in any
-    /// small-scale system (a handful of opens total, the common case
-    /// right after a crash: a repro, a freshly started process, a test)
-    /// the index a dead process just freed is deterministically the
-    /// *first* free one any subsequent scan-from-0 finds. The checking
-    /// process then holds that exact index itself, making the stale word
-    /// it was trying to judge read as "alive" forever -- not because the
-    /// original holder is alive, but because the checker is now squatting
-    /// on its old seat. Starting from a per-process hash of the pid
-    /// instead spreads claims across the whole range, so this specific
-    /// collision is a roughly `1/max_readers` chance instead of
-    /// systematic -- mixed with the current time too (not just the pid),
-    /// so a caller that retries a whole fresh `Region.open()` after a
-    /// collision (`native.zig`'s own capi admission retry loop,
-    /// `db.zig`'s `enterBeforeDeadline`) draws independently each time
-    /// rather than deterministically repeating the same losing scan.
-    /// This is a mitigation, not a closed race: a byte-range-only
-    /// liveness proof has no slot-reuse generation counter to check
-    /// instead (unlike the reader table's own `generation` field, which
-    /// still only guards against *pid* reuse, a different hazard). See
-    /// native.zig's "lite fair writer lock recovers promptly from a
-    /// killed writer's stale lease" for the regression this closes in
-    /// the production path (`fairWriterLockWithIo`), which retries its
-    /// own fresh acquisition attempts for exactly this reason.
-    fn claimLivenessSlot(io: Io, entry: *FdEntry, max_readers: u32) RegionError!u32 {
+    /// word all pack `(pid, liveness_slot)`), and there is no kernel
+    /// primitive tying a slot index to the process that last held it once
+    /// that process is gone -- so a *different* process can legitimately
+    /// claim the exact index a dead holder just freed. v5's
+    /// `liveness_generations` array is the real fix for the staleness that
+    /// would otherwise cause (see `format_version`'s own v5 comment and
+    /// `isReferenceDead`): every claim here, reused index or not, bumps
+    /// the matching slot's own generation, so a reference recorded before
+    /// this claim reads as dead immediately, regardless of which index it
+    /// named.
+    ///
+    /// That leaves this scan free to optimize purely for *performance*,
+    /// not correctness: starting it at a per-process hash of the pid
+    /// (rather than always at index 0) spreads concurrent claims across
+    /// the whole range instead of serializing every opener's first few
+    /// `fcntl` attempts onto the same low indices, which matters under
+    /// bursty open/close churn (many short-lived handles claiming and
+    /// releasing slots in quick succession -- the common shape right
+    /// after a crash: a repro, a freshly started process, a test). Unlike
+    /// the pre-v5 version of this comment, there is no longer any reason
+    /// to also mix in the current time: that existed solely so a caller
+    /// retrying a whole fresh `Region.open()` after colliding with this
+    /// *specific* race wouldn't deterministically repeat the same losing
+    /// scan -- moot now that a collision on a reused index is no longer a
+    /// losing outcome at all. See native.zig's "lite fair writer lock
+    /// recovers promptly from a killed writer's stale lease" for the
+    /// dead-writer-recovery path this all ultimately serves.
+    fn claimLivenessSlot(io: Io, entry: *FdEntry, mapping: []align(std.heap.page_size_min) u8, max_readers: u32) RegionError!struct { slot: u32, generation: u32 } {
         fd_registry_mutex.lockUncancelable(io);
         defer fd_registry_mutex.unlock(io);
-        // Mixes in the current time, not just the pid: a process that
-        // retries this whole open (its own first claim having collided
-        // with a just-freed slot some *other* stale word still names --
-        // see this function's own doc comment) must not deterministically
-        // redo the exact same losing scan every time; a fixed per-pid-only
-        // seed would. `Io.Clock`, not a syscall-backed wall clock, since
-        // this already runs under `fd_registry_mutex` and must not add a
-        // second kind of blocking call to every single open.
         const pid = antfly_platform.process.currentId() orelse 0;
-        const now_ns: u64 = @truncate(@as(u96, @bitCast(Io.Clock.awake.now(io).nanoseconds)));
-        const seed = (@as(u64, pid) *% 2654435761) ^ (now_ns *% 0x9E3779B97F4A7C15);
-        const start: u32 = @intCast(seed % max_readers);
+        const start: u32 = @intCast((@as(u64, pid) *% 2654435761) % max_readers);
         var scanned: u32 = 0;
         next_index: while (scanned < max_readers) : (scanned += 1) {
             const i = (start + scanned) % max_readers;
@@ -843,7 +1025,14 @@ pub const Region = struct {
             }
             if (fcntlTryLock(entry.fd, livenessByteOffset(max_readers, i), std.c.F.WRLCK)) {
                 entry.claimed_slots.append(std.heap.page_allocator, i) catch return RegionError.LivenessSlotsExhausted;
-                return i;
+                // Bump unconditionally, on *every* claim of this index --
+                // including this process's own very first claim of a
+                // never-before-claimed slot (0 -> 1): what matters is that
+                // this claim's own generation is strictly greater than
+                // whatever any *previous* claim of this same index last
+                // recorded, not that it starts at any particular value.
+                const new_generation = livenessGenerationsFromMapping(mapping, max_readers)[i].fetchAdd(1, .acq_rel) +% 1;
+                return .{ .slot = i, .generation = new_generation };
             }
         }
         return RegionError.LivenessSlotsExhausted;
@@ -870,7 +1059,9 @@ pub const Region = struct {
     /// `fork`). Tracked as part of the broader `Io`-usage sweep the rest
     /// of this design still owes (§8.9's later steps).
     pub fn reclaimLivenessAfterFork(self: *Region) RegionError!void {
-        self.own_liveness_slot = try claimLivenessSlot(self.io, self.fd_entry, self.header().max_readers);
+        const claimed = try claimLivenessSlot(self.io, self.fd_entry, self.mapping, self.header().max_readers);
+        self.own_liveness_slot = claimed.slot;
+        self.own_liveness_generation = claimed.generation;
     }
 
     /// Opens (creating if absent) the region next to `db_path` with
@@ -984,10 +1175,8 @@ pub const Region = struct {
             try ensureNoLivePeer(io, fd_entry, &existing_raw, size);
         }
         if (need_init) {
-            // Per-slot overhead: the reader slot itself, the ticket
-            // ring's own 16-byte (tag, owner) word (`packTicketSlot`),
-            // one liveness byte, and one abandonment-flag byte.
-            const region_bytes = header_bytes + @as(u64, max_readers) * (reader_slot_bytes + 18);
+            // `regionBytesFor`'s own doc comment has the per-slot layout.
+            const region_bytes = regionBytesFor(max_readers);
             // Rebuild from a clean slate: a corrupt region's leftover
             // reader-slot/liveness bytes are never trusted either, only
             // the header's own validity was checked above. `setLength(0)`
@@ -1059,8 +1248,8 @@ pub const Region = struct {
 
         const mapping = std.posix.mmap(null, map_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, raw_fd, 0) catch return RegionError.RegionUnavailable;
         errdefer std.posix.munmap(mapping);
-        const own_liveness_slot = try claimLivenessSlot(io, fd_entry, final_max_readers);
-        return .{ .mapping = mapping, .fd_entry = fd_entry, .own_liveness_slot = own_liveness_slot, .io = io };
+        const claimed = try claimLivenessSlot(io, fd_entry, mapping, final_max_readers);
+        return .{ .mapping = mapping, .fd_entry = fd_entry, .own_liveness_slot = claimed.slot, .own_liveness_generation = claimed.generation, .io = io };
     }
 
     /// The pre-rebuild safety check `openSized`'s doc comment describes.
@@ -1101,7 +1290,7 @@ pub const Region = struct {
         if (claimed_max_readers == 0 or claimed_max_readers > max_sane_readers) {
             return RegionError.RegionCorrupt;
         }
-        const implied_bytes = header_bytes + @as(u64, claimed_max_readers) * (reader_slot_bytes + 18);
+        const implied_bytes = regionBytesFor(claimed_max_readers);
         if (implied_bytes > actual_file_bytes) {
             // The claimed slot count doesn't even fit the file's actual
             // size -- the header is corrupt enough that this count can't
@@ -1176,7 +1365,7 @@ pub const Region = struct {
     /// is the FIFO-respecting peer `tryFairWriterLockWithIo` migrates onto
     /// instead).
     pub fn tryAcquireWriter(self: *Region, pid: u32) bool {
-        const want = packHolder(pid, self.own_liveness_slot);
+        const want = packHolderGen(pid, self.own_liveness_slot, self.own_liveness_generation);
         return self.header().writer_holder.cmpxchgStrong(0, want, .acquire, .monotonic) == null;
     }
 
@@ -1341,8 +1530,8 @@ pub const Region = struct {
             // yet) -- not a foreign waiter to report either way; whoever
             // is transitioning it will finish the job.
             if (owner == 0) continue;
-            if (holderPid(owner) == own_pid and holderLivenessSlot(owner) == self.own_liveness_slot) continue;
-            if (self.isSlotDead(holderLivenessSlot(owner))) continue;
+            if (narrowHolderPid(owner) == own_pid and narrowHolderLivenessSlot(owner) == self.own_liveness_slot) continue;
+            if (self.isReferenceDead(narrowHolderLivenessSlot(owner), self.ticketGenerations()[idx].load(.acquire))) continue;
             return true;
         }
         return false;
@@ -1571,7 +1760,7 @@ pub const Region = struct {
         }
         const existing = slots[idx].load(.acquire);
         const owner = ticketSlotOwner(existing);
-        if (owner != 0 and self.isSlotDead(holderLivenessSlot(owner))) {
+        if (owner != 0 and self.isReferenceDead(narrowHolderLivenessSlot(owner), self.ticketGenerations()[idx].load(.acquire))) {
             slots[idx].store(0, .release);
             return true;
         }
@@ -1657,7 +1846,7 @@ pub const Region = struct {
     pub fn writerHolderDead(self: *const Region) bool {
         const word = self.header().writer_holder.load(.acquire);
         if (word == 0) return false;
-        return self.isSlotDead(holderLivenessSlot(word));
+        return self.isReferenceDead(holderLivenessSlot(word), holderClaimGeneration(word));
     }
 
     /// Runs `recovery` (meant to be `native.zig`'s own existing
@@ -1794,12 +1983,19 @@ pub const Region = struct {
         if (slots[idx].cmpxchgStrong(0, want, .acq_rel, .monotonic)) |existing| {
             if (ticketSlotTag(existing) == t +% 1) {
                 const owner = ticketSlotOwner(existing);
-                if (self.isSlotDead(holderLivenessSlot(owner))) {
+                if (self.isReferenceDead(narrowHolderLivenessSlot(owner), self.ticketGenerations()[idx].load(.acquire))) {
                     _ = slots[idx].cmpxchgStrong(existing, 0, .acq_rel, .monotonic);
                 }
             }
             return null;
         }
+        // Step 1 won: publish this claim's own liveness-slot generation
+        // right away, a few instructions after `want` above already
+        // published its (pid, slot) -- see `ticketGenerations`'s own doc
+        // comment for why this is a separate store rather than packed
+        // into `want` itself, and why the narrow window between the two
+        // is benign.
+        self.ticketGenerations()[idx].store(self.own_liveness_generation, .release);
         if (hdr.writer_ticket_tail.cmpxchgStrong(t, t +% 1, .monotonic, .monotonic) != null) {
             slots[idx].store(0, .release);
             return null;
@@ -1825,7 +2021,7 @@ pub const Region = struct {
     pub fn claimReaderSlot(self: *Region, pid: u32) ReaderError!u32 {
         for (self.readerSlots(), 0..) |*slot, i| {
             if (slot.owner.cmpxchgStrong(0, pid, .acquire, .monotonic) == null) {
-                slot.generation = packHolder(pid, self.own_liveness_slot);
+                slot.generation = packHolderGen(pid, self.own_liveness_slot, self.own_liveness_generation);
                 slot.pinned_sequence.store(0, .monotonic);
                 slot.metadata_pinned_sequence.store(0, .monotonic);
                 return @intCast(i);
@@ -1837,10 +2033,10 @@ pub const Region = struct {
         for (self.readerSlots(), 0..) |*slot, i| {
             const owner = slot.owner.load(.acquire);
             if (owner == 0) continue;
-            const gen = slot.generation;
-            if (!self.isSlotDead(holderLivenessSlot(gen))) continue;
+            const existing = slot.generation;
+            if (!self.isReferenceDead(holderLivenessSlot(existing), holderClaimGeneration(existing))) continue;
             if (slot.owner.cmpxchgStrong(owner, pid, .acquire, .monotonic) == null) {
-                slot.generation = packHolder(pid, self.own_liveness_slot);
+                slot.generation = packHolderGen(pid, self.own_liveness_slot, self.own_liveness_generation);
                 slot.pinned_sequence.store(0, .monotonic);
                 slot.metadata_pinned_sequence.store(0, .monotonic);
                 return @intCast(i);
@@ -1935,7 +2131,7 @@ pub const Region = struct {
         const slot = &self.readerSlots()[slot_index];
         const owner = slot.owner.load(.acquire);
         if (owner == 0) return false;
-        return !self.isSlotDead(holderLivenessSlot(slot.generation));
+        return !self.isReferenceDead(holderLivenessSlot(slot.generation), holderClaimGeneration(slot.generation));
     }
 
     /// §8.3's writer-side reuse-frontier scan, replacing
@@ -1962,7 +2158,7 @@ pub const Region = struct {
             // only here, in the writer's own reuse-frontier scan (which
             // already costs more than a warm write's own acquire/release
             // ever does), never on a reader's own pin/unpin path.
-            if (self.isSlotDead(holderLivenessSlot(slot.generation))) {
+            if (self.isReferenceDead(holderLivenessSlot(slot.generation), holderClaimGeneration(slot.generation))) {
                 slot.pinned_sequence.store(0, .monotonic);
                 slot.metadata_pinned_sequence.store(0, .monotonic);
                 slot.generation = 0;
@@ -1995,7 +2191,7 @@ pub const Region = struct {
         for (self.readerSlots()) |*slot| {
             const owner = slot.owner.load(.acquire);
             if (owner == 0) continue;
-            if (self.isSlotDead(holderLivenessSlot(slot.generation))) continue;
+            if (self.isReferenceDead(holderLivenessSlot(slot.generation), holderClaimGeneration(slot.generation))) continue;
             const seq = slot.metadata_pinned_sequence.load(.acquire);
             if (seq == 0) continue;
             if (min == null or seq < min.?) min = seq;
@@ -3276,6 +3472,152 @@ test "shared lock region: a kill -9'd writer is detected dead and recovered" {
     region.releaseWriter();
 }
 
+// v5's own closed race (`format_version`'s comment has the full story):
+// `claimLivenessSlot`'s slot *index* alone was never a stable identity --
+// once a holder dies, a different process can claim that exact index, and
+// the old `isSlotDead` alone would then see *that new claimant's* own
+// liveness lock and (wrongly) call the original, dead holder "alive"
+// forever. `max_readers = 1` forces the collision deterministically
+// (there is only one index to land on) instead of relying on the
+// hash-seeded scan's own `1/max_readers` odds -- the whole point is that
+// this must be detected *every* time, not merely often.
+test "shared lock region: a dead writer's reused liveness slot is still detected dead" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-reused-slot.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var ready_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready_fds));
+
+    // The parent deliberately never opens the region before forking: the
+    // child is the one that creates it (with exactly one liveness slot)
+    // and claims that one and only slot for itself.
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(ready_fds[0]);
+        var region = Region.openSized(std.heap.page_allocator, io, db_path, 1) catch std.c._exit(1);
+        const my_pid: u32 = @bitCast(std.c.getpid());
+        if (!region.tryAcquireWriter(my_pid)) std.c._exit(1);
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(ready_fds[1], @ptrCast(&sig), 1);
+        // Simulate a crash mid-commit: no releaseWriter, no close, just
+        // park until the parent's kill -9 below ends this process
+        // outright, dropping its liveness lock on slot 0 with it.
+        parkForever();
+    }
+    _ = std.posix.system.close(ready_fds[1]);
+    defer _ = std.posix.system.close(ready_fds[0]);
+    var sig: [1]u8 = undefined;
+    try readBounded(ready_fds[0], &sig, 2000);
+
+    _ = std.c.kill(child_pid, std.c.SIG.KILL);
+    _ = try reapBounded(child_pid, 2000);
+
+    // Opens the *same* region, still sized to exactly one liveness slot,
+    // so this claim cannot land anywhere but slot 0 -- the exact index
+    // the now-dead child just freed. Pre-v5, this is precisely the
+    // configuration that broke `isSlotDead`: this handle's own
+    // `claimed_slots` now lists index 0 as "mine", so a liveness probe of
+    // it would trivially report "alive" (this process's own lock, not the
+    // dead child's) regardless of what `writer_holder` actually names.
+    var checker = try Region.openSized(a, io, db_path, 1);
+    defer checker.close();
+    try std.testing.expectEqual(@as(u32, 0), checker.own_liveness_slot);
+
+    // The real fix: `writer_holder` still names (the dead child's pid,
+    // slot 0, the *old* generation). `checker`'s own claim just bumped
+    // slot 0's generation past that, so this is dead on the generation
+    // check alone -- never mind who, if anyone, is sitting on the index
+    // right now.
+    try std.testing.expect(checker.writerHolderDead());
+
+    const recovery = struct {
+        fn run(_: ?*anyopaque) anyerror!void {}
+    };
+    try checker.recoverDeadWriter(.{ .run = &recovery.run });
+    try std.testing.expect(!checker.writerHolderDead());
+
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    try std.testing.expect(checker.tryAcquireWriter(own_pid));
+    checker.releaseWriter();
+}
+
+// The companion to the reused-slot test above: a liveness slot that
+// *hasn't* been reclaimed by anyone else must never read as dead, no
+// matter how long its holder has been sitting on it. Exercises
+// `isReferenceDead`'s other branch (generation matches, so it falls
+// through to the real `fcntl` probe) under the ordinary, non-colliding
+// case every ordinary commit actually takes.
+test "shared lock region: a live writer's own liveness slot is never misdetected dead" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-live-writer.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+
+    var ready_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready_fds));
+    var go_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&go_fds));
+
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(ready_fds[0]);
+        _ = std.posix.system.close(go_fds[1]);
+        const my_pid: u32 = @bitCast(std.c.getpid());
+        // Same reasoning as the kill -9'd-writer test's own comment:
+        // without this, `writer_holder` would carry the inherited (and,
+        // for this handle, un-held) `own_liveness_slot`, not a slot this
+        // child's own liveness lock actually backs.
+        region.reclaimLivenessAfterFork() catch std.c._exit(1);
+        if (!region.tryAcquireWriter(my_pid)) std.c._exit(1);
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(ready_fds[1], @ptrCast(&sig), 1);
+        // Stays alive -- genuinely holding the writer lock, not merely
+        // about to be killed -- until the parent says to let go, so the
+        // check below runs against a holder that really is still
+        // running, not one caught mid-crash.
+        var go: [1]u8 = undefined;
+        readBounded(go_fds[0], &go, 2000) catch std.c._exit(1);
+        region.releaseWriter();
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(ready_fds[1]);
+    defer _ = std.posix.system.close(ready_fds[0]);
+    _ = std.posix.system.close(go_fds[0]);
+    defer _ = std.posix.system.close(go_fds[1]);
+
+    var sig: [1]u8 = undefined;
+    try readBounded(ready_fds[0], &sig, 2000);
+
+    // The child's own claim of its liveness slot is still the current
+    // one -- nobody has reclaimed it -- so `isReferenceDead` falls
+    // through to the real liveness probe, which correctly reports it
+    // alive because it genuinely is.
+    try std.testing.expect(!region.writerHolderDead());
+
+    // Let the child release cleanly and exit, rather than leaving it
+    // parked for a `kill -9` -- that crash case is the *other* test's
+    // own job (both the original one above and the reused-slot one).
+    var go: [1]u8 = .{1};
+    _ = std.c.write(go_fds[1], @ptrCast(&go), 1);
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pid, 2000));
+    try std.testing.expect(!region.writerHolderDead());
+}
+
 // §8.4's dead-reader recovery: simpler than the writer case, no recovery
 // callback needed -- just clear the slot, which the writer's own
 // reuse-frontier scan (`minimumPinnedSequence`) already does inline.
@@ -3943,7 +4285,9 @@ test "shared lock region: Header stays exactly header_bytes with the §9.3b WAL-
     // this test exists so `zig build test`'s normal reporting surfaces
     // the intent in a test name too, matching the file's own convention
     // of also exercising every comptime invariant through a named test.
-    try std.testing.expectEqual(@as(usize, 112), @sizeOf(Header));
+    // 128 since v5 widened `writer_holder` to 128 bits and `_log_reserved`
+    // to match (`format_version`'s own v5 comment).
+    try std.testing.expectEqual(@as(usize, 128), @sizeOf(Header));
 }
 
 test "shared lock region: publishLogState/readLogState round-trip a consistent triple" {
