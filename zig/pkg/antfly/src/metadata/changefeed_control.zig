@@ -1140,11 +1140,13 @@ test "changefeed control verifies complete table enrollment owner rebinding and 
 }
 
 pub fn readOnService(svc: anytype, a: A, id: Id, request: anytype) ![]u8 {
+    if (comptime @hasDecl(@typeInfo(@TypeOf(svc)).pointer.child, "readChangefeedState")) return svc.readChangefeedState(a, id, request);
     try svc.ensureLinearizableReadWithContext(request);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     return store.getChangefeedControl(a, svc.metadata_group_id, id);
 }
 pub fn mutateOnService(svc: anytype, a: A, write: Write, request: anytype) !void {
+    if (comptime @hasDecl(@typeInfo(@TypeOf(svc)).pointer.child, "mutateChangefeedState")) return svc.mutateChangefeedState(a, write, request);
     try write.validate();
     try request.ensureActive();
     _ = try svc.ensureTableTopologyProtocolReadyWithContext(request, protocol_version);

@@ -1863,6 +1863,27 @@ Production feed management/authorization, consumer scheduling, retired-root tran
 standalone native outcomes, bootstrap and the full inbound/outbound contracts
 remain required.
 
+## In progress: internal feed metadata capability
+
+`api/changefeed_metadata.zig` defines a callback-bound state capability with
+owned bounded state parsing, authority reads, and revision-fenced mutations.
+Local metadata status sources register it against the existing linearizable
+service. A request facade lets shared control owners use the capability without
+fabricating local projections or proposal receipts. Original request deadlines
+and cancellation flow through each call; cancellation after a successful write
+is an unknown mutation outcome, never evidence that no commit occurred.
+
+Raw state requires the reserved internal maintenance principal. This is not a
+public authorization policy or an HTTP endpoint. Remote metadata transport,
+public management, live authorization, owner scheduling, and all remaining
+bootstrap/producer/destination/client qualification contracts still require
+implementation. Physical recovery tests cover a lost mutation acknowledgment,
+store reopen, stale retries, and unauthorized reads. Port allocation tests target
+response ownership and parser-entry failure. The combined control-entry and
+retained-history RPC qualification completed successfully (exit 0), including
+27 control-entry tests and 13 HTTP contracts, in
+`feed-metadata-port-final-test.log`.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

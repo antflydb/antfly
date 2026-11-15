@@ -36,3 +36,7 @@ test "history root control observation reconciles only stable scoped predicates"
 test "history root discovery captures authoritative immutable namespaces and complete coverage" {
     try @import("api/history_roots.zig").test_support.contracts();
 }
+
+test "history feed metadata port restricts maintenance and recovers durable unknown mutations" {
+    try @import("api/changefeed_metadata.zig").test_support.contracts();
+}

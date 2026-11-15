@@ -2046,6 +2046,7 @@ pub const StatusSource = struct {
     /// it null; production constructors never assemble it from independent
     /// optional callbacks.
     routing: ?table_catalog.CatalogRoutingSource = null,
+    changefeeds: ?@import("changefeed_metadata.zig").Port = null,
 
     pub const VTable = struct {
         supports_query_definitions: bool = false,
@@ -3169,6 +3170,7 @@ pub const StatusSource = struct {
             .ptr = svc,
             .vtable = &comptime makeHttpServiceVTable(),
             .routing = table_catalog.CatalogSource.fromMetadataHttpService(svc).routingSource() catch unreachable,
+            .changefeeds = @import("changefeed_metadata.zig").Port.fromService(svc),
         };
     }
 
@@ -3177,6 +3179,7 @@ pub const StatusSource = struct {
             .ptr = svc,
             .vtable = &comptime makeServiceVTable(metadata_service.MetadataService),
             .routing = table_catalog.CatalogSource.fromMetadataService(svc).routingSource() catch unreachable,
+            .changefeeds = @import("changefeed_metadata.zig").Port.fromService(svc),
         };
     }
 

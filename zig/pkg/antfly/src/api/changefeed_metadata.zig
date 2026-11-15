@@ -1,0 +1,164 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Internal metadata authority for feed owners. This is not a public state
+//! inspection API: raw records contain private root positions and policy data.
+//! Only a trusted internal maintenance principal may invoke this capability.
+//! Public authorization and ownership checks precede creation of that context.
+const std = @import("std");
+const control = @import("../metadata/changefeed_control.zig");
+const local = @import("antfly_local_sources");
+const Context = local.api_operation.RequestContext;
+const A = std.mem.Allocator;
+pub const Port = struct {
+    ptr: *anyopaque,
+    read_fn: *const fn (*anyopaque, A, control.Id, Context) anyerror![]u8,
+    mutate_fn: *const fn (*anyopaque, A, control.Write, Context) anyerror!void,
+    authority_fn: *const fn (*anyopaque, A, Context) anyerror!?control.Stamp,
+    boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+    pub const VTable = struct { read: @FieldType(Port, "read_fn"), mutate: @FieldType(Port, "mutate_fn"), authority: @FieldType(Port, "authority_fn") };
+    const Boundary = local.runtime_callback_abi.Boundary(VTable);
+    fn authorize(context: Context) !void {
+        try context.ensureActive();
+        const principal = context.principal orelse return error.Forbidden;
+        if (principal.kind != .internal or !std.mem.eql(u8, principal.subject, "changefeed-maintenance")) return error.Forbidden;
+    }
+    pub fn read(self: Port, a: A, id: control.Id, context: Context) ![]u8 {
+        try authorize(context);
+        const bytes = try Boundary.call("read", self.boundary_dispatch, self.read_fn, .{ self.ptr, a, id, context });
+        errdefer a.free(bytes);
+        try context.ensureActive();
+        var parsed = try control.parse(a, bytes);
+        defer parsed.deinit();
+        if (parsed.value.phase != .empty and !std.mem.eql(u8, &parsed.value.id, &id)) return error.ChangefeedCorrupt;
+        return bytes;
+    }
+    pub fn mutate(self: Port, a: A, write: control.Write, context: Context) !void {
+        try authorize(context);
+        try write.validate();
+        try Boundary.call("mutate", self.boundary_dispatch, self.mutate_fn, .{ self.ptr, a, write, context });
+        // Cancellation after a successful callback cannot certify non-commit.
+        context.ensureActive() catch return error.MetadataMutationOutcomeUnknown;
+    }
+    pub fn authority(self: Port, a: A, context: Context) !?control.Stamp {
+        try authorize(context);
+        const result = try Boundary.call("authority", self.boundary_dispatch, self.authority_fn, .{ self.ptr, a, context });
+        try context.ensureActive();
+        if (result) |stamp| if (stamp.sequence == 0 or std.mem.allEqual(u8, &stamp.incarnation, 0)) return error.ChangefeedCorrupt;
+        return result;
+    }
+    pub fn fromService(svc: anytype) Port {
+        const Service = @typeInfo(@TypeOf(svc)).pointer.child;
+        const Adapter = struct {
+            fn cast(raw: *anyopaque) *Service {
+                return @ptrCast(@alignCast(raw));
+            }
+            fn read(raw: *anyopaque, a: A, id: control.Id, context: Context) ![]u8 {
+                try authorize(context);
+                return control.readOnService(cast(raw), a, id, context);
+            }
+            fn mutate(raw: *anyopaque, a: A, write: control.Write, context: Context) !void {
+                try authorize(context);
+                return control.mutateOnService(cast(raw), a, write, context);
+            }
+            fn authority(raw: *anyopaque, a: A, context: Context) !?control.Stamp {
+                try authorize(context);
+                const self = cast(raw);
+                try self.ensureLinearizableReadWithContext(context);
+                const store = self.projectedStore() orelse return error.MissingMetadataStore;
+                return store.getChangefeedAuthority(a, self.metadata_group_id);
+            }
+        };
+        return .{ .ptr = svc, .read_fn = Adapter.read, .mutate_fn = Adapter.mutate, .authority_fn = Adapter.authority };
+    }
+};
+/// Request-scoped facade accepted by the shared feed/root/spool owners. No
+/// synthetic proposal receipt or local projection is manufactured for a port.
+pub const Client = struct {
+    port: Port,
+    pub fn readChangefeedState(self: *Client, a: A, id: control.Id, request: Context) ![]u8 {
+        return self.port.read(a, id, request);
+    }
+    pub fn mutateChangefeedState(self: *Client, a: A, write: control.Write, request: Context) !void {
+        return self.port.mutate(a, write, request);
+    }
+};
+
+pub const test_support = if (@import("builtin").is_test) struct {
+    const fixture = @import("../pg_spool_cleanup_test.zig");
+    const Store = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
+    const Table = @import("../metadata/domain.zig").TableRecord;
+    const group = local.common_group_ids.main_metadata_group_id;
+    pub fn contracts() !void {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/feed-metadata-port", .{tmp.sub_path});
+        defer a.free(path);
+        var store = try Store.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        var svc: fixture.Service = .{ .store = &store, .id = @splat(4) };
+        const port = Port.fromService(&svc);
+        const authorized: Context = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
+        try std.testing.expectError(error.Forbidden, port.read(a, svc.id, .{}));
+        try std.testing.expectError(error.Forbidden, port.authority(a, .{ .principal = .{ .kind = .user, .subject = "changefeed-maintenance" } }));
+        try std.testing.expectEqual(@as(u64, 0), svc.proposals);
+        try std.testing.expect((try port.authority(a, authorized)) == null);
+        const table: Table = .{ .table_id = 7, .name = "docs", .schema_json = "{}" };
+        try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+        var client: Client = .{ .port = port };
+        const write: control.Write = .{ .id = svc.id, .authority = @splat(9), .owner = @splat(1), .authorization = @splat(2), .expected_revision = 0, .expected_epoch = 0, .mutation = .{ .create = .{ .id = svc.id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = control.tableBinding(table), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } } };
+        svc.lose_ack = true;
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, control.mutateOnService(&client, a, write, authorized));
+        svc.lose_ack = false;
+        store.deinit();
+        store = try Store.init(a, .{ .root_dir = path });
+        const bytes = try control.readOnService(&client, a, svc.id, authorized);
+        defer a.free(bytes);
+        var parsed = try control.parse(a, bytes);
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(u64, 1), parsed.value.revision);
+        const authority = (try port.authority(a, authorized)).?;
+        try std.testing.expectEqual(@as(u64, 1), authority.sequence);
+        try std.testing.expectEqual(write.authority, authority.incarnation);
+        // A stale retry cannot manufacture a second creation or receipt.
+        try std.testing.expectError(error.ChangefeedConflict, control.mutateOnService(&client, a, write, authorized));
+        try std.testing.expectEqual(@as(u64, 1), svc.proposals);
+        try std.testing.expectError(error.DeadlineExceeded, port.read(a, svc.id, .{ .principal = authorized.principal, .deadline_ns = 1 }));
+        // Physical cache allocations vary between reads. Exercise the port's
+        // owned response and parser cleanup against a deterministic callback.
+        const Fixed = struct {
+            bytes: []const u8,
+            fn read(raw: *anyopaque, allocator: A, _: control.Id, _: Context) ![]u8 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return allocator.dupe(u8, self.bytes);
+            }
+        };
+        var fixed: Fixed = .{ .bytes = bytes };
+        const fixed_port: Port = .{ .ptr = &fixed, .read_fn = Fixed.read, .mutate_fn = undefined, .authority_fn = undefined };
+        // JSON arena growth may fall back after a failed resize, so allocation
+        // counts are not stable. Fail the two mandatory initial allocations:
+        // the response copy and the parser's first allocation.
+        for (0..2) |fail_index| {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+            try std.testing.expectError(error.OutOfMemory, readAllocations(failing.allocator(), fixed_port, svc.id, authorized));
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+    }
+    fn readAllocations(a: A, port: Port, id: control.Id, context: Context) !void {
+        const bytes = try port.read(a, id, context);
+        defer a.free(bytes);
+    }
+} else struct {};
