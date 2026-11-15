@@ -39089,7 +39089,25 @@ pub const DB = struct {
                 break :blk settled;
             };
             if (ready) return producer_sequence;
-            _ = try self.runGroupSourceSlice();
+            // Drive the identical slice `group_source_owner.Owner.step` runs
+            // in the background, inline, so a foreground visibility wait
+            // doesn't sit idle waiting for that resident owner's own cadence
+            // (a resident owner may not even be registered for every table
+            // that reaches this wait). `runGroupSourceSlice` routinely
+            // returns `EnrichmentSourceChanged` (and the other
+            // `isEnrichmentProgressPending` conditions) when a concurrent
+            // writer or owner turn advances the same partition between this
+            // slice's own reads -- an ordinary mid-flight race, not a
+            // failure. `Owner.step` already treats any error from this
+            // exact call as "no progress this turn, retry" (log and back
+            // off) rather than fatal; mirror that here. Letting it propagate
+            // turned an expected race into a permanent batch failure: the
+            // primary write was already committed, so `batchFailureCode`
+            // surfaced it as ANTFLY_STALLED instead of this loop simply
+            // retrying within its own deadline.
+            _ = self.runGroupSourceSlice() catch |err| {
+                std.log.warn("group source slice deferred during visibility wait: {s}", .{@errorName(err)});
+            };
             if (self.local_execution.optional_runtime_workers_enabled) {
                 // Wake the owner without waiting for a global cursor that
                 // may be blocked on an independent, later request. The
@@ -63405,6 +63423,24 @@ fn denseTargetCountForIndexContextWithCoverage(
                 // once that vacuous match left `.clean` behind).
                 const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
                 const coverage_counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+                // The raw source_total guard below cannot tell "no chunk has
+                // been visited yet" apart from "every chunk was visited and
+                // legitimately skipped" (e.g. this embedding's own source
+                // field, like `caption`, is structurally absent from every
+                // chunk a `text`-only chunker produces, so nothing will ever
+                // write an artifact) -- both read a nonzero source_total with
+                // artifact_count == 0, and the latter deferred forever. Once
+                // any outcome counter exists, the per-outcome accounting
+                // already distinguishes them (it is the same completeness
+                // proof denseTargetCountFromCoverage's non-artifact-counter
+                // path already applies -- and, for `.materialized` coverage,
+                // the same early, no-skip-accounting-required return of a
+                // present `produced` count that path already trusts without
+                // this guard). Defer to it; only a counter-free generation
+                // (nothing attempted yet) falls back to the source_total
+                // bootstrap check.
+                if (coverage_counts.produced != null or coverage_counts.skipped != null or coverage_counts.terminal_failed != null)
+                    return try denseTargetCountFromCoverage(ctx, index_name, coverage, coverage_counts);
                 const source_total = coverage_counts.source_total orelse return null;
                 if (source_total != 0) return null;
             }
