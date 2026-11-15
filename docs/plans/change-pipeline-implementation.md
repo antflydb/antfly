@@ -1472,6 +1472,40 @@ HTTP/ingress/client tests pass without leaks. This is the remote
 transport boundary; production root registration, bounded leader routing and
 remote retained-page delivery remain required before public feed capability.
 
+## In progress: deadline-bound retained-history leader routing
+
+The data runtime exposes a request-scoped `historyControlPort` for a feed-root
+owner. It keeps the HTTP endpoint's callback local-only, so a forwarded control
+cannot bounce between receivers. The routing callback preserves the immutable
+catalog fence and operation, translates the original remaining budget to the
+owned runtime clock, and caps the whole route/lane/transport attempt at five
+seconds. A local leader goes through the existing native proposal/recovery path.
+
+Remote discovery captures the compact peer generation under that same budget.
+It uses an explicitly observed hosted leader, or the captured peer leader when
+there is no hosted observation. A hosted group with no known leader cannot
+fall back to a cached leader. The leader must be eligible for that exact
+group and have an endpoint. Missing/ineligible/newer conflicting observations
+never fall back to an older cached leader, another placement, an unbounded admin
+snapshot, or another proposal. Forwarding uses the owned request lane and the
+bounded signed client. Original receipt recovery stays a read-only operation.
+
+Local transport-neutral completion now also rechecks cancellation before
+returning: a valid receipt survives but confirmation is withheld. This matches
+the remote client's post-response behavior. Leader selection and the real Raft
+fixture are being qualified through the new port. The fixture also starts the
+actual signed HTTP handler and a second caller with no local replica, using a
+cached compact peer view whose fallback fetch is forbidden. It recovers the
+original native receipt and checks that the live Raft log has not grown. It
+also interrupts confirmation after a remotely submitted control is accepted,
+then recovers the same receipt without another proposal. Log assertions read
+the hosted Raft status, including unstable entries; the fixture's backing
+MemoryStorage alone is not evidence of the live log position. All five focused
+runtime checks (including this HTTP/native recovery) and seven HTTP/ingress/client
+checks pass without leaks. This fixture uses in-memory Raft and on-disk native
+storage; it does not qualify WAL-backed multi-node failover. Distributed
+failover and production feed-root binding remain separate required qualification.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

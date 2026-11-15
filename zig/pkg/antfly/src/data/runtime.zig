@@ -13335,6 +13335,64 @@ pub const DataServer = struct {
         };
     }
 
+    /// Request-scoped feed-root transport. HTTP ingress continues to use the
+    /// local-only callback so a forwarded request cannot bounce between peers.
+    pub fn historyControlPort(self: *DataServer) @import("../api/history_control_operations.zig").Port {
+        return .{ .ptr = self, .execute_fn = historyControlRoutedOperation };
+    }
+
+    fn historyControlRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: @import("../api/history_control_operations.zig").wire.Request, original: antfly.public_api.operation.RequestContext) !@import("../api/history_control_operations.zig").wire.Response {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        try original.ensureActive();
+        try original_fence.validate();
+        if (table.len == 0 or table.len > 1024) return error.InvalidCatalogRouteFence;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], original_fence.route.identity_namespace.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], original_fence.route.identity_namespace.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], original_fence.route.identity_namespace.range_id, .big);
+        try input.validate(namespace);
+        const Clock = antfly.public_api.table_catalog.RoutingBudget;
+        var clock = Clock.initIo(null, self.dataRaftIo());
+        const now = clock.nowNs();
+        clock.deadline_ns = @min(clock.deadlineFrom(.{ .deadline_ns = original.deadline_ns, .io = original.deadline_io }) orelse std.math.maxInt(u64), now +| 5 * std.time.ns_per_s);
+        var context = original;
+        context.deadline_ns = clock.deadline_ns;
+        context.deadline_io = clock.io;
+        try context.ensureActive();
+        var fence = original_fence;
+        fence.admission_deadline_ns = context.deadline_ns;
+        fence.admission_deadline_io = context.deadline_io;
+        fence.admission_cancellation = context.cancellation;
+        const group = fence.route.group_id;
+        const observed: struct { local: bool, node: u64, leader: ?u64, hosted: bool } = blk: {
+            try self.lockHistoryRaftOwner(context);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse break :blk .{ .local = false, .node = 0, .leader = null, .hosted = false };
+            const host = raft.host.http_host.host;
+            break :blk .{ .local = host.isLocalLeader(group), .node = host.cfg.local_node_id, .leader = host.leaderId(group), .hosted = host.raftStatus(group) != null };
+        };
+        if (observed.local) return historyControlOperation(self, alloc, fence, table, input, context);
+        // Only a compact, deadline-aware peer capture may discover a remote
+        // endpoint. Never use the generic admin-snapshot routing fallback or
+        // rotate through placement candidates when the leader is unknown.
+        const metadata = self.remote_metadata orelse return error.GroupLeaderUnavailable;
+        const peers = try metadata.acquireControlReadGeneration(.{ .clock = clock, .cancellation = context.cancellation });
+        defer peers.release();
+        const target = try peers.historyControlLeader(group, observed.node, observed.leader, observed.hosted);
+        const uri = (try peers.nodeUri(alloc, target)) orelse return error.GroupLeaderUnavailable;
+        defer alloc.free(uri);
+        try context.ensureActive();
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
+        var lane = try self.acquireDataRaftForwardLaneUntil(group, clock.deadline_ns.?, .{ .discovery = .cached, .cancellation = &cancellation });
+        defer lane.release();
+        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{});
+        defer executor.deinit();
+        var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+        _ = client.withInternalServiceAuth(self.api_server_cfg.internal_service_secret, self.api_server_cfg.internal_service_issuer);
+        return client.fetchGroupHistoryControl(uri, group, table, input, fence, context);
+    }
+
     fn historyControlOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: @import("../api/history_control_operations.zig").wire.Request, context: antfly.public_api.operation.RequestContext) !@import("../api/history_control_operations.zig").wire.Response {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
@@ -25682,6 +25740,13 @@ const ControlReadGeneration = struct {
     fn readable(self: *const ControlReadGeneration, group_id: u64, node_id: u64) bool {
         const group = self.groups.get(group_id) orelse return false;
         return std.mem.indexOfScalar(u64, group.nodes.items, node_id) != null;
+    }
+
+    fn historyControlLeader(self: *const ControlReadGeneration, group_id: u64, local_node: u64, observed_leader: ?u64, hosted: bool) !u64 {
+        const group = self.groups.get(group_id) orelse return error.GroupLeaderUnavailable;
+        const leader = (if (hosted) observed_leader else group.leader) orelse return error.GroupLeaderUnavailable;
+        if (leader == 0 or leader == local_node or !self.readable(group_id, leader) or !self.nodes.contains(leader)) return error.GroupLeaderUnavailable;
+        return leader;
     }
 
     fn forwardingUri(self: *const ControlReadGeneration, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
@@ -43141,10 +43206,106 @@ fn consumerTests() type {
             const ingress_request: ingress.wire.Request = .{ .version = 1, .operation = .recover, .command = .{ .enroll = grant }, .receipt = submitted.entry };
             const ingress_body = try std.json.Stringify.valueAlloc(a, ingress_request, .{});
             defer a.free(ingress_body);
-            const ingress_result = try ingress.execute(.{ .ptr = &server, .execute_fn = DataServer.historyControlOperation }, a, 601, "docs", ingress_body, .{ .catalog_route_fence_json = encoded_fence });
+            const ingress_result = try ingress.execute(server.historyControlPort(), a, 601, "docs", ingress_body, .{ .catalog_route_fence_json = encoded_fence });
             try std.testing.expect(ingress_result.confirmed());
             try std.testing.expectEqualDeep(submitted.entry, ingress_result.receipt.?);
             try std.testing.expectEqual(@as(u64, 1), ingress_result.outcome.?.applied.consumer.?.epoch);
+            // A second caller owns no replica. Route its original receipt over
+            // signed HTTP to this actual native Raft leader, without appending.
+            {
+                const secret = "history-routed-runtime-secret-long-enough";
+                const Status = struct {
+                    fn read(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                        return .{ .metadata_group_id = 1, .metrics = .{} };
+                    }
+                    fn listen(listener: *httpx.Server) void {
+                        listener.listen() catch |err| std.debug.panic("history test listener failed: {}", .{err});
+                    }
+                    fn noFetch(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                        return error.UnexpectedHistoryPeerRefresh;
+                    }
+                };
+                var api_server = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = &server, .execute_fn = DataServer.historyControlOperation } }, .{ .ptr = &server, .vtable = &.{ .status = Status.read } }, null, null);
+                defer api_server.deinit();
+                var handler = try antfly.public_api.kernel_bridge.createHandler(&api_server);
+                defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
+                try handler.initRuntime(a);
+                var network_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer network_io.deinit();
+                var listener = httpx.Server.initWithConfig(a, network_io.io(), .{ .host = "127.0.0.1", .port = 0 });
+                defer listener.deinit();
+                try handler.registerRoutes(&listener);
+                try listener.bind();
+                var task = try std.testing.io.concurrent(Status.listen, .{&listener});
+                defer {
+                    listener.stop();
+                    task.await(std.testing.io);
+                }
+                const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.boundAddress().?.ip4.port});
+                defer a.free(base);
+                var metadata_source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.invalid"}, &.{.{ .ptr = &server, .vtable = &.{ .execute = Status.noFetch } }}, std.testing.io);
+                defer metadata_source.deinit();
+                const peers = try a.create(ControlReadGeneration);
+                peers.* = .{ .alloc = a };
+                metadata_source.control_read_generation = peers;
+                const endpoint = try a.dupe(u8, base);
+                peers.nodes.put(a, 1, endpoint) catch |err| {
+                    a.free(endpoint);
+                    return err;
+                };
+                try peers.groups.put(a, 601, .{ .leader = 1 });
+                try peers.groups.getPtr(601).?.nodes.append(a, 1);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                var origin: DataServer = .{ .alloc = a, .backend_runtime = runtime.ptr(), .remote_metadata = &metadata_source, .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{ .internal_service_secret = secret, .internal_service_issuer = "history-runtime" }, .query_async_limit = .nothing, .listener_cfg = undefined };
+                defer origin.provisioned_storage.deinit();
+                const before_remote = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    break :blk host.raftStatus(601).?.last_index;
+                };
+                const remote_result = try ingress.execute(origin.historyControlPort(), a, 601, "docs", ingress_body, .{ .catalog_route_fence_json = encoded_fence });
+                try std.testing.expect(remote_result.confirmed());
+                try std.testing.expectEqualDeep(submitted.entry, remote_result.receipt.?);
+                try std.testing.expectEqual(@as(u64, 1), remote_result.outcome.?.applied.consumer.?.epoch);
+                const after_remote = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    break :blk host.raftStatus(601).?.last_index;
+                };
+                try std.testing.expectEqual(before_remote, after_remote);
+                var remote_input: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .inspect = ref } };
+                const submit_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});
+                defer a.free(submit_body);
+                const Loss = struct {
+                    fn reach(_: *anyopaque, event: DataRequestLifecycleEvent) !void {
+                        if (event.phase == .proposal_accepted) return error.InjectedRemoteHistoryConfirmationLoss;
+                    }
+                };
+                const unknown_remote = blk: {
+                    server.data_request_lifecycle_hook = .{ .ptr = &server, .reach_fn = Loss.reach };
+                    defer server.data_request_lifecycle_hook = null;
+                    metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                    break :blk try ingress.execute(origin.historyControlPort(), a, 601, "docs", submit_body, .{ .catalog_route_fence_json = encoded_fence });
+                };
+                try std.testing.expect(!unknown_remote.confirmed());
+                try std.testing.expect(unknown_remote.receipt != null);
+                try std.testing.expectEqual(after_remote + 1, unknown_remote.receipt.?.index);
+                remote_input.operation = .recover;
+                remote_input.receipt = unknown_remote.receipt;
+                const recover_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});
+                defer a.free(recover_body);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const confirmed_remote = try ingress.execute(origin.historyControlPort(), a, 601, "docs", recover_body, .{ .catalog_route_fence_json = encoded_fence });
+                try std.testing.expect(confirmed_remote.confirmed());
+                try std.testing.expectEqualDeep(unknown_remote.receipt, confirmed_remote.receipt);
+                try std.testing.expectEqual(@as(u64, 1), confirmed_remote.outcome.?.applied.consumer.?.epoch);
+                const recovered_remote_last = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    break :blk host.raftStatus(601).?.last_index;
+                };
+                try std.testing.expectEqual(unknown_remote.receipt.?.index, recovered_remote_last);
+            }
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
             try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);
             const Interrupted = struct {
@@ -43171,7 +43332,7 @@ fn consumerTests() type {
             const previous_last = blk: {
                 lockAtomic(&server.data_raft_mutex);
                 defer server.data_raft_mutex.unlock();
-                break :blk try log.storage().lastIndex();
+                break :blk host.raftStatus(601).?.last_index;
             };
             const recovered = try server.recoverHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect = ref }, uncertain.entry);
             try std.testing.expectEqual(@as(u64, 1), recovered.applied.consumer.?.epoch);
@@ -43179,7 +43340,7 @@ fn consumerTests() type {
             const recovered_last = blk: {
                 lockAtomic(&server.data_raft_mutex);
                 defer server.data_raft_mutex.unlock();
-                break :blk try log.storage().lastIndex();
+                break :blk host.raftStatus(601).?.last_index;
             };
             try std.testing.expectEqual(previous_last, recovered_last);
         }
@@ -43193,6 +43354,35 @@ fn consumerTests() type {
             var server: DataServer = undefined;
             server.data_raft = null;
             try std.testing.expectError(error.ChangefeedCapabilityUnsupported, server.submitHistoryControlLocal(std.testing.allocator, undefined, "docs", .{ .collect = .{ .namespace = @splat(1), .authority = @splat(2) } }));
+        }
+
+        test "data raft ordered history routing requires a known eligible leader" {
+            const a = std.testing.allocator;
+            var peers: ControlReadGeneration = .{ .alloc = a };
+            defer {
+                var groups = peers.groups.valueIterator();
+                while (groups.next()) |group| {
+                    group.nodes.deinit(a);
+                }
+                peers.groups.deinit(a);
+                peers.nodes.deinit(a);
+            }
+            var group: ControlReadGeneration.Group = .{ .leader = 2 };
+            try group.nodes.appendSlice(a, &.{ 1, 2, 3 });
+            try peers.groups.put(a, 601, group);
+            try peers.nodes.put(a, 2, @constCast("http://leader"));
+            try std.testing.expectEqual(@as(u64, 2), try peers.historyControlLeader(601, 1, null, false));
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(602, 1, null, false));
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 2, null, false));
+            // A newer hosted observation wins over an independently cached
+            // peer leader. Missing eligibility never falls back to the old one.
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 1, 3, true));
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 1, null, true));
+            peers.groups.getPtr(601).?.leader = null;
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 1, null, false));
+            try std.testing.expectEqual(@as(u64, 2), try peers.historyControlLeader(601, 1, 2, true));
+            peers.groups.getPtr(601).?.nodes.clearRetainingCapacity();
+            try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 1, 2, true));
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {

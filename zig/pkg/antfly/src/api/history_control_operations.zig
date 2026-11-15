@@ -48,11 +48,15 @@ pub fn execute(port: ?Port, a: std.mem.Allocator, group: u64, table: []const u8,
     std.mem.writeInt(u64, namespace[16..24], fence.route.identity_namespace.range_id, .big);
     const input = try wire.decodeRequest(a, body, namespace);
     const target = port orelse return error.ChangefeedCapabilityUnsupported;
-    const result = target.execute(a, fence, table, input, context) catch |err| {
+    var result = target.execute(a, fence, table, input, context) catch |err| {
         if (err == error.RaftBatchWriteOutcomeUnknown) return .{ .version = 1, .receipt = input.receipt };
         return err;
     };
     result.validate(input) catch return error.InvalidHistoryControlResponse;
+    context.ensureActive() catch {
+        result.outcome = null;
+        return result;
+    };
     return result;
 }
 
@@ -60,7 +64,8 @@ test "history control ingress validates route before dispatch and preserves unce
     const a = std.testing.allocator;
     const Fake = struct {
         calls: usize = 0,
-        mode: enum { applied, unknown, malformed } = .applied,
+        mode: enum { applied, unknown, malformed, cancel_after } = .applied,
+        cancelled: std.atomic.Value(bool) = .init(false),
         fn run(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata.CatalogRouteFence, table: []const u8, request: wire.Request, _: operation.RequestContext) !wire.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
@@ -70,6 +75,10 @@ test "history control ingress validates route before dispatch and preserves unce
                 .applied => .{ .version = 1, .receipt = request.receipt orelse .{ .term = 2, .index = 3 }, .outcome = .{ .applied = .{} } },
                 .unknown => error.RaftBatchWriteOutcomeUnknown,
                 .malformed => .{ .version = 1, .outcome = .{ .applied = .{} } },
+                .cancel_after => blk: {
+                    self.cancelled.store(true, .release);
+                    break :blk .{ .version = 1, .receipt = request.receipt orelse .{ .term = 2, .index = 3 }, .outcome = .{ .applied = .{} } };
+                },
             };
         }
     };
@@ -105,6 +114,15 @@ test "history control ingress validates route before dispatch and preserves unce
     try std.testing.expect(!recovered_unknown.confirmed());
     fake.mode = .malformed;
     try std.testing.expectError(error.InvalidHistoryControlResponse, execute(port, a, 17, "docs", body, context));
+    fake.mode = .cancel_after;
+    var cancelled_context = context;
+    cancelled_context.cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&fake.cancelled);
+    const cancelled = try execute(port, a, 17, "docs", recovery, cancelled_context);
+    try std.testing.expectEqualDeep(input.receipt, cancelled.receipt);
+    try std.testing.expect(!cancelled.confirmed());
+    const calls_before_cancelled_retry = fake.calls;
+    try std.testing.expectError(error.Canceled, execute(port, a, 17, "docs", recovery, cancelled_context));
+    try std.testing.expectEqual(calls_before_cancelled_retry, fake.calls);
     const previous_calls = fake.calls;
     input.command.collect.namespace[0] ^= 1;
     const wrong_namespace = try std.json.Stringify.valueAlloc(a, input, .{});
