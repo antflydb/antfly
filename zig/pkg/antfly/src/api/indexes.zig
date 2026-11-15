@@ -81,13 +81,43 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
-    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
-    try @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(alloc, index_json);
-    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
+    // Compose new physical consumers with the current privacy graph in the
+    // same table CAS. Existing protected consumers are immutable through this
+    // endpoint; migration creates B, waits for completeness, then swaps A's alias.
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    try privacy.validateUserConfiguration(alloc, index_json);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
+    if (current.value != .object) return error.InvalidTableIndexMetadata;
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
     defer config.deinit();
+    if (config.value != .object) return error.InvalidCreateIndexRequest;
+    if (try privacy.current(alloc, current.value)) |owned| {
+        var resource = owned;
+        defer resource.deinit();
+        if (resource.value.policy.mode == .redact_for_search_and_ai) {
+            if (std.mem.startsWith(u8, index_name, "_privacy_") or
+                @import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.PrivacyManagedGraph;
+            if (current.value.object.contains(index_name)) {
+                var logical_root = try std.json.parseFromSlice(std.json.Value, alloc, resource.value.unprotected_indexes_json, .{});
+                defer logical_root.deinit();
+                const existing = logical_root.value.object.get(index_name) orelse return error.PrivacyManagedGraph;
+                if (!try equivalentIndexConfigValues(alloc, index_name, existing, config.value)) return error.PrivacyManagedGraph;
+                return alloc.dupe(u8, current_indexes_json);
+            }
+            if (current.value.object.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |bindings| {
+                if (bindings != .object) return error.InvalidTableIndexMetadata;
+                if (bindings.object.contains(index_name)) return error.IndexAliasNameConflict;
+            }
+            const logical = try addIndexToTableIndexesJsonWithIo(alloc, io, resource.value.unprotected_indexes_json, index_name, index_json);
+            defer alloc.free(logical);
+            var replacement = resource.value;
+            replacement.unprotected_indexes_json = logical;
+            return try privacy.install(alloc, current_indexes_json, replacement);
+        }
+    }
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
 
     const root = switch (current.value) {
         .object => |object| object,
@@ -11422,4 +11452,36 @@ test "ordered artifact inventory enrichment list owns configs through allocation
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "privacy new index migration preserves protected serving generations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}";
+    const logical = try addIndexToTableIndexesJson(a, "{}", "a", index);
+    const resource = try privacy.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null);
+    const initial = try privacy.install(a, logical, resource);
+    var pinned = (try std.json.parseFromSlice(std.json.Value, a, initial, .{})).value;
+    try pinned.object.put(a, aliases.key, (try std.json.parseFromSlice(std.json.Value, a, "{\"search\":{\"index\":\"a\"}}", .{})).value);
+    const before = try std.json.Stringify.valueAlloc(a, pinned, .{});
+    const updated = try addIndexToTableIndexesJson(a, before, "b", index);
+    try aliases.validateDependencyMutation(a, before, updated);
+    try validateArtifactEnrichmentsForTableIndexesJson(a, updated);
+    const after = (try std.json.parseFromSlice(std.json.Value, a, updated, .{})).value;
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, pinned.object.get("a").?, .{}), try std.json.Stringify.valueAlloc(a, after.object.get("a").?, .{}));
+    const b = after.object.get("b").?;
+    try std.testing.expect(b.object.get("embedder") == null);
+    try std.testing.expect(std.mem.startsWith(u8, b.object.get("sources").?.array.items[0].object.get("artifact").?.string, "_privacy_"));
+    try std.testing.expectEqualStrings(updated, try addIndexToTableIndexesJson(a, updated, "b", index));
+    try std.testing.expectError(error.PrivacyManagedGraph, addIndexToTableIndexesJson(a, updated, "a", "{\"type\":\"full_text\"}"));
+    try std.testing.expectError(error.IndexAliasNameConflict, addIndexToTableIndexesJson(a, updated, "search", index));
+    try std.testing.expectError(error.PrivacyExternalEmbeddingsUnsupported, addIndexToTableIndexesJson(a, updated, "external", "{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}"));
+    try std.testing.expectError(error.PrivacyUnsupportedIndexType, addIndexToTableIndexesJson(a, updated, "graph", "{\"type\":\"graph\"}"));
+    const stored = (try privacy.current(a, after)).?.value;
+    const disabled = try privacy.next(a, stored, .{ .mode = .monitor, .fields = &.{"body"} }, try privacy.etag(a, stored));
+    const restored = (try std.json.parseFromSlice(std.json.Value, a, try privacy.install(a, updated, disabled), .{})).value;
+    try std.testing.expect(restored.object.get("b").?.object.contains("embedder"));
 }

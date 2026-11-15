@@ -4415,6 +4415,11 @@ pub const DB = struct {
                 const replay_started_ns = monotonicTimeNs();
                 replayPendingDerivedBatches(&db, null, null, .{}) catch |err| switch (err) {
                     error.ArtifactRepairRequired => {},
+                    // Producer replies may still be pending after a crash. Keep
+                    // the journal/checkpoints intact and let the worker resume
+                    // after the owner opens and generated work can run again.
+                    // Workerless callers retain the synchronous drain contract.
+                    error.ReplayDocumentNotVisible => if (!db.start_index_workers) return err,
                     else => return err,
                 };
                 profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
@@ -154783,4 +154788,105 @@ test "db commit requirements coverage candidates share pinned configuration acro
         try std.testing.expectEqual(config.ptr, candidate.request.source_template.ptr);
         try std.testing.expect(candidate.request.consumer_indexes.ptr != consumers[0..].ptr);
     }
+}
+
+test "db pending producer replay opens without claiming completion and resumes after input arrives" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    var sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, path, .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+        const batch = derived_types.DerivedBatch{
+            .documents = &.{.{ .key = "pending", .targets = &.{.{ .kind = .dense_vector, .index_name = "dense" }} }},
+        };
+        sequence = db.core.store.reserveNextReplaySequence(1);
+        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, sequence);
+        defer change_journal_mod.deinitRecord(alloc, &record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, record);
+        defer alloc.free(encoded);
+        try replay_stream_mod.appendOpaque(alloc, db.core.store, sequence, encoded);
+    }
+    // The synchronous contract still exposes the exact pending dependency.
+    try std.testing.expectError(error.ReplayDocumentNotVisible, DB.open(alloc, path, .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } }));
+    var db = try DB.open(alloc, path, .{ .start_index_workers = true, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    {
+        const debt = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (debt) |*item| item.deinit(alloc);
+            alloc.free(debt);
+        }
+        var found = false;
+        for (debt) |item| if (std.mem.eql(u8, item.index_name, "dense")) {
+            found = true;
+            try std.testing.expect(item.catch_up_required);
+            try std.testing.expect(item.applied_sequence < sequence);
+        };
+        try std.testing.expect(found);
+    }
+    const stored = try internal_keys.documentKeyAlloc(alloc, "pending");
+    defer alloc.free(stored);
+    try db.core.store.putBatch(&.{.{ .key = stored, .value = "{\"embedding\":[1,0]}" }}, &.{});
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "pending", "dense");
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+    try db.runDerivedUntil(sequence);
+    const debt = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (debt) |*item| item.deinit(alloc);
+        alloc.free(debt);
+    }
+    for (debt) |item| if (std.mem.eql(u8, item.index_name, "dense")) {
+        try std.testing.expect(!item.catch_up_required);
+        try std.testing.expectEqual(sequence, item.applied_sequence);
+    };
+}
+
+test "db replay retires deleted parent chunks without resurrecting inline afterimages" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "parent", .value = "{\"body\":\"old\"}" }}, .sync_level = .full_index });
+    try db.batch(.{ .deletes = &.{"parent"}, .sync_level = .full_index });
+    const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 0);
+    defer alloc.free(chunk);
+    const documents = [_]derived_types.DerivedDocument{ .{ .key = chunk }, .{ .key = chunk, .cleaned_value = "{\"text\":\"old\"}" } };
+    var collected = try collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &documents, db.core.index_manager.byte_range, .{}, null);
+    defer collected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+    try std.testing.expectEqual(@as(usize, 0), collected.items.len);
+}
+
+test "db replay retires deleted parent or certified chunk tail but rejects missing live members" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const generations = @import("artifact_chunk_generation.zig");
+    const manifests = @import("artifact_chunk_manifest.zig");
+    const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 0);
+    defer alloc.free(chunk);
+    const tail = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 1);
+    defer alloc.free(tail);
+    const scope = (try manifests.keyForMemberAlloc(alloc, chunk)).?;
+    defer alloc.free(scope);
+    var builder = manifests.Builder.init();
+    try builder.append(0, "accepted");
+    const spec = try generations.Spec.init(.{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, scope, @splat(3), builder.finish(), 1);
+    var plan = try generations.Plan.init(alloc, scope, spec);
+    defer plan.deinit();
+    const encoded = spec.encode();
+    try db.core.store.putBatch(&.{.{ .key = plan.head_key, .value = &encoded }}, &.{});
+    var collected = try collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &.{.{ .key = tail }}, db.core.index_manager.byte_range, .{}, null);
+    defer collected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+    try std.testing.expectEqual(@as(usize, 0), collected.items.len);
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &.{.{ .key = chunk }}, db.core.index_manager.byte_range, .{}, null));
 }

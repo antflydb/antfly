@@ -18,6 +18,7 @@
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Event
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
@@ -30,7 +31,8 @@ from requests.exceptions import ReadTimeout
 def privacy_provider(request):
     native = request.param if hasattr(request, "param") else False
     calls = {"embed": [], "extract": [], "paths": [], "batches": []}
-    behavior = {"deny": False}
+    behavior = {"deny": False, "embed_gate": Event(), "embed_held": Event()}
+    behavior["embed_gate"].set()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -86,6 +88,9 @@ def privacy_provider(request):
                 if isinstance(inputs, str):
                     inputs = [inputs]
                 calls["embed"].extend(inputs)
+                if not behavior["embed_gate"].is_set():
+                    behavior["embed_held"].set()
+                assert behavior["embed_gate"].wait(timeout=60)
                 return self.reply(
                     200,
                     {
@@ -137,6 +142,7 @@ def privacy_provider(request):
     try:
         yield endpoint, calls, behavior, native
     finally:
+        behavior["embed_gate"].set()
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
@@ -180,14 +186,14 @@ def policy(endpoint):
     }
 
 
-def query(api, table):
+def query(api, table, index="a0"):
     try:
         response = api.s.post(
             api.url + "/query",
             json={
                 "table": table,
-                "indexes": ["a0"],
-                "embeddings": {"a0": [1.0, 0.0]},
+                "indexes": [index],
+                "embeddings": {index: [1.0, 0.0]},
                 "fields": ["body"],
                 "limit": 100,
             },
@@ -207,8 +213,8 @@ def query(api, table):
     return row["hits"]["hits"]
 
 
-def redacted(api, table, docs):
-    hits = query(api, table)
+def redacted(api, table, docs, index="a0"):
+    hits = query(api, table, index)
     if hits is None:
         return None
     for hit in hits:
@@ -312,3 +318,139 @@ def test_privacy_parked_native_failure_requires_explicit_repair_after_restart(
         and current["coverage"]["protected_blocked"] == 0
     ), current
     assert len(calls["extract"]) > previous, calls
+
+
+def test_privacy_policy_replacement_and_new_model_migration(
+    stateful_api, privacy_provider
+):
+    api = stateful_api
+    endpoint, calls, _, _ = privacy_provider
+    table = create_indexed_table(api, endpoint)
+    docs = {"d0": {"body": "Orchard schedule. Contact person@example.invalid."}}
+    api.batch_write(table, inserts=docs, sync_level="full_index")
+    path = f"/tables/{table}/privacy"
+    api.put(path, policy(endpoint))
+    assert wait_until(lambda: redacted(api, table, docs), timeout_s=60), (
+        api.debug_logs()
+    )
+
+    # Each policy update must complete backfill, not merely return 202.
+    for field, value in (("revision", "fixture-v2"), ("replacement", "mask")):
+        current = api.get(path)
+        updated = current["policy"]
+        if field == "revision":
+            updated["producer"][field] = value
+        else:
+            updated[field] = value
+        before = len(calls["extract"])
+        response = api.s.put(
+            api.url + path,
+            json=updated,
+            headers={"If-Match": current["etag"]},
+            timeout=20,
+        )
+        assert response.status_code == 202, response.text
+        assert wait_until(
+            lambda before=before: (
+                len(calls["extract"]) > before and redacted(api, table, docs)
+            ),
+            timeout_s=60,
+        ), api.debug_logs()
+        if field == "replacement":
+            assert "[EMAIL]" not in json.dumps(redacted(api, table, docs))
+
+    alias = f"/tables/{table}/index-aliases/search"
+    api.put(alias, {"index": "a0", "idempotency_key": "initial", "require": "complete"})
+    before = len(calls["extract"])
+    api.create_index(
+        table,
+        "b",
+        {
+            "type": "embeddings",
+            "dimension": 2,
+            "field": "body",
+            "distance_metric": "cosine",
+            "publication_policy": "atomic",
+            "embedder": {
+                "provider": "antfly",
+                "model": "fixture-v2",
+                "api_url": endpoint,
+            },
+        },
+    )
+    assert wait_until(lambda: redacted(api, table, docs, "b"), timeout_s=60), (
+        api.debug_logs()
+    )
+    assert redacted(api, table, docs, "search")
+    # The existing producer's inspection receipts are shared with B.
+    assert len(calls["extract"]) == before
+    api.put(
+        alias,
+        {
+            "index": "b",
+            "expected_index": "a0",
+            "idempotency_key": "cutover",
+            "require": "complete",
+        },
+    )
+    assert redacted(api, table, docs, "search")
+    current = api.get(path)
+    blocked = current["policy"]
+    blocked["replacement"] = "category"
+    response = api.s.put(
+        api.url + path, json=blocked, headers={"If-Match": current["etag"]}, timeout=20
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "IndexReferencedByAlias"
+    assert api.get(path)["etag"] == current["etag"]
+    if api.supports_restart:
+        api.restart_server()
+        assert wait_until(lambda: redacted(api, table, docs, "search"), timeout_s=60), (
+            api.debug_logs()
+        )
+
+
+def test_privacy_held_update_delete_crash_recovers_current_sources(
+    stateful_api, privacy_provider
+):
+    api = stateful_api
+    if not api.supports_restart or not hasattr(api._server, "pause"):
+        pytest.skip("requires locally managed crash recovery")
+    endpoint, _, behavior, _ = privacy_provider
+    table = create_indexed_table(api, endpoint)
+    docs = {"d0": {"body": "Orchard schedule. Contact person@example.invalid."}}
+    api.batch_write(table, inserts=docs, sync_level="full_index")
+    api.put(f"/tables/{table}/privacy", policy(endpoint))
+    assert wait_until(lambda: redacted(api, table, docs), timeout_s=60), (
+        api.debug_logs()
+    )
+    behavior["embed_gate"].clear()
+    try:
+        api.batch_write(
+            table,
+            inserts={
+                "d0": {
+                    "body": "Orchard schedule. Contact person@example.invalid. First revision."
+                },
+                "temporary": {
+                    "body": "Orchard schedule. Contact temporary@example.invalid."
+                },
+            },
+        )
+        assert behavior["embed_held"].wait(timeout=20), api.debug_logs()
+        docs["d0"]["body"] += " Final correction."
+        api.batch_write(table, inserts=docs, deletes=["temporary"])
+        api.s.close()
+        api._server.pause(crash=True)
+        api.resume_server()
+    finally:
+        behavior["embed_gate"].set()
+
+    def recovered():
+        hits = redacted(api, table, docs)
+        return (
+            hits if hits and "Final correction." in hits[0]["_source"]["body"] else None
+        )
+
+    assert wait_until(recovered, timeout_s=90), api.debug_logs()
+    assert "StorageKernelFailure" not in api.debug_logs()

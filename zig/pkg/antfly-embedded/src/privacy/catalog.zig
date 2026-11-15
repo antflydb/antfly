@@ -543,6 +543,45 @@ pub fn install(a: A, indexes_json: []const u8, resource: Resource) ![]u8 {
     var persisted = resource;
     persisted.unprotected_indexes_json = if (resource.policy.mode == .redact_for_search_and_ai) try std.json.Stringify.valueAlloc(scratch, root, .{}) else "";
     if (resource.policy.mode == .redact_for_search_and_ai) try protect(scratch, &root, resource.policy_version);
+    // A consumer generation owns its complete upstream recipe. Bind protected
+    // consumers to both the logical incarnation and policy generation, so ABA
+    // policy changes cannot reuse published coverage. Execution-only edits and
+    // additions of unrelated consumers retain existing physical generations.
+    const prior_protective = if (live.value.object.get(key)) |saved|
+        if (saved == .object) if (saved.object.get("policy")) |policy| std.mem.eql(u8, getString(policy, "mode"), "redact_for_search_and_ai") else false else false
+    else
+        false;
+    const same_policy_generation = if (live.value.object.get(key)) |saved| blk: {
+        if (saved != .object) break :blk false;
+        const version = saved.object.get("policy_version") orelse break :blk false;
+        const generation = saved.object.get("generation") orelse break :blk false;
+        break :blk version == .string and std.mem.eql(u8, version.string, &resource.policy_version) and
+            generation == .integer and generation.integer == resource.generation;
+    } else false;
+    if (resource.policy.mode == .redact_for_search_and_ai or prior_protective) {
+        var consumers = root.object.iterator();
+        while (consumers.next()) |entry| {
+            if (index_metadata.isOpaqueEntry(entry.key_ptr.*) or entry.value_ptr.* != .object or
+                !entry.value_ptr.object.contains("type")) continue;
+            if (same_policy_generation) {
+                if (live.value.object.get(entry.key_ptr.*)) |existing| {
+                    if (@import("../api/index_incarnation.zig").get(existing)) |incarnation| {
+                        try entry.value_ptr.object.put(scratch, "_index_incarnation", .{ .integer = @intCast(incarnation) });
+                    } else _ = entry.value_ptr.object.swapRemove("_index_incarnation");
+                    continue;
+                }
+            }
+            var identity = std.hash.Wyhash.init(0);
+            identity.update(&resource.policy_version);
+            var counters: [16]u8 = undefined;
+            std.mem.writeInt(u64, counters[0..8], resource.generation, .little);
+            std.mem.writeInt(u64, counters[8..16], @import("../api/index_incarnation.zig").get(entry.value_ptr.*) orelse 0, .little);
+            identity.update(&counters);
+            identity.update(entry.key_ptr.*);
+            const incarnation = (identity.final() & std.math.maxInt(i63)) | 1;
+            try entry.value_ptr.object.put(scratch, "_index_incarnation", .{ .integer = @intCast(incarnation) });
+        }
+    }
     var controls = live.value.object.iterator();
     while (controls.next()) |entry| {
         if (index_metadata.isOpaqueEntry(entry.key_ptr.*) and !std.mem.eql(u8, entry.key_ptr.*, key))
@@ -1176,4 +1215,64 @@ test "privacy policy transitions preserve live opaque controls and never resurre
             saved = try install(a, saved, try next(a, resource, policy, try etag(a, resource)));
         }
     }
+}
+
+test "privacy policy replacement rotates dependent generations and preserves alias fences" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const aliases = @import("../api/index_aliases.zig");
+    const incarnation = @import("../api/index_incarnation.zig");
+    var policy = contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} };
+    var saved = try install(a, "{\"dense\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"_index_incarnation\":42,\"embedder\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}}", try next(a, null, policy, null));
+    const first_root = (try std.json.parseFromSlice(std.json.Value, a, saved, .{})).value;
+    const first_incarnation = incarnation.get(first_root.object.get("dense").?).?;
+    var previous_incarnation = first_incarnation;
+    // Replacement changes, producer revision changes, and ABA all require
+    // fresh consumers; tuning and identical PUTs must retain their generations.
+    for (0..5) |step| {
+        const root = (try std.json.parseFromSlice(std.json.Value, a, saved, .{})).value;
+        const resource = (try current(a, root)).?.value;
+        switch (step) {
+            0 => policy.execution.batch_items = 1,
+            1 => policy.replacement = .mask,
+            2 => policy.replacement = .category,
+            3 => policy.producer = .{ .revision = "v2", .config = (try std.json.parseFromSlice(std.json.Value, a, "{\"provider\":\"antfly\",\"model\":\"fixture\",\"schema_version\":2}", .{})).value },
+            else => {},
+        }
+        const updated = try install(a, saved, try next(a, resource, policy, try etag(a, resource)));
+        try aliases.validateDependencyMutation(a, saved, updated);
+        const result = (try std.json.parseFromSlice(std.json.Value, a, updated, .{})).value;
+        const current_incarnation = incarnation.get(result.object.get("dense").?).?;
+        if (step == 0 or step == 4) {
+            try std.testing.expectEqual(previous_incarnation, current_incarnation);
+        } else {
+            try std.testing.expect(previous_incarnation != current_incarnation);
+            try std.testing.expect(first_incarnation != current_incarnation);
+            var pinned_before = root;
+            var pinned_after = result;
+            const bindings = (try std.json.parseFromSlice(std.json.Value, a, "{\"search\":{\"index\":\"dense\"}}", .{})).value;
+            try pinned_before.object.put(a, aliases.key, bindings);
+            try pinned_after.object.put(a, aliases.key, bindings);
+            try std.testing.expectError(error.IndexReferencedByAlias, aliases.validateDependencyMutation(a, try std.json.Stringify.valueAlloc(a, pinned_before, .{}), try std.json.Stringify.valueAlloc(a, pinned_after, .{})));
+        }
+        previous_incarnation = current_incarnation;
+        saved = updated;
+    }
+}
+
+test "privacy policy replacement retains pre-upgrade incarnations on identical PUT" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var resource = try next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null);
+    const initial = try install(a, "{}", resource);
+    var legacy = (try std.json.parseFromSlice(std.json.Value, a, initial, .{})).value;
+    try legacy.object.getPtr("full_text_index_v0").?.object.put(a, "_index_incarnation", .{ .integer = 42 });
+    const before = try std.json.Stringify.valueAlloc(a, legacy, .{});
+    resource = (try current(a, legacy)).?.value;
+    const after = try install(a, before, try next(a, resource, resource.policy, try etag(a, resource)));
+    try @import("../api/index_aliases.zig").validateDependencyMutation(a, before, after);
+    const root = (try std.json.parseFromSlice(std.json.Value, a, after, .{})).value;
+    try std.testing.expectEqual(@as(?u64, 42), @import("../api/index_incarnation.zig").get(root.object.get("full_text_index_v0").?));
 }

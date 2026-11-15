@@ -322,3 +322,22 @@ Generated Go, Python, and Rust clients expose the corresponding
 `getNamespaceTablePrivacyScan`, `listNamespaceTablePrivacyFindings`, and
 `queryNamespaceTablePrivacyFindings` operations (using each language's naming
 convention).
+
+
+### Index migration while protection is active
+
+With `redact_for_search_and_ai`, create a new physical embedding or full-text
+index through the normal create-index API. Antfly attaches it to the current
+protected artifact graph in the same catalog commit. Existing index generations
+and privacy inspection receipts remain usable. Wait for the new index to become
+complete, then move the serving index alias with `expected_index` set to the old
+physical index. Raw external vectors and unsupported graph consumers are rejected.
+Repeating an identical creation request preserves the physical generation.
+
+Semantic policy changes (including producer revision or replacement style)
+replace dependent consumer generations and backfill them under the new policy.
+Identical policy PUTs and execution-only tuning preserve existing generations.
+An alias that still references a changed consumer blocks the policy replacement
+with HTTP 409 `IndexReferencedByAlias`. Move or remove that alias before changing
+the policy; rebind only after the protected index is complete. Protection remains
+active throughout the transition.

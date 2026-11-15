@@ -18076,6 +18076,12 @@ pub const ApiHttpServer = struct {
         // operation idempotent across retries and leadership changes.
         const assembled_indexes_json = indexes_api.addIndexToTableIndexesJsonWithIo(alloc, self.inferenceIo(), table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
             error.IndexAliasNameConflict, error.IndexReferencedByAlias => return error.Conflict,
+            error.PrivacyManagedGraph => return error.Conflict,
+            error.PrivacyUnsupportedIndexType,
+            error.PrivacyExternalEmbeddingsUnsupported,
+            error.PrivacyEmbeddingProducerRequired,
+            error.PrivacyUnknownArtifactSource,
+            => return error.InvalidIndexRequest,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };

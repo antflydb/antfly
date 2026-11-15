@@ -324,6 +324,7 @@ pub fn collectSparseFieldWritesProfiled(
             owned_logical_value = logical;
             break :blk logical;
         } else if (item.inline_value) |inline_value| blk: {
+            if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
             if (profile) |p| p.inline_hits += 1;
             break :blk inline_value;
         } else {

@@ -1111,6 +1111,8 @@ pub const Detail = enum(c_int) {
     storage_descriptor_pressure,
     input_output,
     catalog_changed,
+    index_referenced_by_alias,
+    index_alias_graph_conflict,
 };
 
 pub const Status = extern struct {
@@ -1128,6 +1130,8 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.IndexReferencedByAlias => status(.conflict, .index_referenced_by_alias),
+        error.IndexAliasGraphConflict => status(.conflict, .index_alias_graph_conflict),
         error.CatalogChanged => status(.conflict, .catalog_changed),
         error.SqlStatementReadUnavailable => status(.retryable, .sql_statement_read_unavailable),
         error.UnsupportedSqlExecution => status(.unsupported, .unsupported_sql_execution),
@@ -2341,6 +2345,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
+        .index_referenced_by_alias => "IndexReferencedByAlias",
+        .index_alias_graph_conflict => "IndexAliasGraphConflict",
         .hierarchy_cursor_stale => "HierarchyCursorStale",
         .read_transient_failure => "ReadTransientFailure",
         .read_request_failed => "ReadRequestFailed",
@@ -3842,4 +3848,12 @@ test "positional IO errors preserve identity without becoming retryable pressure
     const value = statusFromError(error.InputOutput);
     try std.testing.expectEqual(@backingInt(Code.internal), value.code);
     try std.testing.expectEqual(error.InputOutput, errorFromStatus(value));
+}
+
+test "index dependency conflicts preserve identity across owner callbacks" {
+    for ([_]anyerror{ error.IndexReferencedByAlias, error.IndexAliasGraphConflict }) |err| {
+        const result = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.conflict), result.code);
+        try std.testing.expectEqual(err, errorFromStatus(result));
+    }
 }
