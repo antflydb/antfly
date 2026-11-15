@@ -113,7 +113,7 @@ pub fn topologyJsonAlloc(alloc: Allocator, tables: []const TableInfo, collect: C
 
 /// Table-name resolution for admission.
 pub fn resolver(tables: *const []const TableInfo) ctx.TableResolver {
-    return .{ .ptr = @constCast(tables), .resolve_fn = resolveName };
+    return .{ .ptr = @ptrCast(@constCast(tables)), .resolve_fn = resolveName };
 }
 
 fn resolveName(ptr: *anyopaque, alloc: Allocator, name: []const u8) anyerror!?[]u8 {
