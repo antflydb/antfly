@@ -186,6 +186,85 @@ test "lite allocator verification follows only identical certain owner checkpoin
     try std.testing.expect((try borrowed.check()).valid);
 }
 
+// perf/lwa-proof-fork: `verifyAllocatorAssumeLocked`'s stashed-receipt
+// reuse (capi/lite_connection.zig) and `inheritAllocatorVerification`'s
+// own post-walk transfer both used to gate on `std.meta.eql` of the
+// *whole* `Header` -- including `commit_sequence`, which
+// `commitTransactionWithDurability`'s ordinary redo-log append advances
+// on every single commit (`self.header.checkpoints[...] = checkpoint`),
+// even one that never touches a real page. That over-invalidated: a
+// commit that cannot possibly have changed the free map still discarded
+// a completed, still-correct proof, forcing `captureAllocatorVerificationSnapshot`
+// to re-walk the ledger from scratch. The fix keys validity on exactly
+// what the proof covers (`allocatorProofIdentity`: which checkpoint slot
+// is active, its free-map root, its page count, and its redo fold
+// boundary) instead of the whole header.
+test "lite allocator proof receipt survives a redo-only commit but not a free-map-changing one" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-proof-receipt.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+    defer file.close();
+    // An explicit transaction, not a bare single-mutation call: only a
+    // staged mutation (`stageMutation`, reached through `stagingTransaction()`)
+    // takes the redo-diverting path at all -- a bare call always builds
+    // real pages immediately, by design (perf/lwa-integration's
+    // "bare commits never divert pages" fix).
+    try file.beginTransaction();
+    try file.putCatalogRecord("seed", "original");
+    try file.commitTransaction();
+    try std.testing.expect(file.free_pages_verified);
+
+    // Stash a receipt for the current, verified state -- exactly what
+    // `reader.allocatorProofReceipt()` hands `Owner.allocator_proof_receipt`
+    // when a completed walk's immediate transfer has to wait for a busy
+    // writer lease (lite_connection.zig's `verifyAllocatorAssumeLocked`).
+    const receipt = (try file.allocatorProofReceipt()).?;
+
+    // A redo-only commit: a small staged catalog write diverts entirely
+    // into the redo log (design doc §9.3) -- no page allocation, no
+    // ledger mutation -- yet `commit_sequence`, and so the whole
+    // `Header`, still advances.
+    const before = file.activeCheckpoint();
+    try file.beginTransaction();
+    try file.putCatalogRecord("seed2", "second");
+    try file.commitTransaction();
+    const after = file.activeCheckpoint();
+    try std.testing.expect(after.commit_sequence != before.commit_sequence);
+    try std.testing.expectEqual(before.free_map_root_page, after.free_map_root_page);
+    try std.testing.expectEqual(before.page_count, after.page_count);
+    try std.testing.expectEqual(before.redo_folded_through, after.redo_folded_through);
+    try std.testing.expect(!std.meta.eql(file.header, receipt.header));
+
+    // The stashed receipt must still be good for reuse: the free map it
+    // proved is exactly the free map on disk right now.
+    file.free_pages_verified = false;
+    try file.inheritAllocatorProofReceipt(receipt);
+    try std.testing.expect(file.free_pages_verified);
+
+    // A free-map-changing commit (delete, fold, reclaim: the ledger's own
+    // content -- and so its copy-on-write root page -- genuinely moves)
+    // must invalidate a receipt captured before it.
+    const stale = (try file.allocatorProofReceipt()).?;
+    try file.beginTransaction();
+    try file.deleteCatalogRecord("seed");
+    try file.commitTransaction();
+    try file.checkpointRedoLog();
+    _ = try file.reclaimPages(4096);
+    // The fold is a real, non-diverting commit (`checkpointing = true`
+    // disables every diversion point for its span), so it advances the
+    // redo fold boundary -- a reliable signal here, unlike
+    // `free_map_root_page` alone, which can legitimately return to the
+    // same page id on quick reuse (the ABA case other allocator tests
+    // cover) without that meaning nothing changed.
+    try std.testing.expect(file.activeCheckpoint().redo_folded_through != stale.header.checkpoints[stale.header.active_checkpoint].redo_folded_through);
+    file.free_pages_verified = false;
+    try file.inheritAllocatorProofReceipt(stale);
+    try std.testing.expect(!file.free_pages_verified);
+}
+
 test "lite allocator detached verification cancels and refuses stale checkpoints" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8793,14 +8872,57 @@ pub const NativeFile = struct {
         return .{ .header = self.header, .inode = (try self.file.stat(self.runtime())).inode };
     }
 
+    /// perf/lwa-proof-fork: the exact state an allocator free-page proof's
+    /// validity depends on -- not the whole `Header`. `commit_sequence`
+    /// (and, for a redo-log file, the whole checkpoint slot payload)
+    /// advances on *every* commit (`commitTransactionWithDurability`'s
+    /// ordinary redo-log append stamps `self.header.checkpoints[active] =
+    /// checkpoint` regardless of whether anything page-shaped happened),
+    /// but a redo-only commit -- everything diverted into the log, no
+    /// page allocation, no ledger mutation -- never touches the free map
+    /// a completed proof walked. Comparing whole headers (`std.meta.eql`)
+    /// discarded a still-correct proof after every such commit, forcing
+    /// `captureAllocatorVerificationSnapshot` to re-walk the ledger from
+    /// scratch. These three fields are exactly what the walk verified:
+    /// `free_map_root_page` is the ledger's own copy-on-write root (any
+    /// real mutation of the free map moves it), `page_count` is the
+    /// universe of pages the ledger accounts for (a page-shaped redo
+    /// diversion -- an external-value chain bypassing the ledger
+    /// entirely, see `redo_folded_through`'s own doc comment -- can
+    /// advance this without the ledger ever knowing), and
+    /// `redo_folded_through` is the fold boundary the walk's own
+    /// snapshot was pinned to. `active_checkpoint` is included so a real
+    /// checkpoint publish that ping-pongs slots is never mistaken for a
+    /// same-slot republish even in the (page-id-collision) limit.
+    /// Whatever else a commit changes (`commit_sequence`, the primary/
+    /// catalog/index-catalog/namespace-directory roots, the manifest
+    /// descriptor) is irrelevant to whether the free map this proof
+    /// covers is still the free map on disk.
+    pub const AllocatorProofIdentity = struct {
+        active_checkpoint: u8,
+        free_map_root_page: u64,
+        page_count: u64,
+        redo_folded_through: u64,
+    };
+
+    pub fn allocatorProofIdentity(header: Header) AllocatorProofIdentity {
+        const checkpoint = header.checkpoints[header.active_checkpoint];
+        return .{
+            .active_checkpoint = header.active_checkpoint,
+            .free_map_root_page = checkpoint.free_map_root_page,
+            .page_count = checkpoint.page_count,
+            .redo_folded_through = checkpoint.redo_folded_through,
+        };
+    }
+
     /// Same acceptance as `inheritAllocatorVerification` from a verified
     /// owner: the identical generation, or a descendant of the proof's base.
     /// Callers fence it the same way, under the writer lease.
     pub fn inheritAllocatorProofReceipt(self: *NativeFile, receipt: AllocatorProofReceipt) !void {
         if (self.free_pages_verified or self.transaction_header != null or self.durable_header != null or
             self.checkpoint_publication_uncertain) return;
-        const identical = std.meta.eql(self.header, receipt.header);
-        const descendant = if (self.allocator_verification_base) |base| std.meta.eql(base, receipt.header) else false;
+        const identical = std.meta.eql(allocatorProofIdentity(self.header), allocatorProofIdentity(receipt.header));
+        const descendant = if (self.allocator_verification_base) |base| std.meta.eql(allocatorProofIdentity(base), allocatorProofIdentity(receipt.header)) else false;
         if (!identical and !descendant) return;
         if ((try self.file.stat(self.runtime())).inode != receipt.inode) return;
         self.free_pages_verified = true;
@@ -8812,8 +8934,8 @@ pub const NativeFile = struct {
         if (!std.mem.eql(u8, self.path, owner.path) or owner.transaction_header != null or owner.durable_header != null or
             owner.checkpoint_publication_uncertain or self.transaction_header != null or self.durable_header != null or
             self.checkpoint_publication_uncertain) return;
-        const identical = std.meta.eql(self.header, owner.header);
-        const descendant = if (self.allocator_verification_base) |base| std.meta.eql(base, owner.header) else false;
+        const identical = std.meta.eql(allocatorProofIdentity(self.header), allocatorProofIdentity(owner.header));
+        const descendant = if (self.allocator_verification_base) |base| std.meta.eql(allocatorProofIdentity(base), allocatorProofIdentity(owner.header)) else false;
         if (!identical and !descendant) return;
         if ((try self.file.stat(self.runtime())).inode != (try owner.file.stat(owner.runtime())).inode) return;
         if (!owner.free_pages_verified) {
