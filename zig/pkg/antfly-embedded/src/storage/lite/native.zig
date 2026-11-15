@@ -186,6 +186,85 @@ test "lite allocator verification follows only identical certain owner checkpoin
     try std.testing.expect((try borrowed.check()).valid);
 }
 
+// perf/lwa-proof-fork: `verifyAllocatorAssumeLocked`'s stashed-receipt
+// reuse (capi/lite_connection.zig) and `inheritAllocatorVerification`'s
+// own post-walk transfer both used to gate on `std.meta.eql` of the
+// *whole* `Header` -- including `commit_sequence`, which
+// `commitTransactionWithDurability`'s ordinary redo-log append advances
+// on every single commit (`self.header.checkpoints[...] = checkpoint`),
+// even one that never touches a real page. That over-invalidated: a
+// commit that cannot possibly have changed the free map still discarded
+// a completed, still-correct proof, forcing `captureAllocatorVerificationSnapshot`
+// to re-walk the ledger from scratch. The fix keys validity on exactly
+// what the proof covers (`allocatorProofIdentity`: which checkpoint slot
+// is active, its free-map root, its page count, and its redo fold
+// boundary) instead of the whole header.
+test "lite allocator proof receipt survives a redo-only commit but not a free-map-changing one" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-proof-receipt.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+    defer file.close();
+    // An explicit transaction, not a bare single-mutation call: only a
+    // staged mutation (`stageMutation`, reached through `stagingTransaction()`)
+    // takes the redo-diverting path at all -- a bare call always builds
+    // real pages immediately, by design (perf/lwa-integration's
+    // "bare commits never divert pages" fix).
+    try file.beginTransaction();
+    try file.putCatalogRecord("seed", "original");
+    try file.commitTransaction();
+    try std.testing.expect(file.free_pages_verified);
+
+    // Stash a receipt for the current, verified state -- exactly what
+    // `reader.allocatorProofReceipt()` hands `Owner.allocator_proof_receipt`
+    // when a completed walk's immediate transfer has to wait for a busy
+    // writer lease (lite_connection.zig's `verifyAllocatorAssumeLocked`).
+    const receipt = (try file.allocatorProofReceipt()).?;
+
+    // A redo-only commit: a small staged catalog write diverts entirely
+    // into the redo log (design doc §9.3) -- no page allocation, no
+    // ledger mutation -- yet `commit_sequence`, and so the whole
+    // `Header`, still advances.
+    const before = file.activeCheckpoint();
+    try file.beginTransaction();
+    try file.putCatalogRecord("seed2", "second");
+    try file.commitTransaction();
+    const after = file.activeCheckpoint();
+    try std.testing.expect(after.commit_sequence != before.commit_sequence);
+    try std.testing.expectEqual(before.free_map_root_page, after.free_map_root_page);
+    try std.testing.expectEqual(before.page_count, after.page_count);
+    try std.testing.expectEqual(before.redo_folded_through, after.redo_folded_through);
+    try std.testing.expect(!std.meta.eql(file.header, receipt.header));
+
+    // The stashed receipt must still be good for reuse: the free map it
+    // proved is exactly the free map on disk right now.
+    file.free_pages_verified = false;
+    try file.inheritAllocatorProofReceipt(receipt);
+    try std.testing.expect(file.free_pages_verified);
+
+    // A free-map-changing commit (delete, fold, reclaim: the ledger's own
+    // content -- and so its copy-on-write root page -- genuinely moves)
+    // must invalidate a receipt captured before it.
+    const stale = (try file.allocatorProofReceipt()).?;
+    try file.beginTransaction();
+    try file.deleteCatalogRecord("seed");
+    try file.commitTransaction();
+    try file.checkpointRedoLog();
+    _ = try file.reclaimPages(4096);
+    // The fold is a real, non-diverting commit (`checkpointing = true`
+    // disables every diversion point for its span), so it advances the
+    // redo fold boundary -- a reliable signal here, unlike
+    // `free_map_root_page` alone, which can legitimately return to the
+    // same page id on quick reuse (the ABA case other allocator tests
+    // cover) without that meaning nothing changed.
+    try std.testing.expect(file.activeCheckpoint().redo_folded_through != stale.header.checkpoints[stale.header.active_checkpoint].redo_folded_through);
+    file.free_pages_verified = false;
+    try file.inheritAllocatorProofReceipt(stale);
+    try std.testing.expect(!file.free_pages_verified);
+}
+
 test "lite allocator detached verification cancels and refuses stale checkpoints" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -7547,14 +7626,82 @@ pub const NativeFile = struct {
             }
         };
         var meta_ctx: MetaCtx = .{};
-        const outcome = try redo_log.replay(allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, folded_through, MetaCtx.onRecord, &meta_ctx);
+        const meta_outcome = try redo_log.replay(allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, folded_through, MetaCtx.onRecord, &meta_ctx);
         // A torn tail or a clean (never-written-past-the-checkpoint) end
         // are both benign (§9.5) -- the valid prefix, possibly empty, is
         // everything this recovery trusts. A corrupt record is not: this
         // open must fail rather than silently serve a truncated view of
         // acknowledged work.
-        if (outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
-        if (meta_ctx.compact) |compact| {
+        if (meta_outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
+        self.manifest_commits_enabled = false;
+
+        const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
+        // perf/lwa-proof-fork: `ensureRedoOverlay`'s own populate callback
+        // below runs a *second*, independent scan of the same physical log
+        // -- strictly after the one just above, but with no lock excluding
+        // a concurrent writer (a different process, racing to append its
+        // own next commit right now) from appending between the two. That
+        // writer's new record is durable (fsynced) the moment its own
+        // `redo_log.replay` could possibly see it, so this second scan can
+        // only find as much or *more* of the log than the first one did,
+        // never less -- confirmed live as "lite redo log cross-process: a
+        // forked child sees commits the parent makes after the child
+        // opens" timing out: the overlay this call populates already had
+        // both the parent's pre-fork and post-fork commits (because a
+        // concurrent writer landed between these two scans), while
+        // `meta_outcome`/`meta_ctx.compact` -- from the earlier scan --
+        // only reflected the first, leaving `redo.durable_sequence` (the
+        // version-resolution mark every overlay read is bounded by)
+        // permanently behind an overlay entry already sitting right there,
+        // so the second commit stayed invisible forever, including across
+        // every later `refreshCrossProcessRedoOverlay` call (gated on
+        // `published.durable_sequence > redo.durable_sequence`, which
+        // never fires once both already agree, wrongly, on the stale
+        // value). `PopulateCtx.outcome`/`.compact` carry this scan's own
+        // (more complete) result back out, below, for exactly this reason.
+        const PopulateCtx = struct {
+            file: *NativeFile,
+            io: std.Io,
+            start_after_sequence: u64,
+            compact: ?CompactCheckpoint = null,
+            outcome: ?redo_log.ReplayOutcome = null,
+        };
+        var pctx = PopulateCtx{ .file = self, .io = io, .start_after_sequence = folded_through };
+        const shared = try inode_lock.ensureRedoOverlay(entry, io, &pctx, struct {
+            fn populate(ctx: *PopulateCtx, overlay: *redo_overlay.SharedRedoOverlay, pop_allocator: Allocator) anyerror!void {
+                const RecordCtx = struct {
+                    overlay: *redo_overlay.SharedRedoOverlay,
+                    pop_allocator: Allocator,
+                    compact: ?CompactCheckpoint = null,
+                    fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
+                        const rc: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+                        if (record.payload.len < CompactCheckpoint.encoded_size + 4) return error.InvalidNativeRedoRecord;
+                        rc.compact = CompactCheckpoint.decode(record.payload[0..CompactCheckpoint.encoded_size]);
+                        const logical_len = std.mem.readInt(u32, record.payload[CompactCheckpoint.encoded_size..][0..4], .little);
+                        const logical_start = CompactCheckpoint.encoded_size + 4;
+                        if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
+                        try rc.overlay.decodeLogicalMutationsPayload(rc.pop_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
+                        try rc.overlay.decodeRedoGroupPayload(rc.pop_allocator, record.payload[logical_start + logical_len ..]);
+                    }
+                };
+                var rctx: RecordCtx = .{ .overlay = overlay, .pop_allocator = pop_allocator };
+                const full_outcome = try redo_log.replay(pop_allocator, ctx.file.file, ctx.io, ctx.file.header.redo_log_offset, ctx.file.header.redo_log_capacity, ctx.start_after_sequence, RecordCtx.onRecord, &rctx);
+                if (full_outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
+                ctx.compact = rctx.compact;
+                ctx.outcome = full_outcome;
+            }
+        }.populate);
+
+        // Prefer the overlay populate's own scan whenever it actually ran
+        // (strictly as complete as, or more complete than, the meta scan
+        // above -- never less, per this function's own comment). When the
+        // overlay was already populated for this pid (`ensureRedoOverlay`'s
+        // "second opener in this process" skip, the common case), nothing
+        // ran here and `meta_outcome`/`meta_ctx.compact` are already
+        // consistent with it: every in-process commit keeps the overlay
+        // and the real log in lockstep by construction.
+        const outcome = pctx.outcome orelse meta_outcome;
+        if (pctx.compact orelse meta_ctx.compact) |compact| {
             // `CompactCheckpoint` carries no `redo_folded_through` of its
             // own (a log record's own embedded checkpoint is always just
             // the *tip* as of that commit, never a fold boundary -- only
@@ -7569,31 +7716,6 @@ pub const NativeFile = struct {
             self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
             self.header.checkpoints[self.header.active_checkpoint].redo_folded_through = folded_through;
         }
-        self.manifest_commits_enabled = false;
-
-        const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
-        const PopulateCtx = struct { file: *NativeFile, io: std.Io, start_after_sequence: u64 };
-        var pctx = PopulateCtx{ .file = self, .io = io, .start_after_sequence = folded_through };
-        const shared = try inode_lock.ensureRedoOverlay(entry, io, &pctx, struct {
-            fn populate(ctx: *PopulateCtx, overlay: *redo_overlay.SharedRedoOverlay, pop_allocator: Allocator) anyerror!void {
-                const RecordCtx = struct {
-                    overlay: *redo_overlay.SharedRedoOverlay,
-                    pop_allocator: Allocator,
-                    fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
-                        const rc: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
-                        if (record.payload.len < CompactCheckpoint.encoded_size + 4) return error.InvalidNativeRedoRecord;
-                        const logical_len = std.mem.readInt(u32, record.payload[CompactCheckpoint.encoded_size..][0..4], .little);
-                        const logical_start = CompactCheckpoint.encoded_size + 4;
-                        if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
-                        try rc.overlay.decodeLogicalMutationsPayload(rc.pop_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
-                        try rc.overlay.decodeRedoGroupPayload(rc.pop_allocator, record.payload[logical_start + logical_len ..]);
-                    }
-                };
-                var rctx: RecordCtx = .{ .overlay = overlay, .pop_allocator = pop_allocator };
-                const full_outcome = try redo_log.replay(pop_allocator, ctx.file.file, ctx.io, ctx.file.header.redo_log_offset, ctx.file.header.redo_log_capacity, ctx.start_after_sequence, RecordCtx.onRecord, &rctx);
-                if (full_outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
-            }
-        }.populate);
 
         // `checkpointRedoLog`'s own fold consumes a fresh `commit_sequence`
         // for its checkpoint publish without ever appending a matching log
@@ -8858,14 +8980,57 @@ pub const NativeFile = struct {
         return .{ .header = self.header, .inode = (try self.file.stat(self.runtime())).inode };
     }
 
+    /// perf/lwa-proof-fork: the exact state an allocator free-page proof's
+    /// validity depends on -- not the whole `Header`. `commit_sequence`
+    /// (and, for a redo-log file, the whole checkpoint slot payload)
+    /// advances on *every* commit (`commitTransactionWithDurability`'s
+    /// ordinary redo-log append stamps `self.header.checkpoints[active] =
+    /// checkpoint` regardless of whether anything page-shaped happened),
+    /// but a redo-only commit -- everything diverted into the log, no
+    /// page allocation, no ledger mutation -- never touches the free map
+    /// a completed proof walked. Comparing whole headers (`std.meta.eql`)
+    /// discarded a still-correct proof after every such commit, forcing
+    /// `captureAllocatorVerificationSnapshot` to re-walk the ledger from
+    /// scratch. These three fields are exactly what the walk verified:
+    /// `free_map_root_page` is the ledger's own copy-on-write root (any
+    /// real mutation of the free map moves it), `page_count` is the
+    /// universe of pages the ledger accounts for (a page-shaped redo
+    /// diversion -- an external-value chain bypassing the ledger
+    /// entirely, see `redo_folded_through`'s own doc comment -- can
+    /// advance this without the ledger ever knowing), and
+    /// `redo_folded_through` is the fold boundary the walk's own
+    /// snapshot was pinned to. `active_checkpoint` is included so a real
+    /// checkpoint publish that ping-pongs slots is never mistaken for a
+    /// same-slot republish even in the (page-id-collision) limit.
+    /// Whatever else a commit changes (`commit_sequence`, the primary/
+    /// catalog/index-catalog/namespace-directory roots, the manifest
+    /// descriptor) is irrelevant to whether the free map this proof
+    /// covers is still the free map on disk.
+    pub const AllocatorProofIdentity = struct {
+        active_checkpoint: u8,
+        free_map_root_page: u64,
+        page_count: u64,
+        redo_folded_through: u64,
+    };
+
+    pub fn allocatorProofIdentity(header: Header) AllocatorProofIdentity {
+        const checkpoint = header.checkpoints[header.active_checkpoint];
+        return .{
+            .active_checkpoint = header.active_checkpoint,
+            .free_map_root_page = checkpoint.free_map_root_page,
+            .page_count = checkpoint.page_count,
+            .redo_folded_through = checkpoint.redo_folded_through,
+        };
+    }
+
     /// Same acceptance as `inheritAllocatorVerification` from a verified
     /// owner: the identical generation, or a descendant of the proof's base.
     /// Callers fence it the same way, under the writer lease.
     pub fn inheritAllocatorProofReceipt(self: *NativeFile, receipt: AllocatorProofReceipt) !void {
         if (self.free_pages_verified or self.transaction_header != null or self.durable_header != null or
             self.checkpoint_publication_uncertain) return;
-        const identical = std.meta.eql(self.header, receipt.header);
-        const descendant = if (self.allocator_verification_base) |base| std.meta.eql(base, receipt.header) else false;
+        const identical = std.meta.eql(allocatorProofIdentity(self.header), allocatorProofIdentity(receipt.header));
+        const descendant = if (self.allocator_verification_base) |base| std.meta.eql(allocatorProofIdentity(base), allocatorProofIdentity(receipt.header)) else false;
         if (!identical and !descendant) return;
         if ((try self.file.stat(self.runtime())).inode != receipt.inode) return;
         self.free_pages_verified = true;
@@ -8877,8 +9042,8 @@ pub const NativeFile = struct {
         if (!std.mem.eql(u8, self.path, owner.path) or owner.transaction_header != null or owner.durable_header != null or
             owner.checkpoint_publication_uncertain or self.transaction_header != null or self.durable_header != null or
             self.checkpoint_publication_uncertain) return;
-        const identical = std.meta.eql(self.header, owner.header);
-        const descendant = if (self.allocator_verification_base) |base| std.meta.eql(base, owner.header) else false;
+        const identical = std.meta.eql(allocatorProofIdentity(self.header), allocatorProofIdentity(owner.header));
+        const descendant = if (self.allocator_verification_base) |base| std.meta.eql(allocatorProofIdentity(base), allocatorProofIdentity(owner.header)) else false;
         if (!identical and !descendant) return;
         if ((try self.file.stat(self.runtime())).inode != (try owner.file.stat(owner.runtime())).inode) return;
         if (!owner.free_pages_verified) {

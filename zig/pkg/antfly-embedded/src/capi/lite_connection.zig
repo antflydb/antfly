@@ -3285,10 +3285,15 @@ pub const Owner = struct {
         if (self.allocator_proof_receipt) |receipt| {
             self.allocator_proof_receipt = null;
             // The same fence as the transfer below: under the writer lease,
-            // the on-disk header and inode must still be the live ones.
+            // the on-disk inode must still be the live one, and the free
+            // map the proof covers (not the whole header -- see
+            // `NativeFile.allocatorProofIdentity`'s own doc comment: a
+            // redo-only commit advances the whole header on every commit
+            // without ever touching the free map) must still be the one
+            // on disk.
             var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
             defer probe.close();
-            if (std.meta.eql(file.header, probe.header) and
+            if (std.meta.eql(native.NativeFile.allocatorProofIdentity(file.header), native.NativeFile.allocatorProofIdentity(probe.header)) and
                 (try file.file.stat(file.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
             {
                 try file.inheritAllocatorProofReceipt(receipt);
@@ -3365,7 +3370,12 @@ pub const Owner = struct {
             if (needsOutcomeReconciliation(current)) return error.OutcomeReconciliationRequired;
             const live = &current.owned_lite_backend.?.native_docstore.?.file;
             if (live.transaction_header != null or live.durable_header != null) return error.FileBusy;
-            if (std.meta.eql(live.header, probe.header) and
+            // The walk ran with both publication locks released (above),
+            // so an ordinary redo-only commit or two may have landed in
+            // the meantime -- compare the allocator-relevant identity, not
+            // the whole header, for the same reason as the stashed-receipt
+            // check above.
+            if (std.meta.eql(native.NativeFile.allocatorProofIdentity(live.header), native.NativeFile.allocatorProofIdentity(probe.header)) and
                 (try live.file.stat(live.runtime())).inode == (try probe.file.stat(probe.runtime())).inode)
                 try live.inheritAllocatorVerification(reader);
         }
@@ -3406,7 +3416,11 @@ pub const Owner = struct {
                     store.mutex.lock();
                     defer store.mutex.unlock();
                     const file = &store.file;
-                    if (file.read_only or !std.meta.eql(file.header, tip.header) or
+                    // Compare the allocator-relevant identity, not the whole
+                    // header: an intervening redo-only commit must not make
+                    // this candidate look foreign to `tip` when the free map
+                    // it would certify is still exactly the one on disk.
+                    if (file.read_only or !std.meta.eql(native.NativeFile.allocatorProofIdentity(file.header), native.NativeFile.allocatorProofIdentity(tip.header)) or
                         (try file.file.stat(file.runtime())).inode != (try tip.file.stat(tip.runtime())).inode) continue;
                     if (!file.free_pages_verified) {
                         if (self.current == root and !needsOutcomeReconciliation(root) and
