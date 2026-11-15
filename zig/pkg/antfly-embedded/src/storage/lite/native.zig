@@ -4707,6 +4707,29 @@ const RedoCommitState = struct {
     /// 25%-remaining bound before trying again, which could otherwise
     /// let it grow uncheckpointed all the way to `error.LogFull`.
     checkpoint_pending_error: bool = false,
+    /// perf/lwa-fold-churn: the cross-process `minimumPinnedSequence()`
+    /// that blocked the *last* fold's physical log-space reclaim (the
+    /// `pinned_below` branch of `checkpointRedoLogWithDurability`'s own
+    /// epilogue), or `null` if the last attempt reclaimed cleanly (or no
+    /// fold has run yet). While set, a blocked fold never actually shrinks
+    /// `redo.writer.remaining()` -- the writer keeps appending past the
+    /// old tail instead of resetting over it -- so under steady load
+    /// `maybeAutoCheckpointRedoLog`'s own 25%-remaining trigger stays true
+    /// forever and would otherwise re-run the *entire* logical fold (a
+    /// real `IndexEditor` pass over every root, `SharedRedoOverlay.reclaim`'s
+    /// own full scan, real page writes) on every single commit for no
+    /// gain: the physical bytes can only free up once this exact pin
+    /// advances. `maybeAutoCheckpointRedoLog` checks the *current*
+    /// `minimumPinnedSequence()` cheaply (one shared-memory read, no fold)
+    /// before paying for another attempt, and skips unless that pin has
+    /// moved past the value recorded here. Never consulted by the hard
+    /// `error.LogFull` paths in `commitTransactionWithDurability`/
+    /// `publishCheckpoint` (`pendingRecordLen() > redo.writer.remaining()`):
+    /// those force an unconditional fold the moment a record genuinely
+    /// cannot fit, regardless of this backoff -- this only throttles the
+    /// *opportunistic* 25%-remaining attempt, which exists purely to stay
+    /// ahead of that hard limit, never to be the thing enforcing it.
+    checkpoint_backoff_min_pinned: ?u64 = null,
     /// perf/lwa-txn-overlay (transaction isolation): every `appendVersion`/
     /// `appendPage` call this in-flight transaction has itself made onto
     /// `shared`, in staging order -- the redo-overlay analogue of
@@ -8442,11 +8465,12 @@ pub const NativeFile = struct {
         // one: an externally-pinned backlog never resolves on its own,
         // the same rule every other reader-pin-blocks-reclaim case in
         // this codebase already follows.
-        const pinned_below: bool = blk: {
-            const region = (self.regionForInode() catch break :blk false) orelse break :blk false;
-            const min_pinned = region.minimumPinnedSequence() orelse break :blk false;
-            break :blk min_pinned < new_checkpoint_sequence;
+        const blocking_pin: ?u64 = blk: {
+            const region = (self.regionForInode() catch break :blk null) orelse break :blk null;
+            const min_pinned = region.minimumPinnedSequence() orelse break :blk null;
+            break :blk if (min_pinned < new_checkpoint_sequence) min_pinned else null;
         };
+        const pinned_below = blocking_pin != null;
         if (!pinned_below) {
             if (old_tail > 0) {
                 const zeros = try self.allocator.alloc(u8, @intCast(old_tail));
@@ -8462,7 +8486,18 @@ pub const NativeFile = struct {
             // `maybeShrinkRedoLogCapacity`'s own doc comment.
             try self.maybeShrinkRedoLogCapacity();
             redo.writer = redo_log.Writer.init(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity);
+            // perf/lwa-fold-churn: a clean reclaim means the next
+            // opportunistic attempt is worth paying for again regardless
+            // of what used to block it.
+            redo.checkpoint_backoff_min_pinned = null;
         } else {
+            // perf/lwa-fold-churn: record exactly which pin blocked this
+            // reclaim so `maybeAutoCheckpointRedoLog`'s next call can skip
+            // its own expensive attempt until that pin has actually moved
+            // -- see `RedoCommitState.checkpoint_backoff_min_pinned`'s own
+            // doc comment for why retrying blind, every commit, is pure
+            // waste while this is set.
+            redo.checkpoint_backoff_min_pinned = blocking_pin;
             // Deferred: `old_tail`/the bytes already in the log are left
             // exactly as they are (still correct, just now superseded).
             // But `redo.writer.last_sequence` must still advance past
@@ -9022,12 +9057,42 @@ pub const NativeFile = struct {
         if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain or
             self.header.page_size != header.page_size or self.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
         if (std.meta.eql(self.header, header)) return;
-        self.allocator_rebase_header = if (self.free_pages_verified and self.ledger != null) self.header else null;
-        if (self.allocator_rebase_header == null) self.invalidateLedger();
+        // perf/lwa-fold-churn: under the redo log, this rebind runs on
+        // essentially every commit (`self.header` changes every commit --
+        // `commit_sequence` alone guarantees that), but almost none of
+        // those commits touch the allocator's own free map at all. Only
+        // `AllocatorProofIdentity` (`active_checkpoint`, `free_map_root_page`,
+        // `page_count`, `redo_folded_through` -- see that type's own doc
+        // comment, same reasoning as 105b6eaa3d's fix one layer up in
+        // `Owner.verifyAllocatorAssumeLocked`) says whether the free map
+        // this instance already verified is still the free map on disk.
+        // Unconditionally clearing `free_pages_verified` here regardless
+        // -- as every commit used to -- threw away an otherwise-still-good
+        // verification on every redo-only commit, forcing
+        // `inheritAllocatorCertificate`/the full ledger walk to redo work
+        // that had nothing left to find; under a steadily re-folding log
+        // (the companion fix in `maybeAutoCheckpointRedoLog`/
+        // `checkpointRedoLogWithDurability`) that meant *every* commit,
+        // not just an occasional one, which is what kept the background
+        // allocator-verification walk permanently busy and, by holding a
+        // verification snapshot's own reader pin open across that
+        // perpetual re-walk, kept `checkpointRedoLogWithDurability`'s own
+        // `pinned_below` gate blocked too -- the two problems reinforced
+        // each other. When the identity hasn't moved, skip straight to
+        // adopting the new header: no ledger invalidation, no clearing of
+        // `free_pages_verified`/`allocator_verification_base`, nothing for
+        // a pending verification to lose.
+        const identity_unchanged = std.meta.eql(allocatorProofIdentity(self.header), allocatorProofIdentity(header));
+        if (identity_unchanged) {
+            self.allocator_rebase_header = null;
+        } else {
+            self.allocator_rebase_header = if (self.free_pages_verified and self.ledger != null) self.header else null;
+            if (self.allocator_rebase_header == null) self.invalidateLedger();
+            self.free_pages_verified = false;
+            self.allocator_verification_base = null;
+        }
         self.page_cache.clear(self.allocator);
         if (self.secondary_page_cache) |cache| cache.clear(self.allocator);
-        self.free_pages_verified = false;
-        self.allocator_verification_base = null;
         self.namespace_directory_cache_root = std.math.maxInt(u64);
         self.namespace_directory_delta_depth = 0;
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
@@ -19436,6 +19501,32 @@ pub const NativeFile = struct {
         const redo: *RedoCommitState = if (self.redo) |*r| r else return;
         if (redo.checkpointing) return;
         if (!redo.checkpoint_pending_error and redo.writer.remaining() >= redo.writer.capacity / 4) return;
+        // perf/lwa-fold-churn: the fold below is never a no-op cost just
+        // because the log stays past the 25%-remaining line -- it runs a
+        // real `IndexEditor` pass over every root plus
+        // `SharedRedoOverlay.reclaim`'s own full scan. If the *last*
+        // attempt found a cross-process reader pinned below the
+        // checkpoint it would have published (`checkpoint_backoff_min_pinned`,
+        // set by `checkpointRedoLogWithDurability`'s own `pinned_below`
+        // branch), `remaining()` cannot have recovered since then -- the
+        // writer only ever appended past the old tail, never reset over
+        // it -- so without this check every single commit would repeat
+        // the identical, identically-futile attempt for as long as that
+        // one reader stays pinned. Checking whether the pin has moved is
+        // one shared-memory read; skip the real attempt unless it has.
+        // `checkpoint_pending_error` bypasses this (an actual failure,
+        // not a reclaim-blocked-by-a-reader non-failure, must always keep
+        // retrying per that flag's own doc comment).
+        if (!redo.checkpoint_pending_error) {
+            if (redo.checkpoint_backoff_min_pinned) |blocking| {
+                const still_blocked = blk: {
+                    const region = (self.regionForInode() catch break :blk false) orelse break :blk false;
+                    const min_pinned = region.minimumPinnedSequence() orelse break :blk false;
+                    break :blk min_pinned <= blocking;
+                };
+                if (still_blocked) return;
+            }
+        }
         self.checkpointRedoLog() catch |err| {
             redo.checkpoint_pending_error = true;
             self.allocator_work.redo_checkpoint_failures +|= 1;

@@ -59,13 +59,24 @@ pub const VersionedOverlayEntry = struct {
     /// number of nodes freed, so a caller tracking how many *superseded*
     /// versions remain outstanding (`SharedRedoOverlay.pending_retirement_versions`)
     /// can keep that count accurate without a second walk.
-    pub fn destroyChain(head: *VersionedOverlayEntry, allocator: Allocator) usize {
+    ///
+    /// perf/lwa-fold-churn: the node itself is returned to `pool`'s free
+    /// list, never `allocator.destroy`'d directly -- see
+    /// `SharedRedoOverlay.entry_pool`'s own doc comment for why a raw
+    /// `std.heap.page_allocator` create/destroy per version (the
+    /// allocator every call site here is required to pass, since the
+    /// overlay's own lifetime outlives any one caller's allocator) was a
+    /// real per-commit mmap/munmap cost, not merely a theoretical one.
+    /// `node.value` (the variable-length payload bytes, not the fixed-size
+    /// struct) is unrelated to the pool and still freed through
+    /// `allocator` directly.
+    pub fn destroyChain(head: *VersionedOverlayEntry, allocator: Allocator, pool: *EntryPool) usize {
         var current: ?*VersionedOverlayEntry = head;
         var freed: usize = 0;
         while (current) |node| {
             const next = node.older;
             allocator.free(node.value);
-            allocator.destroy(node);
+            pool.destroy(node);
             current = next;
             freed += 1;
         }
@@ -86,6 +97,26 @@ pub const VersionedOverlayEntry = struct {
         return null;
     }
 };
+
+/// perf/lwa-fold-churn: a dedicated free-list pool for `VersionedOverlayEntry`
+/// nodes, one per `SharedRedoOverlay` (so it shares that struct's own
+/// lifetime -- see `inode_lock.zig`'s own doc comment on why the overlay as
+/// a whole cannot be tied to any one caller's allocator). Every version
+/// chained onto an existing key is created and destroyed once per commit
+/// under steady single-writer load (`appendVersion` on the way in,
+/// `reclaim`'s floor advance on the way out), so routing that specific,
+/// fixed-size allocation through `std.heap.page_allocator` directly --
+/// every other call in this file still does, for the genuinely page-sized
+/// or one-off allocations `allocator` is passed in for -- cost one `mmap`
+/// and one `munmap` syscall per version, found live as the dominant cost
+/// inside `SharedRedoOverlay.reclaim` on `NativeFile.commitTransactionWithDurability`'s
+/// own hot path. `EntryPool.create`/`.destroy` are a free-list push/pop
+/// instead: no syscall once the pool has grown past its current high-water
+/// mark. Every creation site in this file must use this pool (never a raw
+/// `allocator.create(VersionedOverlayEntry)`), and every destruction must
+/// go through `VersionedOverlayEntry.destroyChain`'s own `pool.destroy` --
+/// mixing the two would hand the free list a pointer it does not own.
+const EntryPool = std.heap.MemoryPool(VersionedOverlayEntry);
 
 const OverlayMap = std.StringHashMapUnmanaged(*VersionedOverlayEntry);
 
@@ -150,13 +181,19 @@ pub const SharedRedoOverlay = struct {
     /// `getOrPut` and `reclaim`'s own walk -- see
     /// `NativeFile.redoCheckpointWouldRetire`, the only reader.
     pending_retirement_versions: u64 = 0,
+    /// perf/lwa-fold-churn: see `EntryPool`'s own doc comment. Grows (via
+    /// `page_allocator`-backed arena blocks, not a per-node `mmap`) the
+    /// first time a chain lengthens past whatever it has already handed
+    /// out; every `destroy` is a free-list push, reused by the next
+    /// `create` with no syscall either way.
+    entry_pool: EntryPool = .empty,
 
     pub fn deinit(self: *SharedRedoOverlay, allocator: Allocator) void {
         for (&self.maps) |*map| {
             var it = map.iterator();
             while (it.next()) |kv| {
                 allocator.free(kv.key_ptr.*);
-                _ = kv.value_ptr.*.destroyChain(allocator);
+                _ = kv.value_ptr.*.destroyChain(allocator, &self.entry_pool);
             }
             map.deinit(allocator);
         }
@@ -164,6 +201,7 @@ pub const SharedRedoOverlay = struct {
         while (pages_it.next()) |bytes| allocator.free(bytes.*);
         self.pages.deinit(allocator);
         self.pins.deinit(allocator);
+        self.entry_pool.deinit(allocator);
         self.* = undefined;
     }
 
@@ -306,8 +344,18 @@ pub const SharedRedoOverlay = struct {
         external_value_len: usize,
     ) !void {
         std.debug.assert(root < 3);
-        const node = try allocator.create(VersionedOverlayEntry);
-        errdefer allocator.destroy(node);
+        // perf/lwa-fold-churn: the lock now covers `entry_pool.create` too
+        // (moved ahead of where it used to run unlocked) -- the pool's own
+        // free list is shared, mutable state this struct's single mutex
+        // already protects for everything else; creating under the lock
+        // (rather than before taking it, as the plain-`allocator.create`
+        // version safely could) is what makes `destroyChain`'s matching
+        // `pool.destroy` calls elsewhere in this file -- all already
+        // inside the same lock -- never race this one.
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const node = try self.entry_pool.create(allocator);
+        errdefer self.entry_pool.destroy(node);
         node.* = .{
             .sequence = sequence,
             .value = value,
@@ -315,8 +363,6 @@ pub const SharedRedoOverlay = struct {
             .external_value_root_page = external_value_root_page,
             .external_value_len = external_value_len,
         };
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
         const gop = try self.maps[root].getOrPut(allocator, key);
         if (gop.found_existing) {
             node.older = gop.value_ptr.*;
@@ -361,7 +407,7 @@ pub const SharedRedoOverlay = struct {
             allocator.free(kv.key);
         }
         allocator.free(node.value);
-        allocator.destroy(node);
+        self.entry_pool.destroy(node);
     }
 
     /// Discards one page-shaped write this process itself staged and
@@ -678,7 +724,7 @@ pub const SharedRedoOverlay = struct {
                         // `appendVersion` counted one-by-one as it grew;
                         // freeing it here is the only place that run ever
                         // shrinks, so mirror the count back out.
-                        self.pending_retirement_versions -|= stale.destroyChain(allocator);
+                        self.pending_retirement_versions -|= stale.destroyChain(allocator, &self.entry_pool);
                     }
                     // Dropping the whole key (map pointer included) is only
                     // safe when `keep_node` *is* the live head -- i.e. the
@@ -727,7 +773,7 @@ pub const SharedRedoOverlay = struct {
                     // accounted for above) -- it was never counted as
                     // superseded, so its own removal here does not
                     // decrement `pending_retirement_versions`.
-                    _ = removed.value.destroyChain(allocator);
+                    _ = removed.value.destroyChain(allocator, &self.entry_pool);
                 }
             }
         }
@@ -796,8 +842,13 @@ pub const SharedRedoOverlay = struct {
                 pos += value_len;
             }
             errdefer allocator.free(decoded.value);
-            const node = try allocator.create(VersionedOverlayEntry);
-            errdefer allocator.destroy(node);
+            // No lock needed here (see this function's own doc comment --
+            // single-threaded recovery population), but `entry_pool` is
+            // still the only valid source of a `VersionedOverlayEntry` node:
+            // `destroyChain`'s `pool.destroy` elsewhere would otherwise be
+            // handed a pointer the pool's own free list does not own.
+            const node = try self.entry_pool.create(allocator);
+            errdefer self.entry_pool.destroy(node);
             node.* = decoded;
             const gop = try self.maps[root].getOrPut(allocator, key);
             if (gop.found_existing) {
