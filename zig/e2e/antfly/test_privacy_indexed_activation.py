@@ -222,6 +222,19 @@ def query(api, table, index="a0", vector=None):
     return row["hits"]["hits"]
 
 
+def wait_complete(api, table, index):
+    observation = {}
+
+    def complete():
+        nonlocal observation
+        observation = api.get_index(table, index)
+        return (
+            observation.get("status", {}).get("readiness", {}).get("complete") is True
+        )
+
+    assert wait_until(complete, timeout_s=60), (observation, api.debug_logs())
+
+
 def redacted(api, table, docs, index="a0", vector=None):
     hits = query(api, table, index, vector)
     if hits is None:
@@ -369,6 +382,7 @@ def test_privacy_policy_replacement_and_new_model_migration(
             assert "[EMAIL]" not in json.dumps(redacted(api, table, docs))
 
     alias = f"/tables/{table}/index-aliases/search"
+    wait_complete(api, table, "a0")
     api.put(alias, {"index": "a0", "idempotency_key": "initial", "require": "complete"})
     before = len(calls["extract"])
     api.create_index(
@@ -393,6 +407,7 @@ def test_privacy_policy_replacement_and_new_model_migration(
     assert redacted(api, table, docs, "search")
     # The existing producer's inspection receipts are shared with B.
     assert len(calls["extract"]) == before
+    wait_complete(api, table, "b")
     api.put(
         alias,
         {
@@ -406,7 +421,7 @@ def test_privacy_policy_replacement_and_new_model_migration(
     assert hits and all(hit["_score"] > 0.99 for hit in hits), hits
     # The old model can be decommissioned while protection remains active.
     response = api.s.delete(api.url + f"/tables/{table}/indexes/a0", timeout=20)
-    assert response.status_code == 201, response.text
+    assert response.status_code == 201, (response.text, api.debug_logs())
     previous_models = len(calls["embed_models"])
     docs["d0"]["body"] += " Updated after retirement."
     api.batch_write(table, inserts=docs, sync_level="full_index")
@@ -441,6 +456,7 @@ def test_privacy_policy_replacement_and_new_model_migration(
     assert wait_until(
         lambda: redacted(api, table, docs, "b", [0.0, 1.0]), timeout_s=60
     ), api.debug_logs()
+    wait_complete(api, table, "b")
     api.put(
         alias, {"index": "b", "idempotency_key": "recreated", "require": "complete"}
     )
