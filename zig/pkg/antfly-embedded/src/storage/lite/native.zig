@@ -7626,14 +7626,82 @@ pub const NativeFile = struct {
             }
         };
         var meta_ctx: MetaCtx = .{};
-        const outcome = try redo_log.replay(allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, folded_through, MetaCtx.onRecord, &meta_ctx);
+        const meta_outcome = try redo_log.replay(allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, folded_through, MetaCtx.onRecord, &meta_ctx);
         // A torn tail or a clean (never-written-past-the-checkpoint) end
         // are both benign (§9.5) -- the valid prefix, possibly empty, is
         // everything this recovery trusts. A corrupt record is not: this
         // open must fail rather than silently serve a truncated view of
         // acknowledged work.
-        if (outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
-        if (meta_ctx.compact) |compact| {
+        if (meta_outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
+        self.manifest_commits_enabled = false;
+
+        const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
+        // perf/lwa-proof-fork: `ensureRedoOverlay`'s own populate callback
+        // below runs a *second*, independent scan of the same physical log
+        // -- strictly after the one just above, but with no lock excluding
+        // a concurrent writer (a different process, racing to append its
+        // own next commit right now) from appending between the two. That
+        // writer's new record is durable (fsynced) the moment its own
+        // `redo_log.replay` could possibly see it, so this second scan can
+        // only find as much or *more* of the log than the first one did,
+        // never less -- confirmed live as "lite redo log cross-process: a
+        // forked child sees commits the parent makes after the child
+        // opens" timing out: the overlay this call populates already had
+        // both the parent's pre-fork and post-fork commits (because a
+        // concurrent writer landed between these two scans), while
+        // `meta_outcome`/`meta_ctx.compact` -- from the earlier scan --
+        // only reflected the first, leaving `redo.durable_sequence` (the
+        // version-resolution mark every overlay read is bounded by)
+        // permanently behind an overlay entry already sitting right there,
+        // so the second commit stayed invisible forever, including across
+        // every later `refreshCrossProcessRedoOverlay` call (gated on
+        // `published.durable_sequence > redo.durable_sequence`, which
+        // never fires once both already agree, wrongly, on the stale
+        // value). `PopulateCtx.outcome`/`.compact` carry this scan's own
+        // (more complete) result back out, below, for exactly this reason.
+        const PopulateCtx = struct {
+            file: *NativeFile,
+            io: std.Io,
+            start_after_sequence: u64,
+            compact: ?CompactCheckpoint = null,
+            outcome: ?redo_log.ReplayOutcome = null,
+        };
+        var pctx = PopulateCtx{ .file = self, .io = io, .start_after_sequence = folded_through };
+        const shared = try inode_lock.ensureRedoOverlay(entry, io, &pctx, struct {
+            fn populate(ctx: *PopulateCtx, overlay: *redo_overlay.SharedRedoOverlay, pop_allocator: Allocator) anyerror!void {
+                const RecordCtx = struct {
+                    overlay: *redo_overlay.SharedRedoOverlay,
+                    pop_allocator: Allocator,
+                    compact: ?CompactCheckpoint = null,
+                    fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
+                        const rc: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+                        if (record.payload.len < CompactCheckpoint.encoded_size + 4) return error.InvalidNativeRedoRecord;
+                        rc.compact = CompactCheckpoint.decode(record.payload[0..CompactCheckpoint.encoded_size]);
+                        const logical_len = std.mem.readInt(u32, record.payload[CompactCheckpoint.encoded_size..][0..4], .little);
+                        const logical_start = CompactCheckpoint.encoded_size + 4;
+                        if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
+                        try rc.overlay.decodeLogicalMutationsPayload(rc.pop_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
+                        try rc.overlay.decodeRedoGroupPayload(rc.pop_allocator, record.payload[logical_start + logical_len ..]);
+                    }
+                };
+                var rctx: RecordCtx = .{ .overlay = overlay, .pop_allocator = pop_allocator };
+                const full_outcome = try redo_log.replay(pop_allocator, ctx.file.file, ctx.io, ctx.file.header.redo_log_offset, ctx.file.header.redo_log_capacity, ctx.start_after_sequence, RecordCtx.onRecord, &rctx);
+                if (full_outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
+                ctx.compact = rctx.compact;
+                ctx.outcome = full_outcome;
+            }
+        }.populate);
+
+        // Prefer the overlay populate's own scan whenever it actually ran
+        // (strictly as complete as, or more complete than, the meta scan
+        // above -- never less, per this function's own comment). When the
+        // overlay was already populated for this pid (`ensureRedoOverlay`'s
+        // "second opener in this process" skip, the common case), nothing
+        // ran here and `meta_outcome`/`meta_ctx.compact` are already
+        // consistent with it: every in-process commit keeps the overlay
+        // and the real log in lockstep by construction.
+        const outcome = pctx.outcome orelse meta_outcome;
+        if (pctx.compact orelse meta_ctx.compact) |compact| {
             // `CompactCheckpoint` carries no `redo_folded_through` of its
             // own (a log record's own embedded checkpoint is always just
             // the *tip* as of that commit, never a fold boundary -- only
@@ -7648,31 +7716,6 @@ pub const NativeFile = struct {
             self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
             self.header.checkpoints[self.header.active_checkpoint].redo_folded_through = folded_through;
         }
-        self.manifest_commits_enabled = false;
-
-        const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
-        const PopulateCtx = struct { file: *NativeFile, io: std.Io, start_after_sequence: u64 };
-        var pctx = PopulateCtx{ .file = self, .io = io, .start_after_sequence = folded_through };
-        const shared = try inode_lock.ensureRedoOverlay(entry, io, &pctx, struct {
-            fn populate(ctx: *PopulateCtx, overlay: *redo_overlay.SharedRedoOverlay, pop_allocator: Allocator) anyerror!void {
-                const RecordCtx = struct {
-                    overlay: *redo_overlay.SharedRedoOverlay,
-                    pop_allocator: Allocator,
-                    fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
-                        const rc: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
-                        if (record.payload.len < CompactCheckpoint.encoded_size + 4) return error.InvalidNativeRedoRecord;
-                        const logical_len = std.mem.readInt(u32, record.payload[CompactCheckpoint.encoded_size..][0..4], .little);
-                        const logical_start = CompactCheckpoint.encoded_size + 4;
-                        if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
-                        try rc.overlay.decodeLogicalMutationsPayload(rc.pop_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
-                        try rc.overlay.decodeRedoGroupPayload(rc.pop_allocator, record.payload[logical_start + logical_len ..]);
-                    }
-                };
-                var rctx: RecordCtx = .{ .overlay = overlay, .pop_allocator = pop_allocator };
-                const full_outcome = try redo_log.replay(pop_allocator, ctx.file.file, ctx.io, ctx.file.header.redo_log_offset, ctx.file.header.redo_log_capacity, ctx.start_after_sequence, RecordCtx.onRecord, &rctx);
-                if (full_outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
-            }
-        }.populate);
 
         // `checkpointRedoLog`'s own fold consumes a fresh `commit_sequence`
         // for its checkpoint publish without ever appending a matching log
