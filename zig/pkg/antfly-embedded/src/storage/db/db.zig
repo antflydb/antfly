@@ -38962,6 +38962,28 @@ pub const DB = struct {
         return self.waitForSyncLevelWithPublicationCut(sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait, null);
     }
 
+    /// `runEnrichmentUntilWithVisibilityDeadline` itself never retries
+    /// `error.EnrichmentSourceChanged` -- a concurrent owner-turn/group-source
+    /// rebase of the same namespace mid-wait, surfaced the same way
+    /// `groupSourcesReadyThrough`'s own doc comment tolerates it
+    /// ("not ready yet, not a failure -- never a real deadline, so retrying
+    /// costs nothing but a wasted poll tick"). A request-visibility barrier
+    /// at `.enrichments`/`.full_index` must retry it the same way, bounded
+    /// by the same `wait.check()` this call's own deadline already governs,
+    /// rather than surface a transient rebase as a hard visibility failure.
+    fn runEnrichmentUntilWithVisibilityDeadlineRetrying(self: *DB, sequence: u64, cancellation: types.CancellationToken, deadline_ns: ?u64, wait: derived_executor_mod.VisibilityWait) !void {
+        while (true) {
+            self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns) catch |err| switch (err) {
+                error.EnrichmentSourceChanged => {
+                    try wait.check();
+                    continue;
+                },
+                else => return err,
+            };
+            return;
+        }
+    }
+
     fn waitForSyncLevelWithPublicationCut(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool, publication_cut: ?PublicationCut) !void {
         const timeout_ms = if (self.enrichment_runtime) |runtime|
             runtime.syncWaitTimeoutMs()
@@ -38998,7 +39020,7 @@ pub const DB = struct {
             .propose, .write => {},
             .enrichments => {
                 if (wait_primary_enrichments)
-                    try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                    try self.runEnrichmentUntilWithVisibilityDeadlineRetrying(sequence, cancellation, deadline_ns, wait);
             },
             .full_text => {
                 try self.runDerivedUntilTargetsWithVisibilityWait(sequence, sync_targets.full_text_indexes, wait);
@@ -39006,7 +39028,7 @@ pub const DB = struct {
             },
             .full_index => {
                 if (has_groups) {
-                    if (wait_primary_enrichments) try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                    if (wait_primary_enrichments) try self.runEnrichmentUntilWithVisibilityDeadlineRetrying(sequence, cancellation, deadline_ns, wait);
                     // Own grouped publications have been accepted before
                     // this cut. Include them once without chasing unrelated
                     // producer scheduling or publications appended afterward.
