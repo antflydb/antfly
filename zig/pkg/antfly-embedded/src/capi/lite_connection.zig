@@ -1390,6 +1390,54 @@ pub const WriterLane = struct {
         return lease;
     }
 
+    /// `Owner.acquireMaintenancePathLeaseAssumeLocked`/
+    /// `tryWriterLeaseAssumeLocked` acquire a lease on this same lane --
+    /// by taking what `takeParkedForRoot`/`takeParkedAnyRoot` hand back,
+    /// or by a fresh kernel acquisition when neither has anything parked
+    /// -- without ever touching `checked_out` at all: this struct's own
+    /// "at most one writer is ever checked out of the lane at a time"
+    /// invariant (its own doc comment above) was never extended to cover
+    /// a maintenance-held lease, only `checkout`/`checkin`'s own pair.
+    /// With nothing marking the lane busy, `WriterLane.checkout`'s cold
+    /// path (`!self.checked_out`) sees the lane as free the moment
+    /// `takeParkedForRoot`/`takeParkedAnyRoot` clears `self.parked` for
+    /// maintenance, and proceeds straight to `Connection.
+    /// acquireForOwnCheckout`'s own *fresh* kernel acquisition -- which
+    /// self-conflicts with (races) the lease maintenance is still
+    /// actively using, rather than queuing behind it. That let a
+    /// foreground commit land while a maintenance commit's own
+    /// fsync/publish was still in flight on a different `NativeFile`
+    /// instance on the same inode, corrupting the `active_writer` backstop
+    /// (perf/lwa-xproc-writers item 7: "stale writer base reached
+    /// publishCheckpoint" / "NativeFile publishing without holding the
+    /// writer lease", and the page-kind corruption it leads to under
+    /// sustained load). Call this once a maintenance acquisition succeeds
+    /// (`Owner.enterMaintenanceWriter`, guarded by that function's own
+    /// `maintenance_writer_references == 0 -> 1` transition so nested
+    /// re-entry on the same root never calls this twice) and
+    /// `clearCheckedOutByMaintenance` once that lease is fully released
+    /// (`Owner.leaveMaintenanceWriter`, at the matching `-> 0` transition).
+    pub fn markCheckedOutByMaintenance(self: *WriterLane) void {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        self.checked_out = true;
+        self.mutex.unlock(io);
+    }
+
+    /// Pairs with `markCheckedOutByMaintenance`; see its own doc comment.
+    /// A waiter here only ever polls `checked_out` with its own bounded
+    /// backoff (`waitParkedForStore`) rather than blocking on a condition
+    /// variable, so no wake is needed -- the next poll simply observes
+    /// `false` and (finding nothing parked, since the maintenance lease
+    /// this guarded was closed, never parked) falls through to its own
+    /// fresh kernel acquisition, which now safely succeeds.
+    pub fn clearCheckedOutByMaintenance(self: *WriterLane) void {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        self.checked_out = false;
+        self.mutex.unlock(io);
+    }
+
     /// Like `takeParkedForStore`, but when nothing is parked *yet* only
     /// because this same process's lane is still between `checkout` and
     /// `checkin` (`checked_out`), wait for it instead of handing the
@@ -2720,6 +2768,16 @@ pub const Owner = struct {
             else => return err,
         };
         errdefer lease.close();
+        // See `WriterLane.markCheckedOutByMaintenance`'s own doc comment:
+        // neither handoff branch above nor a fresh kernel acquisition ever
+        // marks this lane busy on its own, so a concurrent/subsequent
+        // `WriterLane.checkout` would otherwise see `checked_out == false`
+        // and race this lease with its own fresh acquisition instead of
+        // queuing behind it. Cleared by the matching `errdefer` on any
+        // early return below, or by `leaveMaintenanceWriter` at the
+        // matching `maintenance_writer_references -> 0` transition.
+        self.writer_lane.markCheckedOutByMaintenance();
+        errdefer self.writer_lane.clearCheckedOutByMaintenance();
         // The hold starts here: admission checks and rebases run under it.
         const held_from = nowNs();
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
@@ -2797,6 +2855,11 @@ pub const Owner = struct {
         // this lease; waking replay here makes each idle turn schedule itself.
         // Generated and replay publications notify at their commit boundary.
         lease.close();
+        // Pairs with `enterMaintenanceWriter`'s own `markCheckedOutByMaintenance`
+        // call: this lease is fully released (never parked for reuse --
+        // maintenance always closes, see `WriterLane.markCheckedOutByMaintenance`'s
+        // own doc comment), so the lane is no longer busy on its account.
+        self.writer_lane.clearCheckedOutByMaintenance();
         // Status readers serialize publication_stats under the gate; record
         // before releasing it.
         MaintenanceHoldSites.record(self.publication_stats.maintenance_hold_sites.writer(@fromBackingInt(@intCast(root.maintenance_writer_scope))), root.maintenance_writer_held_from);
