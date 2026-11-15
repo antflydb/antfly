@@ -6410,7 +6410,7 @@ pub const ReadView = struct {
         // refuse it (`error.ReadSnapshotReclaimed`) instead of letting it
         // fall through missing overlay entries to a tree that predates
         // the fold. Callers reopen to get a current view.
-        if (file.redo) |*redo| try redo.shared.pinUnlessReclaimed(std.heap.page_allocator, io, view.mark);
+        if (file.redo) |*redo| try redo.shared.pinUnlessReclaimed(std.heap.page_allocator, io, view.mark, checkpoint.commit_sequence);
         errdefer if (file.redo) |*redo| redo.shared.unpin(io, view.mark);
         if (file.inode_lock_ref.load(.acquire)) |entry| {
             try inode_lock.pinReader(entry, io, .{ .data = checkpoint.commit_sequence, .metadata = checkpoint.commit_sequence });

@@ -595,10 +595,14 @@ pub const SharedRedoOverlay = struct {
     /// `pin`, but refuses a mark `reclaim` has already collapsed past:
     /// the check and the pin share one lock, so no reclaim can slip
     /// between them.
-    pub fn pinUnlessReclaimed(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, sequence: u64) !void {
+    pub fn pinUnlessReclaimed(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, sequence: u64, checkpoint_sequence: u64) !void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (sequence < self.reclaimed_through) return error.ReadSnapshotReclaimed;
+        // Versions at or below the reclaim floor were dropped or folded into
+        // the durable checkpoint. A view whose own tree is at least that
+        // checkpoint sees them there; only an older tree with a mark below
+        // the floor has lost something.
+        if (sequence < self.reclaimed_through and checkpoint_sequence < self.durable_checkpoint_sequence) return error.ReadSnapshotReclaimed;
         try self.pins.append(allocator, sequence);
     }
 
