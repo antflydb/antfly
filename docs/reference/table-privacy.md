@@ -391,13 +391,18 @@ coverage generation and recipe fingerprint; the active privacy policy version;
 the currently sanitized `document_json` and its SHA-256 fingerprint; and a
 `current` publication flag. Each vector carries its real artifact ID, producer
 name, provider/model identity, producer fingerprint, exact source text and
-SHA-256 fingerprint, and persisted float values. Fingerprints are lowercase
+SHA-256 fingerprint, the persisted artifact fingerprint and opaque provider cache identity, and
+persisted float values. Fingerprints are lowercase
 SHA-256 hex over the exact represented bytes.
 
 Source, selected chunk heads, recipe, publication guards, and stored vectors
 are captured while apply is held shared, with the source and vectors read from
-one storage snapshot. Every member requires current policy-owned publication
-evidence. `current: false` and an `incomplete_reason` do not certify vector
+one storage snapshot. Standalone inspection uses the same source-guarded coverage generations and
+clean projection checkpoints as protected serving; ordered owners additionally
+verify per-output causal provenance. The payload identifies this authority and
+reports the index/checkpoint config hashes, checkpoint status, applied sequence
+and replay target sequence. It does not substitute asset privacy witnesses for
+vector authority. `current: false` and an `incomplete_reason` do not certify vector
 equivalence. Pending root publication never yields certified vectors.
 The operation never calls an embedding provider to reconstruct missing values.
 It seeks only the selected producers for this document and bounds inspection

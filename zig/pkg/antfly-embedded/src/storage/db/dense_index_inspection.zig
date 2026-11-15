@@ -22,6 +22,7 @@ const keys = @import("../internal_keys.zig");
 const ids = @import("artifact_ids.zig");
 const codec = @import("enrichment/artifact_codec.zig");
 const privacy = @import("privacy_read.zig");
+const generation = @import("artifact_extraction_generation.zig");
 const contract = @import("../../privacy/contract.zig");
 const manager = @import("catalog/index_manager.zig");
 const Store = @import("../docstore.zig").DocStore;
@@ -38,6 +39,8 @@ const Vector = struct {
     producer_fingerprint: []const u8,
     source_text: []const u8,
     source_fingerprint: []const u8,
+    artifact_fingerprint: []const u8,
+    provider_cache_identity: []const u8,
     values: []const f32,
 };
 const Snapshot = struct {
@@ -49,6 +52,12 @@ const Snapshot = struct {
     policy_version: []const u8,
     document_json: []const u8,
     document_fingerprint: []const u8,
+    publication_authority: []const u8,
+    index_config_hash: u64,
+    checkpoint_config_hash: u64,
+    checkpoint_status: []const u8,
+    applied_sequence: u64,
+    replay_target_sequence: u64,
     current: bool,
     incomplete_reason: ?[]const u8 = null,
     vectors: []const Vector = &.{},
@@ -78,6 +87,11 @@ pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !
     // published sanitized root remains a serving failure, not an empty vector.
     const safe = try privacy.project(a, policy, document, original, &read);
     if (safe.len > max_source_bytes) return error.ResourceBudgetExceeded;
+    const local = policy.native and try @import("../source_authority.zig").maintenanceMode(&read) == .local and try @import("artifact_publication.zig").authority(&read) == null;
+    const checkpoint = try db.core.loadProjectionCheckpoint(a, name);
+    var applied = try db.core.loadAppliedSequence(a, name);
+    if (db.executor.appliedSequence(name)) |live| applied = @max(applied, live);
+    const target = try db.managedIndexReplayTargetSequence(a, name, entry.config.kind, applied);
     var snapshot: Snapshot = .{
         .index = name,
         .index_generation = entry.config.coverage_generation,
@@ -86,6 +100,12 @@ pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !
         .policy_version = &policy.prepared.version,
         .document_json = safe,
         .document_fingerprint = try digest(a, safe),
+        .publication_authority = if (local) "standalone_guarded_coverage" else "ordered_causal_provenance",
+        .index_config_hash = types.indexConfigHash(entry.config),
+        .checkpoint_config_hash = checkpoint.config_hash,
+        .checkpoint_status = @tagName(checkpoint.status),
+        .applied_sequence = applied,
+        .replay_target_sequence = target,
         .current = true,
     };
     _ = privacy.requirePublished(db, a, .{}) catch |err| switch (err) {
@@ -95,6 +115,10 @@ pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !
         },
         else => return err,
     };
+    if (snapshot.current and (checkpoint.status != .clean or checkpoint.config_hash != snapshot.index_config_hash or applied < target)) {
+        snapshot.current = false;
+        snapshot.incomplete_reason = "ProjectionPending";
+    }
     var vectors: std.ArrayList(Vector) = .empty;
     var values: usize = 0;
     var source_bytes: usize = safe.len;
@@ -126,9 +150,20 @@ pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !
                 const transient = proof_scratch.allocator();
                 const text = (try @import("../../chunking/chunk.zig").artifactTextAlloc(transient, chunk.value, cfg.field)) orelse return error.InvalidChunkArtifact;
                 const key = try keys.derivedEmbeddingArtifactKeyAlloc(a, chunk.key, producer);
-                const raw = try privacy.projectArtifact(transient, policy, key, &read);
+                // Standalone's guarded writes enroll and settle the exact
+                // source generation in coverage, checked above under the same
+                // apply fence. It does not mint asset privacy witnesses for
+                // vectors. Ordered owners additionally need per-output causal
+                // provenance; neither path treats provider bytes as authority.
+                var input = try generation.captureInput(transient, &read, key);
+                defer input.deinit();
+                const raw = if (local)
+                    input.value orelse return error.IndexRebuilding
+                else
+                    try privacy.projectArtifact(transient, policy, key, &read);
                 const header = codec.decodeHeader(raw) catch return null;
                 if (header.flags.vector_elided) return null;
+                if (!header.flags.has_source_hash or header.flags.authored) return error.EnrichmentSourceChanged;
                 const dims = try codec.decodeDenseEmbeddingDims(raw);
                 if (dims > max_values -| values) return error.ResourceBudgetExceeded;
                 values += dims;
@@ -146,6 +181,8 @@ pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !
                     .producer_fingerprint = producer_fingerprint,
                     .source_text = try a.dupe(u8, text),
                     .source_fingerprint = try digest(a, text),
+                    .artifact_fingerprint = try digest(a, raw),
+                    .provider_cache_identity = try std.fmt.allocPrint(a, "{x:0>16}", .{header.source_hash}),
                     .values = vector,
                 });
             }
