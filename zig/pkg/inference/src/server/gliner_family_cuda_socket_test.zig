@@ -631,11 +631,34 @@ fn directDecideBatch32(node: *Node, directory: []const u8) !void {
     try std.testing.expectEqual(@as(usize, 8), pipeline.config.decision_batch_size);
     const labels = [_]gliner.DecisionLabel{ .{ .name = "yes" }, .{ .name = "no" } };
     const tasks = [_]gliner.DecisionTask{.{ .name = "urgent", .labels = &labels }};
-    const requests: [32]gliner.DecisionRequest = @splat(.{ .text = "Water is leaking onto the bed. Please send someone immediately.", .tasks = &tasks });
-    const single = try pipeline.decideBatch(requests[0..1]);
-    defer {
-        for (single) |*result| result.deinit(a);
-        a.free(single);
+    try std.testing.expectEqual(@as(usize, 4096), pipeline.config.decision_batch_tokens);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var requests: [32]gliner.DecisionRequest = undefined;
+    var expected_logits: [32][]const f32 = undefined;
+    for (&requests, &expected_logits, 0..) |*request, *expected, i| {
+        var text: std.ArrayList(u8) = .empty;
+        try text.appendSlice(scratch, try std.fmt.allocPrint(scratch, "Incident {d}: please send help.", .{i}));
+        // Deliberately interleave long and short rows so length sorting must
+        // restore the caller's order across all four physical forwards.
+        const target: usize = if (i % 4 == 0) 508 else 30 + (i * 37) % 400;
+        while (true) {
+            request.* = .{ .text = text.items, .tasks = &tasks };
+            var prepared = try pipeline.prepareDecisionBatch(&.{request.*});
+            defer prepared.deinit();
+            try std.testing.expectEqual(@as(usize, 1), prepared.rows.len);
+            const tokens = prepared.rows[0].input_ids.len;
+            try std.testing.expect(tokens <= 512);
+            if (tokens >= target) break;
+            try text.appendSlice(scratch, " water");
+        }
+        const single = try pipeline.decideBatch(&.{request.*});
+        defer {
+            for (single) |*result| result.deinit(a);
+            a.free(single);
+        }
+        expected.* = try scratch.dupe(f32, single[0].raw_logits);
     }
     const before = factory.getCudaRuntimeStats(loaded.session).?;
     const results = try pipeline.decideBatch(&requests);
@@ -647,9 +670,9 @@ fn directDecideBatch32(node: *Node, directory: []const u8) !void {
     // Each physical decision forward downloads exactly one logit tensor.
     try std.testing.expectEqual(@as(usize, 4), after.to_float32_calls - before.to_float32_calls);
     try std.testing.expectEqual(@as(usize, 32), results.len);
-    for (results) |result| {
-        try std.testing.expectEqual(single[0].raw_logits.len, result.raw_logits.len);
-        for (single[0].raw_logits, result.raw_logits) |expected, actual|
+    for (results, expected_logits) |result, baseline| {
+        try std.testing.expectEqual(baseline.len, result.raw_logits.len);
+        for (baseline, result.raw_logits) |expected, actual|
             try std.testing.expectApproxEqAbs(expected, actual, 5e-3);
     }
     std.debug.print("direct_decide_batch model={s} items=32 physical_forwards=4 parity=true\n", .{std.fs.path.basename(directory)});
