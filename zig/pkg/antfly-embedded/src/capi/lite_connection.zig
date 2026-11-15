@@ -3670,6 +3670,22 @@ pub const Owner = struct {
                         continue;
                     }
                     try file.sync();
+                    // `sync()` can itself force a durability-barrier commit,
+                    // which (perf/lwa-grouped-stall's `refreshIfWriterBaseStale`)
+                    // may discover this instance's own writer base is behind
+                    // the inode registry's latest committed sequence and
+                    // adopt the newer on-disk header -- invalidating
+                    // `free_pages_verified` as part of that adoption
+                    // (`adoptIndexPublicationHeader`'s own doc comment).
+                    // The check above is no longer valid once that happens:
+                    // `certifyAllocator`'s own precondition would otherwise
+                    // panic on a verification this exact call just undid.
+                    // Treat it the same as never having been verified.
+                    if (!file.free_pages_verified) {
+                        if (self.current == root and !needsOutcomeReconciliation(root) and
+                            file.transaction_header == null and file.durable_header == null) can_prove_current = true;
+                        continue;
+                    }
                     _ = try file.certifyAllocator();
                     return;
                 }
