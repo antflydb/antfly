@@ -39053,40 +39053,57 @@ pub const DB = struct {
         }
     }
 
+    /// Pulled out of `waitForGroupSourcesThrough` so its own `try`s can be
+    /// caught as a unit at that single call site (a bare block's `try`
+    /// propagates out of the *function*, not the block, so there is
+    /// nothing a block-local `catch` could ever attach to).
+    fn groupSourcesReadyThrough(self: *DB, through: u64, producer_sequence: *u64) !bool {
+        var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer pinned.release();
+        const plan = pinned.plan().group_sources orelse return true;
+        var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = a, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
+        const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation);
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const baseline = @import("group_source_baseline.zig");
+        var namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+        const generation = baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation);
+        var settled = true;
+        for (plan.entries) |entry| {
+            const definition = @import("group_source_index.zig").Definition{ .table_incarnation = table, .configuration = entry.configuration };
+            if ((try baseline.load(a, &read, definition, generation)).phase != .ready) settled = false;
+            if (try @import("group_source_debt.zig").earliest(a, &read, definition, through)) |event| {
+                settled = false;
+                var source_namespace = namespace;
+                if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
+                const owner = @import("group_source_state.zig").Owner{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
+                producer_sequence.* = @max(producer_sequence.*, try @import("group_source_visibility.zig").producerSequence(a, &read, owner, event));
+            }
+        }
+        return settled;
+    }
+
     fn waitForGroupSourcesThrough(self: *DB, through: u64, wait: derived_executor_mod.VisibilityWait) !u64 {
         const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
         var producer_sequence = through;
         while (true) {
             try wait.check();
             if (self.async_context.background_closing.load(.acquire)) return error.Canceled;
-            const ready = blk: {
-                var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
-                defer arena.deinit();
-                const a = arena.allocator();
-                var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
-                defer pinned.release();
-                const plan = pinned.plan().group_sources orelse break :blk true;
-                var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = a, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
-                const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation);
-                var read = try self.core.store.beginReadTxn();
-                defer read.abort();
-                const baseline = @import("group_source_baseline.zig");
-                var namespace: [24]u8 = undefined;
-                doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-                const generation = baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation);
-                var settled = true;
-                for (plan.entries) |entry| {
-                    const definition = @import("group_source_index.zig").Definition{ .table_incarnation = table, .configuration = entry.configuration };
-                    if ((try baseline.load(a, &read, definition, generation)).phase != .ready) settled = false;
-                    if (try @import("group_source_debt.zig").earliest(a, &read, definition, through)) |event| {
-                        settled = false;
-                        var source_namespace = namespace;
-                        if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
-                        const owner = @import("group_source_state.zig").Owner{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
-                        producer_sequence = @max(producer_sequence, try @import("group_source_visibility.zig").producerSequence(a, &read, owner, event));
-                    }
-                }
-                break :blk settled;
+            const ready = self.groupSourcesReadyThrough(through, &producer_sequence) catch |err| switch (err) {
+                // The same benign, concurrent-write/owner-turn race
+                // `runGroupSourceSlice` below already tolerates (a staged
+                // debt/baseline record this probe's own reads observe
+                // mid-update) can surface here too, in this read-only
+                // readiness probe rather than the slice that advances it.
+                // Treat it identically: not ready yet, not a failure --
+                // never a real deadline, so retrying costs nothing but a
+                // wasted poll tick.
+                error.EnrichmentSourceChanged => false,
+                else => return err,
             };
             if (ready) return producer_sequence;
             // Drive the identical slice `group_source_owner.Owner.step` runs
@@ -39113,7 +39130,17 @@ pub const DB = struct {
                 // may be blocked on an independent, later request. The
                 // durable source debt above is the completion authority.
                 if (self.enrichment_runtime) |runtime| runtime.notifySequence(producer_sequence);
-            } else try self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
+            } else self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?) catch |err| switch (err) {
+                // Driving the enrichment runtime's own foreground catch-up
+                // pass synchronously here (the no-resident-worker fallback)
+                // reaches the exact same source/catalog staleness checks
+                // its background worker loop already treats as "retry, not
+                // fatal" (`isEnrichmentProgressPending`). Mirror that here
+                // too: this wait's own retry loop is a better fit for that
+                // than failing the whole batch outright.
+                error.EnrichmentSourceChanged => {},
+                else => return err,
+            };
             try wait.check();
             try io.sleep(.fromMilliseconds(5), .awake);
         }
