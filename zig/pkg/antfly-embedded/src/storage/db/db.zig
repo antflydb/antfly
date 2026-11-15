@@ -26013,13 +26013,36 @@ pub const DB = struct {
     /// Returned bytes belong to the page and survive read-transaction teardown.
     pub fn nativeHistoryPage(self: *DB, allocator: std.mem.Allocator, request: HistoryPageRequest) !HistoryPage {
         if (comptime storage_engine.enabled) return storage_engine.call("nativeHistoryPage", .{ self, allocator, request });
+        return self.historyPageForAuthority(allocator, request, .native, 0);
+    }
+
+    /// Trusted Raft owner read. The caller first establishes a leader ReadIndex
+    /// barrier; this method verifies that cut against the same storage snapshot
+    /// used for the lease and frame, never a separate watermark observation.
+    pub fn orderedHistoryPage(self: *DB, allocator: std.mem.Allocator, request: HistoryPageRequest, minimum_applied_index: u64) !HistoryPage {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedHistoryPage", .{ self, allocator, request, minimum_applied_index });
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        return self.historyPageForAuthority(allocator, request, .raft, minimum_applied_index);
+    }
+
+    fn historyPageForAuthority(self: *DB, allocator: std.mem.Allocator, request: HistoryPageRequest, kind: @import("../source_authority.zig").Kind, minimum_applied_index: u64) !HistoryPage {
         if (self.isClosed()) return error.StorageUnavailable;
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
         const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
         if (!std.mem.eql(u8, &namespace, &request.reference.namespace)) return error.HistoryResynchronizationRequired;
-        _ = try @import("../source_authority.zig").require(&txn, .native, namespace);
+        _ = try @import("../source_authority.zig").require(&txn, kind, namespace);
+        if (kind == .raft) {
+            const marker = txn.get(&internal_keys.ordered_document_applied_entry_key) catch |err| switch (err) {
+                error.NotFound => return error.StorageReadTemporarilyUnavailable,
+                else => return err,
+            };
+            if (marker.len != ordered_apply_receipt_value_len or
+                std.mem.readInt(u64, marker[0..8], .little) == 0 or
+                std.mem.readInt(u64, marker[8..16], .little) == 0) return error.CorruptOrderedApplyReceipt;
+            if (std.mem.readInt(u64, marker[8..16], .little) < minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
+        }
         return @import("../history_page.zig").read(allocator, &txn, request);
     }
 

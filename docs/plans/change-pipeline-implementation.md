@@ -1189,6 +1189,33 @@ remain required before distributed feeds can use it. The unlinked storage
 profile fails closed. Public HTTP/SQL, coherent bootstrap, typed pgoutput and
 existing-client qualification remain outstanding.
 
+## In progress: Raft history read cuts and compiled-owner transport
+
+`DB.orderedHistoryPage` accepts only persisted Raft authority and a nonzero
+minimum applied index. The authority, ordinary ordered marker, consumer lease
+and retained frame are read from one stable transaction. A root behind the cut
+returns a retryable read error; a corrupt marker fails closed. Standalone reads
+continue to require native authority. This primitive does not manufacture a
+ReadIndex proof: the production owner must establish and validate that barrier
+and the original route/root identity before exposing a page.
+
+The private `history_page_wire` transport carries binary committed-frame bytes
+and bounded page metadata in a checksummed envelope. It binds the returned
+namespace, frame sequence, first ordinal, frame count, continuation and caught-up
+state to the original request. Its domain-separated checksum also binds every
+lease reference field, request timestamp and both budgets, so a valid response
+cannot be transplanted to a different grant or request. Decode budgets are
+checked before allocation;
+returned schemas and tuple images belong to the page. Qualification covers
+binary images, partial/complete/empty pages, mutation of every encoded byte,
+forged checksummed metadata and every allocation-failure point.
+
+Physical storage qualification checks lagging cuts, zero cuts, standalone/Raft
+authority separation, expired leases, historical data surviving close/reopen,
+and ACK visibility. Logs: `zig/ordered-history-read-cut-qualification.log`.
+The compiled-owner ABI read operation and production routing are still pending;
+this primitive alone cannot expose a linearizable public feed.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

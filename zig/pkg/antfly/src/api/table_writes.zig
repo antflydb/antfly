@@ -40387,6 +40387,14 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "history page wire owns binary images through every allocation failure" {
+            try @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire.test_support.allocationFailures();
+        }
+
+        test "history page wire validates checksums cursor metadata and budgets" {
+            try @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire.test_support.malformedPages();
+        }
+
         test "ordered history consumer effects and rejections survive reopen without replaying collection" {
             const a = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
@@ -40417,6 +40425,28 @@ fn implementationTests() type {
             try std.testing.expectEqualDeep(admitted, try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 2 }, false));
             try std.testing.expectError(error.ConflictingOrderedApplyReceipt, db.applyOrderedHistoryConsumerControl(.{ .enroll = invalid }, .{ .term = 1, .index = 2 }, false));
             const ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = consumer.epoch, .grant = grant.sequence, .definition = grant.definition };
+            const read_request: db_mod.DB.HistoryPageRequest = .{ .reference = ref, .after = .{}, .now_seconds = 100, .max_events = 1 };
+            try std.testing.expectError(error.OnlineSourceScopeChanged, db.nativeHistoryPage(a, read_request));
+            try std.testing.expectError(error.InvalidHistoryAdmission, db.orderedHistoryPage(a, read_request, 0));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedHistoryPage(a, read_request, 4));
+            var retained = try db.orderedHistoryPage(a, read_request, 3);
+            defer retained.deinit();
+            try std.testing.expectEqual(@as(usize, 1), retained.events.len);
+            try std.testing.expectEqualStrings("{\"v\":1}", retained.events[0].after.?);
+            try std.testing.expectEqual(@as(u64, 1), retained.next.sequence);
+            try std.testing.expect(retained.caught_up);
+            const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire;
+            const encoded_page = try wire.encode(a, retained, read_request);
+            defer a.free(encoded_page);
+            var transported = try wire.decode(a, encoded_page, read_request);
+            defer transported.deinit();
+            try std.testing.expectEqualDeep(retained.header, transported.header);
+            try std.testing.expectEqualDeep(retained.events, transported.events);
+            var failing_read = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            try std.testing.expectError(error.OutOfMemory, db.orderedHistoryPage(failing_read.allocator(), read_request, 3));
+            var expired_read = read_request;
+            expired_read.now_seconds = grant.expires_at_seconds;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedHistoryPage(a, expired_read, 3));
             const bad_ack = try db.applyOrderedHistoryConsumerControl(.{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 999 } }, .{ .term = 1, .index = 4 }, false);
             try std.testing.expectEqual(ordered.Rejection.checkpoint_conflict, bad_ack.rejected);
             const ack: history.Command = .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 1 } };
@@ -40427,6 +40457,16 @@ fn implementationTests() type {
             db = try db_mod.DB.open(a, path, options);
             db_open = true;
             try std.testing.expectEqualDeep(confirmed, try db.applyOrderedHistoryConsumerControl(ack, .{ .term = 1, .index = 5 }, false));
+            // The page owns its historical image across writer close/reopen.
+            try std.testing.expectEqualStrings("{\"v\":1}", retained.events[0].after.?);
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedHistoryPage(a, read_request, 5));
+            var caught_up_request = read_request;
+            caught_up_request.after = retained.next;
+            var caught_up_page = try db.orderedHistoryPage(a, caught_up_request, 5);
+            defer caught_up_page.deinit();
+            try std.testing.expect(caught_up_page.caught_up);
+            try std.testing.expectEqual(@as(usize, 0), caught_up_page.events.len);
+
             try std.testing.expectEqual(.superseded, try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 2 }, false));
             const closed: history.Command = .{ .retire = .{ .namespace = namespace, .authority = grant.authority, .sequence = 2, .consumer = grant.consumer, .definition = grant.definition, .grant = 1 } };
             _ = try db.applyOrderedHistoryConsumerControl(closed, .{ .term = 1, .index = 6 }, false);

@@ -1019,7 +1019,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     write_implementation_module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const native_history_root_tests = b.addTest(.{ .root_module = write_implementation_module, .filters = &.{"provisioned native history root"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("provisioned-native-history-test", "Verify provisioned native history identity, resident leases and writer reopen").dependOn(&b.addRunArtifact(native_history_root_tests).step);
-    const ordered_history_tests = b.addTest(.{ .root_module = write_implementation_module, .filters = &.{"ordered history consumer"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const ordered_history_tests = b.addTest(.{ .root_module = write_implementation_module, .filters = &.{ "ordered history consumer", "history page wire" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("ordered-history-consumer-test", "Verify atomic Raft retention outcomes, replay, rejection and reopen").dependOn(&b.addRunArtifact(ordered_history_tests).step);
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),

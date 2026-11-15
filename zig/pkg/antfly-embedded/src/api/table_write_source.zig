@@ -26,6 +26,7 @@ const backend_types = @import("../storage/backend_types.zig");
 pub const history_consumer = @import("../storage/history_consumer.zig");
 pub const history_ordered = @import("../storage/history_ordered.zig");
 pub const history_page = @import("../storage/history_page.zig");
+pub const history_page_wire = @import("../storage/history_page_wire.zig");
 pub const changefeed_projection = @import("../common/changefeed_projection.zig");
 const table_create_contract = @import("table_create_contract.zig");
 const backup_contract = @import("backup_contract.zig");
