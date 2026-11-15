@@ -21123,11 +21123,7 @@ test "api query contract lowers live context filters into stored-row filters" {
         ,
         \\{"field":"tags","equals":"blue"}
         ,
-        \\{"min_lat":1,"min_lon":1,"max_lat":2,"max_lon":2,"field":"loc"}
-        ,
-        \\{"cidr":"10.0.0.0/8","field":"ip"}
-        ,
-        \\{"bool":true,"field":"active"}
+        \\{"regexp":"eu-[0-9]+","field":"sku"}
     }) |raw| {
         var value = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
         defer value.deinit();
