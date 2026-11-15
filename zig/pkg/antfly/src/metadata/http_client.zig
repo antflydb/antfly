@@ -509,7 +509,7 @@ pub const MetadataHttpClient = struct {
         // clock. The request's absolute deadline may use a borrowed test clock.
         const transport_budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() +| @as(u64, timeout) * std.time.ns_per_ms, .cancellation = &signal };
         var response = self.executeWithRetryPolicy(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .headers = &headers, .timeout_ms = timeout, .max_response_bytes = feeds.max_wire_bytes, .cancellation = &signal, .delivery_tracker = &delivery }, transport_budget, .at_most_once) catch |err| {
-            if (input.action == .mutate and delivery.load() != .not_sent) return error.MetadataMutationOutcomeUnknown;
+            if (input.action == .mutate and (err == error.ReallocationOutcomeUnknown or err == error.MetadataMutationOutcomeUnknown or delivery.load() != .not_sent)) return error.MetadataMutationOutcomeUnknown;
             return err;
         };
         defer response.deinit(self.alloc);
@@ -4934,11 +4934,13 @@ test "metadata changefeed state transport validates replies and never replays un
     const feeds = @import("../api/changefeed_metadata.zig");
     const Executor = struct {
         calls: usize = 0,
+        lost_reply: bool = false,
         outcome: []const u8 = routes.Routes.raft_mutation_outcome_committed,
         body: []const u8 = "{\"version\":1,\"action\":\"mutate\",\"metadata_group_id\":77,\"metadata_incarnation\":\"11111111111111111111111111111111\"}",
         fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
+            if (self.lost_reply) return error.Timeout;
             try std.testing.expect(std.mem.endsWith(u8, request.uri, feeds.path));
             try std.testing.expectEqual(feeds.max_wire_bytes, request.max_response_bytes.?);
             try std.testing.expect(request.header(routes.routing_remaining_ms_header) != null);
@@ -4967,6 +4969,13 @@ test "metadata changefeed state transport validates replies and never replays un
     try std.testing.expect(authority.value.authority == null);
     try std.testing.expectError(error.InvalidChangefeed, client.accessChangefeedState("http://metadata.invalid", .{ .action = .authority, .id = @splat(1), .metadata_group_id = input.metadata_group_id, .metadata_incarnation = input.metadata_incarnation }, .{}));
     try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    executor.lost_reply = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessChangefeedState("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
+    executor.lost_reply = false;
+    executor.outcome = "";
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessChangefeedState("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 6), executor.calls);
 }
 
 test "metadata.lake index owner projection read negotiates older peers without weakening grants" {

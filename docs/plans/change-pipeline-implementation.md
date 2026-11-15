@@ -1902,11 +1902,34 @@ cover exact dispatch counts and reply/action validation. Six explicitly
 discovered tests passed in `feed-metadata-handler-test.log`; the final stricter
 outcome/deadline qualification is in `feed-metadata-transport-final-test.log`.
 
-The data runtime's remote metadata source still needs to register a routed port
-and preserve the full original request budget across peer selection. These
-private operations are not public feed management, a consumer scheduler, or a
-coherent bootstrap implementation. The broader completion requirements remain
-open.
+The data runtime binding is described below. These private operations are not
+public feed management, a consumer scheduler, or a coherent bootstrap
+implementation. The broader completion requirements remain open.
+
+## In progress: registered remote metadata feed port
+
+The data runtime's `RemoteMetadataSource.statusSource` registers the feed-state
+port. It captures a single deadline on the source clock, discovers the immutable
+metadata identity under that budget, and uses the private state endpoint for
+every state/authority read. Cached metadata heads supply identity only, never
+feed state or a substitute for the endpoint's strong-read barrier. Read failover
+preserves the original deadline and cancellation. Each mutation selects one peer;
+an uncertain result returns to the durable owner without mutation peer failover.
+Returned state storage belongs to the caller and passes the same envelope/ID
+validation as local state. Maintenance-principal admission remains mandatory.
+
+The focused runtime test covers read failover, exact write dispatch count,
+state ownership/validation and expiry. The first run passed in
+`feed-metadata-runtime-test.log`. The stronger rerun also checks shrinking
+per-request budgets, alongside the transport lost-reply/empty-outcome tests,
+in `feed-metadata-runtime-qualified-test.log`; the combined gate completed with
+exit 0 (one runtime test and six transport tests, no failures or leaks).
+The metadata client now maps its legacy transport ambiguity error to an unknown
+feed mutation even when send telemetry is absent.
+
+This registration does not implement a public feed owner, policy binding,
+scheduling, coherent bootstrap, typed pgoutput producer or destination adapters.
+Those and the remaining full issue acceptance contracts are still required.
 
 ## Working constraints
 

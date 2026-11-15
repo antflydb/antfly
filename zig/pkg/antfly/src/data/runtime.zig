@@ -26965,6 +26965,7 @@ const RemoteMetadataSource = struct {
         return .{
             .ptr = self,
             .routing = self.catalogSource().routingSource() catch unreachable,
+            .changefeeds = .{ .ptr = self, .read_fn = remoteChangefeedRead, .mutate_fn = remoteChangefeedMutate, .authority_fn = remoteChangefeedAuthority },
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
                 .table_record = remoteTableRecord,
@@ -28055,6 +28056,65 @@ const RemoteMetadataSource = struct {
         try routing_budget.checkpoint();
         ensureBudgetActive(outer_budget) catch |err| return if (err == error.Cancelled or err == error.Canceled) error.Canceled else error.CatalogRoutingSnapshotTimeout;
         return last_err;
+    }
+
+    fn accessChangefeedMetadata(self: *RemoteMetadataSource, a: std.mem.Allocator, action: @import("../api/changefeed_metadata.zig").Action, id: ?@import("../metadata/changefeed_control.zig").Id, write: ?[]const u8, original: antfly.public_api.operation.RequestContext) !std.json.Parsed(@import("../api/changefeed_metadata.zig").Reply) {
+        const feeds = @import("../api/changefeed_metadata.zig");
+        var request = original;
+        request.deadline_ns = try requestDeadlineOnClock(original, self.awakeNs(), 5 * std.time.ns_per_s);
+        request.deadline_io = runtime_io_abi.Borrow.init(&self.io);
+        var signal = antfly.common.http.http_common.RequestCancellation.fromToken(request.cancellation);
+        const budget: antfly.metadata_http_client.RequestBudget = .{ .deadline_ns = request.deadline_ns.?, .io = self.io, .cancellation = &signal };
+        // Discover identity under the original budget. A cached head supplies
+        // identity only; the state endpoint always executes its own strong read.
+        const head = try self.fetchHeadWithBudget(budget);
+        const incarnation = head.metadata_incarnation orelse return error.MetadataIncarnationUnavailable;
+        const input: feeds.Request = .{ .action = action, .id = id, .write = write, .metadata_group_id = head.metadata_group_id, .metadata_incarnation = incarnation };
+        const first = try self.metadataReadApiIndexForAttemptWithBudget(0, budget);
+        var last_error: anyerror = error.MissingMetadataApi;
+        // A mutation gets exactly one selected peer. An unknown outcome must
+        // return to the durable owner for reconciliation, never peer failover.
+        const attempts = if (action == .mutate) @min(self.base_uris.len, 1) else self.base_uris.len;
+        for (0..attempts) |attempt| {
+            try request.ensureActive();
+            try ensureBudgetActive(budget);
+            const index = (first + attempt) % self.base_uris.len;
+            var client = self.metadataClient(a);
+            var reply = client.accessChangefeedState(self.base_uris[index], input, request) catch |err| {
+                if (action == .mutate) return err;
+                try request.ensureActive();
+                if (err == error.OutOfMemory or err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded) return err;
+                last_error = err;
+                continue;
+            };
+            errdefer reply.deinit();
+            original.ensureActive() catch |err| return if (action == .mutate) error.MetadataMutationOutcomeUnknown else err;
+            self.noteMetadataReadSuccessWithBudget(index, budget) catch |err| return if (action == .mutate) error.MetadataMutationOutcomeUnknown else err;
+            return reply;
+        }
+        return last_error;
+    }
+
+    fn remoteChangefeedRead(ptr: *anyopaque, a: std.mem.Allocator, id: @import("../metadata/changefeed_control.zig").Id, request: antfly.public_api.operation.RequestContext) ![]u8 {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var reply = try self.accessChangefeedMetadata(a, .read, id, null, request);
+        defer reply.deinit();
+        return a.dupe(u8, reply.value.state.?);
+    }
+
+    fn remoteChangefeedMutate(ptr: *anyopaque, a: std.mem.Allocator, write: @import("../metadata/changefeed_control.zig").Write, request: antfly.public_api.operation.RequestContext) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const bytes = try @import("../metadata/changefeed_control.zig").encodeWrite(a, write);
+        defer a.free(bytes);
+        var reply = try self.accessChangefeedMetadata(a, .mutate, null, bytes, request);
+        defer reply.deinit();
+    }
+
+    fn remoteChangefeedAuthority(ptr: *anyopaque, a: std.mem.Allocator, request: antfly.public_api.operation.RequestContext) !?@import("../metadata/changefeed_control.zig").Stamp {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var reply = try self.accessChangefeedMetadata(a, .authority, null, null, request);
+        defer reply.deinit();
+        return reply.value.authority;
     }
 
     fn remotePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {
@@ -47675,6 +47735,74 @@ fn consumerTests() type {
             }, error.MetadataLinearizableReadTimeout, "clock_only_borrow expects=MetadataLinearizableReadTimeout");
             try std.testing.expectEqual(@as(usize, 1), fixture.calls);
             try SnapshotDeadlineTest.expectUnpublished(&source);
+        }
+
+        test "remote metadata changefeed port shares budgets and never fails over uncertain writes" {
+            const a = std.testing.allocator;
+            const feeds = @import("../api/changefeed_metadata.zig");
+            const control = @import("../metadata/changefeed_control.zig");
+            const routes = @import("../metadata/http_routes.zig");
+            const VoprIo = @import("vopr").vopr_io.VoprIo;
+            var clock = try VoprIo.init(.{ .monotonic_ns = std.time.ns_per_s });
+            defer clock.deinit();
+            const Probe = struct {
+                clock: *VoprIo,
+                reads: usize = 0,
+                writes: usize = 0,
+                previous_remaining: ?u64 = null,
+                fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (std.mem.endsWith(u8, request.uri, routes.Routes.head)) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(allocator, antfly.metadata_api.MetadataHead{ .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_epoch = 1 }, .{}) };
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, feeds.path));
+                    var input = try feeds.parseRequest(allocator, request.body);
+                    defer input.deinit();
+                    try std.testing.expectEqual(@as(u64, 77), input.value.metadata_group_id);
+                    const remaining = try std.fmt.parseUnsigned(u64, request.header(routes.routing_remaining_ms_header).?, 10);
+                    try std.testing.expect(remaining > 0 and remaining <= 100);
+                    if (self.previous_remaining) |previous| try std.testing.expect(remaining < previous);
+                    self.previous_remaining = remaining;
+                    self.clock.monotonic_ns += std.time.ns_per_ms;
+                    var result: feeds.Reply = .{ .action = input.value.action, .metadata_group_id = input.value.metadata_group_id, .metadata_incarnation = input.value.metadata_incarnation };
+                    if (input.value.action == .mutate) {
+                        self.writes += 1;
+                        const headers = try allocator.alloc(antfly.common.http.Header, 1);
+                        headers[0] = .{ .name = try allocator.dupe(u8, routes.Routes.raft_mutation_outcome_header), .value = try allocator.dupe(u8, routes.Routes.raft_mutation_outcome_unknown) };
+                        return .{ .status = 503, .headers = headers, .body = try allocator.dupe(u8, "unknown") };
+                    }
+                    self.reads += 1;
+                    if (self.reads == 1) return .{ .status = 503, .body = try allocator.dupe(u8, "not leader") };
+                    if (input.value.action == .authority) {
+                        result.authority = .{ .incarnation = @splat(9), .sequence = 42 };
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(allocator, result, .{}) };
+                    }
+                    const state = try control.encode(allocator, .{});
+                    defer allocator.free(state);
+                    result.id = input.value.id;
+                    result.state = state;
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(allocator, result, .{}) };
+                }
+            };
+            var probe: Probe = .{ .clock = &clock };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{ "http://follower.test", "http://leader.test" }, &.{.{ .ptr = &probe, .vtable = &.{ .execute = Probe.execute } }}, clock.io());
+            defer source.deinit();
+            const io = clock.io();
+            const request: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" }, .deadline_ns = std.time.ns_per_s + 100 * std.time.ns_per_ms, .deadline_io = runtime_io_abi.Borrow.init(&io) };
+            const port = source.statusSource().changefeeds.?;
+            try std.testing.expectError(error.Forbidden, port.authority(a, .{}));
+            const stamp = (try port.authority(a, request)).?;
+            try std.testing.expectEqual(@as(u64, 42), stamp.sequence);
+            try std.testing.expectEqual(@as(usize, 2), probe.reads);
+            const state = try port.read(a, @splat(4), request);
+            defer a.free(state);
+            var parsed = try control.parse(a, state);
+            defer parsed.deinit();
+            try std.testing.expectEqual(control.Phase.empty, parsed.value.phase);
+            const write: control.Write = .{ .id = @splat(4), .authority = @splat(9), .owner = @splat(1), .authorization = @splat(2), .expected_revision = 0, .expected_epoch = 0, .mutation = .{ .create = .{ .id = @splat(4), .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = @splat(3), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } } };
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.mutate(a, write, request));
+            try std.testing.expectEqual(@as(usize, 1), probe.writes);
+            clock.monotonic_ns += 200 * std.time.ns_per_ms;
+            try std.testing.expectError(error.DeadlineExceeded, port.authority(a, request));
+            try std.testing.expectEqual(@as(usize, 3), probe.reads);
         }
 
         test "remote metadata source pins one cluster incarnation across cache invalidation" {

@@ -133,6 +133,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
+        "remote metadata changefeed port shares budgets and never fails over uncertain writes",
         "remote metadata source restore staging authority binds every owner read",
         "remote table descriptors prefer ordered peers before legacy fallback",
         "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
