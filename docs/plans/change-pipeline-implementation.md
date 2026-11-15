@@ -528,6 +528,45 @@ required; this codec alone does not satisfy the pgoutput requirement.
 all v1 message variants, framing, malformed feedback, bounds and allocation
 failure cleanup. This target also runs in the regular unit suite.
 
+## In progress: durable PostgreSQL slot correlation
+
+`metadata/pg_slot.zig` defines a slot-scoped virtual byte ordering domain, distinct
+from native frontiers and inbound source positions. Each issued complete
+transaction binds its before/after feed cursors, immutable serialization digest,
+completion authority, byte length, commit offset, xid, and commit time to one
+persisted LSN interval. Replay retains those assignments. Interior restart
+positions rewind to Begin; expired positions require resynchronization.
+
+The slot state is embedded in the existing durable changefeed metadata record.
+`Mutation.slot.confirm` advances its confirmed LSN and native feed acknowledgement
+in one metadata transaction. Feedback beyond issued positions fails; feedback
+inside a transaction cannot release that transaction. Ordinary native ACK calls
+cannot bypass slot confirmation during streaming. Physical root reclamation is
+still separate and follows the shared acknowledged floor.
+
+Slot sessions use durable actor/fence tokens, bounded leases, explicit takeover,
+and monotonic observed time. Pending mappings and serialized bytes have quotas;
+slow clients receive backpressure, never silent eviction. Slot names are scoped
+by immutable database identity and select a deterministic metadata feed ID.
+The decoder floor advances to 93 before these state/mutation shapes are admitted.
+Legacy envelopes without slot fields remain readable.
+
+These are private authority contracts. Production replication privilege checks,
+publication/catalog integration, slot creation/drop/recreation and socket
+activation remain unfinished. In particular, the provider must implement bounded
+durable committed-transaction spooling and certify complete projected outcomes
+before issuing a mapping; a caller-supplied digest is not a substitute. No public
+PostgreSQL capability is advertised on the strength of the metadata tests.
+Native feed restart rejects a configured slot rather than resetting its LSNs.
+
+Qualification: `zig build changefeed-control-test docstore-history-test -j2`
+passes, including the actual metadata-store reopen/snapshot/takeover/lost-reply
+case, native consumer/provider recovery, retained history and decoder-floor
+checks. Standalone control tests pass 20 cases, including slot lag quotas,
+allocation failures, partial-frame rejection and legacy envelope decoding. Logs:
+`zig/pg-slot-durable-final-qualification.log`, `zig/pg-slot-control-test.log`.
+
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

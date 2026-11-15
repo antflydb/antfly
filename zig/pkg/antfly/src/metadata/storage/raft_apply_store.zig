@@ -45677,3 +45677,112 @@ test "metadata changefeed control snapshot preserves enrollment authority and pe
     try std.testing.expectEqualStrings("AQ", parsed.value.cursors[0].provider_context);
     try std.testing.expectEqual(@as(u64, 2), parsed.value.roots[0].grant_sequence);
 }
+
+test "metadata changefeed control logical slot survives reopen snapshot failover and lost confirmation reply" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/logical-slot", .{tmp.sub_path});
+    defer a.free(path);
+    const target_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/logical-slot-failover", .{tmp.sub_path});
+    defer a.free(target_path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    var target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    defer target.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const slot = changefeed_control.pg_slot;
+    const id = slot.feedId(@splat(1), "qualified_slot");
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = "{}" };
+    const definition: changefeed_control.Definition = .{ .owner = @splat(1), .authorization = @splat(2), .projection = .rows, .tables = &.{.{ .table_id = 7, .binding = changefeed_control.tableBinding(table), .policy_revision = 1, .contract = .native_relational }} };
+    const Harness = struct {
+        store: *RaftApplyStore,
+        a: std.mem.Allocator,
+        index: u64 = 0,
+        id: changefeed_control.Id,
+        fn apply(self: *@This(), command: TransitionCommand) !void {
+            const bytes = try encodeTransitionCommand(self.a, command);
+            self.index += 1;
+            const entries = try raft_state_machine.encodeCommittedEntries(self.a, &.{.{ .term = 1, .index = self.index, .entry_type = .normal, .data = bytes }});
+            try self.store.snapshotBuilder().applyBatch(.{ .group_id = group_ids.main_metadata_group_id, .commit_index = self.index, .entries_bytes = entries });
+        }
+        fn read(self: *@This()) !changefeed_control.Parsed {
+            return changefeed_control.parse(self.a, try self.store.getChangefeedControl(self.a, group_ids.main_metadata_group_id, self.id));
+        }
+        fn mutate(self: *@This(), mutation: changefeed_control.Mutation) !void {
+            var parsed = try self.read();
+            defer parsed.deinit();
+            const before = parsed.value;
+            const write: changefeed_control.Write = .{ .id = self.id, .authority = @splat(9), .owner = @splat(1), .authorization = @splat(2), .expected_revision = before.revision, .expected_epoch = before.epoch, .mutation = mutation };
+            try self.apply(.{ .apply_changefeed_control = try changefeed_control.encodeWrite(self.a, write) });
+        }
+    };
+    var h: Harness = .{ .store = &store, .a = scratch, .id = id };
+    try h.apply(.{ .upsert_table = table });
+    try h.mutate(.{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = 1000 } });
+    var namespace: changefeed_control.Namespace = @splat(0);
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 1, .big);
+    std.mem.writeInt(u64, namespace[16..24], 1, .big);
+    try h.mutate(.{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} });
+    try h.mutate(.{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 1, .start = 10 } });
+    try h.mutate(.{ .seal = .{ .cut = @splat(7) } });
+    try h.mutate(.{ .slot = .{ .configure = .{ .database = @splat(1), .name = "qualified_slot" } } });
+    try h.mutate(.{ .slot = .{ .acquire = .{ .actor = @splat(2), .expected = 0, .now = 100, .expires = 150 } } });
+    var initial = try h.read();
+    defer initial.deinit();
+    const session = initial.value.slot.?.session.?;
+    var delivery: changefeed_control.Delivery = .{ .sequence = 1, .before = initial.value.latest_cursor, .cursor = @splat(0), .authority = @splat(8), .issued_at = 101, .advances = &.{.{ .namespace = namespace, .position = .{ .sequence = 11 } }} };
+    delivery.cursor = delivery.identity(id, 1);
+    try h.mutate(.{ .issue = delivery });
+    const transaction: slot.Prepared = .{ .before = delivery.before, .after = delivery.cursor, .content = @splat(3), .completion = @splat(4), .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1 };
+    try h.mutate(.{ .slot = .{ .issue = .{ .session = session, .now = 102, .transaction = transaction } } });
+    store.deinit();
+    store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    var reopened = try h.read();
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 101), reopened.value.slot.?.next_lsn);
+    try std.testing.expectEqual(@as(u64, 1), try reopened.value.slot.?.restartAt(100));
+    const before_retry = reopened.value.revision;
+    try h.mutate(.{ .slot = .{ .issue = .{ .session = session, .now = 103, .transaction = transaction } } });
+    var retry = try h.read();
+    defer retry.deinit();
+    try std.testing.expectEqual(before_retry + 1, retry.value.revision);
+    try std.testing.expectEqual(@as(usize, 1), retry.value.slot.?.entries.len);
+    var prepared = (try store.snapshotBuilder().prepareSnapshot(group, h.index)) orelse return error.TestUnexpectedResult;
+    defer prepared.deinit();
+    var materialized = try prepared.materialize(a);
+    defer materialized.deinit(a);
+    const snapshot = switch (materialized) {
+        .bytes => |bytes| bytes,
+        .artifact => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group, h.index, snapshot));
+    h.store = &target;
+    try h.mutate(.{ .slot = .{ .acquire = .{ .actor = @splat(3), .expected = 1, .now = 150, .expires = 200 } } });
+    var transferred = try h.read();
+    defer transferred.deinit();
+    try std.testing.expectEqual(@as(u64, 2), transferred.value.slot.?.session.?.fence);
+    const fenced_revision = transferred.value.revision;
+    try h.mutate(.{ .slot = .{ .confirm = .{ .session = session, .now = 151, .flushed = 101 } } });
+    var fenced = try h.read();
+    defer fenced.deinit();
+    try std.testing.expectEqual(fenced_revision, fenced.value.revision);
+    const confirmation: changefeed_control.Mutation = .{ .slot = .{ .confirm = .{ .session = transferred.value.slot.?.session.?, .now = 151, .flushed = 101 } } };
+    try h.mutate(confirmation);
+    // Simulate losing the confirmation response and reopening the new owner.
+    target.deinit();
+    target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    try h.mutate(confirmation);
+    var confirmed = try h.read();
+    defer confirmed.deinit();
+    try std.testing.expectEqual(@as(u64, 101), confirmed.value.slot.?.confirmed_lsn);
+    try std.testing.expectEqual(@as(u64, 1), confirmed.value.acknowledged_delivery);
+    try std.testing.expectEqual(@as(u64, 11), confirmed.value.roots[0].acknowledged.sequence);
+    try std.testing.expectEqual(@as(u64, 10), confirmed.value.roots[0].reclaimed_through);
+    try std.testing.expectEqual(@as(usize, 0), confirmed.value.slot.?.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), confirmed.value.cursors.len);
+}

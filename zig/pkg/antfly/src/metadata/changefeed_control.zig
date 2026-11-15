@@ -21,7 +21,8 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 92;
+pub const protocol_version: u16 = 93;
+pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
 pub const max_roots = 4096;
 pub const max_cursors = 128;
@@ -197,6 +198,7 @@ pub const State = struct {
     acknowledged_provider_context: []const u8 = "",
     cursors: []const Delivery = &.{},
     reset_reason: Reset = .none,
+    slot: ?pg_slot.State = null,
     pub fn rootIndex(self: State, namespace: Namespace) !usize {
         var low: usize = 0;
         var high = self.roots.len;
@@ -245,7 +247,7 @@ pub const State = struct {
         if (self.phase == .empty) {
             if (self.revision != 0 or self.epoch != 0 or nz(self.id) or nz(self.authority) or self.authority_sequence != 0 or self.definition != null or
                 self.created_at != 0 or self.expires_at != 0 or self.bootstrap_expires_at != 0 or nz(self.cut) or self.roots.len != 0 or self.cursors.len != 0 or
-                self.latest_delivery != 0 or self.acknowledged_delivery != 0 or nz(self.latest_cursor) or nz(self.acknowledged_cursor) or self.reset_reason != .none or self.latest_provider_context.len != 0 or self.acknowledged_provider_context.len != 0) return error.InvalidChangefeed;
+                self.latest_delivery != 0 or self.acknowledged_delivery != 0 or nz(self.latest_cursor) or nz(self.acknowledged_cursor) or self.reset_reason != .none or self.latest_provider_context.len != 0 or self.acknowledged_provider_context.len != 0 or self.slot != null) return error.InvalidChangefeed;
             return;
         }
         const definition = self.definition orelse return error.InvalidChangefeed;
@@ -276,6 +278,37 @@ pub const State = struct {
             if (!nz(self.cut) or self.roots.len == 0 or !nz(self.latest_cursor) or !nz(self.acknowledged_cursor)) return error.InvalidChangefeed;
             for (self.roots) |root| if (root.consumer_epoch == 0 or root.released or (definition.start == .snapshot_then_changes and root.snapshot == null)) return error.InvalidChangefeed;
         }
+        if (self.slot) |slot| {
+            if (self.phase == .enrolling) return error.InvalidChangefeed;
+            try slot.validate();
+            if (!equal(self.id, pg_slot.feedId(slot.database, slot.name)) or slot.session_expires_at > self.expires_at or !equal(slot.acknowledged_cursor, self.acknowledged_cursor)) return error.InvalidChangefeed;
+            try slotDefinition(definition);
+            var partial: [max_roots]bool = @splat(false);
+            var partial_count: usize = 0;
+            for (self.roots, 0..) |root, root_index| {
+                partial[root_index] = root.acknowledged.event != 0;
+                if (partial[root_index]) partial_count += 1;
+            }
+            // A slot cannot begin at a native partial-frame acknowledgement.
+            if (partial_count != 0) return error.InvalidChangefeed;
+            var cursor = slot.acknowledged_cursor;
+            var index: usize = 0;
+            for (slot.entries) |entry| {
+                if (!equal(entry.transaction.before, cursor)) return error.InvalidChangefeed;
+                while (index < self.cursors.len) : (index += 1) {
+                    for (self.cursors[index].advances) |advance| {
+                        const root_index = try self.rootIndex(advance.namespace);
+                        if (partial[root_index]) partial_count -= 1;
+                        partial[root_index] = advance.position.event != 0;
+                        if (partial[root_index]) partial_count += 1;
+                    }
+                    if (equal(self.cursors[index].cursor, entry.transaction.after)) break;
+                }
+                if (index == self.cursors.len or partial_count != 0) return error.InvalidChangefeed;
+                cursor = entry.transaction.after;
+                index += 1;
+            }
+        }
         var previous = self.acknowledged_cursor;
         for (self.cursors, 0..) |cursor, i| {
             if (cursor.sequence != self.acknowledged_delivery + i + 1 or !equal(cursor.before, previous) or !nz(cursor.authority) or cursor.issued_at == 0 or
@@ -298,6 +331,7 @@ fn validateAdvances(state: State, advances: []const Advance) !void {
     }
 }
 pub const Mutation = union(enum) {
+    slot: pg_slot.Mutation,
     create: struct { id: Id, definition: Definition, now: u64, expires_at: u64, bootstrap_expires_at: u64 = 0 },
     plan_roots: []const RootPlan,
     enroll: struct { namespace: Namespace, ownership_epoch: u64, grant_sequence: u64, consumer_epoch: u64, start: u64, snapshot: ?Snapshot = null },
@@ -318,6 +352,7 @@ pub const Mutation = union(enum) {
     restart: struct { definition: Definition, now: u64, expires_at: u64, bootstrap_expires_at: u64 = 0 },
     pub fn validate(self: Mutation) !void {
         switch (self) {
+            .slot => |operation| try operation.validate(),
             .create => |value| {
                 if (!nz(value.id)) return error.InvalidChangefeed;
                 try value.definition.validate();
@@ -365,6 +400,48 @@ pub const Mutation = union(enum) {
         if (!nz(stamp.incarnation) or stamp.sequence == 0 or stamp.sequence <= state.authority_sequence or (state.phase != .empty and !equal(stamp.incarnation, state.authority))) return error.ChangefeedConflict;
         var next = state;
         switch (self) {
+            .slot => |operation| {
+                if (state.phase != .streaming and state.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
+                try slotDefinition(state.definition.?);
+                switch (operation) {
+                    .configure => |configuration| {
+                        if (!equal(state.id, pg_slot.feedId(configuration.database, configuration.name))) return error.ChangefeedConflict;
+                        if (state.slot) |existing| {
+                            if (!equal(existing.database, configuration.database) or !std.mem.eql(u8, existing.name, configuration.name) or existing.byte_limit != configuration.byte_limit) return error.ChangefeedConflict;
+                            return state;
+                        }
+                        if (state.cursors.len != 0) return error.ChangefeedConflict;
+                        for (state.roots) |root| if (root.acknowledged.event != 0) return error.ChangefeedConflict;
+                        next.slot = try pg_slot.State.initialize(configuration.database, configuration.name, state.acknowledged_cursor, configuration.byte_limit);
+                    },
+                    .acquire => |claim| {
+                        if (claim.now >= state.expires_at or claim.expires > state.expires_at) return error.ChangefeedLeaseExpired;
+                        next.slot = try (state.slot orelse return error.ChangefeedConflict).acquire(claim.actor, claim.expected, claim.now, claim.expires);
+                    },
+                    .release => |release| {
+                        if (release.now >= state.expires_at) return error.ChangefeedLeaseExpired;
+                        next.slot = try (state.slot orelse return error.ChangefeedConflict).release(release.session, release.now);
+                    },
+                    .issue => |issue| {
+                        if (state.phase != .streaming) return error.ChangefeedConflict;
+                        if (issue.now >= state.expires_at) return error.ChangefeedLeaseExpired;
+                        const roots = try state.rootsAt(a, issue.transaction.after);
+                        defer a.free(roots);
+                        // A page boundary within a retained frame cannot be
+                        // certified as a complete PostgreSQL transaction.
+                        for (roots) |root| if (root.delivered.event != 0) return error.ChangefeedConflict;
+                        next.slot = try (state.slot orelse return error.ChangefeedConflict).issue(a, issue.session, issue.now, issue.transaction);
+                    },
+                    .confirm => |confirmation| {
+                        if (state.phase != .streaming) return error.ChangefeedConflict;
+                        if (confirmation.now >= state.expires_at) return error.ChangefeedLeaseExpired;
+                        const slot = state.slot orelse return error.ChangefeedConflict;
+                        const confirmed = try slot.confirm(a, confirmation.session, confirmation.now, confirmation.flushed);
+                        if (!equal(confirmed.acknowledged_cursor, slot.acknowledged_cursor)) try acknowledge(a, state, &next, confirmed.acknowledged_cursor);
+                        next.slot = confirmed;
+                    },
+                }
+            },
             .create => |create| {
                 if (state.phase != .empty or !nz(create.id)) return error.ChangefeedConflict;
                 try create.definition.validate();
@@ -463,21 +540,14 @@ pub const Mutation = union(enum) {
             },
             .acknowledge => |cursor| {
                 if (state.phase != .streaming and state.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
+                if (state.slot != null and state.phase == .streaming) return error.ChangefeedConflict;
                 if (equal(cursor, state.acknowledged_cursor)) return state;
-                const selected = for (state.cursors, 0..) |entry, i| {
-                    if (equal(entry.cursor, cursor)) break i;
-                } else return error.ChangefeedCursorExpired;
-                const roots = try a.dupe(Root, state.roots);
-                for (state.cursors[0 .. selected + 1]) |entry| for (entry.advances) |advance| {
-                    const root = &roots[try state.rootIndex(advance.namespace)];
-                    root.acknowledged = advance.position;
-                    if (advance.snapshot) |position| root.snapshot_acknowledged = position;
-                };
-                next.roots = roots;
-                next.acknowledged_delivery = state.cursors[selected].sequence;
-                next.acknowledged_cursor = cursor;
-                next.acknowledged_provider_context = state.cursors[selected].provider_context;
-                next.cursors = try a.dupe(Delivery, state.cursors[selected + 1 ..]);
+                try acknowledge(a, state, &next, cursor);
+                if (next.slot) |*slot| {
+                    if (slot.entries.len != 0) return error.ChangefeedConflict;
+                    slot.acknowledged_cursor = cursor;
+                    slot.mapped_cursor = cursor;
+                }
             },
             .reclaimed => |progress| {
                 const index = try state.rootIndex(progress.namespace);
@@ -548,6 +618,9 @@ pub const Mutation = union(enum) {
                 next.phase = .deleted;
             },
             .restart => |restart| {
+                // Invalidated slots retain their ordering domain; a native
+                // feed restart must not silently reuse their LSNs.
+                if (state.slot != null) return error.ChangefeedCapabilityUnsupported;
                 if (state.phase != .reset_required) return error.ChangefeedConflict;
                 for (state.roots) |root| if (!root.released or (root.snapshot != null and !root.snapshot_released)) return error.ChangefeedConflict;
                 try restart.definition.validate();
@@ -563,6 +636,28 @@ pub const Mutation = union(enum) {
         return next;
     }
 };
+fn acknowledge(a: A, state: State, next: *State, cursor: Digest) !void {
+    if (state.phase != .streaming and state.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
+    if (equal(cursor, state.acknowledged_cursor)) return;
+    const selected = for (state.cursors, 0..) |entry, i| {
+        if (equal(entry.cursor, cursor)) break i;
+    } else return error.ChangefeedCursorExpired;
+    const roots = try a.dupe(Root, state.roots);
+    for (state.cursors[0 .. selected + 1]) |entry| for (entry.advances) |advance| {
+        const root = &roots[try state.rootIndex(advance.namespace)];
+        root.acknowledged = advance.position;
+        if (advance.snapshot) |position| root.snapshot_acknowledged = position;
+    };
+    next.roots = roots;
+    next.acknowledged_delivery = state.cursors[selected].sequence;
+    next.acknowledged_cursor = cursor;
+    next.acknowledged_provider_context = state.cursors[selected].provider_context;
+    next.cursors = try a.dupe(Delivery, state.cursors[selected + 1 ..]);
+}
+fn slotDefinition(definition: Definition) !void {
+    if (definition.projection != .rows or definition.events != 1) return error.ChangefeedCapabilityUnsupported;
+    for (definition.tables) |table| if (table.contract != .native_relational) return error.ChangefeedCapabilityUnsupported;
+}
 fn lease(now: u64, expires: u64) !void {
     if (now == 0 or expires <= now or expires - now > max_lease_seconds) return error.InvalidChangefeed;
 }
@@ -1047,6 +1142,7 @@ test "changefeed control reads legacy envelopes without rebinding cursor identit
     var raw = try std.json.parseFromSlice(std.json.Value, a, try encode(a, state), .{ .parse_numbers = false });
     defer raw.deinit();
     const record = raw.value.object.getPtr("state").?;
+    _ = record.object.orderedRemove("slot");
     _ = record.object.orderedRemove("latest_provider_context");
     _ = record.object.orderedRemove("acknowledged_provider_context");
     for (record.object.getPtr("cursors").?.array.items) |*receipt| _ = receipt.object.orderedRemove("provider_context");
@@ -1072,4 +1168,75 @@ test "changefeed control rejects deeply nested unknown state before digest trave
     for (0..32) |i| try bytes.appendSlice(a, if (i == 0) "0" else ",0");
     try bytes.appendSlice(a, "]}");
     try std.testing.expectError(error.ChangefeedCorrupt, parse(a, bytes.items));
+}
+
+fn testSlotState(a: A) !State {
+    var definition = testDefinition(.now);
+    definition.projection = .rows;
+    const id = pg_slot.feedId(@splat(1), "slot");
+    var state = try step(a, .{}, .{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = 1000 } });
+    state = try step(a, state, .{ .plan_roots = &.{.{ .namespace = testNamespace(7), .ownership_epoch = 1 }} });
+    state = try step(a, state, .{ .enroll = .{ .namespace = testNamespace(7), .ownership_epoch = 1, .grant_sequence = state.roots[0].grant_sequence, .consumer_epoch = 6, .start = 10 } });
+    state = try step(a, state, .{ .seal = .{ .cut = @splat(7) } });
+    state = try step(a, state, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "slot" } } });
+    return step(a, state, .{ .slot = .{ .acquire = .{ .actor = @splat(2), .expected = 0, .now = 100, .expires = 150 } } });
+}
+test "changefeed logical slot confirms native ACK atomically and fences ordinary acknowledgements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testSlotState(a);
+    const initial = state.latest_cursor;
+    const session = state.slot.?.session.?;
+    const delivery = testDelivery(state, &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 11 } }});
+    state = try step(a, state, .{ .issue = delivery });
+    state = try step(a, state, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "slot" } } });
+    const transaction: pg_slot.Prepared = .{ .before = initial, .after = delivery.cursor, .content = @splat(3), .completion = @splat(4), .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1 };
+    state = try step(a, state, .{ .slot = .{ .issue = .{ .session = session, .now = 101, .transaction = transaction } } });
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .acknowledge = delivery.cursor }));
+    const encoded = try encode(a, state);
+    var parsed = try parse(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 101), parsed.value.slot.?.next_lsn);
+    const partial = try step(a, parsed.value, .{ .slot = .{ .confirm = .{ .session = session, .now = 102, .flushed = 100 } } });
+    try std.testing.expectEqual(@as(u64, 0), partial.acknowledged_delivery);
+    state = try step(a, partial, .{ .slot = .{ .confirm = .{ .session = session, .now = 103, .flushed = 101 } } });
+    try std.testing.expectEqual(@as(u64, 1), state.acknowledged_delivery);
+    try std.testing.expectEqual(@as(u64, 11), state.roots[0].acknowledged.sequence);
+    try std.testing.expectEqual(@as(u64, 10), state.roots[0].reclaimed_through);
+    try std.testing.expectEqual(@as(u64, 101), state.slot.?.confirmed_lsn);
+    try std.testing.expectEqual(@as(usize, 0), state.cursors.len);
+    try std.testing.expectEqual(@as(usize, 0), state.slot.?.entries.len);
+    state = try step(a, state, .{ .slot = .{ .acquire = .{ .actor = @splat(3), .expected = 1, .now = 150, .expires = 200 } } });
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .slot = .{ .confirm = .{ .session = session, .now = 151, .flushed = 101 } } }));
+}
+test "changefeed logical slot rejects partial frame endpoints and document table compatibility" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testSlotState(a);
+    const initial = state.latest_cursor;
+    const delivery = testDelivery(state, &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 10, .event = 1 } }});
+    state = try step(a, state, .{ .issue = delivery });
+    const transaction: pg_slot.Prepared = .{ .before = initial, .after = delivery.cursor, .content = @splat(3), .completion = @splat(4), .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1 };
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .slot = .{ .issue = .{ .session = state.slot.?.session.?, .now = 101, .transaction = transaction } } }));
+    var document = try testState(a, .now);
+    document.id = pg_slot.feedId(@splat(1), "slot");
+    var definition = document.definition.?;
+    definition.projection = .rows;
+    const tables = try a.dupe(Table, definition.tables);
+    tables[0].contract = .native_document;
+    definition.tables = tables;
+    document.definition = definition;
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, step(a, document, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "slot" } } }));
+}
+
+test "changefeed closed state rejects even an already acknowledged native cursor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testState(a, .now);
+    const cursor = state.acknowledged_cursor;
+    state = try step(a, state, .close);
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, step(a, state, .{ .acknowledge = cursor }));
 }
