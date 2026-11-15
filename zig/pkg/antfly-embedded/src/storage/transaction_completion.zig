@@ -82,6 +82,25 @@ pub const Admission = struct {
             try participant.validate();
             if (i != 0 and std.mem.order(u8, &self.participants[i - 1].namespace, &participant.namespace) != .lt) return error.InvalidTxnRecord;
         }
+        const coordinator = self.find(self.coordinator_namespace) orelse return error.InvalidTxnRecord;
+        if (!same(coordinator.owner_fence, self.coordinator_fence)) return error.InvalidTxnRecord;
+    }
+    fn find(self: Admission, namespace: Namespace) ?Participant {
+        var low: usize = 0;
+        var high = self.participants.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            switch (std.mem.order(u8, &self.participants[mid].namespace, &namespace)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => return self.participants[mid],
+            }
+        }
+        return null;
+    }
+    pub fn member(self: Admission, namespace: Namespace) !Participant {
+        try self.validate();
+        return self.find(namespace) orelse error.InvalidParticipant;
     }
     pub fn manifest(self: Admission, commit_version: u64) !Manifest {
         const result: Manifest = .{ .version = self.version, .transaction_id = self.transaction_id, .admission_digest = self.admission_digest, .coordinator_namespace = self.coordinator_namespace, .coordinator_fence = self.coordinator_fence, .commit_version = commit_version, .participants = self.participants };

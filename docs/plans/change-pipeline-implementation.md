@@ -2000,7 +2000,8 @@ pinned; the new primitive must not be enabled as a production serving capability
 
 The history capture layer observes frozen coordinator admission in the same
 native batch as BEGIN and reserves capacity from the existing aggregate history
-quota whenever retention is active or outstanding credits require capture. The
+quota in an initialized history scope, including after the last public consumer
+has been removed. The
 checksummed per-transaction credit binds the admission digest. Its bound covers
 the saved admission, a complete certificate for every participant (including
 guard/checkpoint-only members), and metadata/chunk overhead. Credits share the
@@ -2023,13 +2024,50 @@ reservations, reopen, consumer release, unresolved abort debt, pre-expiry abort
 credit retirement, atomic full-quota rejection, saved-encoding replay, and an
 escaped-payload certificate bound.
 
-This reserves coordinator capacity in an existing qualified history scope, not
-participant completion capacity across a distributed transaction. Unprovisioned
-or inactive scopes must not be advertised as supporting prepared completion
-evidence. Production protocol activation, explicit participant prepare credits,
+This coordinator change was followed by the participant primitives below.
+Unprovisioned scopes must not be advertised as supporting prepared completion
+evidence. Production protocol activation, distributed participant qualification,
 applying-cut/owner validation, zero-effect receipts, complete certificate capture
 and publication, recovery/GC handoff and topology transfer remain required.
 Public coordinated delivery stays disabled until that integration is qualified.
+
+## In progress: participant completion admission and credit-gated votes
+
+`TxnManager.initParticipantWithCompletionAdmission` persists the original frozen
+plan at a non-coordinator participant and rejects an uninitialized history scope.
+The existing capture layer reserves the same full completion bound before that
+participant can prepare, even when the initialized scope has no public consumers.
+Plan reads bind the transaction's coordinator/participant role to its physical
+namespace and require membership in the original manifest. Admission now requires
+an explicit coordinator member with the matching owner fence. The native recovery
+list keeps that original coordinator locator first, independently of canonical
+namespace sorting; a non-coordinator stores the original coordinator as its
+recovery owner.
+
+Planned PREPARE verifies the saved credit amount and digest under the native
+apply/prepare fence. A guard-only member cannot install public row or graph
+mutations; checkpoint-only writes remain limited to private metadata. A pending
+planned transaction cannot commit before its prepare vote is durable, including
+zero-effect participants. Existing ordinary transaction behavior remains covered
+by the broader transaction suite.
+
+All 133 docstore/transaction tests and the completion gate passed in
+`participant-completion-vote-test.log`. Six direct frame/codec tests passed in
+`participant-completion-codec-test.log`. Physical tests cover guard-only votes,
+no-consumer credits, rejection before scope initialization, forbidden effects,
+commit-before-vote rejection, reopen, original owner ordering, and refusal to
+presume abort for a prepared remote participant.
+
+These are trusted storage-owner primitives, not production protocol activation
+or distributed feed qualification. The next required boundary is an atomic
+per-participant resolution receipt tied to the exact retained frame or a positive
+zero-effect decision and the applying native/Raft cut. It must survive retries
+without allocating a new identity. The coordinator still needs authenticated
+receipt collection, complete certificate assembly/publication, explicit retained
+handoff before GC, and ownership/topology recovery. Frozen routed-input/payload
+verification and current-owner validation must be integrated at the native
+prepare ingress before exposing this capability. Public coordinated delivery
+remains disabled until these contracts and failure/recovery checks pass.
 
 ## Working constraints
 

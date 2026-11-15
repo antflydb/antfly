@@ -244,6 +244,17 @@ const CompletionCredit = struct {
         return raw;
     }
 };
+/// Called under the native prepare/apply fence, before publishing the vote.
+/// BEGIN's durable credit must still bind this exact immutable admission.
+pub fn requireCompletionReservation(txn: anytype, namespace: frame.Namespace, admission: completion.Admission) !void {
+    const state = (try load(txn)) orelse return error.HistoryResynchronizationRequired;
+    try requireNamespace(txn, state, namespace);
+    const plan_key = completion.admission_prefix.* ++ admission.transaction_id;
+    const plan = (try optional(txn, &plan_key)) orelse return error.HistoryCorrupt;
+    const expected = try admission.reservationBytes(plan.len);
+    const credit = try CompletionCredit.load(txn, admission.transaction_id);
+    if (credit.bytes != expected or state.reserved_bytes < expected or !std.mem.eql(u8, &credit.digest, &admission.digest())) return error.HistoryCorrupt;
+}
 const Reservation = struct {
     members: u64 = 0,
     bytes: u64 = 0,
@@ -322,7 +333,7 @@ pub const Capture = struct {
                 // Consumer removal cannot discard credits already promised
                 // to a prepared transaction. Finish those resolutions even
                 // when the last public consumer has been released.
-                self.enabled = if (state) |current| current.active() or current.reserved_bytes != 0 else false;
+                self.enabled = if (state) |current| current.active() or current.reserved_bytes != 0 or completion_admission else false;
                 if (state) |current| {
                     try requireNamespace(txn, current, current.namespace);
                     self.namespace = current.namespace;
@@ -373,7 +384,8 @@ pub const Capture = struct {
             var parsed = try completion.parseAdmission(a, raw);
             defer parsed.deinit();
             const admission = parsed.value.admission;
-            if (!std.mem.eql(u8, &admission.transaction_id, &id) or !std.mem.eql(u8, &admission.coordinator_namespace, &self.namespace)) return error.InvalidTxnRecord;
+            if (!std.mem.eql(u8, &admission.transaction_id, &id)) return error.InvalidTxnRecord;
+            _ = try admission.member(self.namespace);
             if (entry.value_ptr.previous != 0 and !std.mem.eql(u8, &entry.value_ptr.digest, &parsed.value.digest)) return error.InvalidTxnRecord;
             entry.value_ptr.next = try admission.reservationBytes(raw.len);
             entry.value_ptr.digest = parsed.value.digest;
