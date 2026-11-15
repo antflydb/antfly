@@ -31,6 +31,8 @@ const metadata_transition_state = @import("transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const tables_api = @import("../api/tables.zig");
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const transaction_contract = @import("antfly_local_sources").api_local_table_writes.distributed_txn;
+const source_effects = @import("antfly_local_sources").api_local_table_writes.source_effects;
 const backend_types = @import("antfly_local_sources").storage_backend_types;
 const secrets = @import("antfly_local_sources").common_secrets;
 const pattern_filter = @import("antfly_local_sources").search_pattern_filter;
@@ -152,6 +154,7 @@ fn replicationErrorEndsRound(err: anyerror) bool {
 
 fn classifyReplicationError(err: anyerror) []const u8 {
     return switch (err) {
+        error.ReplicationProjectionIncomplete,
         error.ReplicationExactCutoverRequired,
         error.ForeignAuthFailed,
         error.ForeignTableNotFound,
@@ -1849,13 +1852,8 @@ pub const StreamingReplicationRunner = struct {
             }
             // Streaming apply happens outside any bulk-ingest window, so the
             // enrichment runtime can always see the row being waited on here.
-            var apply_summary: ReplicationApplySummary = .{};
+            const apply_summary = try applyReplicationTransaction(self.alloc, self.write_source, table.name, transaction, parsed, cdc_apply_sync_level);
             for (transaction) |member| {
-                try self.checkpointWork();
-                if (existing_status) |status| try callCheckCutoverAuthority(status_sink, table.replication_sources_json, status);
-                const applied = try applyReplicationChange(self.alloc, self.write_source, table.name, member, parsed, cdc_apply_sync_level);
-                apply_summary.writes_applied += applied.writes_applied;
-                apply_summary.deletes_applied += applied.deletes_applied;
                 try self.reachLifecycle(
                     .stream_change_applied,
                     table.table_id,
@@ -1881,8 +1879,8 @@ pub const StreamingReplicationRunner = struct {
             else if (result.lag_millis > 0) result.lag_millis else 0;
 
             // Only the complete source transaction grants a resume frontier.
-            // A failed later member leaves the previous durable checkpoint,
-            // so a retry replays the transaction instead of losing its suffix.
+            // A rejected atomic group leaves the previous durable checkpoint.
+            // Receipt-based lost-response recovery is a separate admission fence.
             summary.changes_applied += transaction.len;
             summary.last_checkpoint_len = change.checkpoint.len;
             summary.writes_applied += apply_summary.writes_applied;
@@ -2393,142 +2391,165 @@ fn applyReplicationChange(
     parsed: ParsedReplicationSourceConfig,
     sync_level: db_mod.types.SyncLevel,
 ) !ReplicationApplySummary {
-    if (parsed.routes.len > 0) {
-        return try applyReplicationChangeRouted(alloc, write_source, change, parsed, sync_level);
-    }
-
-    switch (change.op) {
-        .insert, .update => {
-            const row = change.row orelse return error.InvalidReplicationSourceRow;
-            const key = try renderReplicationChangeKeyAlloc(alloc, change, parsed.key_template);
-            defer alloc.free(key);
-            const transforms = if (parsed.on_update_json) |on_update_json|
-                try resolveConfiguredTransformOpsAlloc(alloc, on_update_json, row)
-            else
-                try autoSetTransformOpsAlloc(alloc, row);
-            defer freeTransformOpsOwned(alloc, transforms);
-            const doc_transforms = [_]db_mod.types.DocumentTransform{.{
-                .key = key,
-                .operations = transforms,
-                .upsert = true,
-            }};
-            try applyReplicationBatchRequired(alloc, write_source, table_name, .{
-                .transforms = doc_transforms[0..],
-                .sync_level = sync_level,
-            });
-            return .{ .writes_applied = 1 };
-        },
-        .delete => {
-            const key = try renderReplicationChangeKeyAlloc(alloc, change, parsed.key_template);
-            defer alloc.free(key);
-            if (parsed.delete_document_on_delete or change.row == null) {
-                const deletes = [_][]const u8{key};
-                try applyReplicationBatchRequired(alloc, write_source, table_name, .{
-                    .deletes = deletes[0..],
-                    .sync_level = sync_level,
-                });
-                return .{ .deletes_applied = 1 };
-            } else {
-                const transforms = if (parsed.on_delete_json) |on_delete_json|
-                    try resolveConfiguredTransformOpsAlloc(alloc, on_delete_json, change.row.?)
-                else if (parsed.on_update_json) |on_update_json|
-                    try deriveUnsetTransformOpsFromUpdateAlloc(alloc, on_update_json, parsed.key_template)
-                else
-                    try autoUnsetTransformOpsAlloc(alloc, change.row.?, parsed.key_template);
-                defer freeTransformOpsOwned(alloc, transforms);
-                const doc_transforms = [_]db_mod.types.DocumentTransform{.{
-                    .key = key,
-                    .operations = transforms,
-                    .upsert = false,
-                }};
-                try applyReplicationBatchRequired(alloc, write_source, table_name, .{
-                    .transforms = doc_transforms[0..],
-                    .sync_level = sync_level,
-                });
-                return .{ .deletes_applied = 1 };
-            }
-        },
-    }
+    return applyReplicationTransaction(alloc, write_source, table_name, &.{change}, parsed, sync_level);
 }
 
-fn applyReplicationChangeRouted(
+/// Compile all final destination effects before the first destination mutation.
+/// A multi-table projection requires the existing atomic commit contract; never
+/// fall back to sequential per-table writes when that capability is absent.
+fn applyReplicationTransaction(
     alloc: Allocator,
     write_source: table_writes_api.TableWriteSource,
-    change: foreign_mod.ReplicationChange,
+    table_name: []const u8,
+    changes: []const foreign_mod.ReplicationChange,
     parsed: ParsedReplicationSourceConfig,
     sync_level: db_mod.types.SyncLevel,
 ) !ReplicationApplySummary {
-    const row = change.row orelse return error.InvalidReplicationSourceRow;
+    var plan = source_effects.Plan.init(alloc, .{});
+    defer plan.deinit();
     var summary: ReplicationApplySummary = .{};
-
-    for (parsed.routes) |route| {
-        const key = try renderRouteChangeKeyAlloc(alloc, change, parsed, route);
-        defer alloc.free(key);
-        if (!(try routeMatchesRow(alloc, route, key, row))) continue;
-
-        switch (change.op) {
-            .insert, .update => {
-                const transforms = if (route.on_update_json) |on_update_json|
-                    try resolveConfiguredTransformOpsAlloc(alloc, on_update_json, row)
-                else
-                    try autoSetTransformOpsAlloc(alloc, row);
-                defer freeTransformOpsOwned(alloc, transforms);
-                const doc_transforms = [_]db_mod.types.DocumentTransform{.{
-                    .key = key,
-                    .operations = transforms,
-                    .upsert = true,
-                }};
-                try applyReplicationBatchRequired(alloc, write_source, route.target_table, .{
-                    .transforms = doc_transforms[0..],
-                    .sync_level = sync_level,
-                });
-                summary.writes_applied += 1;
-            },
-            .delete => {
-                if (route.delete_document_on_delete) {
-                    const deletes = [_][]const u8{key};
-                    try applyReplicationBatchRequired(alloc, write_source, route.target_table, .{
-                        .deletes = deletes[0..],
-                        .sync_level = sync_level,
-                    });
-                    summary.deletes_applied += 1;
-                } else {
-                    const transforms = if (route.on_delete_json) |on_delete_json|
-                        try resolveConfiguredTransformOpsAlloc(alloc, on_delete_json, row)
-                    else if (route.on_update_json) |on_update_json|
-                        try deriveUnsetTransformOpsFromUpdateAlloc(alloc, on_update_json, route.key_template orelse parsed.key_template)
-                    else
-                        try autoUnsetTransformOpsAlloc(alloc, row, route.key_template orelse parsed.key_template);
-                    defer freeTransformOpsOwned(alloc, transforms);
-                    const doc_transforms = [_]db_mod.types.DocumentTransform{.{
-                        .key = key,
-                        .operations = transforms,
-                        .upsert = false,
-                    }};
-                    try applyReplicationBatchRequired(alloc, write_source, route.target_table, .{
-                        .transforms = doc_transforms[0..],
-                        .sync_level = sync_level,
-                    });
-                    summary.deletes_applied += 1;
-                }
-            },
-        }
+    for (changes) |change| {
+        const applied = try compileReplicationChange(alloc, &plan, table_name, change, parsed);
+        summary.writes_applied += applied.writes_applied;
+        summary.deletes_applied += applied.deletes_applied;
     }
-
+    const effects = try plan.finish();
+    if (effects.len == 0) return summary;
+    const requests = try alloc.alloc(transaction_contract.TableCommitRequest, effects.len);
+    defer alloc.free(requests);
+    for (effects, requests) |effect, *request| request.* = .{
+        .table_name = effect.table_name,
+        .transforms = effect.transforms,
+        .deletes = effect.deletes,
+    };
+    const outcome = (try write_source.commitBatch(alloc, requests, sync_level)) orelse return error.UnsupportedReplicationRoute;
+    if (outcome == .conflict) return error.IntentConflict;
+    if (outcome.committed.propagation_pending or outcome.committed.visibility_pending) return error.SourceOutcomeUnresolved;
     return summary;
 }
 
-fn renderRouteChangeKeyAlloc(
+fn compileReplicationChange(
     alloc: Allocator,
+    plan: *source_effects.Plan,
+    table_name: []const u8,
     change: foreign_mod.ReplicationChange,
     parsed: ParsedReplicationSourceConfig,
-    route: ParsedReplicationRouteConfig,
-) ![]u8 {
-    if (route.key_template == null) {
-        return try renderReplicationChangeKeyAlloc(alloc, change, parsed.key_template);
+) !ReplicationApplySummary {
+    var summary: ReplicationApplySummary = .{};
+    if (parsed.routes.len == 0) {
+        return compileReplicationProjection(alloc, plan, change, parsed.key_template, .{
+            .target_table = @constCast(table_name),
+            .on_update_json = parsed.on_update_json,
+            .on_delete_json = parsed.on_delete_json,
+            .delete_document_on_delete = parsed.delete_document_on_delete,
+        });
     }
-    const row = change.row orelse return error.InvalidReplicationSourceRow;
-    return try renderDocumentKeyAlloc(alloc, row, route.key_template.?);
+    for (parsed.routes) |route| {
+        const applied = try compileReplicationProjection(alloc, plan, change, parsed.key_template, route);
+        summary.writes_applied += applied.writes_applied;
+        summary.deletes_applied += applied.deletes_applied;
+    }
+    return summary;
+}
+
+fn compileReplicationProjection(
+    alloc: Allocator,
+    plan: *source_effects.Plan,
+    change: foreign_mod.ReplicationChange,
+    default_key_template: []const u8,
+    route: ParsedReplicationRouteConfig,
+) !ReplicationApplySummary {
+    const key_template = route.key_template orelse default_key_template;
+    var materialized: ?std.json.Value = null;
+    defer if (materialized) |*value| foreign_mod.deinitJsonValue(alloc, value);
+    var row = change.row orelse {
+        if (change.op != .delete or change.key == null) return error.InvalidReplicationSourceRow;
+        if (route.where_json != null) return error.ReplicationProjectionIncomplete;
+        try plan.delete(route.target_table, change.key.?);
+        return .{ .deletes_applied = 1 };
+    };
+    // FULL old images can fill unchanged-TOAST holes without looking up a
+    // later provider row or reverse-mapping an already transformed destination.
+    if (change.op == .update and !change.row_complete and change.before_complete) {
+        const before = change.beforeImage() orelse return error.ReplicationProjectionIncomplete;
+        if (row != .object or before != .object) return error.InvalidReplicationSourceRow;
+        materialized = try cloneJsonValueAllocLocal(alloc, before);
+        var fields = row.object.iterator();
+        while (fields.next()) |field| {
+            if (materialized.?.object.getPtr(field.key_ptr.*)) |existing| {
+                var replacement = try cloneJsonValueAllocLocal(alloc, field.value_ptr.*);
+                errdefer foreign_mod.deinitJsonValue(alloc, &replacement);
+                foreign_mod.deinitJsonValue(alloc, existing);
+                existing.* = replacement;
+            } else {
+                const name = try alloc.dupe(u8, field.key_ptr.*);
+                errdefer alloc.free(name);
+                var value = try cloneJsonValueAllocLocal(alloc, field.value_ptr.*);
+                errdefer foreign_mod.deinitJsonValue(alloc, &value);
+                try materialized.?.object.put(alloc, name, value);
+            }
+        }
+        row = materialized.?;
+    }
+    const key = if (route.key_template == null and change.key != null)
+        try alloc.dupe(u8, change.key.?)
+    else
+        try renderDocumentKeyAlloc(alloc, row, key_template);
+    defer alloc.free(key);
+    if (route.where_json != null and !change.row_complete and materialized == null) return error.ReplicationProjectionIncomplete;
+    if (change.op == .delete) {
+        if (route.where_json != null and !change.before_complete) return error.ReplicationProjectionIncomplete;
+        if (!try routeMatchesRow(alloc, route, key, row)) return .{};
+        try compileReplicationDelete(alloc, plan, route, key_template, key, row, change.before_complete);
+        return .{ .deletes_applied = 1 };
+    }
+    var summary: ReplicationApplySummary = .{};
+    const matches = try routeMatchesRow(alloc, route, key, row);
+    if (change.op == .update) {
+        if (route.where_json != null and !change.before_complete) return error.ReplicationProjectionIncomplete;
+        if (change.beforeImage()) |before| {
+            const old_key = try renderDocumentKeyAlloc(alloc, before, key_template);
+            defer alloc.free(old_key);
+            const moved = !std.mem.eql(u8, old_key, key);
+            if (moved and !change.row_complete and materialized == null) return error.ReplicationProjectionIncomplete;
+            if ((moved or !matches) and try routeMatchesRow(alloc, route, old_key, before)) {
+                try compileReplicationDelete(alloc, plan, route, key_template, old_key, before, change.before_complete);
+                summary.deletes_applied += 1;
+            }
+        }
+    }
+    if (matches) {
+        const ops = if (route.on_update_json) |configured|
+            try resolveConfiguredTransformOpsAlloc(alloc, configured, row)
+        else
+            try autoSetTransformOpsAlloc(alloc, row);
+        defer freeTransformOpsOwned(alloc, ops);
+        try plan.transform(route.target_table, .{ .key = key, .operations = ops, .upsert = true });
+        summary.writes_applied += 1;
+    }
+    return summary;
+}
+
+fn compileReplicationDelete(
+    alloc: Allocator,
+    plan: *source_effects.Plan,
+    route: ParsedReplicationRouteConfig,
+    key_template: []const u8,
+    key: []const u8,
+    row: std.json.Value,
+    complete: bool,
+) !void {
+    if (route.delete_document_on_delete) return plan.delete(route.target_table, key);
+    const ops = if (route.on_delete_json) |configured|
+        try resolveConfiguredTransformOpsAlloc(alloc, configured, row)
+    else if (route.on_update_json) |configured|
+        try deriveUnsetTransformOpsFromUpdateAlloc(alloc, configured, key_template)
+    else blk: {
+        if (!complete) return error.ReplicationProjectionIncomplete;
+        break :blk try autoUnsetTransformOpsAlloc(alloc, row, key_template);
+    };
+    defer freeTransformOpsOwned(alloc, ops);
+    try plan.transform(route.target_table, .{ .key = key, .operations = ops, .upsert = false });
 }
 
 fn routeMatchesRow(
@@ -3626,7 +3647,7 @@ test "metadata snapshot backfill stops before apply when its work permit is revo
         .registry = &registry,
         .write_source = .{
             .ptr = &state,
-            .vtable = &.{ .batch = State.batch },
+            .vtable = &.{ .batch = State.batch, .commit_batch = comptime testSingleTableCommit(State.batch) },
         },
         .work_permit = .{
             .ptr = &state,
@@ -4758,6 +4779,7 @@ test "metadata replication backfill routes matching snapshot rows to target tabl
                 .ptr = self,
                 .vtable = &.{
                     .batch = batch,
+                    .commit_batch = comptime testSingleTableCommit(batch),
                     .begin_bulk_ingest = beginBulkIngest,
                     .finish_bulk_ingest = finishBulkIngest,
                     .abort_bulk_ingest = abortBulkIngest,
@@ -6034,6 +6056,7 @@ test "metadata replication backfill production round entry point rotates across 
         .ptr = &AcceptAllWriteSource.sentinel,
         .vtable = &.{
             .batch = AcceptAllWriteSource.batch,
+            .commit_batch = comptime testSingleTableCommit(AcceptAllWriteSource.batch),
         },
     };
 
@@ -6326,6 +6349,7 @@ test "metadata replication backfill round persists the cursor past a source that
         .ptr = &AcceptAllWriteSource.sentinel,
         .vtable = &.{
             .batch = AcceptAllWriteSource.batch,
+            .commit_batch = comptime testSingleTableCommit(AcceptAllWriteSource.batch),
         },
     };
 
@@ -6839,7 +6863,7 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
         .registry = &registry,
         .write_source = .{
             .ptr = &NullWriteSource.sentinel,
-            .vtable = &.{ .batch = NullWriteSource.batch },
+            .vtable = &.{ .batch = NullWriteSource.batch, .commit_batch = comptime testSingleTableCommit(NullWriteSource.batch) },
         },
     };
     const table = metadata_table_manager.TableRecord{
@@ -6938,6 +6962,122 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
     try std.testing.expectEqual(@as(usize, 2), status_sink.durable_calls);
 }
 
+/// Adapter for test-only single-table batch spies. Reject multi-table effects
+/// before invoking any spy; actual fan-out fixtures supply commit_batch.
+fn testSingleTableCommit(comptime batch_callback: anytype) @FieldType(table_writes_api.TableWriteSource.VTable, "commit_batch") {
+    return struct {
+        fn commit(ptr: *anyopaque, a: Allocator, tables: []const transaction_contract.TableCommitRequest, sync_level: db_mod.types.SyncLevel) !?transaction_contract.CommitOutcome {
+            if (tables.len != 1) return error.UnsupportedReplicationRoute;
+            const table = tables[0];
+            _ = (try batch_callback(ptr, a, table.table_name, .{
+                .writes = table.writes,
+                .deletes = table.deletes,
+                .transforms = table.transforms,
+                .sync_level = sync_level,
+            })) orelse return error.UnsupportedReplicationRoute;
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    }.commit;
+}
+
+test "metadata replication stream compiles route leave enter and key changes as one destination transaction" {
+    const a = std.testing.allocator;
+    var before = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":\"old\",\"tier\":\"premium\",\"name\":\"large retained value\"}", .{});
+    defer before.deinit();
+    var after = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":\"new\",\"tier\":\"free\"}", .{});
+    defer after.deinit();
+    var change: foreign_mod.ReplicationChange = .{
+        .op = .update,
+        .checkpoint = @constCast("commit"),
+        .before = before.value,
+        .before_kind = .full,
+        .before_complete = true,
+        .row = after.value,
+        .row_complete = false,
+    };
+    var routes = [_]ParsedReplicationRouteConfig{
+        .{ .target_table = @constCast("premium"), .where_json = @constCast("{\"term\":\"premium\",\"field\":\"tier\"}"), .delete_document_on_delete = true },
+        .{ .target_table = @constCast("free"), .where_json = @constCast("{\"term\":\"free\",\"field\":\"tier\"}"), .delete_document_on_delete = true },
+    };
+    const config: ParsedReplicationSourceConfig = .{
+        .type_name = @constCast("postgres"),
+        .dsn = @constCast("postgres://db"),
+        .postgres_table = @constCast("users"),
+        .key_template = @constCast("id"),
+        .slot_name = @constCast("slot"),
+        .publication_name = @constCast("publication"),
+        .routes = &routes,
+    };
+    const Destination = struct {
+        calls: usize = 0,
+        fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.TestUnexpectedResult;
+        }
+        fn commit(ptr: *anyopaque, _: Allocator, tables: []const transaction_contract.TableCommitRequest, _: db_mod.types.SyncLevel) !?transaction_contract.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), tables.len);
+            try std.testing.expectEqualStrings("premium", tables[0].table_name);
+            try std.testing.expectEqualStrings("old", tables[0].deletes[0]);
+            try std.testing.expectEqualStrings("free", tables[1].table_name);
+            try std.testing.expectEqualStrings("new", tables[1].transforms[0].key);
+            var retained = false;
+            for (tables[1].transforms[0].operations) |op| {
+                if (std.mem.eql(u8, op.path, "name")) {
+                    try std.testing.expectEqualStrings("\"large retained value\"", op.value_json.?);
+                    retained = true;
+                }
+            }
+            try std.testing.expect(retained);
+            return .{ .committed = .{ .participant_count = 2 } };
+        }
+    };
+    var destination: Destination = .{};
+    const writer: table_writes_api.TableWriteSource = .{ .ptr = &destination, .vtable = &.{ .batch = Destination.batch, .commit_batch = Destination.commit } };
+    const summary = try applyReplicationTransaction(a, writer, "source", &.{change}, config, .write);
+    try std.testing.expectEqual(@as(usize, 1), summary.writes_applied);
+    try std.testing.expectEqual(@as(usize, 1), summary.deletes_applied);
+    try std.testing.expectEqual(@as(usize, 1), destination.calls);
+    const unsupported: table_writes_api.TableWriteSource = .{ .ptr = &destination, .vtable = &.{ .batch = Destination.batch } };
+    try std.testing.expectError(error.UnsupportedReplicationRoute, applyReplicationTransaction(a, unsupported, "source", &.{change}, config, .write));
+    change.before_complete = false;
+    try std.testing.expectError(error.ReplicationProjectionIncomplete, applyReplicationTransaction(a, writer, "source", &.{change}, config, .write));
+    try std.testing.expectEqual(@as(usize, 1), destination.calls);
+}
+
+test "metadata replication stream rejects a later invalid member without applying a transaction prefix" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/replication-transaction-atomic", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try db_mod.DB.open(a, path, .{});
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"count\":0}" },
+        .{ .key = "b", .value = "{\"count\":0}" },
+    } });
+    var source = table_writes_api.BoundTableWriteSource.init("docs", &db);
+    var config = try parseReplicationSourceConfig(a, "docs",
+        \\[{"type":"postgres","dsn":"postgres://db","postgres_table":"users","key_template":"id","on_update":[{"op":"$inc","path":"count","value":"{{amount}}"}]}]
+    , 0, null);
+    defer config.deinit(a);
+    var first = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":\"a\",\"amount\":1}", .{});
+    defer first.deinit();
+    var invalid = try std.json.parseFromSlice(std.json.Value, a, "{\"id\":\"b\",\"amount\":\"invalid numeric operand\"}", .{});
+    defer invalid.deinit();
+    const changes = [_]foreign_mod.ReplicationChange{
+        .{ .op = .insert, .checkpoint = @constCast("commit"), .row = first.value },
+        .{ .op = .insert, .checkpoint = @constCast("commit"), .row = invalid.value },
+    };
+    try std.testing.expectError(error.InvalidArgument, applyReplicationTransaction(a, source.source(), "docs", &changes, config, .write));
+    var result = (try db.lookup(a, "a", .{})).?;
+    defer result.deinit(a);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result.json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("count").?.integer);
+}
+
 test "metadata replication stream resumes a whole transaction after a later member fails" {
     const alloc = std.testing.allocator;
     const State = struct {
@@ -6950,7 +7090,7 @@ test "metadata replication stream resumes a whole transaction after a later memb
         fn batch(ptr: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            if (!self.failed and self.calls == 3) {
+            if (!self.failed and self.calls == 2) {
                 self.failed = true;
                 return error.InjectedDestinationFailure;
             }
@@ -7024,7 +7164,7 @@ test "metadata replication stream resumes a whole transaction after a later memb
     var runner: StreamingReplicationRunner = .{
         .alloc = alloc,
         .registry = &registry,
-        .write_source = .{ .ptr = &state, .vtable = &.{ .batch = State.batch } },
+        .write_source = .{ .ptr = &state, .vtable = &.{ .batch = State.batch, .commit_batch = comptime testSingleTableCommit(State.batch) } },
     };
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 11,
@@ -7039,7 +7179,7 @@ test "metadata replication stream resumes a whole transaction after a later memb
     const resumed = try runner.runTableSourceFromCheckpoint(&sink, table, 0, 0, "", failed.checkpoint, null);
     try std.testing.expect(state.resumed);
     try std.testing.expectEqual(@as(usize, 2), resumed.changes_applied);
-    try std.testing.expectEqual(@as(usize, 5), state.calls);
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
     try std.testing.expectEqualStrings("second-commit", sink.records.items[sink.records.items.len - 1].checkpoint);
 }
 
@@ -7367,16 +7507,23 @@ test "metadata replication stream routes matching rows to target tables" {
             };
             changes[1] = .{
                 .op = .update,
+                .before_kind = .full,
+                .before_complete = true,
+                .before = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"r-2\",\"name\":\"Bob\",\"tier\":\"free\"}", .{}),
                 .checkpoint = try inner_alloc.dupe(u8, "lsn:21"),
                 .row = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"r-2\",\"name\":\"Bob\",\"tier\":\"free\"}", .{}),
             };
             changes[2] = .{
                 .op = .update,
+                .before_kind = .full,
+                .before_complete = true,
+                .before = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"r-3\",\"name\":\"Eve\",\"tier\":\"enterprise\"}", .{}),
                 .checkpoint = try inner_alloc.dupe(u8, "lsn:22"),
                 .row = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"r-3\",\"name\":\"Eve\",\"tier\":\"enterprise\"}", .{}),
             };
             changes[3] = .{
                 .op = .delete,
+                .before_complete = true,
                 .checkpoint = try inner_alloc.dupe(u8, "lsn:23"),
                 .row = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"r-1\",\"name\":\"Alice\",\"tier\":\"premium\"}", .{}),
             };
@@ -7430,6 +7577,7 @@ test "metadata replication stream routes matching rows to target tables" {
                 .ptr = self,
                 .vtable = &.{
                     .batch = batch,
+                    .commit_batch = comptime testSingleTableCommit(batch),
                 },
             };
         }
@@ -7874,6 +8022,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
                 .ptr = &NullSource.sentinel,
                 .vtable = &.{
                     .batch = NullSource.batch,
+                    .commit_batch = comptime testSingleTableCommit(NullSource.batch),
                 },
             },
         },
@@ -8115,6 +8264,7 @@ test "metadata replication stream coordinator recovers after transient polling f
                 .ptr = &NullSource.sentinel,
                 .vtable = &.{
                     .batch = NullSource.batch,
+                    .commit_batch = comptime testSingleTableCommit(NullSource.batch),
                 },
             },
         },
@@ -8373,6 +8523,7 @@ test "metadata replication stream production round entry point rotates across th
             .ptr = &NullSource.sentinel,
             .vtable = &.{
                 .batch = NullSource.batch,
+                .commit_batch = comptime testSingleTableCommit(NullSource.batch),
             },
         },
     };
@@ -8609,6 +8760,7 @@ test "metadata replication stream coordinator marks missing slot as terminal fai
                 .ptr = &NullSource.sentinel,
                 .vtable = &.{
                     .batch = NullSource.batch,
+                    .commit_batch = comptime testSingleTableCommit(NullSource.batch),
                 },
             },
         },

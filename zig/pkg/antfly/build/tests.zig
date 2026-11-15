@@ -389,15 +389,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[7],
         .filters = &.{
             "metadata replication stream",
+            "metadata replication backfill routes matching snapshot rows",
+            "metadata replication backfill applies configured update transforms",
+            "metadata snapshot backfill stops before apply",
             "replication transactions group opaque checkpoints",
             "postgres libpq parser rejects truncate",
             "postgres libpq parser decodes pgoutput",
         },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const source_effects_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_effects.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"source effects"},
+    });
+    const run_source_effects_tests = b.addRunArtifact(source_effects_tests);
     const source_transaction_step = b.step("source-transaction-test", "Verify shared source envelopes and complete CDC transaction checkpoints");
     const run_source_transaction_tests = b.addRunArtifact(source_transaction_tests);
     source_transaction_step.dependOn(&run_source_transaction_tests.step);
+    source_transaction_step.dependOn(&run_source_effects_tests.step);
     source_transaction_step.dependOn(&b.addRunArtifact(replication_transaction_tests).step);
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
     const cypher_owner_readiness = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "selected owner readiness", "system catalog baseline resumes after snapshot and activates atomically before sparse updates" } });
@@ -6203,6 +6216,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_source_admission_codec_tests = b.addRunArtifact(source_admission_codec_tests);
     b.step("source-admission-codec-test", "Verify bounded durable source receipts and pending replay fencing").dependOn(&run_source_admission_codec_tests.step);
     unit_test_step.dependOn(&run_source_admission_codec_tests.step);
+    unit_test_step.dependOn(&run_source_effects_tests.step);
     const committed_history_step = b.step("docstore-history-test", "Verify atomic committed before/after images, prepared credits and retention");
     committed_history_step.dependOn(&run_committed_history_tests.step);
     committed_history_step.dependOn(&run_committed_frame_tests.step);

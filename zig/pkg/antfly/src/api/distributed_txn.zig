@@ -1263,6 +1263,7 @@ pub fn executeCrossGroup(
     req: db_mod.types.TransactionIntentRequest,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !ExecuteResult {
+    if (req.source_admission != null) return error.UnsupportedOperation;
     if (req.range_guards.len != 0) return error.InvalidTxnRequest;
     const tables = [_]TableCommitRequest{.{
         .table_name = table_name,
@@ -1342,6 +1343,9 @@ pub fn executeMultiTableCommitWithOptions(
     trace_writer: ?tracing.AntflyTraceWriter,
     options: ExecuteOptions,
 ) !CommitOutcome {
+    // Root-local source receipts cannot be silently discarded by routing.
+    // The source-head anchor and participant receipts must be compiled first.
+    for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
     return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, trace_writer, options);
 }
 

@@ -16,6 +16,7 @@
 pub const physical_local_write = if (@import("storage_source_options").control_only) struct {} else @import("antfly_source_root").antfly_sources.local_write;
 pub const std = @import("std");
 pub const source_admission = @import("../storage/source_admission.zig");
+pub const source_effects = @import("../storage/source_effects.zig");
 pub const storage_source_options = @import("storage_source_options");
 pub const control_only_storage_sources = storage_source_options.control_only;
 pub const backups_api = @import("backups.zig");

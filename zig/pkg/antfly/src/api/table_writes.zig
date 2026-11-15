@@ -22324,6 +22324,7 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
@@ -23440,6 +23441,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        if (req.source_admission != null) return error.UnsupportedOperation;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
         if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
@@ -26329,6 +26331,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
         return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
@@ -26867,6 +26870,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        if (req.source_admission != null) return error.UnsupportedOperation;
         return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
             .row_policy_principal_proof = req.row_policy_principal_proof,
             .row_policy_database = req.row_policy_database,

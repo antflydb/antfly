@@ -6077,6 +6077,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         topology_epoch: u64,
         req: db_types.TransactionIntentRequest,
     ) !?void {
+        if (req.source_admission != null) return error.UnsupportedOperation;
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         comptime std.debug.assert(@sizeOf(db_types.TransactionWrite) == @sizeOf(db_types.BatchWrite));
         if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;

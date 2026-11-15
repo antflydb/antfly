@@ -110,6 +110,43 @@ The source command is currently private. Distributed routing/anchor ownership,
 replicated transport, managed connector invocation, and writable-Iceberg adapters
 still require integration; this does not advertise those destination capabilities.
 
+## In progress: transaction-wide source projection and destination apply
+
+- `storage/source_effects.zig` owns a bounded source-ordered projection plan.
+  Full deletes remove preceding transforms for that key; later transforms retain
+  their individual upsert behavior against the deleted base. Limits count all
+  input operations, including superseded work, and rejected partial plans cannot
+  be submitted. Final effects and their bytes belong to the plan arena.
+- Managed streaming compiles every member of a complete provider transaction
+  before the first destination mutation, then calls canonical `commitBatch`.
+  This is required even for one destination table: ordinary routed table batches
+  can fan out sequentially across shards. Unsupported transaction capabilities
+  fail before falling back to any non-atomic table writes.
+- Routed projection uses historical images for key changes, enter/update/leave
+  and deletes. FULL before-images can fill unchanged-TOAST holes in new images.
+  Filtering or cleanup requiring unavailable historical fields fails explicitly
+  with `ReplicationProjectionIncomplete`; it cannot advance progress by
+  treating omitted fields or identity placeholders as historical NULL values.
+- Private native source commands are rejected at routed/coordinator/participant
+  boundaries until source-head anchor and participant transport are implemented,
+  instead of silently discarding their durable admission metadata.
+- `zig build source-transaction-test -j2` passes the expanded 18-case
+  snapshot/stream/parser suite, source envelope checks, and two planner tests.
+  Coverage includes native rollback when a later member is invalid, atomic
+  multi-table request shape, old-key removal, route enter/leave, historical TOAST
+  reconstruction, missing-capability/incomplete-image rejection before mutation,
+  snapshot routes, configured transforms, and work-permit revocation. Current
+  log: `zig/source-atomic-routing-qualified-final.log`.
+
+This improves atomic application but does not yet connect managed source progress
+to durable admission receipts. Lost acknowledgments can still replay transforms
+until the source actor persists sequence/pending identity/accepted timestamp and
+uses destination receipt resolution. Native source schema qualification must also
+validate that a mapping without FULL old rows uses a stable replica-identity key;
+arbitrary non-identity key expressions cannot silently inherit that guarantee.
+Writable-Iceberg transformation/admission and accepted-versus-catalog-committed
+progress remain separate required adapters.
+
 ## Remaining implementation phases
 
 1. Finish root history tests, prepared credit accounting and native integration.
@@ -148,8 +185,8 @@ local artifacts. Keep draft PR scope/status honest as implementation grows.
   trusted private source-admission field, not admitted from public document keys.
 - Managed PostgreSQL capture is in `metadata/replication_backfill.zig`; its
   transaction iterator groups complete checkpoint runs, but destination apply
-  still calls the per-row writer. Preserve configured transform order and route
-  fan-out when replacing that with transaction admission. Key changes and
+  now submits complete groups through canonical transaction commit. Preserve
+  this ordered projection when adding durable destination admission. Key changes and
   filtered enter/leave need provider before-images; the current pgoutput update
   parser now retains old tuples and completeness; routed apply still must consume
   those images before claiming that scope.
