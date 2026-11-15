@@ -6183,6 +6183,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_docstore_unit_tests = addCuratedTestRunArtifact(b, docstore_unit_tests, &.{ "storage.docstore.", "storage.transactions." });
 
+    const committed_history_tests = b.addTest(.{
+        .root_module = docstore_test_mod,
+        .filters = &.{ "docstore committed history", "committed history transaction reservations" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_committed_history_tests = addFilteredTestRunArtifact(b, committed_history_tests);
+    const committed_frame_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/committed_frame.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_committed_frame_tests = b.addRunArtifact(committed_frame_tests);
+    const committed_history_step = b.step("docstore-history-test", "Verify atomic committed before/after images, prepared credits and retention");
+    committed_history_step.dependOn(&run_committed_history_tests.step);
+    committed_history_step.dependOn(&run_committed_frame_tests.step);
+    unit_test_step.dependOn(&run_committed_history_tests.step);
+    unit_test_step.dependOn(&run_committed_frame_tests.step);
+
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
     const retained_effects_tests = b.addTest(.{

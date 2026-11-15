@@ -118,25 +118,7 @@ pub const WriteIntent = struct {
     retained_artifact_keys: u64 = 0,
 };
 
-pub const IntentValue = struct {
-    value: ?[]const u8,
-    prepared_row: ?[]const u8 = null,
-
-    pub fn decode(bytes: []const u8) !IntentValue {
-        if (bytes.len == 0) return error.InvalidTxnRecord;
-        return switch (bytes[0]) {
-            0 => .{ .value = bytes[1..] },
-            1 => if (bytes.len == 1) .{ .value = null } else error.InvalidTxnRecord,
-            2 => blk: {
-                if (bytes.len < 5) return error.InvalidTxnRecord;
-                const length = std.mem.readInt(u32, bytes[1..5], .little);
-                if (length > bytes.len - 5 or length == bytes.len - 5) return error.InvalidTxnRecord;
-                break :blk .{ .value = bytes[5..][0..length], .prepared_row = bytes[5 + length ..] };
-            },
-            else => error.InvalidTxnRecord,
-        };
-    }
-};
+pub const IntentValue = @import("transaction_intent_value.zig").Value;
 
 /// Admission counts retained input/AROW bytes and per-row commit metadata.
 /// Transient parsing and preparation allocations are independently charged by
@@ -155,16 +137,7 @@ pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
 /// derived index/vector writes. AROW metadata replacement preserves length.
 /// Document numbers retain their exact source spelling. Only special-field
 /// stripping serializes JSON; count its exact output with a bounded writer.
-fn isRawMetadataIntentKey(key: []const u8) bool {
-    return range_protection.counterBucket(key) != null or
-        range_protection.indexCounterDigest(key) != null or
-        std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_generation_retirement") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
-        @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
-}
+const isRawMetadataIntentKey = @import("transaction_intent_value.zig").isRawMetadataKey;
 
 fn isRawMetadataPredicateKey(key: []const u8) bool {
     return isRawMetadataIntentKey(key) or
@@ -181,24 +154,7 @@ fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
     if (isRawMetadataIntentKey(intent.key)) return 0;
     var payload: u64 = if (intent.prepared_row) |row| row.len else if (intent.value) |value| value.len else 0;
     if (intent.prepared_row == null) if (intent.value) |value| {
-        // No escaped property name and no special spelling means the mapper
-        // borrows original bytes; do not parse or allocate on that common path.
-        if (std.mem.indexOf(u8, value, "_edges") != null or std.mem.indexOf(u8, value, "_embeddings") != null or std.mem.indexOfScalar(u8, value, '\\') != null) {
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{ .parse_numbers = false }) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidTxnRecord,
-            };
-            defer parsed.deinit();
-            if (parsed.value == .object) {
-                var buffer: [1024]u8 = undefined;
-                var counter = std.Io.Writer.Discarding.init(&buffer);
-                try std.json.Stringify.value(parsed.value, .{}, &counter.writer);
-                // Native DB removes special/vector fields, while the generic
-                // transaction manager can preserve raw document bytes. Cover
-                // both authorities; removing fields never grows this encoding.
-                payload = @max(payload, counter.fullCount());
-            }
-        }
+        payload = try @import("transaction_intent_value.zig").documentImageBytes(alloc, value);
     };
     const primary = std.math.add(u64, 16 + 2 + internal_keys.encodedComponentLen(intent.key), payload) catch return error.TransactionTooLarge;
     return std.math.add(u64, primary, intent.retained_artifact_bytes) catch error.TransactionTooLarge;
@@ -3253,6 +3209,95 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "committed history transaction reservations survive reopen and committed recovery emits one original transaction" {
+    const history = @import("committed_history.zig");
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-committed-history");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(77);
+    const namespace: history.frame.Namespace = @splat(6);
+    const physical = try internal_keys.documentKeyAlloc(alloc, "row");
+    defer alloc.free(physical);
+    var consumer: history.Consumer = undefined;
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(&internal_keys.identity_namespace_key, &namespace);
+            try @import("source_authority.zig").bind(&txn, .native, namespace);
+            try txn.commit();
+        }
+        try store.put(physical, "before");
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            consumer = try history.admit(&txn, namespace, @splat(1), history.default_limit, 1000, 1);
+            try txn.commit();
+        }
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.initTransaction(id, 1);
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = "after" }}, &.{});
+        try manager.writeIntents(id, &.{ .{ .key = "row", .value = "replacement" }, .{ .key = "row", .value = "after" } }, &.{});
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const state = (try history.load(&read)).?;
+        try std.testing.expect(state.reserved_bytes > 2 * 1024 * 1024);
+        try std.testing.expectEqual(@as(u64, 0), state.latest);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.resolveIntents(id, .committed, 1234);
+        try manager.resolveIntents(id, .committed, 1234);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const state = (try history.load(&read)).?;
+        try std.testing.expectEqual(@as(u64, 0), state.reserved_bytes);
+        try std.testing.expectEqual(@as(u64, 1), state.latest);
+        try std.testing.expectEqualStrings("after", try read.get(physical));
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const descriptor = (try history.read(scratch, &read, namespace, consumer.id, consumer.epoch, 0)).?;
+        var source = try history.ChunkSource(DocStore.Txn).init(alloc, &read, descriptor);
+        defer source.deinit();
+        var reader: history.frame.Reader = .{ .descriptor = descriptor, .source = source.source() };
+        const header = try reader.header(scratch);
+        try std.testing.expectEqualSlices(u8, &id, &header.value.transaction_id);
+        const effect = (try reader.next(scratch)).?;
+        try std.testing.expectEqualStrings("before", effect.before.?);
+        try std.testing.expectEqualStrings("after", effect.after.?);
+        try std.testing.expect((try reader.next(scratch)) == null);
+        const later_id: TxnId = @splat(78);
+        try manager.initTransaction(later_id, 2);
+        try manager.writeIntents(later_id, &.{.{ .key = "row", .value = "after-release" }}, &.{});
+        {
+            var control = try store.beginWriteTxn();
+            errdefer control.abort();
+            try history.release(&control, namespace, consumer.id, consumer.epoch);
+            try control.commit();
+        }
+        try manager.resolveIntents(later_id, .committed, 1235);
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        const final_state = (try history.load(&current)).?;
+        try std.testing.expect(!final_state.active());
+        try std.testing.expectEqual(@as(u64, 0), final_state.reserved_bytes);
+        try std.testing.expectEqual(@as(u64, 2), final_state.latest);
+        try std.testing.expectEqualStrings("after-release", try current.get(physical));
+    }
+}
 
 test "retained transaction reservations survive LSM reopen and guarantee committed resolution at quota" {
     const alloc = std.testing.allocator;
