@@ -1179,6 +1179,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         resolution.status,
                         resolution.commit_version,
                         .{
+                            .source_purpose = resolution.source_purpose,
                             .completion_writes = completion_writes,
                             .resolved_participant = resolution.resolved_participant,
                             .expected_intent_revision = resolution.expected_intent_revision,
@@ -3188,6 +3189,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     resolution.status,
                     resolution.commit_version,
                     .{
+                        .source_purpose = resolution.source_purpose,
                         .commit_participant = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
                         .writes = write_buffers.store_writes.items,
                         .deletes = write_buffers.delete_keys.items,
@@ -3982,6 +3984,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             visibility_cancellation: types.CancellationToken,
             ordered_receipt: ?OrderedApplyReceipt,
             resolved_participant: ?[]const u8,
+            source_purpose: ?[32]u8,
         ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
@@ -3994,6 +3997,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 visibility_cancellation,
                 ordered_receipt,
                 resolved_participant,
+                source_purpose,
                 &preparation.guard,
             ) catch |err| return preparation.mapError(err);
         }
@@ -4007,6 +4011,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             visibility_cancellation: types.CancellationToken,
             ordered_receipt: ?OrderedApplyReceipt,
             resolved_participant: ?[]const u8,
+            source_purpose: ?[32]u8,
             preparation: *PreparedRowAllocator,
         ) !void {
             const alloc = preparation.allocator();
@@ -4035,6 +4040,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                 } else &.{};
                 _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
+                    .source_purpose = source_purpose,
                     .completion_writes = marker_writes,
                     .resolved_participant = resolved_participant,
                 }) catch |err| switch (err) {
@@ -4088,6 +4094,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         status,
                         commit_version,
                         .{
+                            .source_purpose = source_purpose,
                             .completion_writes = marker_writes,
                             .resolved_participant = resolved_participant,
                             .expected_intent_revision = intents.revision,
@@ -4127,6 +4134,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .ordered_apply_receipt = ordered_receipt,
                     .durable_rows = &durable_rows,
                     .transaction_resolution = .{
+                        .source_purpose = source_purpose,
                         .txn_id = txn_id,
                         .status = status,
                         .commit_version = commit_version,

@@ -143,6 +143,10 @@ fn runRecoveryPageWithConfig(
     transaction: for (page.items) |txn| {
         summary.recovery.scanned_records += 1;
         if (txn.status == .pending) {
+            if (txn.source_purpose != null) {
+                summary.recovery.kept_recent_pending += 1;
+                continue;
+            }
             const cutoff = now_ns -| config.cutoff_ns;
             if (txn.coordinator_known and txn.coordinator and txn.created_at > 0 and txn.created_at < cutoff) {
                 const participants = try manager.getParticipants(alloc, txn.txn_id);
@@ -551,6 +555,42 @@ test "transaction recovery runtime recoverOnce works with lsm backend store" {
     });
     try std.testing.expectEqual(@as(u64, 1), stats.auto_aborted);
     try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
+}
+
+test "transaction recovery never presumes abort for source-owned reservations" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(a, .{ .name = "source-recovery" });
+    defer runtime_store.deinit();
+    var manager = try transactions_mod.TxnManager.init(a, &runtime_store);
+    defer manager.deinit();
+    const unprepared: transactions_mod.TxnId = @splat(12);
+    const prepared: transactions_mod.TxnId = @splat(13);
+    for ([_]transactions_mod.TxnId{ unprepared, prepared }, 0..) |id, index| {
+        const proof: [32]u8 = @splat(@intCast(7 + index));
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10_000, 1_000, &.{"docs:0"}, true, true, .{ .source_purpose = proof });
+        if (index != 0) try manager.writeIntentsExtraBatch(id, &.{.{ .key = "a", .value = "source" }}, &.{}, .{ .source_purpose = proof });
+    }
+    const ordinary: transactions_mod.TxnId = @splat(14);
+    try manager.initTransaction(ordinary, 1_000);
+    const Recorder = struct {
+        calls: usize = 0,
+        fn resolve(ptr: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+    };
+    var recorder: Recorder = .{};
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(5_000);
+    const stats = try recoverOnce(a, &runtime_store, .{ .enabled = true, .cutoff_ns = 3_000, .clock = clock.clock(), .resolver_ctx = &recorder, .resolve_participant_fn = Recorder.resolve });
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.auto_aborted);
+    try std.testing.expectEqual(@as(u64, 2), stats.kept_recent_pending);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(unprepared));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(prepared));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(ordinary));
 }
 
 test "transaction recovery delegates stale coordinator abort to replicated resolver" {

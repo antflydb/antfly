@@ -889,6 +889,7 @@ pub const BoundTableWriteSource = struct {
         const table = tables[0];
         if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
         const command = table.source_admission.?;
+        if (!retain_terminal) return error.InvalidSourceAdmission;
         try command.validate();
         if (command.accepted_at_ns != begin_timestamp or !std.mem.eql(u8, &txn_id, &command.transactionId())) return error.SourceTransactionIdentityConflict;
         if (!std.mem.eql(u8, &command.participant_digest, &admission.operationsDigest(table))) return error.SourcePayloadConflict;
@@ -934,6 +935,11 @@ pub const BoundTableWriteSource = struct {
         return .{ .committed = result };
     }
 
+    fn resolveBoundTransaction(db: *db_mod.DB, command: ?source_admission.Command, txn_id: db_mod.types.TxnId, status: transactions_mod.TxnStatus, version: u64, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !void {
+        if (command) |source_command| return db.resolveSourceTransaction(source_command, status, sync_level, cancellation);
+        return db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, version, sync_level, cancellation);
+    }
+
     fn commitBoundTransactionInner(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -959,17 +965,20 @@ pub const BoundTableWriteSource = struct {
         defer alloc.free(local_participant);
         const participants = [_][]const u8{local_participant};
 
-        _ = db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
-            txn_id,
-            begin_timestamp,
-            nextTxnTimestamp(db.backend_runtime.io()),
-            &participants,
-            true,
-            retain_terminal,
-        ) catch |err| switch (err) {
+        _ = (if (table.source_admission) |command|
+            db.beginSourceTransaction(command, nextTxnTimestamp(db.backend_runtime.io()), &participants)
+        else
+            db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+                txn_id,
+                begin_timestamp,
+                nextTxnTimestamp(db.backend_runtime.io()),
+                &participants,
+                true,
+                retain_terminal,
+            )) catch |err| switch (err) {
             error.DecisionConflict => switch (try db.getTransactionStatus(txn_id)) {
                 .committed => {
-                    db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, .committed, commit_version, sync_level, cancellation) catch |barrier_err| {
+                    resolveBoundTransaction(db, table.source_admission, txn_id, .committed, commit_version, sync_level, cancellation) catch |barrier_err| {
                         const durable_status = db.getTransactionStatus(txn_id) catch return barrier_err;
                         if (durable_status != .committed) return barrier_err;
                         var propagation_pending = false;
@@ -1054,7 +1063,7 @@ pub const BoundTableWriteSource = struct {
             // rejected write. In particular, graph transform validation is
             // performed by DB.writeTransaction after begin, so returning the
             // validation error without aborting would strand its transaction.
-            db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch |abort_err| {
+            resolveBoundTransaction(db, table.source_admission, txn_id, .aborted, commit_version, .propose, .none) catch |abort_err| {
                 std.log.err("failed to abort rejected bound transaction write_err={s} abort_err={s}", .{
                     @errorName(err),
                     @errorName(abort_err),
@@ -1079,7 +1088,7 @@ pub const BoundTableWriteSource = struct {
                 else => return err,
             }
         };
-        db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, .committed, commit_version, sync_level, cancellation) catch |err| {
+        resolveBoundTransaction(db, table.source_admission, txn_id, .committed, commit_version, sync_level, cancellation) catch |err| {
             const durable_status = db.getTransactionStatus(txn_id) catch return err;
             if (durable_status == .committed) {
                 std.log.warn("bound transaction acknowledged after durable commit barrier failure txn_id={x} err={s}", .{

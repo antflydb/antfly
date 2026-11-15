@@ -241,10 +241,27 @@ parser/stream regressions, metadata snapshot/recovery/decoder checks and native
 adapter qualification. Logs: `zig/native-source-adapter-final-qualification.log`
 and `zig/source-delivery-relocation-test.log`.
 
-Native BEGIN still needs a persisted source-purpose contract to distinguish source
-transactions from ordinary transaction IDs and freeze source-prepared intent sets.
-Distributed admission must carry that purpose and original participant authority
-through its private RPCs; current distributed source markers remain rejected.
+Native BEGIN now atomically persists the command fingerprint as a distinct source
+purpose (journal v8). Ordinary records retain the existing v6/v7 encoding and
+cannot upgrade into source transactions. Source PREPARE requires the original
+purpose and freezes its complete final intent set; exact retries preserve the
+vote and revision. DB retries of prepared source commands skip transform/default
+and identity expansion. Pending COMMIT/ABORT decisions require the same purpose;
+commit before a complete prepare is rejected. Source-owned pending records stay
+under source-control recovery, rather than ordinary timeout/presume-abort loops.
+
+Purpose-aware native recovery, journal and server recovery qualification pass:
+`zig build docstore-transaction-reservations-test source-admission-test
+antfly-server-db-test -j2` runs 57 journal tests, 77 server integration/recovery
+tests and five native admission/recovery tests with no failures or leaks.
+The checks include mixed-purpose BEGIN/PREPARE/decision rejection, immutable
+source intent sets, source record reopen/corruption, v6 compatibility, rejection
+of commit before prepare, and source-owned timeout recovery while ordinary stale
+transactions still abort. Log: `zig/source-purpose-complete-qualification.log`.
+Distributed admission still must
+carry source purpose and original participant authority through its private RPCs;
+current distributed source markers remain rejected. Durable not-admitted proofs,
+replan attempt fences and explicit destination retirement/reseed remain required.
 Managed
 runner wiring, distributed source authority and writable-Iceberg adapters remain
 required. The callbacks and actor do not yet

@@ -43849,14 +43849,10 @@ fn implementationTests() type {
             request.source_admission = command;
             const participant = try distributed_txn.participantIdForGroup(alloc, "docs", 0);
             defer alloc.free(participant);
-            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
-                command.transactionId(),
-                command.accepted_at_ns,
-                command.accepted_at_ns,
-                &.{participant},
-                true,
-                true,
-            );
+            _ = try db.beginSourceTransaction(command, command.accepted_at_ns, &.{participant});
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(command.transactionId(), command.accepted_at_ns, command.accepted_at_ns, &.{participant}, true, true));
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.resolveTransactionIntents(command.transactionId(), .aborted, command.accepted_at_ns + 1));
+            try std.testing.expectError(error.SourceOutcomeUnresolved, db.resolveSourceTransaction(command, .committed, .write, .none));
             try db.writeTransaction(command.transactionId(), .{
                 .source_admission = command,
                 .transforms = request.transforms,
@@ -43868,6 +43864,8 @@ fn implementationTests() type {
                 .transforms = request.transforms,
             });
             try std.testing.expect((try db.sourceAdmissionReceipt(command)) == null);
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeTransaction(command.transactionId(), .{ .writes = &.{.{ .key = "counter", .value = "{\"count\":999}" }} }));
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.resolveTransactionIntents(command.transactionId(), .committed, command.accepted_at_ns + 1));
             db.close();
             db = try db_mod.DB.open(alloc, path, options);
             source = BoundTableWriteSource.init("docs", &db);

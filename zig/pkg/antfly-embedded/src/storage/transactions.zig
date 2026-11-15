@@ -241,6 +241,7 @@ pub const TxnError = error{
     DecisionConflict,
     TxnNotFound,
     InvalidTxnRecord,
+    SourceTransactionIdentityConflict,
 };
 
 pub const RecoveryStats = struct {
@@ -263,6 +264,7 @@ pub const RecoveryOptions = struct {
 };
 
 pub const TxnSummary = struct {
+    source_purpose: ?[32]u8 = null,
     txn_id: TxnId,
     status: TxnStatus,
     begin_timestamp: u64,
@@ -284,6 +286,7 @@ pub const TxnSummaryPage = struct {
 };
 
 pub const ResolutionExtraBatch = struct {
+    source_purpose: ?[32]u8 = null,
     /// Borrowed through this resolution attempt. Terminal-decision retries do
     /// not attach it: they must never re-certify already applied row effects.
     commit_participant: ?@import("commit_participant.zig").Participant = null,
@@ -320,6 +323,9 @@ pub const ResolutionExtraBatch = struct {
 /// transaction metadata transition. Raft apply uses this to fence the exact log
 /// entry without a crash window between the transaction and its replay marker.
 pub const MutationExtraBatch = struct {
+    /// Immutable source-command fingerprint installed with BEGIN and required
+    /// by PREPARE. Ordinary sessions cannot adopt a source transaction ID.
+    source_purpose: ?[32]u8 = null,
     document_revisions: ?bool = null,
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
@@ -404,6 +410,7 @@ pub const IntentBatch = struct {
 };
 
 const TxnRecord = struct {
+    source_purpose: ?[32]u8 = null,
     document_revisions: bool = false,
     status: TxnStatus,
     begin_timestamp: u64,
@@ -453,6 +460,7 @@ const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
 const txn_record_v6_size = 53;
 const txn_record_v7_size = 54;
+const txn_record_v8_size = 87;
 
 // ============================================================================
 // TxnManager
@@ -591,12 +599,14 @@ pub const TxnManager = struct {
         retain_terminal: bool,
         extra_batch: MutationExtraBatch,
     ) !void {
+        if (extra_batch.source_purpose) |purpose| if (std.mem.allEqual(u8, &purpose, 0)) return error.SourceTransactionIdentityConflict;
         const key = makeRecordKey(txn_id);
         const existing = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
             TxnError.TxnNotFound => null,
             else => return err,
         };
         if (existing) |record| {
+            if (!samePurpose(record.source_purpose, extra_batch.source_purpose)) return error.SourceTransactionIdentityConflict;
             if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
             if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
             if (record.retain_terminal_known and record.retain_terminal != retain_terminal) return TxnError.DecisionConflict;
@@ -625,6 +635,7 @@ pub const TxnManager = struct {
             return;
         }
         const record = TxnRecord{
+            .source_purpose = extra_batch.source_purpose,
             .status = .pending,
             .begin_timestamp = timestamp,
             .commit_version = 0,
@@ -686,6 +697,7 @@ pub const TxnManager = struct {
         for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
+        if (!samePurpose(record.source_purpose, extra_batch.source_purpose)) return error.SourceTransactionIdentityConflict;
         const first_prepare = record.prepared_known and !record.prepared and record.intent_revision == 0;
 
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
@@ -701,6 +713,16 @@ pub const TxnManager = struct {
         defer if (previous_lease) |value| self.alloc.free(value);
         if (previous_lease) |value| if (extra_batch.schema_binding != null and !std.mem.eql(u8, value, &schema_lease_value))
             return error.SchemaInUse;
+
+        if (record.source_purpose != null and record.prepared) {
+            // A source PREPARE is one complete immutable final write set, not
+            // an incremental session. Never re-evaluate its old read guards or
+            // replace its retained rows after the durable vote.
+            if (extra_batch.document_revisions) |revisions| if (revisions != record.document_revisions) return error.SourcePayloadConflict;
+            try self.requireSamePreparedSourceIntents(txn_id, intents);
+            if (extra_batch.writes.len != 0 or extra_batch.deletes.len != 0) return error.SourcePayloadConflict;
+            return;
+        }
 
         // Emit CheckPredicates before checks: TLA+ spec models this as an
         // always-succeeding snapshot step; WriteIntentFails detects conflicts.
@@ -938,6 +960,10 @@ pub const TxnManager = struct {
         const rec_key = makeRecordKey(txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var record = try self.loadTransactionRecord(txn_id);
+        if (record.status == .pending or extra_batch.source_purpose != null) {
+            if (!samePurpose(record.source_purpose, extra_batch.source_purpose)) return error.SourceTransactionIdentityConflict;
+        }
+        if (record.source_purpose != null and record.status == .pending and status == .committed and !record.prepared) return error.SourceOutcomeUnresolved;
         var resolved_participant_key: [resolved_participants_prefix.len + 16]u8 = undefined;
         var resolved_participant_value: ?[]u8 = null;
         defer if (resolved_participant_value) |value| self.alloc.free(value);
@@ -1551,6 +1577,7 @@ pub const TxnManager = struct {
             const record = try decodeRecord(record_entry.value);
             const txn_id = record_entry.key[records_prefix.len..][0..16].*;
             try items.append(alloc, .{
+                .source_purpose = record.source_purpose,
                 .txn_id = txn_id,
                 .status = record.status,
                 .begin_timestamp = record.begin_timestamp,
@@ -1808,6 +1835,12 @@ pub const TxnManager = struct {
             stats.scanned_records += 1;
 
             if (summary.status == .pending) {
+                if (summary.source_purpose != null) {
+                    // Source-control recovery owns this original reservation;
+                    // elapsed time cannot invalidate an acknowledged source vote.
+                    stats.kept_recent_pending += 1;
+                    continue;
+                }
                 if (summary.created_at > 0 and summary.created_at < cutoff_timestamp) {
                     if (!options.presume_abort_distributed) {
                         const participants = try self.getParticipants(self.alloc, txn_id);
@@ -2293,6 +2326,29 @@ pub const TxnManager = struct {
         return key;
     }
 
+    pub fn requireSourcePurpose(self: *TxnManager, txn_id: TxnId, purpose: [32]u8) !void {
+        const record = try self.loadTransactionRecord(txn_id);
+        if (!samePurpose(record.source_purpose, purpose)) return error.SourceTransactionIdentityConflict;
+    }
+
+    fn requireSamePreparedSourceIntents(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent) !void {
+        var incoming = std.StringHashMapUnmanaged(WriteIntent).empty;
+        defer incoming.deinit(self.alloc);
+        for (intents) |intent| try incoming.put(self.alloc, intent.key, intent);
+        var previous = try self.collectIntentBatch(self.alloc, txn_id);
+        defer previous.deinit(self.alloc);
+        const entries = previous.owned_entries orelse {
+            if (incoming.count() != 0) return error.SourcePayloadConflict;
+            return;
+        };
+        if (entries.len != incoming.count()) return error.SourcePayloadConflict;
+        for (entries) |entry| {
+            const value = try IntentValue.decode(entry.value);
+            const next = incoming.get(entry.key[intents_prefix.len + 17 ..]) orelse return error.SourcePayloadConflict;
+            if (!sameBytes(value.value, next.value) or !sameBytes(value.prepared_row, next.prepared_row)) return error.SourcePayloadConflict;
+        }
+    }
+
     fn loadTransactionRecord(self: *TxnManager, txn_id: TxnId) !TxnRecord {
         const key = makeRecordKey(txn_id);
         const val = self.getAlloc(self.alloc, &key) catch |err| switch (err) {
@@ -2310,7 +2366,7 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, if (record.document_revisions) txn_record_v7_size else txn_record_v6_size);
+        const buf = try self.alloc.alloc(u8, if (record.source_purpose != null) txn_record_v8_size else if (record.document_revisions) txn_record_v7_size else txn_record_v6_size);
         buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -2322,7 +2378,11 @@ pub const TxnManager = struct {
         buf[50] = @intFromBool(record.coordinator);
         buf[51] = @intFromBool(record.retain_terminal);
         buf[52] = @intFromBool(record.intents_resolved);
-        if (record.document_revisions) buf[53] = 1;
+        if (record.source_purpose) |purpose| {
+            buf[53] = @intFromBool(record.document_revisions);
+            buf[54] = 1; // complete source delivery, never an ordinary session
+            @memcpy(buf[55..87], &purpose);
+        } else if (record.document_revisions) buf[53] = 1;
         return buf;
     }
 
@@ -2982,7 +3042,24 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
     };
 }
 
+fn samePurpose(left: ?[32]u8, right: ?[32]u8) bool {
+    if (left) |value| return right != null and std.mem.eql(u8, &value, &right.?);
+    return right == null;
+}
+fn sameBytes(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left) |value| return right != null and std.mem.eql(u8, value, right.?);
+    return right == null;
+}
+
 fn decodeRecord(raw: []const u8) !TxnRecord {
+    if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return error.InvalidTxnRecord;
+    if (raw.len == txn_record_v8_size) {
+        if (raw[53] > 1 or raw[54] != 1 or std.mem.allEqual(u8, raw[55..87], 0)) return error.InvalidTxnRecord;
+        var record = try decodeRecord(raw[0..txn_record_v6_size]);
+        record.document_revisions = raw[53] == 1;
+        record.source_purpose = raw[55..87].*;
+        return record;
+    }
     if (raw.len == txn_record_v7_size) {
         if (raw[53] != 1) return error.InvalidTxnRecord;
         var record = try decodeRecord(raw[0..txn_record_v6_size]);
@@ -3860,6 +3937,83 @@ test "transaction intent snapshot owns one payload copy and retirement reads onl
     });
     try std.testing.expect(!try mgr.hasSchemaLeases());
     try std.testing.expect(!try mgr.hasIntents(txn_id));
+}
+
+test "transaction source purpose fences sessions freezes prepared intents and survives recovery" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-source-purpose");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var mgr = try TxnManager.init(a, &store);
+    defer mgr.deinit();
+    const txn_id: TxnId = @splat(12);
+    const proof: [32]u8 = @splat(7);
+    const extra: MutationExtraBatch = .{ .source_purpose = proof };
+    try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(txn_id, 10_000, 1_000, &.{"docs:0"}, true, true, extra);
+    try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(txn_id, 10_000, 9_000, &.{"docs:0"}, true, true, extra);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithParticipantsCreatedAtRoleAndRetention(txn_id, 10_000, 1_000, &.{"docs:0"}, true, true));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(txn_id, 10_000, 1_000, &.{"docs:0"}, true, true, .{ .source_purpose = @splat(8) }));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.writeIntents(txn_id, &.{.{ .key = "a", .value = "session" }}, &.{}));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.resolveIntents(txn_id, .aborted, 11_000));
+    try std.testing.expectError(error.SourceOutcomeUnresolved, mgr.resolveIntentsWithExtraBatch(txn_id, .committed, 11_000, .{ .source_purpose = proof }));
+    const effects = [_]WriteIntent{ .{ .key = "a", .value = "source" }, .{ .key = "b", .value = null } };
+    try mgr.writeIntentsExtraBatch(txn_id, &effects, &.{}, extra);
+    var first = try mgr.collectIntentBatch(a, txn_id);
+    defer first.deinit(a);
+    // Equivalent final intent sets may arrive in another order. The original
+    // durable vote, schema lease and reservation revision remain unchanged.
+    try mgr.writeIntentsExtraBatch(txn_id, &.{ effects[1], effects[0] }, &.{}, extra);
+    try std.testing.expectError(error.SourcePayloadConflict, mgr.writeIntentsExtraBatch(txn_id, &.{effects[0]}, &.{}, extra));
+    try std.testing.expectError(error.SourcePayloadConflict, mgr.writeIntentsExtraBatch(txn_id, &.{ effects[0], .{ .key = "b", .value = "changed" } }, &.{}, extra));
+    try std.testing.expectError(error.SourcePayloadConflict, mgr.writeIntentsExtraBatch(txn_id, &.{ effects[0], effects[1], .{ .key = "c", .value = "added" } }, &.{}, extra));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.writeIntents(txn_id, &effects, &.{}));
+    var unchanged = try mgr.collectIntentBatch(a, txn_id);
+    defer unchanged.deinit(a);
+    try std.testing.expectEqual(first.revision, unchanged.revision);
+    const stats = try mgr.recoverTransactions(20_000, 30_000);
+    try std.testing.expectEqual(@as(u64, 0), stats.auto_aborted);
+    try std.testing.expectEqual(@as(u64, 1), stats.kept_recent_pending);
+    const summaries = try mgr.listTransactions(a);
+    defer a.free(summaries);
+    try std.testing.expectEqual(proof, summaries[0].source_purpose.?);
+    const raw = try mgr.getAlloc(a, &makeRecordKey(txn_id));
+    defer a.free(raw);
+    try std.testing.expectEqual(@as(usize, txn_record_v8_size), raw.len);
+    try std.testing.expectEqual(proof, (try decodeRecord(raw)).source_purpose.?);
+    const malformed = try a.dupe(u8, raw);
+    defer a.free(malformed);
+    malformed[54] = 2;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(malformed));
+    @memcpy(malformed, raw);
+    malformed[53] = 2;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(malformed));
+    @memcpy(malformed, raw);
+    malformed[0] = 255;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(malformed));
+    @memcpy(malformed, raw);
+    @memset(malformed[55..87], 0);
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(malformed));
+    mgr.deinit();
+    store.close();
+    store = try DocStore.open(a, path, .{});
+    mgr = try TxnManager.init(a, &store);
+    try mgr.requireSourcePurpose(txn_id, proof);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.resolveIntents(txn_id, .committed, 11_000));
+    _ = try mgr.resolveIntentsWithExtraBatch(txn_id, .committed, 11_000, .{ .source_purpose = proof });
+    const stored_value = try getVisibleDocRuntime(&mgr.store, a, "a");
+    defer a.free(stored_value);
+    try std.testing.expectEqualStrings("source", stored_value);
+    try std.testing.expectEqual(TxnStatus.committed, try mgr.getTransactionStatus(txn_id));
+    const ordinary: TxnId = @splat(13);
+    try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetention(ordinary, 10_000, 1_000, &.{"docs:0"}, true, true);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(ordinary, 10_000, 1_000, &.{"docs:0"}, true, true, extra));
+    const legacy = try mgr.getAlloc(a, &makeRecordKey(ordinary));
+    defer a.free(legacy);
+    try std.testing.expectEqual(@as(usize, txn_record_v6_size), legacy.len);
+    try std.testing.expect((try decodeRecord(legacy)).source_purpose == null);
 }
 
 test "transaction protocol fences begin prepare snapshot and idempotent resolution" {

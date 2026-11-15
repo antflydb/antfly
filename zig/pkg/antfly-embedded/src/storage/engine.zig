@@ -335,6 +335,8 @@ pub const VTable = struct {
     beginReplicatedTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8) Outcome(@import("transactions.zig").TxnId),
     writeIntents: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, intents: []const @import("transactions.zig").WriteIntent, predicates: []const @import("transactions.zig").VersionPredicate) Outcome(void),
     writeTransaction: *const fn (self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) Outcome(void),
+    resolveSourceTransaction: *const fn (self: *DB, command: @import("source_admission.zig").Command, status: @import("transactions.zig").TxnStatus, sync_level: types.SyncLevel, cancellation: types.CancellationToken) Outcome(void),
+    beginSourceTransaction: *const fn (self: *DB, command: @import("source_admission.zig").Command, created_at_ns: u64, participants: []const []const u8) Outcome(types.TxnId),
     nativeSourceAdmissionNamespace: *const fn (self: *DB) Outcome([24]u8),
     sourceAdmissionStatus: *const fn (self: *DB, command: @import("source_admission.zig").Command) Outcome(@import("source_admission.zig").Status),
     resolveTransactionIntentsWithSyncLevelAndCancellation: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, sync_level: types.SyncLevel, visibility_cancellation: types.CancellationToken) Outcome(void),

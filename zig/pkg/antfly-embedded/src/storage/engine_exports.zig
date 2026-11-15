@@ -1134,6 +1134,13 @@ fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntent
     return .{ .value = self.writeTransaction(txn_id, req) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn resolveSourceTransaction(self: *DB, command: @import("source_admission.zig").Command, status: @import("transactions.zig").TxnStatus, sync_level: types.SyncLevel, cancellation: types.CancellationToken) engine.Outcome(void) {
+    self.resolveSourceTransaction(command, status, sync_level, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
+}
+fn beginSourceTransaction(self: *DB, command: @import("source_admission.zig").Command, created_at_ns: u64, participants: []const []const u8) engine.Outcome(types.TxnId) {
+    return .{ .value = self.beginSourceTransaction(command, created_at_ns, participants) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn nativeSourceAdmissionNamespace(self: *DB) engine.Outcome([24]u8) {
     return .{ .value = self.nativeSourceAdmissionNamespace() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

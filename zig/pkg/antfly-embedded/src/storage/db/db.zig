@@ -25803,6 +25803,28 @@ pub const DB = struct {
         };
     }
 
+    /// Install immutable source purpose with BEGIN, before any source rows can
+    /// be prepared. A legacy/session transaction with this ID cannot upgrade.
+    pub fn beginSourceTransaction(self: *DB, command: @import("../source_admission.zig").Command, created_at_ns: u64, participants: []const []const u8) !types.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginSourceTransaction", .{ self, command, created_at_ns, participants });
+        try command.validate();
+        if (participants.len != 1 or participants[0].len == 0) return error.InvalidSourceAdmission;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            if (self.core.identity_namespace.table_id != command.table_id) return error.SourceTableMismatch;
+            if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, null);
+        }
+        return self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(command.transactionId(), command.accepted_at_ns, created_at_ns, participants, true, true, .{ .source_purpose = command.fingerprint() });
+    }
+
     /// Capability probe for the single-root native destination adapter. Raft
     /// roots must use their ordered owner; a local handle cannot bypass it.
     pub fn nativeSourceAdmissionNamespace(self: *DB) ![24]u8 {
@@ -25909,6 +25931,22 @@ pub const DB = struct {
         if (req.source_admission) |command| {
             try command.validate();
             if (!std.mem.eql(u8, &command.participant_digest, &source_admission_mod.operationsDigest(req))) return error.SourcePayloadConflict;
+            if (!std.mem.eql(u8, &txn_id, &command.transactionId())) return error.SourceTransactionIdentityConflict;
+            // A durable source vote owns its prepared images. An exact retry
+            // must not re-expand transforms, defaults or identity allocation.
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            try manager.requireSourcePurpose(txn_id, command.fingerprint());
+            switch (try source_admission_mod.lookupStatus(&read, self.core.identity_namespace.table_id, command)) {
+                .committed => return error.SourceAlreadyCommitted,
+                .prepared => return,
+                .absent => {},
+            }
         }
         var source_arena = std.heap.ArenaAllocator.init(preparation_alloc);
         defer source_arena.deinit();
@@ -26284,6 +26322,7 @@ pub const DB = struct {
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .source_purpose = if (req.source_admission) |command| command.fingerprint() else null,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
@@ -26628,6 +26667,14 @@ pub const DB = struct {
         try self.resolveTransactionIntents(txn_id, .committed, timestamp_ns);
     }
 
+    pub fn resolveSourceTransaction(self: *DB, command: @import("../source_admission.zig").Command, status: transactions_mod.TxnStatus, sync_level: types.SyncLevel, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveSourceTransaction", .{ self, command, status, sync_level, cancellation });
+        try command.validate();
+        _ = try self.nativeSourceAdmissionNamespace();
+        if (command.table_id != self.core.identity_namespace.table_id) return error.SourceTableMismatch;
+        try self.resolveTransactionIntentsInternal(command.transactionId(), status, command.accepted_at_ns + 1, sync_level, cancellation, null, null, command.fingerprint());
+    }
+
     pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("resolveTransactionIntents", .{ self, txn_id, status, commit_version });
         try self.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, .propose);
@@ -26667,6 +26714,7 @@ pub const DB = struct {
             visibility_cancellation,
             null,
             null,
+            null,
         );
     }
 
@@ -26689,6 +26737,7 @@ pub const DB = struct {
             visibility_cancellation,
             identity,
             resolved_participant,
+            null,
         );
     }
 
