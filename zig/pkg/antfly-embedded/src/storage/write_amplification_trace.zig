@@ -184,6 +184,12 @@ pub const Stage = enum(u8) {
     // for where both still count as the same kind of idle-flush cost for
     // ceiling-exclusion purposes.
     redo_checkpoint_fold,
+    // `DB.drainScheduledTextMerges` run synchronously by a `.full_index`
+    // write when no `text_merge_runtime` is attached. Its merge commits ride
+    // along (non-durable), so this tag should carry no durable commits; it
+    // exists so any regression shows up here rather than in the generic
+    // `.main_txn_commit` bucket.
+    text_merge_drain,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;

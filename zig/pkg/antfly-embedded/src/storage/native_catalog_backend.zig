@@ -706,8 +706,11 @@ pub const Backend = struct {
                     // does, consistent with ride-along work being safe to
                     // lose per the design doc's crash invariant.
                     if (self.durable) self.backend.drainPendingRideAlong() catch {};
+                    wal_trace.recordCommit();
                 }
-                wal_trace.recordCommit();
+                // A deferred submission records no commit of its own: it
+                // advances no commit sequence until the group it joins
+                // publishes, and that publish is what gets counted.
             }
 
             lockBackend(self.backend);

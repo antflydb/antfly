@@ -5300,7 +5300,14 @@ pub const Store = struct {
                     };
                     if (self.request.done) break;
                     self.store.commit_mutex.unlock(io);
-                    self.store.forceDrainDurable();
+                    {
+                        // The same idle-window barrier `rideAlongFlushLoop`
+                        // runs, so attribute it the same way whichever
+                        // thread happens to reach it first.
+                        const flush_scope = wal_trace.scope(.ride_along_flush);
+                        defer flush_scope.end();
+                        self.store.forceDrainDurable();
+                    }
                     self.store.commit_mutex.lockUncancelable(io);
                 } else {
                     self.store.commit_ready.waitUncancelable(io, &self.store.commit_mutex);

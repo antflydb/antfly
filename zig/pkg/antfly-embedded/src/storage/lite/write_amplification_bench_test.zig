@@ -1584,7 +1584,7 @@ fn printStageTable(mode_name: []const u8, mode: ModeReport) void {
     );
     for (std.meta.tags(wal_trace.Stage)) |stage| {
         const counts = mode.report.stage(stage);
-        if (counts.sync_calling_thread + counts.sync_background + counts.write_calls_calling_thread + counts.write_calls_background == 0) continue;
+        if (counts.sync_calling_thread + counts.sync_background + counts.write_calls_calling_thread + counts.write_calls_background + counts.commits_calling_thread + counts.commits_background == 0) continue;
         std.debug.print("    {s}: sync(calling={d},background={d}) write_bytes(calling={d},background={d}) commits(calling={d},background={d})\n", .{
             @tagName(stage),
             counts.sync_calling_thread,
