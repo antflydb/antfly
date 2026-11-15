@@ -13334,6 +13334,173 @@ pub const DataServer = struct {
         };
     }
 
+    pub const HistorySubmission = struct {
+        entry: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Entry,
+        /// Null means accepted but unconfirmed. A superseded outcome likewise
+        /// cannot certify success. Recover the original entry before any ACK.
+        outcome: ?@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome = null,
+    };
+
+    fn validateHistoryProposalAuthority(expected_term: u64, current_term: u64, expected_membership: u64, current_membership: u64, is_leader: bool) !void {
+        if (!is_leader or expected_term == 0 or expected_term != current_term or expected_membership != current_membership) return error.GroupLeaderUnavailable;
+    }
+
+    fn lockHistoryRaftOwner(self: *DataServer, context: antfly.public_api.operation.RequestContext) !void {
+        while (!self.data_raft_mutex.tryLock()) {
+            try context.ensureActive();
+            try self.sleepDataRaftRetry(std.time.ns_per_ms);
+        }
+        errdefer self.data_raft_mutex.unlock();
+        try context.ensureActive();
+    }
+
+    /// Private local-leader submission. Known accepted controls preserve their
+    /// exact receipt on failure; RaftBatchWriteOutcomeUnknown is ambiguous.
+    pub fn submitHistoryControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, command: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command) !HistorySubmission {
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        const raft = self.data_raft orelse return error.ChangefeedCapabilityUnsupported;
+        const apply_sm = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
+        const owner = apply_sm.kernel_owner_source orelse return error.ChangefeedCapabilityUnsupported;
+        if (owner.online_source_authority != .raft) return error.ChangefeedCapabilityUnsupported;
+        try original_fence.validate();
+        const original_context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = original_fence.admission_deadline_ns, .deadline_io = original_fence.admission_deadline_io, .cancellation = original_fence.admission_cancellation };
+        const routing_now = self.dataRaftMonotonicNs();
+        const normalized = try original_context.platformDeadline();
+        const remaining_ns = if (normalized.deadline_ns) |limit| limit -| platform_time.monotonicNs() else 5 * std.time.ns_per_s;
+        if (remaining_ns == 0) return error.DeadlineExceeded;
+        const request_io = self.dataRaftIo();
+        var fence = original_fence;
+        fence.admission_deadline_ns = routing_now +| @min(remaining_ns, 5 * std.time.ns_per_s);
+        fence.admission_deadline_io = if (request_io) |*io| @import("antfly_runtime_abi").io_abi.Borrow.init(io) else null;
+        const context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation };
+        const deadline = fence.admission_deadline_ns.?;
+        const group = fence.route.group_id;
+        const required = @import("history_control_entry.zig").required_protocol_version;
+        // Create cache ownership atomically with the hosted-group check, so
+        // retirement cannot clean the group just before a stale insertion.
+        const activation = blk: {
+            try self.lockHistoryRaftOwner(context);
+            defer self.data_raft_mutex.unlock();
+            if (!raft.host.http_host.host.isLocalLeader(group)) return error.GroupLeaderUnavailable;
+            break :blk try self.dataRaftProtocolActivationEntry(group);
+        };
+        defer activation.release(self.alloc);
+        while (!activation.activation_mutex.tryLock()) {
+            try context.ensureActive();
+            try self.sleepDataRaftRetry(std.time.ns_per_ms);
+        }
+        var activation_locked = true;
+        defer if (activation_locked) activation.activation_mutex.unlock();
+        const authority = blk: {
+            try self.lockHistoryRaftOwner(context);
+            defer self.data_raft_mutex.unlock();
+            if (!raft.host.http_host.host.isLocalLeader(group)) return error.GroupLeaderUnavailable;
+            const status = raft.host.http_host.host.raftStatus(group) orelse return error.GroupLeaderUnavailable;
+            break :blk .{ .term = status.hard.current_term, .plan = try self.dataRaftProtocolProbePlanLocked(alloc, raft, group, status.conf_state, raft.host.http_host.host.cfg.local_node_id) };
+        };
+        var plan = authority.plan;
+        defer plan.deinit(alloc);
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(fence.admission_cancellation);
+        const preflight = self.dataRaftBatchProtocolPreflight(alloc, plan, required, deadline, &cancellation);
+        if (preflight.activatable_version < required) return switch (preflight.failure) {
+            .unsupported => error.ChangefeedCapabilityUnsupported,
+            .none, .unavailable => error.GroupLeaderUnavailable,
+        };
+        try context.ensureActive();
+        const admission_source = &apply_sm.write_source;
+        const admission_deadline = admission_source.catalog.budget(null).nowNs() +| (deadline -| self.dataRaftMonotonicNs());
+        var admission = try admission_source.acquireRoutedWriteAdmission(alloc, table_name, fence, admission_deadline, fence.admission_cancellation);
+        var admission_active = true;
+        defer if (admission_active) admission.deinit();
+        var descriptor = try owner.loadDescriptorWithContext(alloc, group, table_name, context);
+        defer descriptor.deinit(alloc);
+        const expected_identity = fence.route.identity_namespace;
+        if (descriptor.identity.table_id != expected_identity.table_id or descriptor.identity.shard_id != expected_identity.shard_id or descriptor.identity.range_id != expected_identity.range_id) return error.HistoryResynchronizationRequired;
+        const control: @import("history_control_entry.zig").Entry = .{ .table = table_name, .storage_owner = descriptor.view(), .history_control = .{ .command = command } };
+        const encoded = try @import("history_control_entry.zig").encode(alloc, control, required);
+        defer alloc.free(encoded);
+        const durable = try self.durableDataRaftBatchProtocolVersion(group);
+        activation.protocol_version.store(durable, .release);
+        var token: ?RaftTableApplyStateMachine.ApplyOutcomeToken = null;
+        defer if (token) |registered| apply_sm.cancelRegisteredApplyOutcome(registered);
+        const accepted: HistorySubmission = blk: {
+            try self.lockHistoryRaftOwner(context);
+            defer self.data_raft_mutex.unlock();
+            try context.ensureActive();
+            const status = raft.host.http_host.host.raftStatus(group) orelse return error.GroupLeaderUnavailable;
+            try validateHistoryProposalAuthority(authority.term, status.hard.current_term, plan.conf_state_fingerprint, dataRaftConfStateFingerprint(status.conf_state), raft.host.http_host.host.isLocalLeader(group));
+            if (!dataRaftProtocolUsable(activation, authority.term, required)) {
+                const barrier = try data_raft_batch.encodeProtocolBarrier(alloc, table_name, required);
+                defer alloc.free(barrier);
+                var barrier_index: ?u64 = null;
+                raft.host.http_host.proposeWithReceipt(group, barrier, &barrier_index) catch |err| {
+                    if (barrier_index == null) return err;
+                };
+                if (barrier_index == null) return error.GroupLeaderUnavailable;
+                activation.pending_version.store(required, .release);
+                activation.pending_term.store(authority.term, .release);
+            }
+            try context.ensureActive();
+            var accepted_index: ?u64 = null;
+            raft.host.http_host.proposeWithReceipt(group, encoded, &accepted_index) catch |err| {
+                if (accepted_index == null) return err;
+            };
+            const index = accepted_index orelse return error.RaftBatchWriteOutcomeUnknown;
+            token = apply_sm.registerApplyOutcomeToken(group, index, authority.term) catch null;
+            break :blk .{ .entry = .{ .term = authority.term, .index = index } };
+        };
+        admission.deinit();
+        admission_active = false;
+        activation.activation_mutex.unlock();
+        activation_locked = false;
+        self.reachDataRequestLifecycle(.{ .phase = .proposal_accepted, .group_id = group, .log_index = accepted.entry.index, .table_name = table_name }) catch return accepted;
+        const registered = token orelse return accepted;
+        while (true) {
+            context.ensureActive() catch return accepted;
+            const slice_deadline = @min(deadline, self.dataRaftMonotonicNs() +| 10 * std.time.ns_per_ms);
+            apply_sm.waitApplyOutcome(registered, slice_deadline) catch |err| switch (err) {
+                error.Timeout => if (self.dataRaftMonotonicNs() < deadline) continue else return accepted,
+                else => return accepted,
+            };
+            break;
+        }
+        _ = apply_sm.takeRegisteredApplyOutcome(registered);
+        token = null;
+        const recovered = self.recoverHistoryControlLocal(alloc, fence, table_name, command, accepted.entry) catch |err| {
+            std.log.warn("history control result remains unconfirmed group={} index={} err={s}", .{ group, accepted.entry.index, @errorName(err) });
+            return accepted;
+        };
+        return .{ .entry = accepted.entry, .outcome = recovered };
+    }
+
+    /// Recover only the original receipt. Transient read contention may retry;
+    /// this operation never appends a barrier or control command.
+    pub fn recoverHistoryControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, command: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command, receipt: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Entry) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome {
+        if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
+        const apply_sm = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
+        const owner = apply_sm.kernel_owner_source orelse return error.ChangefeedCapabilityUnsupported;
+        const original: antfly.public_api.operation.RequestContext = .{ .deadline_ns = original_fence.admission_deadline_ns, .deadline_io = original_fence.admission_deadline_io, .cancellation = original_fence.admission_cancellation };
+        const now = self.dataRaftMonotonicNs();
+        const normalized = try original.platformDeadline();
+        const remaining = if (normalized.deadline_ns) |limit| limit -| platform_time.monotonicNs() else 5 * std.time.ns_per_s;
+        if (remaining == 0) return error.DeadlineExceeded;
+        const request_io = self.dataRaftIo();
+        var fence = original_fence;
+        fence.admission_deadline_ns = now +| @min(remaining, 5 * std.time.ns_per_s);
+        fence.admission_deadline_io = if (request_io) |*io| @import("antfly_runtime_abi").io_abi.Borrow.init(io) else null;
+        const context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation };
+        while (true) {
+            try context.ensureActive();
+            return owner.orderedHistoryOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = receipt.index }) catch |err| switch (err) {
+                error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded => {
+                    try self.sleepDataRaftRetry(std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
     fn proposeRaftBatchGroupWithLeaderWait(
         self: *DataServer,
         alloc: std.mem.Allocator,
@@ -42837,6 +43004,172 @@ fn consumerTests() type {
                 invalid.writes = &.{.{ .key = "ordinary", .value = "{}" }};
                 try std.testing.expectError(error.InvalidBatchRequest, antfly.db.types.validateGraphEndpointCleanupCommand(invalid));
             }
+        }
+
+        test "data raft ordered history local submission confirms through real Raft and ReadIndex" {
+            if (comptime !linked_storage) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            const Catalog = struct {
+                fn snapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" }}), .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{ .group_id = 601, .table_id = 7, .range_id = 601, .start_key = "", .end_key = null }}), .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+                }
+                fn free(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn tableSnapshot(ptr: *anyopaque, _: []const u8, deadline: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+                    return antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot(ptr, deadline);
+                }
+                fn iface(ptr: *anyopaque) antfly.public_api.table_catalog.CatalogSource {
+                    const Adapter = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free);
+                    return .{ .ptr = ptr, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = Adapter.routingSnapshot, .table_routing_snapshot = tableSnapshot, .linearizable_table_routing_snapshot = tableSnapshot, .linearizable_routing_snapshot = Adapter.linearizableSnapshot, .free_routing_snapshot = Adapter.freeRoutingSnapshot } };
+                }
+            };
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/history-proposal", .{tmp.sub_path});
+            defer a.free(root);
+            const projection_root = try std.fmt.allocPrint(a, "{s}/projection", .{root});
+            defer a.free(projection_root);
+            var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(a, .{});
+            defer runtime.deinit();
+            var catalog_context: u8 = 0;
+            const catalog = Catalog.iface(&catalog_context);
+            var owner = antfly.public_api.ProvisionedKernelOwnerSource.init(a, root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier());
+            defer owner.deinit();
+            var projection = try DataRaftApplyStore.init(a, .{ .root_dir = projection_root, .native_source_delegate = true });
+            defer projection.deinit();
+            var sm = try RaftTableApplyStateMachine.init(a, root, catalog, runtime.ptr());
+            defer sm.deinit();
+            sm.attachKernelOwnerSource(&owner);
+            sm.topology_apply_store = &projection;
+            const Apply = struct {
+                raw: *DataRaftApplyStore,
+                native: *RaftTableApplyStateMachine,
+                fn apply(ptr: *anyopaque, group: u64, snapshot: ?raft_engine.core.types.Snapshot, entries: []const raft_engine.core.Entry, reads: []const raft_engine.core.types.ReadState) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (entries.len != 0) {
+                        const encoded = try antfly.raft.state_machine.encodeCommittedEntries(std.testing.allocator, entries);
+                        defer std.testing.allocator.free(encoded);
+                        try self.raw.applyBatch(group, entries[entries.len - 1].index, encoded);
+                    }
+                    try self.native.stateMachine().applyReady(group, snapshot, entries, reads);
+                }
+                fn retry(ptr: *anyopaque, group: u64, err: anyerror) bool {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    return RaftTableApplyStateMachine.isApplyRetryable(self.native, group, err);
+                }
+            };
+            var apply: Apply = .{ .raw = &projection, .native = &sm };
+            var log = raft_engine.core.MemoryStorage.init(a);
+            defer log.deinit();
+            var host = antfly.raft.host.Host.init(a, .{ .local_node_id = 1 }, .{ .io = std.testing.io, .runtime_hooks = .{ .state_machine = .{ .ptr = &apply, .vtable = &.{ .apply_ready = Apply.apply, .is_apply_retryable = Apply.retry } } } });
+            defer host.deinit();
+            _ = try host.runtime_host.ensureReplica(.{ .group = .{ .group_id = 601, .local_node_id = 1, .raft_config = .{ .id = 1, .group_id = 601, .peers = &.{1}, .election_tick = 5, .heartbeat_tick = 1, .pre_vote = false }, .storage = log.storage() }, .bootstrap = .empty });
+            try host.campaignGroup(601);
+            _ = try host.runProgressRoundBounded(64, 64);
+            try std.testing.expect(host.isLocalLeader(601));
+            var http: antfly.raft.HttpHost = undefined;
+            http.host = &host;
+            var managed: antfly.raft.ManagedHttpHostService = undefined;
+            managed.metrics = .{};
+            managed.host.http_host = &http;
+            managed.host.owned_data_store = &projection;
+            managed.host.owned_wal_replica_provider = null;
+            managed.host.owned_file_replica_provider = null;
+            var server: DataServer = .{ .alloc = a, .data_raft = &managed, .data_raft_apply = &sm, .backend_runtime = runtime.ptr(), .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{}, .query_async_limit = .nothing, .listener_cfg = undefined };
+            defer server.provisioned_storage.deinit();
+            defer {
+                var it = server.data_raft_protocol_activations.valueIterator();
+                while (it.next()) |entry| entry.*.release(a);
+                server.data_raft_protocol_activations.deinit(a);
+                server.data_raft_protocol_capabilities.deinit(a);
+            }
+            _ = owner.withReadSafetyBarrier(server.dataReadSafetyBarrier());
+            const Progress = struct {
+                server: *DataServer,
+                host: *antfly.raft.host.Host,
+                stopped: std.atomic.Value(bool) = .init(false),
+                fn run(self: *@This()) !void {
+                    while (!self.stopped.load(.acquire)) {
+                        lockAtomic(&self.server.data_raft_mutex);
+                        _ = self.host.runProgressRoundBounded(64, 64) catch |err| {
+                            self.server.data_raft_mutex.unlock();
+                            return err;
+                        };
+                        self.server.data_raft_mutex.unlock();
+                        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                }
+            };
+            var progress: Progress = .{ .server = &server, .host = &host };
+            var worker = try std.testing.io.concurrent(Progress.run, .{&progress});
+            defer {
+                progress.stopped.store(true, .release);
+                worker.await(std.testing.io) catch {};
+            }
+            const route = try antfly.public_api.table_catalog.routedGroupIdSnapshotUntil(a, catalog, "docs", 601, null);
+            var namespace: [24]u8 = undefined;
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 601, .big);
+            std.mem.writeInt(u64, namespace[16..24], 601, .big);
+            const control = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            const grant: control.Grant = .{ .namespace = namespace, .authority = @splat(1), .consumer = @splat(2), .definition = @splat(3), .sequence = 1, .expires_at_seconds = 1000, .policy_revision = 1 };
+            var unknown_group = route.fence().?;
+            unknown_group.route.group_id = 602;
+            try std.testing.expectError(error.GroupLeaderUnavailable, server.submitHistoryControlLocal(a, unknown_group, "docs", .{ .enroll = grant }));
+            try std.testing.expectEqual(@as(usize, 0), server.data_raft_protocol_activations.count());
+            const submitted = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .enroll = grant });
+            try std.testing.expect(submitted.outcome != null);
+            try std.testing.expectEqual(@as(u64, 1), submitted.outcome.?.applied.consumer.?.epoch);
+            try std.testing.expect(submitted.entry.index > 1);
+            try std.testing.expectEqual(@import("history_control_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            const ref: control.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = 1, .grant = 1, .definition = grant.definition };
+            const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
+            try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);
+            const Interrupted = struct {
+                index: ?u64 = null,
+                fn reach(ptr: *anyopaque, event: DataRequestLifecycleEvent) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (event.phase == .proposal_accepted) {
+                        self.index = event.log_index;
+                        return error.InjectedHistoryConfirmationLoss;
+                    }
+                }
+            };
+            var interruption: Interrupted = .{};
+            server.data_request_lifecycle_hook = .{ .ptr = &interruption, .reach_fn = Interrupted.reach };
+            const uncertain = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect = ref });
+            server.data_request_lifecycle_hook = null;
+            try std.testing.expect(uncertain.outcome == null);
+            try std.testing.expectEqual(interruption.index.?, uncertain.entry.index);
+            const recovery_deadline = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+            while (sm.appliedIndex(601) < uncertain.entry.index) {
+                if (platform_time.monotonicNs() >= recovery_deadline) return error.Timeout;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            const previous_last = blk: {
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
+                break :blk try log.storage().lastIndex();
+            };
+            const recovered = try server.recoverHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect = ref }, uncertain.entry);
+            try std.testing.expectEqual(@as(u64, 1), recovered.applied.consumer.?.epoch);
+            try std.testing.expectEqual(@as(u64, 0), recovered.applied.consumer.?.acknowledged);
+            const recovered_last = blk: {
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
+                break :blk try log.storage().lastIndex();
+            };
+            try std.testing.expectEqual(previous_last, recovered_last);
+        }
+
+        test "data raft ordered history proposal authority fences term membership and missing owners" {
+            try DataServer.validateHistoryProposalAuthority(2, 2, 3, 3, true);
+            try std.testing.expectError(error.GroupLeaderUnavailable, DataServer.validateHistoryProposalAuthority(0, 0, 3, 3, true));
+            try std.testing.expectError(error.GroupLeaderUnavailable, DataServer.validateHistoryProposalAuthority(2, 3, 3, 3, true));
+            try std.testing.expectError(error.GroupLeaderUnavailable, DataServer.validateHistoryProposalAuthority(2, 2, 3, 4, true));
+            try std.testing.expectError(error.GroupLeaderUnavailable, DataServer.validateHistoryProposalAuthority(2, 2, 3, 3, false));
+            var server: DataServer = undefined;
+            server.data_raft = null;
+            try std.testing.expectError(error.ChangefeedCapabilityUnsupported, server.submitHistoryControlLocal(std.testing.allocator, undefined, "docs", .{ .collect = .{ .namespace = @splat(1), .authority = @splat(2) } }));
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {

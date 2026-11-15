@@ -1330,6 +1330,43 @@ proposal ordering, and retain the original accepted entry identity through
 outcome recovery. Capability advertisement must reflect the actual native apply
 profile. This evidence classification is not a completed control proposer.
 
+## In progress: local leader control submission and exact recovery
+
+`DataServer.submitHistoryControlLocal` now submits dedicated retention entries
+through the actual local data-Raft leader. It requires the compiled native owner,
+probes every applying peer for protocol 30, acquires routed structural admission,
+loads a bounded original owner descriptor and verifies its namespace against the
+route. Under proposal ordering it rechecks the captured leader term and exact
+membership fingerprint, appends the protocol barrier when needed, then proposes
+the control and registers its exact apply waiter before releasing the Raft lock.
+Structural admission and activation ownership are released before waiting.
+Hosted-group validation and activation-cache insertion share proposal ordering,
+so unhosted requests cannot allocate cache entries or race retirement cleanup.
+
+Known accepted entries always retain their original term/index on interrupted
+confirmation. A null outcome is unconfirmed, and a superseded receipt cannot
+certify success. `recoverHistoryControlLocal` uses bounded read-only recovery
+through the fenced adapter; it retries transient read contention without
+appending another control. Leader/route replacement and non-retryable failures
+remain unconfirmed rather than inventing a successful ACK. Deadline conversion
+preserves remaining nanosecond budgets; consensus-lock acquisition and apply
+waiting honor cancellation. The original command is never re-proposed by the
+recovery operation.
+
+Qualification uses a real in-process single-node Raft log, actual native
+projection and compiled owner, a concurrent progress driver and production
+ReadIndex/frozen-proof callbacks. It confirms enrollment and typed ACK rejection,
+persists protocol activation, interrupts confirmation after acceptance, and
+recovers the original receipt while proving the log index did not advance.
+The gate also covers apply reply loss, membership/term fences and peer capability
+preflight. Logs: `zig/ordered-history-local-submission-qualification.log` and
+`zig/ordered-history-local-submission-repeat-qualification.log`.
+
+This is a private local leader path. Remote control transport, serving-profile
+capability advertisement, feed root binding, topology/history transfer and
+file-backed multi-node recovery qualification remain required. Public feeds,
+bootstrap and existing-client qualification are not complete.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

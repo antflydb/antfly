@@ -3143,6 +3143,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         return result;
     }
 
+    pub fn loadDescriptorWithContext(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, context: request_operation.RequestContext) !LoadedDescriptor {
+        try context.ensureActive();
+        var budget = self.catalog.budget(self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
+        budget.cancellation = context.cancellation;
+        var descriptor = try self.loadDescriptorWithBudget(alloc, group_id, table_name, budget);
+        errdefer descriptor.deinit(alloc);
+        try context.ensureActive();
+        return descriptor;
+    }
+
     pub fn loadDescriptor(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
