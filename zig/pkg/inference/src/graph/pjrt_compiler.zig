@@ -136,19 +136,6 @@ pub fn compilePartitionWithOptions(
     defer part_set.deinit(allocator);
     for (part.node_ids) |nid| try part_set.put(allocator, nid, {});
 
-    // Track allocated weight data — freed after serialization.
-    var weight_bufs = std.ArrayListUnmanaged([]f32).empty;
-    defer {
-        for (weight_bufs.items) |buf| allocator.free(buf);
-        weight_bufs.deinit(allocator);
-    }
-
-    var integer_constants: std.ArrayListUnmanaged([]i32) = .empty;
-    defer {
-        for (integer_constants.items) |data| allocator.free(data);
-        integer_constants.deinit(allocator);
-    }
-
     // ── 0. Build add-reducer sub-computation for reductions ─────
     //
     // This is a tiny computation: add(lhs, rhs) used as the combiner
@@ -255,8 +242,10 @@ pub fn compilePartitionWithOptions(
 
     // ── 2. Walk partition nodes, emit HLO ops ───────────────────
 
-    // Side-channel for fused_linear_no_bias_pair second output.
-    var pair_second: ?hlo.Id = null;
+    // Secondary results belong to their producer. Topological scheduling may
+    // interleave independent pairs before visiting either secondary consumer.
+    var pair_seconds: std.AutoHashMapUnmanaged(NodeId, hlo.Id) = .empty;
+    defer pair_seconds.deinit(allocator);
     // Track whether we need the reducer computation.
     var needs_reducer = false;
     var needs_max_reducer = false;
@@ -292,8 +281,9 @@ pub fn compilePartitionWithOptions(
                     );
                     return err;
                 };
+                defer cb.free(ct);
                 const f32_data = try cb.toFloat32(ct, allocator);
-                try weight_bufs.append(allocator, f32_data);
+                defer allocator.free(f32_data);
 
                 const shape = graphShapeToHlo(n);
                 node_map[nid] = try b.constantF32(shape, f32_data);
@@ -315,16 +305,15 @@ pub fn compilePartitionWithOptions(
                     &next_param,
                 )) |input_id| {
                     node_map[nid] = input_id;
-                } else if (pair_second) |second| {
-                    node_map[nid] = second;
-                    pair_second = null;
+                } else if (n.op == .fused_to_float32 and ins.len > 0 and ins[0] != null_node and graph.node(ins[0]).op == .fused_linear_no_bias_pair) {
+                    node_map[nid] = pair_seconds.get(ins[0]) orelse return error.MissingPairedGraphOutput;
                 } else if (ins.len > 0 and ins[0] != null_node) {
                     node_map[nid] = node_map[@intCast(ins[0])];
                 }
             },
 
             .fused_segment_attention => |attrs| {
-                node_map[nid] = try emitSegmentAttention(allocator, &b, &integer_constants, n, try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1]), try getHloId(node_map, ins[2]), try getHloId(node_map, ins[3]), attrs, &reducer_comp, &max_reducer_comp);
+                node_map[nid] = try emitSegmentAttention(allocator, &b, n, try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1]), try getHloId(node_map, ins[2]), try getHloId(node_map, ins[3]), attrs, &reducer_comp, &max_reducer_comp);
                 needs_reducer = true;
                 needs_max_reducer = true;
             },
@@ -352,7 +341,7 @@ pub fn compilePartitionWithOptions(
                 const wt1 = try transposeLastTwo(&b, w1);
                 const wt2 = try transposeLastTwo(&b, w2);
                 node_map[nid] = try b.matmul(x, wt1);
-                pair_second = try b.matmul(x, wt2);
+                try pair_seconds.put(allocator, node_id, try b.matmul(x, wt2));
             },
 
             .fused_rms_norm => |attrs| {
@@ -460,7 +449,6 @@ pub fn compilePartitionWithOptions(
                 node_map[nid] = try emitStaticRope(
                     allocator,
                     &b,
-                    &weight_bufs,
                     n,
                     try getHloId(node_map, ins[0]),
                     attrs,
@@ -477,7 +465,6 @@ pub fn compilePartitionWithOptions(
                 const emitted = try emitStaticGqaAttention(
                     allocator,
                     &b,
-                    &weight_bufs,
                     n,
                     q,
                     k,
@@ -824,7 +811,6 @@ fn isEmbeddingIdsPlaceholder(
 fn emitStaticRope(
     allocator: Allocator,
     b: *hlo.Builder,
-    owned_constants: *std.ArrayListUnmanaged([]f32),
     node: *const Node,
     x: hlo.Id,
     attrs: ml.graph.node.RopeAttrs,
@@ -852,7 +838,7 @@ fn emitStaticRope(
         attrs.consecutive_pairs,
         .cos,
     );
-    try owned_constants.append(allocator, cos_mask);
+    defer allocator.free(cos_mask);
 
     const sin_mask = try buildRopeScaleMask(
         allocator,
@@ -866,7 +852,7 @@ fn emitStaticRope(
         attrs.consecutive_pairs,
         .sin,
     );
-    try owned_constants.append(allocator, sin_mask);
+    defer allocator.free(sin_mask);
 
     const cos_id = try b.constantF32(hlo.Shape.init(.f32, &.{ @intCast(rows), @intCast(hidden) }), cos_mask);
     const sin_id = try b.constantF32(hlo.Shape.init(.f32, &.{ @intCast(rows), @intCast(hidden) }), sin_mask);
@@ -1003,6 +989,16 @@ fn emitPrimitiveNode(
 ) !bool {
     const ins = n.getInputs();
     switch (n.op) {
+        .gather => |attrs| {
+            if (attrs.axis != 0) return error.UnsupportedShape;
+            node_map[nid] = try b.gather(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1]), graphShapeToHlo(n));
+        },
+        .fused_disentangled_attention => |attrs| {
+            if (ins.len != 3) return error.UnsupportedShape;
+            node_map[nid] = try @import("pjrt_relative_attention.zig").emit(allocator, b, try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1]), try getHloId(node_map, ins[2]), attrs, reducer_comp.id, max_reducer_comp.id);
+            needs_add_reducer.* = true;
+            needs_max_reducer.* = true;
+        },
         .stop_gradient => node_map[nid] = try getHloId(node_map, ins[0]),
         .fused_softmax => {
             const source = try getHloId(node_map, ins[0]);
@@ -1188,7 +1184,6 @@ fn segmentMetadataLane(b: *hlo.Builder, metadata: hlo.Id, start: usize, limit: u
 fn emitSegmentAttention(
     allocator: Allocator,
     b: *hlo.Builder,
-    integer_constants: *std.ArrayListUnmanaged([]i32),
     node: *const Node,
     q: hlo.Id,
     k: hlo.Id,
@@ -1210,10 +1205,7 @@ fn emitSegmentAttention(
     const metadata_shape = b.getInst(metadata).shape;
     if (metadata_shape.element_type != .s32 or metadata_shape.dimensions.len != 1 or metadata_shape.dimensions[0] != metadata_count) return error.InvalidAttentionMetadata;
     const indices = try allocator.alloc(i32, @as(usize, attrs.keys) + 1);
-    integer_constants.append(allocator, indices) catch |err| {
-        allocator.free(indices);
-        return err;
-    };
+    defer allocator.free(indices);
     for (indices[0..attrs.keys], 0..) |*value, index| value.* = std.math.cast(i32, index) orelse return error.UnsupportedShape;
     indices[attrs.keys] = @bitCast(attrs.window);
     const index = try b.constantS32(hlo.Shape.init(.s32, &.{columns}), indices[0..attrs.keys]);
@@ -1264,7 +1256,6 @@ fn emitSegmentAttention(
 fn emitStaticGqaAttention(
     allocator: Allocator,
     b: *hlo.Builder,
-    owned_constants: *std.ArrayListUnmanaged([]f32),
     node: *const Node,
     q: hlo.Id,
     k: hlo.Id,
@@ -1294,14 +1285,14 @@ fn emitStaticGqaAttention(
     const q_heads = try reshapeAttentionInputToHeads(b, q, q_len, num_heads, head_dim);
     const k_heads = try reshapeAttentionInputToHeads(
         b,
-        try repeatGqaKvHeads(allocator, b, owned_constants, k_for_attention, kv_len, num_kv_heads, num_heads, head_dim),
+        try repeatGqaKvHeads(b, k_for_attention, kv_len, num_kv_heads, num_heads, head_dim),
         kv_len,
         num_heads,
         head_dim,
     );
     const v_heads = try reshapeAttentionInputToHeads(
         b,
-        try repeatGqaKvHeads(allocator, b, owned_constants, v_for_attention, kv_len, num_kv_heads, num_heads, head_dim),
+        try repeatGqaKvHeads(b, v_for_attention, kv_len, num_kv_heads, num_heads, head_dim),
         kv_len,
         num_heads,
         head_dim,
@@ -1316,10 +1307,7 @@ fn emitStaticGqaAttention(
     const scale = try b.constantScalarF32(1.0 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))));
     scores = try b.multiply(scores, scale);
     if (past_k == null) {
-        const mask = try buildCausalMask(allocator, @intCast(num_heads), @intCast(q_len));
-        try owned_constants.append(allocator, mask);
-        const mask_id = try b.constantF32(hlo.Shape.init(.f32, &.{ num_heads, q_len, q_len }), mask);
-        scores = try b.add(scores, mask_id);
+        scores = try b.add(scores, try emitCausalMask(allocator, b, num_heads, q_len));
     }
     if (bias) |bias_id| scores = try b.add(scores, bias_id);
 
@@ -1367,58 +1355,26 @@ fn reshapeAttentionInputToHeads(
     return b.transpose(value4, &.{ 1, 0, 2 }, hlo.Shape.init(.f32, &.{ num_heads, seq_len, head_dim }));
 }
 
-fn repeatGqaKvHeads(
-    allocator: Allocator,
-    b: *hlo.Builder,
-    owned_constants: *std.ArrayListUnmanaged([]f32),
-    value: hlo.Id,
-    seq_len: i64,
-    num_kv_heads: i64,
-    num_heads: i64,
-    head_dim: i64,
-) !hlo.Id {
+fn repeatGqaKvHeads(b: *hlo.Builder, value: hlo.Id, seq_len: i64, num_kv_heads: i64, num_heads: i64, head_dim: i64) !hlo.Id {
     if (num_kv_heads == num_heads) return value;
     const repeat_factor = std.math.divExact(i64, num_heads, num_kv_heads) catch return error.UnsupportedShape;
-    const value3 = try b.reshape(value, hlo.Shape.init(.f32, &.{ seq_len, num_kv_heads, head_dim }));
-    const transposed = try b.transpose(value3, &.{ 0, 2, 1 }, hlo.Shape.init(.f32, &.{ seq_len, head_dim, num_kv_heads }));
-    const flat_rows = seq_len * head_dim;
-    const flat = try b.reshape(transposed, hlo.Shape.init(.f32, &.{ flat_rows, num_kv_heads }));
-    const repeat = try buildGqaRepeatMatrix(allocator, @intCast(num_kv_heads), @intCast(num_heads), @intCast(repeat_factor));
-    try owned_constants.append(allocator, repeat);
-    const repeat_id = try b.constantF32(hlo.Shape.init(.f32, &.{ num_kv_heads, num_heads }), repeat);
-    const expanded_flat = try b.matmul(flat, repeat_id);
-    const expanded = try b.reshape(expanded_flat, hlo.Shape.init(.f32, &.{ seq_len, head_dim, num_heads }));
-    return b.transpose(expanded, &.{ 0, 2, 1 }, hlo.Shape.init(.f32, &.{ seq_len, num_heads, head_dim }));
+    const grouped = try b.reshape(value, hlo.Shape.init(.f32, &.{ seq_len, num_kv_heads, 1, head_dim }));
+    const expanded = try b.broadcast(grouped, &.{ 0, 1, 2, 3 }, hlo.Shape.init(.f32, &.{ seq_len, num_kv_heads, repeat_factor, head_dim }));
+    return b.reshape(expanded, hlo.Shape.init(.f32, &.{ seq_len, num_heads, head_dim }));
 }
 
-fn buildGqaRepeatMatrix(
-    allocator: Allocator,
-    num_kv_heads: usize,
-    num_heads: usize,
-    repeat_factor: usize,
-) ![]f32 {
-    const data = try allocator.alloc(f32, num_kv_heads * num_heads);
-    @memset(data, 0.0);
-    for (0..num_kv_heads) |kv_head| {
-        for (0..repeat_factor) |rep| {
-            data[kv_head * num_heads + kv_head * repeat_factor + rep] = 1.0;
-        }
-    }
-    return data;
-}
-
-fn buildCausalMask(allocator: Allocator, num_heads: usize, seq_len: usize) ![]f32 {
-    const data = try allocator.alloc(f32, num_heads * seq_len * seq_len);
-    var idx: usize = 0;
-    for (0..num_heads) |_| {
-        for (0..seq_len) |q_pos| {
-            for (0..seq_len) |k_pos| {
-                data[idx] = if (k_pos <= q_pos) 0.0 else -1.0e9;
-                idx += 1;
-            }
-        }
-    }
-    return data;
+fn emitCausalMask(allocator: Allocator, b: *hlo.Builder, heads: i64, rows: i64) !hlo.Id {
+    const positions = try allocator.alloc(i32, std.math.cast(usize, rows) orelse return error.UnsupportedShape);
+    defer allocator.free(positions);
+    for (positions, 0..) |*value, index| value.* = std.math.cast(i32, index) orelse return error.UnsupportedShape;
+    const index = try b.constantS32(hlo.Shape.init(.s32, &.{rows}), positions);
+    const grid = hlo.Shape.init(.s32, &.{ rows, rows });
+    const allowed = try b.compare(try b.broadcast(index, &.{0}, grid), try b.broadcast(index, &.{1}, grid), "GE");
+    const floats = hlo.Shape.init(.f32, &.{ rows, rows });
+    // Preserve the existing finite exclusion value while computing the mask
+    // from O(S) host metadata rather than serializing H*S*S float constants.
+    const mask = try b.select(allowed, try b.broadcast(try b.constantScalarF32(0), &.{}, floats), try b.broadcast(try b.constantScalarF32(-1.0e9), &.{}, floats));
+    return b.broadcast(mask, &.{ 1, 2 }, hlo.Shape.init(.f32, &.{ heads, rows, rows }));
 }
 
 fn emitSoftmaxLastDim(

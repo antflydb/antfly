@@ -1117,6 +1117,8 @@ pub fn supportsLinearNormActivation(op: OpCode) bool {
 /// and concatenation ops that the HLO compiler handles.
 pub fn supportsPjrt(op: OpCode) bool {
     return switch (op) {
+        .gather => |attrs| attrs.axis == 0,
+        .fused_disentangled_attention => |attrs| attrs.batch > 0 and attrs.seq_len > 0 and attrs.num_heads > 0 and attrs.head_dim > 0,
         .fused_gqa_causal_attention => |attrs| blk: {
             const num_kv_heads = if (attrs.num_kv_heads > 0) attrs.num_kv_heads else attrs.num_heads;
             break :blk attrs.batch == 1 and

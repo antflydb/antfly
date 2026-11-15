@@ -790,7 +790,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     b.modules.put(b.allocator, b.dupe("inference_onnx_graph"), inference_onnx.graph) catch @panic("OOM");
     const inference_pjrt_xla_proto_mod = b.createModule(.{
-        .root_source_file = b.path("lib/pjrt/proto/xla_proto_stub.zig"),
+        .root_source_file = b.path("lib/pjrt/proto/xla_proto.zig"),
         .target = target,
         .optimize = optimize,
     });

@@ -1821,10 +1821,6 @@ pub const PreparedWeights = struct {
 pub fn prepare(allocator: std.mem.Allocator, model_path: []const u8, loaded_model: *model_definition.LoadedModel, preparation: HostPreparation) !PreparedWeights {
     var direct_quant_enabled = directQuantEnabled();
     const cpu_plan_context = defaultPlanContextForBackend(.cpu);
-    if (preparation.backend == .pjrt) switch (loaded_model.architecture) {
-        .gliner_boundary => return error.UnsupportedGlinerBoundaryBackend,
-        else => {},
-    };
     var mf = loaded_model.manifest;
 
     // Detect architecture from config.json

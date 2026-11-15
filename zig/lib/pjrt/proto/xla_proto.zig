@@ -1,19 +1,7 @@
-//! Stub `xla_proto` module.
-//!
-//! The real `xla_proto` module used to be generated at build time from
-//! `proto/hlo.desc` via `@import("protobuf").addProtoModule(...)`. That
-//! helper was removed when the pinned `protobuf` library dropped its
-//! build-time codegen support, and no checked-in generated file exists
-//! yet. Rather than port the generator or stop compiling pjrt entirely
-//! (pjrt is imported unconditionally by `lib/pjrt/src/root.zig` which is
-//! in turn imported by `inference_mod`), we stub out just enough of the
-//! `xla.*` surface that `src/hlo.zig` actually touches so the module
-//! semantically analyses. Methods that serialize/deserialize return
-//! empty buffers / errors at runtime — pjrt is disabled by default
-//! (`-Dpjrt=false`), and when someone turns it on they'll need to
-//! restore real generated bindings.
-//!
-//! Keep this file in lockstep with the field set used by `src/hlo.zig`.
+//! Owned subset of the OpenXLA HLO protobuf wire format used by the compiler.
+//! Encoding produces real HLO modules consumed by PJRT providers. Decoding
+//! reads the metadata subset required by this package, not arbitrary round trips.
+//! Keep field numbers synchronized with proto/hlo.desc and src/hlo.zig.
 
 const std = @import("std");
 const wire = @import("protobuf").wire;

@@ -20,6 +20,10 @@ const factory = internal.architectures.session_factory;
 const pipeline = internal.pipelines.embedding_gemma2;
 const Bounded = internal.runtime.bounded_allocator.BoundedAllocator;
 
+const Backend = enum { native, metal, pjrt };
+const Session = internal.backends.Session;
+const Tensor = internal.backends.Tensor;
+
 const Case = struct { name: []const u8, token_ids: []const i64, attention_mask: ?[]const i64 = null, dimensions: usize = 768 };
 const Suite = struct { cases: []const Case };
 const Memory = if (@import("build_options").enable_metal) internal.metal_runtime.RawRuntimeMemoryStats else struct {};
@@ -46,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     var model: ?[]const u8 = null;
     var suite_path: ?[]const u8 = null;
     var output: ?[]const u8 = null;
-    var metal = true;
+    var backend: Backend = .metal;
     var warmups: usize = 2;
     var iterations: usize = 20;
     var long_iterations: usize = 5;
@@ -57,8 +61,7 @@ pub fn main(init: std.process.Init) !void {
         const key = args[i];
         const value = args[i + 1];
         if (std.mem.eql(u8, key, "--model")) model = value else if (std.mem.eql(u8, key, "--suite")) suite_path = value else if (std.mem.eql(u8, key, "--output")) output = value else if (std.mem.eql(u8, key, "--case")) try selected.append(a, value) else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--iterations")) iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--long-iterations")) long_iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--backend")) {
-            if (!std.mem.eql(u8, value, "metal") and !std.mem.eql(u8, value, "native")) return error.InvalidBackend;
-            metal = std.mem.eql(u8, value, "metal");
+            backend = std.meta.stringToEnum(Backend, value) orelse return error.InvalidBackend;
         } else return error.UnknownArgument;
     }
     if (iterations == 0 or iterations > 100 or long_iterations == 0 or long_iterations > 100 or warmups > 100) return error.InvalidIterations;
@@ -72,7 +75,13 @@ pub fn main(init: std.process.Init) !void {
         };
         if (!found) return error.UnknownCase;
     }
-    const session = if (metal) try factory.createMetalSession(a, model orelse return error.MissingModel) else try factory.createNativeSession(a, model orelse return error.MissingModel);
+    const metal = backend == .metal;
+    const session = switch (backend) {
+        .metal => try factory.createMetalSession(a, model orelse return error.MissingModel),
+        .native => try factory.createNativeSession(a, model orelse return error.MissingModel),
+        // Frames retain this allocator, so request temporaries must be reusable.
+        .pjrt => try factory.createPjrtSession(std.heap.c_allocator, model orelse return error.MissingModel),
+    };
     defer session.close();
     if (!metal) factory.attachIo(session, init.io);
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.WrongArchitecture;
@@ -104,27 +113,13 @@ pub fn main(init: std.process.Init) !void {
         for (0..warmups + n) |iteration| {
             var bounded = Bounded{ .backing = pipeline.workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 };
             {
-                var permit = try session.admit(.{ .batch = 1, .sequence = case.token_ids.len, .workspace_bytes = if (metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 768 * 4 });
-                defer permit.deinit();
-                // The Python driver owns and can terminate this dedicated
-                // process. Offline backend access avoids requiring an HTTP
-                // worker's hard-cancellation boundary in this child.
-                var cb = try factory.getComputeBackend(session, bounded.allocator());
-                defer cb.deinit();
                 if (iteration == warmups) vm_before = try vmCounters();
-                const started = try now();
-                const current = try pipeline.preparedText(&cb, bounded.allocator(), cfg, case.token_ids, mask, case.dimensions);
-                defer bounded.allocator().free(current);
-                const elapsed = try now() - started;
+                const measured = try measureIteration(session, bounded.allocator(), cfg, case, mask, backend);
+                defer bounded.allocator().free(measured.vector);
                 if (iteration + 1 == warmups + n) vm_after = try vmCounters();
-                if (comptime @import("build_options").enable_metal) {
-                    if (metal) {
-                        const compute: *internal.native_compute.metal.MetalCompute = @ptrCast(@alignCast(cb.ptr));
-                        gpu_memory[iteration] = internal.metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime);
-                    } else gpu_memory[iteration] = .{};
-                } else gpu_memory[iteration] = .{};
-                if (iteration >= warmups) samples[iteration - warmups] = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s;
-                if (iteration + 1 == warmups + n) vector = try a.dupe(f32, current);
+                gpu_memory[iteration] = measured.memory;
+                if (iteration >= warmups) samples[iteration - warmups] = @as(f64, @floatFromInt(measured.elapsed)) / std.time.ns_per_s;
+                if (iteration + 1 == warmups + n) vector = try a.dupe(f32, measured.vector);
             }
             if (bounded.live != 0) return error.WorkspaceLeak;
             peak = @max(peak, bounded.peak);
@@ -133,6 +128,45 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("encoder {s}: {d} samples, host peak {d}\n", .{ case.name, n, peak });
     }
     if (measurements.items.len == 0) return error.NoCases;
-    const report = try std.json.Stringify.valueAlloc(a, .{ .version = 1, .timing_scope = "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback", .backend = if (metal) "metal" else "native", .warmups = warmups, .vm_counters_available = @import("build_options").enable_metal, .cases = measurements.items }, .{ .whitespace = .indent_2 });
+    const report = try std.json.Stringify.valueAlloc(a, .{ .version = 1, .timing_scope = "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback", .backend = @tagName(backend), .memory_scope = "tracked Antfly host workspace; provider heaps excluded", .compiled_call_includes_public_session = backend == .pjrt, .warmups = warmups, .vm_counters_available = @import("build_options").enable_metal, .cases = measurements.items }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output orelse return error.MissingOutput, .data = report });
+}
+
+const Iteration = struct { vector: []f32, elapsed: u64, memory: Memory = .{} };
+fn measureIteration(session: Session, allocator: std.mem.Allocator, cfg: anytype, case: Case, mask: []const i64, backend: Backend) !Iteration {
+    if (backend == .pjrt) {
+        const started = try now();
+        const vector = try compiledVector(session, allocator, case, mask);
+        return .{ .vector = vector, .elapsed = try now() - started };
+    }
+    var permit = try session.admit(.{ .batch = 1, .sequence = case.token_ids.len, .workspace_bytes = if (backend == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 768 * 4 });
+    defer permit.deinit();
+    var cb = try factory.getComputeBackend(session, allocator);
+    defer cb.deinit();
+    const started = try now();
+    const vector = try pipeline.preparedText(&cb, allocator, cfg, case.token_ids, mask, case.dimensions);
+    errdefer allocator.free(vector);
+    const elapsed = try now() - started;
+    var memory: Memory = .{};
+    if (comptime @import("build_options").enable_metal) if (backend == .metal) {
+        const compute: *internal.native_compute.metal.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        memory = internal.metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime);
+    };
+    return .{ .vector = vector, .elapsed = elapsed, .memory = memory };
+}
+fn compiledVector(session: Session, allocator: std.mem.Allocator, case: Case, mask: []const i64) ![]f32 {
+    const shape = [_]i64{ 1, @intCast(case.token_ids.len) };
+    const dimensions = [_]i64{@intCast(case.dimensions)};
+    const inputs = [_]Tensor{
+        .{ .data = @constCast(std.mem.sliceAsBytes(case.token_ids)), .dtype = .i64, .shape = &shape, .name = "input_ids", .allocator = allocator, .owns_data = false, .owns_shape = false },
+        .{ .data = @constCast(std.mem.sliceAsBytes(mask)), .dtype = .i64, .shape = &shape, .name = "attention_mask", .allocator = allocator, .owns_data = false, .owns_shape = false },
+        .{ .data = @constCast(std.mem.sliceAsBytes(&dimensions)), .dtype = .i64, .shape = &.{1}, .name = "output_dimensions", .allocator = allocator, .owns_data = false, .owns_shape = false },
+    };
+    const outputs = try session.runWithControl(&inputs, allocator, .{ .native_call_policy = .in_process });
+    defer allocator.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    if (outputs.len != 1 or outputs[0].dtype != .f32 or !outputs[0].owns_data or !std.mem.eql(i64, outputs[0].shape, &.{ 1, @intCast(case.dimensions) })) return error.InvalidCompiledEmbeddingOutput;
+    const vector = outputs[0].asFloat32Mut();
+    outputs[0].owns_data = false;
+    return vector;
 }

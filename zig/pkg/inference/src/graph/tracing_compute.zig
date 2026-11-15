@@ -312,6 +312,7 @@ pub const TracingCompute = struct {
         .sliceRows2D = &sliceRows2DOp,
         .fromInt32Shape = &fromInt32ShapeOp,
         .fromConstantBytes = &fromConstantBytesOp,
+        .gatherOp = &primitiveGather,
         .lessThan = &primitiveLessThan,
         .whereSelect = &primitiveWhereSelect,
         .reshapeOp = &primitiveReshape,
@@ -470,6 +471,18 @@ pub const TracingCompute = struct {
         if (try tc.runtimeInput(data, dtype, shape)) |node| return try tc.makeHandle(node);
         const loc = try tc.graph.internConstantBytes(data, dtype);
         return try tc.makeHandle(try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } }, .output_shape = shape }));
+    }
+
+    fn primitiveGather(ctx: *anyopaque, input: CT, indices: CT, axis: u8, dims: []const i64) anyerror!CT {
+        const tc = fromCtx(ctx);
+        const shape = try tc.checkedInputShape(input, dims);
+        const index_shape = tc.graph.node(nodeIdFromCT(indices)).output_shape;
+        if (axis != 0 or shape.rank() == 0 or (index_shape.dtype != .i64 and index_shape.dtype != .i32) or index_shape.rank() + shape.rank() - 1 > 8) return error.UnsupportedShape;
+        var result: [8]i64 = undefined;
+        @memcpy(result[0..index_shape.rank()], index_shape.dims[0..index_shape.rank()]);
+        @memcpy(result[index_shape.rank()..][0 .. shape.rank() - 1], shape.dims[1..shape.rank()]);
+        var builder = Builder.init(tc.getGraphMut());
+        return tc.makeHandle(try builder.gather(nodeIdFromCT(input), nodeIdFromCT(indices), Shape.init(shape.dtype, result[0 .. index_shape.rank() + shape.rank() - 1])));
     }
 
     fn primitiveLessThan(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
@@ -1124,27 +1137,47 @@ pub const TracingCompute = struct {
         return tc.makeHandle(id);
     }
 
-    fn debertaOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, _: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    fn debertaOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
         const tc = fromCtx(ctx);
-        const q_id = nodeIdFromCT(Q);
-        const out_shape = tc.graph.node(q_id).output_shape;
-        // 5 inputs: Q, K, V, Q_r, K_r — but we only have 4 inline slots.
-        // Store the first 4 inline; K_r will be an extra node reference
-        // stored via vjp_alternate as a temporary workaround.
-        // TODO: support overflow inputs when needed.
-        const id = try tc.graph.addNode(.{
-            .op = .{ .fused_causal_self_attention = .{
-                .batch = @intCast(batch),
-                .seq_len = @intCast(seq_len),
-                .num_heads = @intCast(num_heads),
-                .head_dim = @intCast(head_dim),
-            } },
-            .output_shape = out_shape,
-            .inputs = .{ q_id, nodeIdFromCT(K), nodeIdFromCT(V), nodeIdFromCT(Q_r) },
-            .num_inputs = 4,
-            .vjp_alternate = nodeIdFromCT(K_r),
+        if (batch == 0 or seq_len == 0 or num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+        const rows = try std.math.mul(usize, batch, seq_len);
+        const width = try std.math.mul(usize, num_heads, head_dim);
+        const relatives = try std.math.sub(usize, try std.math.mul(usize, 2, seq_len), 1);
+        if (mask.len != rows) return error.InvalidAttentionShape;
+        var builder = Builder.init(tc.getGraphMut());
+        var content: [3]NodeId = undefined;
+        for ([_]CT{ Q, K, V }, &content) |value, *node| {
+            const source = nodeIdFromCT(value);
+            if (tc.graph.node(source).output_shape.numElements() != (std.math.cast(i64, try std.math.mul(usize, rows, width)) orelse return error.InvalidAttentionShape)) return error.InvalidAttentionShape;
+            node.* = try builder.reshape(source, Shape.init(.f32, &.{ @intCast(rows), @intCast(width) }));
+        }
+        var relative: [2]NodeId = undefined;
+        for ([_]CT{ Q_r, K_r }, &relative) |value, *node| {
+            const source = nodeIdFromCT(value);
+            if (tc.graph.node(source).output_shape.numElements() != (std.math.cast(i64, try std.math.mul(usize, relatives, width)) orelse return error.InvalidAttentionShape)) return error.InvalidAttentionShape;
+            node.* = try builder.reshape(source, Shape.init(.f32, &.{ @intCast(relatives), @intCast(width) }));
+        }
+        const qkv = try builder.concat(try builder.concat(content[0], content[1], 0), content[2], 0);
+        const qrkr = try builder.concat(relative[0], relative[1], 0);
+        // Only a linear visibility vector enters the constant pool. The graph
+        // expresses its expanded score layout, allowing compiled fusion.
+        const visibility = try tc.allocator.alloc(f32, rows);
+        defer tc.allocator.free(visibility);
+        for (mask, visibility) |bit, *value| {
+            if (bit != 0 and bit != 1) return error.InvalidAttentionMask;
+            value.* = if (bit == 0) -std.math.inf(f32) else 0;
+        }
+        const location = try tc.graph.internConstant(visibility);
+        const keys = try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = location.offset, .data_len = location.len } }, .output_shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(seq_len) }) });
+        const expanded = try tc.broadcastNode(keys, &.{ 0, 3 }, Shape.init(.f32, &.{ @intCast(batch), @intCast(num_heads), @intCast(seq_len), @intCast(seq_len) }));
+        const bias = try builder.reshape(expanded, Shape.init(.f32, &.{ @intCast(batch * num_heads), @intCast(seq_len), @intCast(seq_len) }));
+        const output = try tc.graph.addNode(.{
+            .op = .{ .fused_disentangled_attention = .{ .batch = @intCast(batch), .seq_len = @intCast(seq_len), .num_heads = @intCast(num_heads), .head_dim = @intCast(head_dim) } },
+            .output_shape = Shape.init(.f32, &.{ @intCast(rows), @intCast(width) }),
+            .inputs = .{ qkv, qrkr, bias, null_node },
+            .num_inputs = 3,
         });
-        return tc.makeHandle(id);
+        return tc.makeHandle(output);
     }
 
     fn debertaBackwardOp(_: *anyopaque, _: CT, _: CT, _: CT, _: CT, _: CT, _: []const i64, _: CT, _: usize, _: usize, _: usize, _: usize) anyerror!CT {

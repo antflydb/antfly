@@ -68,6 +68,7 @@ test {
     _ = @import("captured_primitives_test.zig");
     _ = @import("model_program_e2e_test.zig");
     _ = @import("whisper_frontend.zig");
+    _ = @import("marker_classifier.zig");
     _ = @import("../backends/compute_factory.zig");
     _ = @import("decoder_forward.zig");
     _ = @import("native_decoder_program.zig");

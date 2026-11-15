@@ -270,8 +270,10 @@ pub const Cache = struct {
 
             const owner = result.backendFor(&frame.executable.runtime, i);
             const data = try owner.toFloat32(value, allocator);
-            defer allocator.free(data);
-            outputs[i] = try Tensor.initFloat32(allocator, forward.output_names[i], shape.dims[0..shape.rank()], data);
+            outputs[i] = Tensor.initFloat32Owned(allocator, forward.output_names[i], shape.dims[0..shape.rank()], data) catch |err| {
+                allocator.free(data);
+                return err;
+            };
             count += 1;
         }
         return outputs;

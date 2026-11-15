@@ -794,6 +794,19 @@ fn embeddings(
     // Multiply by attention mask (DeBERTa-v3 zeros out padding embeddings).
     if (allAttentionMaskOnes(attention_mask, total)) return normed;
 
+    if (cb.kind() == .graph) {
+        const values = try allocator.alloc(f32, total);
+        defer allocator.free(values);
+        for (attention_mask[0..total], values) |bit, *value| value.* = @floatFromInt(bit);
+        const linear = try cb.fromFloat32Shape(values, &.{ @intCast(total), 1 });
+        defer cb.free(linear);
+        const broadcast = try cb.primBroadcastInDim(linear, &.{ @intCast(total), H }, &.{ 0, 1 }, &.{ @intCast(total), 1 });
+        defer cb.free(broadcast);
+        const masked = try cb.multiply(normed, broadcast);
+        cb.free(normed);
+        return masked;
+    }
+
     // Keep the normalized activations on the backend and only upload the mask.
     const mask_data = try allocator.alloc(f32, total * H);
     defer allocator.free(mask_data);

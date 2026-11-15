@@ -400,9 +400,12 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
         if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
         // Do not publish a compiled target whose production forward has no
         // semantic frontend. Loading may fall back only before publication.
-        if (sessionTaskForModelType(loaded_model.manifest.model_type, override) != .generic or loaded_model.manifest.glide_declared) return error.UnsupportedModelProgram;
+        const selected_task = sessionTaskForModelType(loaded_model.manifest.model_type, override);
+        if ((selected_task != .generic and !(selected_task == .extractor and decisionProgramEncoder(loaded_model.architecture) != null)) or loaded_model.manifest.glide_declared) return error.UnsupportedModelProgram;
+        if (loaded_model.architecture == .modern_bert and loaded_model.architecture.modern_bert.laya != null) return error.UnsupportedModelProgram;
         switch (loaded_model.architecture) {
-            .bert, .modern_bert, .nomic_bert, .embedding_gemma2, .whisper, .gpt => {},
+            .bert, .modern_bert, .nomic_bert, .embedding_gemma2, .whisper, .gpt, .deberta, .gliner, .gliner_modern_bert => {},
+            .gliner_boundary => |cfg| if (cfg.encoder.family != .deberta) return error.UnsupportedModelProgram,
             else => return error.UnsupportedModelProgram,
         }
     }
@@ -7812,12 +7815,33 @@ fn eagerHostRunObserved(raw: *anyopaque, inputs: []const Tensor, allocator: std.
     return archRunImplWithContext(raw, inputs, allocator, control, context, receipt, preentry);
 }
 
+fn decisionProgramEncoder(config: ArchConfig) ?gliner_encoder.Config {
+    return switch (config) {
+        .gliner => |cfg| if (cfg.label_marker_decision_head) .{ .deberta = cfg } else null,
+        .gliner_modern_bert => |cfg| .{ .modern_bert = cfg },
+        else => null,
+    };
+}
+fn validateDecisionProgram(ptr: *anyopaque, inputs: []const @import("capture.zig").Input) anyerror!void {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    _ = try @import("marker_classifier.zig").validate(decisionProgramEncoder(self.arch_config) orelse return error.UnsupportedModelProgram, inputs);
+}
+fn forwardDecisionProgram(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const @import("capture.zig").Input) anyerror![]@import("capture.zig").Output {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    return @import("marker_classifier.zig").run(decisionProgramEncoder(self.arch_config) orelse return error.UnsupportedModelProgram, cb, allocator, inputs);
+}
+
 fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig").Stage) anyerror!?@import("capture.zig").Forward {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.task == .extractor and decisionProgramEncoder(self.arch_config) != null) return switch (stage) {
+        .forward, .readout => .{ .context = self, .fingerprint = 4, .output_names = &.{"logits"}, .validate = validateDecisionProgram, .run = forwardDecisionProgram },
+        else => null,
+    };
     if (self.task != .generic or self.glide_head != null) return null;
     if (self.arch_config == .whisper) return @import("whisper_frontend.zig").resolve(&self.arch_config.whisper, stage);
     const encoder = switch (self.arch_config) {
-        .bert, .modern_bert, .nomic_bert, .embedding_gemma2, .gpt => true,
+        .bert, .modern_bert, .nomic_bert, .embedding_gemma2, .gpt, .deberta, .gliner => true,
+        .gliner_boundary => |cfg| cfg.encoder.family == .deberta,
         else => false,
     };
     return switch (stage) {
@@ -7880,6 +7904,16 @@ fn archValidateProgramInputs(ptr: *anyopaque, inputs: []const @import("capture.z
         .bert => |cfg| {
             _ = try bert_arch.validateBertForwardInputs(cfg, bi.input_ids, bi.attention_mask, bi.token_type_ids, bi.batch, bi.seq_len);
         },
+        .deberta, .gliner => |cfg| {
+            if (cfg.hidden_size == 0 or cfg.num_attention_heads == 0 or cfg.hidden_size % cfg.num_attention_heads != 0 or bi.seq_len > cfg.max_position_embeddings or bi.token_type_ids != null) return error.InvalidInputShape;
+            for (bi.input_ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidTokenId;
+        },
+        .gliner_boundary => |boundary| {
+            if (boundary.encoder.family != .deberta) return error.UnsupportedModelProgram;
+            const cfg = boundary.encoder.toDeberta();
+            if (cfg.hidden_size == 0 or cfg.num_attention_heads == 0 or cfg.hidden_size % cfg.num_attention_heads != 0 or bi.seq_len > cfg.max_position_embeddings or bi.token_type_ids != null) return error.InvalidInputShape;
+            for (bi.input_ids) |id| if (id < 0 or id >= cfg.vocab_size) return error.InvalidTokenId;
+        },
         .nomic_bert => |cfg| {
             _ = try nomic_bert_arch.validateInputs(cfg, bi.input_ids, bi.attention_mask, bi.token_type_ids, bi.batch, bi.seq_len);
         },
@@ -7921,6 +7955,8 @@ fn archProgramForward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator:
     const bi = (try programTextInputs(inputs)).text;
     const hidden = switch (self.arch_config) {
         .bert => |cfg| try bert_arch.forwardCtWithControl(cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.token_type_ids, bi.batch, bi.seq_len, cb.execution_control),
+        .deberta, .gliner => |cfg| try deberta_arch.forwardCt(cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len, false),
+        .gliner_boundary => |cfg| try deberta_arch.forwardCt(cb, allocator, cfg.encoder.toDeberta(), bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len, false),
         .modern_bert => |cfg| try modern_bert_arch.forwardCT(cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len),
         .nomic_bert => |cfg| try nomic_bert_arch.forwardCT(cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.token_type_ids, bi.batch, bi.seq_len),
         .embedding_gemma2 => |cfg| try embedding_gemma2_arch.forwardCT(cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len),
@@ -7929,6 +7965,8 @@ fn archProgramForward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator:
     defer cb.free(hidden);
     const width = switch (self.arch_config) {
         .bert => |cfg| cfg.hidden_size,
+        .deberta, .gliner => |cfg| cfg.hidden_size,
+        .gliner_boundary => |cfg| cfg.encoder.hidden_size,
         .modern_bert => |cfg| cfg.hidden_size,
         .nomic_bert => |cfg| cfg.hidden_size,
         .embedding_gemma2 => |cfg| cfg.embedding_dim,
@@ -8070,6 +8108,31 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
     if (self.glide_head) |head| {
         glide_mod.trace.mark("session compute backend");
         return runGlideReadout(self, &cb, allocator, head, inputs);
+    }
+
+    if (self.task == .generic and (self.arch_config == .gliner or (self.arch_config == .gliner_boundary and self.arch_config.gliner_boundary.encoder.family == .deberta))) {
+        const declared = try allocator.alloc(@import("capture.zig").Input, inputs.len);
+        defer allocator.free(declared);
+        for (inputs, declared) |input, *value| value.* = .{ .tensor = input };
+        try archValidateProgramInputs(self, declared);
+        const outputs = try archProgramForward(self, &cb, allocator, declared);
+        defer allocator.free(outputs);
+        defer for (outputs) |value| cb.free(value.value);
+        const result = try allocator.alloc(Tensor, outputs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*value| value.deinit();
+            allocator.free(result);
+        }
+        for (outputs, result) |value, *host| {
+            const shape = try cb.tensorShape(value.value, allocator);
+            defer allocator.free(shape);
+            const data = try cb.toFloat32(value.value, allocator);
+            errdefer allocator.free(data);
+            host.* = try Tensor.initFloat32Owned(allocator, value.name, shape, data);
+            initialized += 1;
+        }
+        return result;
     }
 
     // Dispatch based on architecture
@@ -9247,6 +9310,8 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
             if (self.task == .classifier) output_seq = 1;
             break :blk if (self.task == .classifier or self.task == .extractor) cfg.num_labels else cfg.hidden_size;
         },
+        .gliner_boundary => |cfg| if (self.task == .generic) cfg.encoder.hidden_size else return null,
+        .gliner => |cfg| if (self.task == .generic) cfg.hidden_size else return null,
         .modern_bert => |cfg| blk: {
             if (self.task == .extractor and self.gliner_span_encoder_family == .modern_bert) {
                 const markers = inputs.named("decision_marker_positions") orelse return error.GlinerSpanExtractionRequiresSchema;
