@@ -1978,8 +1978,8 @@ the exact frozen plan. Changed plans, legacy BEGIN without the frozen envelope,
 and adopting an existing ordinary transaction are rejected. Reads verify the
 transaction ID, coordinator role and current physical namespace. Ordinary
 committed-record cleanup cannot erase completion admission before the explicit
-retention/publication handoff. Fully resolved aborted transactions remove the
-plan with their terminal metadata.
+retention/publication handoff. Fully resolved aborted transactions can retire the
+plan before terminal retry-record expiry, preserving the aborted retry fence.
 
 The physical LSM test covers store reopen, repeated BEGIN, durable replay marker,
 changed input/namespace, legacy retry/adoption rejection, committed cleanup
@@ -1995,6 +1995,41 @@ completion credits before prepare votes, capture atomic effect/zero-effect
 receipts, and complete the retained certificate handoff before releasing the
 committed plan. Until that handoff exists, committed plans deliberately remain
 pinned; the new primitive must not be enabled as a production serving capability.
+
+## In progress: coordinator completion capacity credits
+
+The history capture layer observes frozen coordinator admission in the same
+native batch as BEGIN and reserves capacity from the existing aggregate history
+quota whenever retention is active or outstanding credits require capture. The
+checksummed per-transaction credit binds the admission digest. Its bound covers
+the saved admission, a complete certificate for every participant (including
+guard/checkpoint-only members), and metadata/chunk overhead. Credits share the
+limit with prepared row effects; quota failure aborts the whole BEGIN batch,
+including its transaction record, plan and replay marker. Replay reuses the
+original saved plan bytes after identity verification, avoiding repricing or
+retry failure after serialization changes.
+
+Completion credits survive row resolution, removal of the last public consumer,
+and store reopen. Committed plans remain pinned for certificate handoff. Aborted
+plans release capacity only after local intents/outbox debt and every participant
+ACK drain. This partial cleanup retains the terminal aborted record until its
+ordinary retry cutoff. A first/late history enrollment rejects outstanding
+completion admission rather than creating an uncertified cut.
+
+All 132 docstore/transaction tests and the completion build gate passed in
+`completion-credit-replay-test.log`; the focused history gate passed eight tests
+in `completion-credit-debt-test.log`. Tests cover credits plus prepared row
+reservations, reopen, consumer release, unresolved abort debt, pre-expiry abort
+credit retirement, atomic full-quota rejection, saved-encoding replay, and an
+escaped-payload certificate bound.
+
+This reserves coordinator capacity in an existing qualified history scope, not
+participant completion capacity across a distributed transaction. Unprovisioned
+or inactive scopes must not be advertised as supporting prepared completion
+evidence. Production protocol activation, explicit participant prepare credits,
+applying-cut/owner validation, zero-effect receipts, complete certificate capture
+and publication, recovery/GC handoff and topology transfer remain required.
+Public coordinated delivery stays disabled until that integration is qualified.
 
 ## Working constraints
 

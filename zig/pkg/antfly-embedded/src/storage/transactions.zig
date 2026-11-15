@@ -38,7 +38,7 @@ const stderr_writer = @import("../tracing/stderr_writer.zig");
 const ttl = @import("ttl.zig");
 const retained_effects = @import("retained_effects.zig");
 pub const completion = @import("transaction_completion.zig");
-const completion_admission_prefix = "\x00\x00__txn_completion_admission__:";
+const completion_admission_prefix = completion.admission_prefix;
 
 // ============================================================================
 // Key prefixes
@@ -574,7 +574,9 @@ pub const TxnManager = struct {
             if (member.found_existing) return error.InvalidParticipant;
             try members.append(scratch, participant.locator);
         }
-        const encoded = try completion.encodeAdmission(scratch, admission);
+        // Preserve the original encoding as well as its logical identity. A
+        // serializer upgrade must not reprice credits or break pending retry.
+        const encoded = if (existing_record != null) try self.getAlloc(scratch, &key) else try completion.encodeAdmission(scratch, admission);
         var writes: std.ArrayList(docstore.KVPair) = .empty;
         try writes.appendSlice(scratch, extra.writes);
         try writes.append(scratch, .{ .key = &key, .value = encoded });
@@ -2554,6 +2556,25 @@ pub const TxnManager = struct {
         }
         const cutoff = if (record.retain_terminal) retained_cutoff_timestamp else cutoff_timestamp;
         if (retired_source == null and record.finalized_at >= cutoff) {
+            if (record.status == .aborted) {
+                if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+                    var frozen = saved;
+                    defer frozen.deinit();
+                    const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
+                    defer freeParticipantList(self.alloc, unresolved);
+                    if (unresolved.len == 0) {
+                        // Retain the terminal retry fence, but an all-aborted
+                        // cohort needs no future committed certificate.
+                        const plan_key = makeSidecarKey(completion_admission_prefix, txn_id);
+                        var deletes: std.ArrayList([]const u8) = .empty;
+                        defer deletes.deinit(self.alloc);
+                        try deletes.appendSlice(self.alloc, extra_batch.deletes);
+                        try deletes.append(self.alloc, &plan_key);
+                        try self.applyBatch(extra_batch.writes, deletes.items, null);
+                        return false;
+                    }
+                }
+            }
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
@@ -3444,6 +3465,12 @@ test "committed history completion admission freezes the coordinator plan with b
         defer manager.deinit();
         try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{ .writes = &.{.{ .key = marker_key, .value = "first-begin" }} });
         try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{ .writes = &.{.{ .key = marker_key, .value = "confirmed-retry" }} });
+        const plan_key = makeSidecarKey(completion_admission_prefix, admission.transaction_id);
+        const plan_bytes = try manager.getAlloc(a, &plan_key);
+        defer a.free(plan_bytes);
+        const original_encoding = try std.fmt.allocPrint(a, "{s}\n ", .{plan_bytes});
+        defer a.free(original_encoding);
+        try store.put(&plan_key, original_encoding);
     }
     {
         var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
@@ -3455,6 +3482,11 @@ test "committed history completion admission freezes the coordinator plan with b
         var saved = (try manager.getCompletionAdmission(a, admission.transaction_id)).?;
         defer saved.deinit();
         try std.testing.expectEqual(admission.digest(), saved.value.digest);
+        try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+        const plan_key = makeSidecarKey(completion_admission_prefix, admission.transaction_id);
+        const original_encoding = try manager.getAlloc(a, &plan_key);
+        defer a.free(original_encoding);
+        try std.testing.expect(std.mem.endsWith(u8, original_encoding, "\n "));
         const marker = try manager.getAlloc(a, marker_key);
         defer a.free(marker);
         try std.testing.expectEqualStrings("confirmed-retry", marker);
@@ -3492,6 +3524,105 @@ test "committed history completion admission freezes the coordinator plan with b
         try manager.markParticipantsResolvedExtraBatch(aborted.transaction_id, &.{ "original-writer", "original-guard" }, .{});
         try std.testing.expect(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, std.math.maxInt(u64), std.math.maxInt(u64)));
         try std.testing.expect((try manager.getCompletionAdmission(a, aborted.transaction_id)) == null);
+    }
+}
+
+test "committed history completion admission credits survive resolution and reject full begin atomically" {
+    const history = @import("committed_history.zig");
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "completion-credits");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    const namespace: completion.Namespace = @splat(17);
+    const members = [_]completion.Participant{
+        .{ .namespace = namespace, .owner_fence = @splat(2), .roles = completion.Roles.effects, .locator = "writer" },
+        .{ .namespace = @splat(19), .owner_fence = @splat(4), .roles = completion.Roles.guards, .locator = "guard" },
+    };
+    const admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = @splat(2), .participants = &members };
+    const encoded = try completion.encodeAdmission(a, admission);
+    defer a.free(encoded);
+    const credit = try admission.reservationBytes(encoded.len);
+    const State = struct {
+        fn read(store: *DocStore) !history.State {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            return (try history.load(&txn)).?;
+        }
+    };
+    for (0..2) |phase| {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        if (phase == 0) {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(&internal_keys.identity_namespace_key, &namespace);
+            try @import("source_authority.zig").bind(&txn, .native, namespace);
+            try txn.commit();
+            var enrollment = try store.beginWriteTxn();
+            errdefer enrollment.abort();
+            const consumer = try history.admit(&enrollment, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+            try enrollment.commit();
+            try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            try manager.writeIntents(admission.transaction_id, &.{.{ .key = "row", .value = "after" }}, &.{});
+            try std.testing.expect((try State.read(&store)).reserved_bytes > credit);
+            try manager.resolveIntents(admission.transaction_id, .committed, 20);
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            var release = try store.beginWriteTxn();
+            errdefer release.abort();
+            try history.release(&release, namespace, consumer.id, consumer.epoch);
+            try release.commit();
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+        } else {
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            {
+                var late = try store.beginWriteTxn();
+                defer late.abort();
+                try std.testing.expectError(error.HistoryPreparedTransactionsPresent, history.admit(&late, namespace, @splat(2), 4 * 1024 * 1024, 1000, 1));
+            }
+            var aborted = admission;
+            aborted.transaction_id = @splat(8);
+            try manager.initTransactionWithCompletionAdmission(aborted, 30, 31, true, .{});
+            try std.testing.expect((try State.read(&store)).reserved_bytes > credit);
+            try manager.resolveIntents(aborted.transaction_id, .aborted, 0);
+            try std.testing.expect(!(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, 0, 0)));
+            {
+                var unresolved_plan = (try manager.getCompletionAdmission(a, aborted.transaction_id)).?;
+                defer unresolved_plan.deinit();
+                try std.testing.expectEqual(aborted.digest(), unresolved_plan.value.digest);
+            }
+            try std.testing.expect((try State.read(&store)).reserved_bytes > credit);
+            try manager.markParticipantsResolvedExtraBatch(aborted.transaction_id, &.{ "writer", "guard" }, .{});
+            try std.testing.expect(!(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, 0, 0)));
+            try std.testing.expect((try manager.getCompletionAdmission(a, aborted.transaction_id)) == null);
+            try std.testing.expectEqual(TxnStatus.aborted, (try manager.loadTransactionRecord(aborted.transaction_id)).status);
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            try std.testing.expect(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, std.math.maxInt(u64), std.math.maxInt(u64)));
+            try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
+            const before_fill = try State.read(&store);
+            const available = before_fill.limit - before_fill.retained_bytes - before_fill.reserved_bytes;
+            const payload = try a.alloc(u8, @intCast(available - 2048));
+            defer a.free(payload);
+            @memset(payload, 'x');
+            const physical = try internal_keys.documentKeyAlloc(a, "large");
+            defer a.free(physical);
+            try store.put(physical, payload);
+            const full = try State.read(&store);
+            var rejected = admission;
+            rejected.transaction_id = @splat(7);
+            const marker = "\x00\x00__completion_quota_test_marker";
+            try std.testing.expectError(error.HistoryFull, manager.initTransactionWithCompletionAdmission(rejected, 40, 41, true, .{ .writes = &.{.{ .key = marker, .value = "must-not-commit" }} }));
+            try std.testing.expect((try manager.getCompletionAdmission(a, rejected.transaction_id)) == null);
+            try std.testing.expectError(TxnError.TxnNotFound, manager.loadTransactionRecord(rejected.transaction_id));
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, marker));
+            try std.testing.expectEqualDeep(full, try State.read(&store));
+        }
     }
 }
 

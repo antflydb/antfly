@@ -27,6 +27,7 @@ pub const Namespace = [24]u8;
 pub const max_participants = 1024;
 pub const max_locator_bytes = 1024;
 pub const max_bytes = 16 * 1024 * 1024;
+pub const admission_prefix = "\x00\x00__txn_completion_admission__:";
 pub const Roles = struct {
     pub const effects: u8 = 1;
     pub const guards: u8 = 2;
@@ -63,6 +64,18 @@ pub const Admission = struct {
     coordinator_namespace: Namespace,
     coordinator_fence: Digest,
     participants: []const Participant,
+    /// Includes the frozen admission itself, a complete certificate, and
+    /// bounded key/chunk overhead. Each resolution has five bounded binary
+    /// identities, scalar versions and one tagged outcome; 2048 JSON bytes is
+    /// a conservative ceiling even with maximal byte escaping. No capacity
+    /// is inferred from the number of participants that happen to emit rows.
+    pub fn reservationBytes(self: Admission, encoded_admission_bytes: usize) !u64 {
+        try self.validate();
+        if (encoded_admission_bytes > max_bytes) return error.HistoryTooLarge;
+        const certificate = std.math.add(u64, 4096 + @as(u64, @intCast(encoded_admission_bytes)), @as(u64, @intCast(self.participants.len)) * 2048) catch return error.HistoryTooLarge;
+        if (certificate > max_bytes) return error.HistoryTooLarge;
+        return certificate + encoded_admission_bytes + 128;
+    }
     pub fn validate(self: Admission) !void {
         if (self.version != 1 or !nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.coordinator_namespace) or !nonzero(self.coordinator_fence) or self.participants.len == 0 or self.participants.len > max_participants) return error.InvalidTxnRecord;
         for (self.participants, 0..) |participant, i| {
@@ -347,4 +360,29 @@ test "transaction completion source positions require canonical positive native 
     try validatePosition(position);
     position[31] = 3;
     try std.testing.expectError(error.InvalidTxnRecord, validatePosition(position));
+}
+
+test "transaction completion reservation covers escaped plans and every participant outcome" {
+    const a = std.testing.allocator;
+    const locator: [max_locator_bytes]u8 = @splat(1);
+    var members: [16]Participant = undefined;
+    for (&members, 0..) |*member, i| {
+        var namespace: Namespace = @splat(0);
+        std.mem.writeInt(u64, namespace[16..24], i + 1, .big);
+        member.* = .{ .namespace = namespace, .owner_fence = @splat(255), .roles = Roles.effects | Roles.guards | Roles.checkpoint, .locator = &locator };
+    }
+    const admission: Admission = .{ .transaction_id = @splat(255), .admission_digest = @splat(255), .coordinator_namespace = members[0].namespace, .coordinator_fence = @splat(255), .participants = &members };
+    const manifest = try admission.manifest(std.math.maxInt(u64));
+    var position: Digest = @splat(0);
+    @memset(position[0..16], 255);
+    position[31] = 1;
+    var resolutions: [members.len]Resolution = undefined;
+    for (&resolutions, members, 0..) |*resolution, member, i| resolution.* = .{ .namespace = member.namespace, .owner_fence = member.owner_fence, .manifest_digest = manifest.digest(), .commit_version = manifest.commit_version, .source_position = position, .outcome = if (i % 2 == 0) .{ .effects = .{ .sequence = std.math.maxInt(u64), .frame_digest = @splat(255) } } else .{ .no_effect = @splat(255) } };
+    const plan = try encodeAdmission(a, admission);
+    defer a.free(plan);
+    const certificate = try encode(a, .{ .manifest = manifest, .resolutions = &resolutions });
+    defer a.free(certificate);
+    const reserved = try admission.reservationBytes(plan.len);
+    try std.testing.expect(plan.len + certificate.len + 128 <= reserved);
+    try std.testing.expectError(error.HistoryTooLarge, admission.reservationBytes(max_bytes));
 }

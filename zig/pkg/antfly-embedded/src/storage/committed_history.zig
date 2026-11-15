@@ -29,6 +29,8 @@ const chunk_prefix = "\x00\x00__committed_history__:chunk:";
 const member_prefix = "\x00\x00__committed_history__:member:";
 const reservation_prefix = "\x00\x00__committed_history__:reservation:";
 const intents_prefix = "\x00\x00__txn_intents__:";
+const completion = frame.completion;
+const completion_credit_prefix = "\x00\x00__committed_history__:completion_credit:";
 pub const default_limit: u64 = 256 * 1024 * 1024;
 pub const max_consumers = 32;
 const transaction_overhead: u64 = 2 * frame.max_schema_bytes + 1024 + 256 * 32;
@@ -145,6 +147,7 @@ pub fn admit(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64, e
         var cursor = try txn.openCursor();
         defer cursor.close();
         if (try cursor.seekAtOrAfter(intents_prefix)) |entry| if (std.mem.startsWith(u8, entry.key, intents_prefix)) return error.HistoryPreparedTransactionsPresent;
+        if (try cursor.seekAtOrAfter(completion.admission_prefix)) |entry| if (std.mem.startsWith(u8, entry.key, completion.admission_prefix)) return error.HistoryPreparedTransactionsPresent;
     }
     for (&state.consumers) |*consumer| if (consumer.epoch == 0) {
         state.epoch = std.math.add(u64, state.epoch, 1) catch return error.HistoryCorrupt;
@@ -219,6 +222,28 @@ fn memberKey(key: []const u8) [member_prefix.len + 32]u8 {
 fn reservationKey(id: [16]u8) [reservation_prefix.len + 16]u8 {
     return reservation_prefix.* ++ id;
 }
+fn completionCreditKey(id: [16]u8) [completion_credit_prefix.len + 16]u8 {
+    return completion_credit_prefix.* ++ id;
+}
+const CompletionCredit = struct {
+    bytes: u64 = 0,
+    digest: completion.Digest = @splat(0),
+    fn load(txn: anytype, id: [16]u8) !CompletionCredit {
+        const raw = (try optional(txn, &completionCreditKey(id))) orelse return .{};
+        if (raw.len != 76 or !std.mem.eql(u8, raw[0..4], "CCV1") or !std.mem.eql(u8, raw[44..76], &frame.digest(raw[0..44]))) return error.HistoryCorrupt;
+        const result: CompletionCredit = .{ .bytes = std.mem.readInt(u64, raw[4..12], .little), .digest = raw[12..44].* };
+        if (result.bytes == 0 or result.bytes > 2 * completion.max_bytes + 128) return error.HistoryCorrupt;
+        return result;
+    }
+    fn encode(self: CompletionCredit) [76]u8 {
+        var raw: [76]u8 = undefined;
+        @memcpy(raw[0..4], "CCV1");
+        std.mem.writeInt(u64, raw[4..12], self.bytes, .little);
+        @memcpy(raw[12..44], &self.digest);
+        @memcpy(raw[44..76], &frame.digest(raw[0..44]));
+        return raw;
+    }
+};
 const Reservation = struct {
     members: u64 = 0,
     bytes: u64 = 0,
@@ -252,8 +277,12 @@ pub const Capture = struct {
     reservation_previous: std.AutoHashMapUnmanaged([16]u8, Reservation) = .empty,
     members: std.StringHashMapUnmanaged(u64) = .empty,
     transaction_id: ?[16]u8 = null,
+    completion_credits: std.AutoHashMapUnmanaged([16]u8, CompletionCreditChange) = .empty,
+
+    const CompletionCreditChange = struct { previous: u64, next: u64, digest: completion.Digest };
 
     pub fn deinit(self: *Capture, a: A) void {
+        self.completion_credits.deinit(a);
         var rows = self.rows.iterator();
         while (rows.next()) |entry| {
             a.free(entry.key_ptr.*);
@@ -271,7 +300,7 @@ pub const Capture = struct {
         if (self.staging) return;
         errdefer self.poisoned = true;
         if (std.mem.eql(u8, key, state_key) or std.mem.eql(u8, key, consumer_authority_key)) {
-            if (self.touched_primary or self.rows.count() != 0 or self.reservations.count() != 0) return error.HistoryMixedControl;
+            if (self.touched_primary or self.rows.count() != 0 or self.reservations.count() != 0 or self.completion_credits.count() != 0) return error.HistoryMixedControl;
             self.control = true;
             if (cache) |known| known.store(2, .release);
             return;
@@ -281,9 +310,10 @@ pub const Capture = struct {
             return;
         }
         const intent = std.mem.startsWith(u8, key, intents_prefix);
+        const completion_admission = std.mem.startsWith(u8, key, completion.admission_prefix);
         const primary = keys.isStoredDocumentRowKey(key);
         const schema_change = std.mem.eql(u8, key, keys.public_schema_json_key);
-        if (!primary and !intent and !schema_change) return;
+        if (!primary and !intent and !schema_change and !completion_admission) return;
         if (primary) self.touched_primary = true;
         if (!self.checked) {
             self.checked = true;
@@ -305,6 +335,7 @@ pub const Capture = struct {
         }
         if (!self.enabled) return;
         if (self.control or self.poisoned) return error.HistoryMixedControl;
+        if (completion_admission) return self.touchCompletion(a, txn, key, value);
         if (intent) return self.touchIntent(a, txn, key, value);
         if (!self.schema_checked) {
             self.schema_checked = true;
@@ -330,6 +361,25 @@ pub const Capture = struct {
         try self.rows.put(a, owned_key, owned_value);
         self.row_bytes += size;
     }
+    fn touchCompletion(self: *Capture, a: A, txn: anytype, key: []const u8, value: ?[]const u8) !void {
+        if (key.len != completion.admission_prefix.len + 16) return error.InvalidTxnRecord;
+        const id = key[completion.admission_prefix.len..][0..16].*;
+        const entry = try self.completion_credits.getOrPut(a, id);
+        if (!entry.found_existing) {
+            const previous = try CompletionCredit.load(txn, id);
+            entry.value_ptr.* = .{ .previous = previous.bytes, .next = previous.bytes, .digest = previous.digest };
+        }
+        if (value) |raw| {
+            var parsed = try completion.parseAdmission(a, raw);
+            defer parsed.deinit();
+            const admission = parsed.value.admission;
+            if (!std.mem.eql(u8, &admission.transaction_id, &id) or !std.mem.eql(u8, &admission.coordinator_namespace, &self.namespace)) return error.InvalidTxnRecord;
+            if (entry.value_ptr.previous != 0 and !std.mem.eql(u8, &entry.value_ptr.digest, &parsed.value.digest)) return error.InvalidTxnRecord;
+            entry.value_ptr.next = try admission.reservationBytes(raw.len);
+            entry.value_ptr.digest = parsed.value.digest;
+        } else entry.value_ptr.next = 0;
+    }
+
     fn touchIntent(self: *Capture, a: A, txn: anytype, key: []const u8, value: ?[]const u8) !void {
         if (key.len <= intents_prefix.len + 17 or key[intents_prefix.len + 16] != ':') return error.InvalidTxnRecord;
         const id = key[intents_prefix.len..][0..16].*;
@@ -382,12 +432,23 @@ pub const Capture = struct {
     }
     pub fn stage(self: *Capture, a: A, txn: anytype) !void {
         if (self.poisoned) return error.HistoryTransactionFailed;
-        if (!self.enabled or (self.rows.count() == 0 and self.reservations.count() == 0)) return;
+        if (!self.enabled or (self.rows.count() == 0 and self.reservations.count() == 0 and self.completion_credits.count() == 0)) return;
         errdefer self.poisoned = true;
         self.staging = true;
         defer self.staging = false;
         var state = (try load(txn)) orelse return error.HistoryCorrupt;
         try requireNamespace(txn, state, self.namespace);
+        var completions = self.completion_credits.iterator();
+        while (completions.next()) |entry| {
+            const change = entry.value_ptr.*;
+            state.reserved_bytes = std.math.add(u64, std.math.sub(u64, state.reserved_bytes, change.previous) catch return error.HistoryCorrupt, change.next) catch return error.HistoryFull;
+            if (change.next == 0) {
+                txn.delete(&completionCreditKey(entry.key_ptr.*)) catch |err| if (err != error.NotFound) return err;
+            } else {
+                const credit: CompletionCredit = .{ .bytes = change.next, .digest = change.digest };
+                try txn.put(&completionCreditKey(entry.key_ptr.*), &credit.encode());
+            }
+        }
         var reservations = self.reservations.iterator();
         while (reservations.next()) |entry| {
             const previous = self.reservation_previous.get(entry.key_ptr.*) orelse return error.HistoryCorrupt;
