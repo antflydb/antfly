@@ -8948,6 +8948,52 @@ pub const NativeFile = struct {
     fn refreshIfWriterBaseStale(self: *NativeFile) !void {
         const entry = self.inode_lock_ref.load(.acquire) orelse return;
         const latest = inode_lock.committedSequence(entry);
+        // perf/lwa-grouped-stall: `base` below (the checkpoint's own
+        // `commit_sequence`) and `redo.writer.last_sequence` (this
+        // instance's redo-log continuity counter, independently checked
+        // by `redo_log.Writer.append`) are two different pieces of state
+        // that can desync even when `base` itself already matches
+        // `latest` -- confirmed live: `base == latest == 57` while
+        // `redo.writer.last_sequence` was still 55 on a maintenance
+        // owner's repeatedly-reopened `NativeFile` instance, so every
+        // later append computed `commit_sequence = base + 1 = 58`,
+        // which failed `58 != 55 + 1` (`error.SequenceOutOfOrder`,
+        // surfacing as the far less specific `error.OutcomeUnknown`)
+        // forever -- nothing ever advanced the redo writer's own counter
+        // to match, because the full refresh below only runs when `base`
+        // itself is stale, and the `base >= latest` early return skipped
+        // past this instance's own now-separately-stale redo counter.
+        // Sync it unconditionally and first. The logical overlay for this
+        // inode is already shared and current across every same-process
+        // instance (`inode_lock.Entry`'s one `redo.shared`, per
+        // `recoverRedoLog`'s own doc comment -- "there is nothing to
+        // replay here, only this instance's own bookkeeping to catch
+        // up"), so no second populate of it is needed; but `redo.writer`
+        // is NOT shared -- its `tail` is this instance's own physical
+        // append cursor, and bumping only `last_sequence`/`durable_sequence`
+        // without it left `tail` pointing right after this instance's own
+        // last-seen record, so its next append wrote over bytes a
+        // different, more current instance had already physically
+        // written for the sequences in between (`error.NativeRedoLogCorrupt`
+        // on replay, caught live the first time this fix tried the
+        // `last_sequence`-only version). A no-op-callback replay of the
+        // valid prefix recomputes the real `tail`/`last_sequence` the
+        // same way a cold `recoverRedoLog` open would, without re-applying
+        // any record content (already shared and current).
+        if (self.redo) |*redo| {
+            const current = redo.writer.last_sequence orelse 0;
+            if (latest > current) {
+                const io = self.runtime();
+                const Noop = struct {
+                    fn onRecord(_: ?*anyopaque, _: redo_log.RecordView) anyerror!void {}
+                };
+                const outcome = try redo_log.replay(self.allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, redo.checkpoint_sequence, Noop.onRecord, null);
+                if (outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
+                redo.writer.tail = outcome.valid_bytes;
+                redo.writer.last_sequence = outcome.last_sequence;
+                if (latest > redo.durable_sequence) redo.durable_sequence = latest;
+            }
+        }
         const base = self.activeCheckpoint().commit_sequence;
         if (base >= latest) return;
         const io = self.runtime();
@@ -32980,6 +33026,86 @@ test "lite redo log a second writer-mode handle refreshes to the registry's logi
     try writer.beginTransaction();
     try writer.putDocument("w-after", "v-after");
     try writer.commitTransaction();
+}
+
+// Regression for the grouped-source background-maintenance stall: unlike
+// the sibling test above (`base < latest`, both of `redo.durable_sequence`/
+// `redo.writer.last_sequence` bumped together by the existing refresh),
+// this forces the specific desync that refresh used to miss entirely --
+// `base`/`durable_sequence` already agree with the registry's `latest`,
+// but `redo.writer.last_sequence` (the counter `redo_log.Writer.append`'s
+// own continuity check actually reads) was never told, because the old
+// `base >= latest` early return skipped straight past it. Confirmed live
+// under a repeatedly-reopened `NativeFile` driving Lite's background
+// maintenance owner: `base == latest == 57`, `writer.last_sequence == 55`,
+// so every append after that point computed `commit_sequence = base + 1`,
+// failed the writer's own `commit_sequence == last_sequence + 1` check
+// forever (`error.SequenceOutOfOrder`, surfacing as the far less specific
+// `error.OutcomeUnknown`), and the catch-up loop never advanced its
+// applied sequence.
+test "lite redo log in-process base refresh also resyncs the redo writer's own continuity counter" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-stale-writer-counter.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    try writer.beginTransaction();
+    try writer.putDocument("w0", "v0");
+    try writer.commitTransaction();
+
+    var second = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    try std.testing.expect(second.redo != null);
+
+    var key_buf: [16]u8 = undefined;
+    for (0..5) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "w{d}", .{i + 1});
+        try writer.beginTransaction();
+        try writer.putDocument(key, "v");
+        try writer.commitTransaction();
+    }
+    try std.testing.expectEqual(@as(u64, 6), writer.activeCheckpoint().commit_sequence);
+
+    // Force exactly the desync described above: `base` and
+    // `durable_sequence` already match the registry's `latest` (6), but
+    // this instance's own redo-log continuity counter was never told.
+    second.header.checkpoints[second.header.active_checkpoint].commit_sequence = 6;
+    second.redo.?.durable_sequence = 6;
+    second.redo.?.writer.last_sequence = 4;
+
+    // `beginTransaction` calls `refreshIfWriterBaseStale` internally.
+    // `base (6) >= latest (6)` alone must no longer be enough to skip the
+    // redo writer's own resync.
+    try second.beginTransaction();
+    try std.testing.expectEqual(@as(u64, 6), second.redo.?.writer.last_sequence);
+
+    // The real regression: this commit used to compute
+    // `commit_sequence = base + 1 = 7` against a writer whose own
+    // continuity counter was still 4, failing `error.SequenceOutOfOrder`
+    // on every retry, forever.
+    try second.putDocument("second-doc", "second-value");
+    try second.commitTransaction();
+    try std.testing.expectEqual(@as(u64, 7), second.activeCheckpoint().commit_sequence);
+
+    const value = (try second.getDocumentAlloc(a, "second-doc")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("second-value", value);
+
+    // A fix that only bumped the logical counter without recomputing the
+    // writer's own physical `tail` left the physical cursor wrong instead
+    // -- it wrote "second-doc" over bytes a different, more current
+    // instance had already physically appended, surfacing later as
+    // `error.NativeRedoLogCorrupt`. Close both handles and reopen fresh to
+    // confirm the log is still structurally valid and the write is
+    // actually durable.
+    second.close();
+    writer.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    const confirmed = (try reopened.getDocumentAlloc(a, "second-doc")).?;
+    defer a.free(confirmed);
+    try std.testing.expectEqualStrings("second-value", confirmed);
 }
 
 test "lite redo log checkpointer defers log reclaim while a cross-process reader is pinned behind it" {
