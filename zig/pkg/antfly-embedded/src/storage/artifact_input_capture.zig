@@ -65,6 +65,8 @@ pub const Capture = struct {
     }
 
     pub fn touch(self: *Capture, alloc: std.mem.Allocator, txn: anytype, key: []const u8, value: ?[]const u8) !void {
+        errdefer self.poisoned = true;
+        if (self.participant) |participant| if (participant.charge) |charge| try charge(participant.ptr, key, value);
         if (self.staging) return;
         if (self.participant) |participant| participant.observe(participant.ptr, key, value);
         self.allocator = alloc;
@@ -120,7 +122,6 @@ pub const Capture = struct {
             self.selected = try publication.authority(txn);
             self.checked = true;
         }
-        if (self.selected == null) return;
         if (artifact) {
             if (self.artifacts.contains(key)) return;
             const document = try @import("db/artifact_publication_owner.zig").documentAlloc(alloc, key);
@@ -128,6 +129,7 @@ pub const Capture = struct {
             defer if (owned) alloc.free(document);
             const owner = try self.artifact_owners.getOrPut(alloc, document);
             if (!owner.found_existing) owned = false;
+            if (self.selected == null) return;
             // Chunk reconstruction pages fence an entire root/unit stream,
             // including insertions and deletions beyond their current cursor.
             // The manifest need not exist: its revision is a prefix witness,
@@ -156,6 +158,7 @@ pub const Capture = struct {
             try self.rememberArtifact(alloc, key);
             return;
         }
+        if (self.selected == null) return;
         const document = (try keys.decodeDocumentComponentAlloc(alloc, key)) orelse return error.InvalidBatchRequest;
         errdefer alloc.free(document);
         const result = try self.documents.getOrPut(alloc, document);
@@ -167,7 +170,18 @@ pub const Capture = struct {
     /// while this helper stages only the revision sidecars and native clock.
     pub fn stage(self: *Capture, txn: anytype, retained_advanced: bool) !void {
         if (self.poisoned) return error.RetainedEffectsTransactionFailed;
-        if (self.staged or (self.documents.count() == 0 and self.artifacts.count() == 0)) return;
+        if (self.staged) return;
+        // Prepared primary writers freeze the retirement footprint too.
+        // Background producers may not expand the old postimage after a yes
+        // vote. Resolution removes its own intent locks in this same writer,
+        // so its source and artifact effects remain one atomic transition.
+        if (self.artifact_owners.count() != 0) {
+            var guard = @import("transactions.zig").IntentReadGuard.init(self.allocator orelse return error.ArtifactCatalogCorrupt, null);
+            defer guard.deinit();
+            var affected = self.artifact_owners.keyIterator();
+            while (affected.next()) |document| try guard.check(txn, document.*);
+        }
+        if (self.documents.count() == 0 and self.artifacts.count() == 0) return;
         errdefer self.poisoned = true;
         const expected = self.selected orelse return error.ArtifactCatalogCorrupt;
         const current = (try publication.authority(txn)) orelse return error.RetainedEffectsFenceMismatch;
@@ -205,6 +219,20 @@ pub const Capture = struct {
         }
         var artifacts = self.artifacts.keyIterator();
         while (artifacts.next()) |artifact| try txn.put(&publication.artifactRevisionKey(expected.namespace, artifact.*), &encoded);
+        // A producer's closed result is invalidated by changes to that stream,
+        // not by unrelated siblings publishing against the same primary row.
+        var scope_keys: std.AutoHashMapUnmanaged(publication.ProducerScopeRevisionKey, void) = .empty;
+        const scope_alloc = self.allocator orelse return error.ArtifactCatalogCorrupt;
+        defer scope_keys.deinit(scope_alloc);
+        var scope_artifacts = self.artifacts.keyIterator();
+        while (scope_artifacts.next()) |artifact| {
+            const stream = (try keys.artifactNameAlloc(scope_alloc, artifact.*)) orelse continue;
+            defer scope_alloc.free(stream);
+            const document = try @import("db/artifact_publication_owner.zig").documentAlloc(scope_alloc, artifact.*);
+            defer scope_alloc.free(document);
+            const key = publication.producerScopeRevisionKey(expected.namespace, document, stream);
+            if (!(try scope_keys.getOrPut(scope_alloc, key)).found_existing) try txn.put(&key, &encoded);
+        }
         if (self.participant) |participant| {
             var view_txn = txn;
             try participant.stage(participant.ptr, @import("commit_participant.zig").View.from(&view_txn), &encoded);

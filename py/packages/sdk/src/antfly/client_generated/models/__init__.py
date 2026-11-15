@@ -201,6 +201,7 @@ from .cohere_embedder_config_provider import CohereEmbedderConfigProvider
 from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from .cohere_reranker_config import CohereRerankerConfig
 from .cohere_reranker_config_provider import CohereRerankerConfigProvider
+from .commit_requires import CommitRequires
 from .committed_mutation_outcome import CommittedMutationOutcome
 from .committed_mutation_outcome_status import CommittedMutationOutcomeStatus
 from .composed_query_source import ComposedQuerySource
@@ -2898,6 +2899,7 @@ __all__ = (
     "CohereEmbedderConfigTruncate",
     "CohereRerankerConfig",
     "CohereRerankerConfigProvider",
+    "CommitRequires",
     "CommittedMutationOutcome",
     "CommittedMutationOutcomeStatus",
     "ComposedQuerySource",

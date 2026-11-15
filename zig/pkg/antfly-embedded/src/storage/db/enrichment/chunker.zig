@@ -76,6 +76,15 @@ pub fn chunkTextWithConfigJson(
     return try chunkTextWithConfigJsonAndProvider(alloc, text, config_json, null);
 }
 
+pub fn chunkTextWithConfigJsonControlled(alloc: Allocator, text: []const u8, config_json: []const u8, context: ?@import("antfly_inference_execution_context").RequestContext) ![]Chunk {
+    if (context) |control| {
+        try control.check();
+        const provider = chunk_provider.Provider{ .execution = .{ .io = control.io, .deadline_ns = control.deadline_ns, .cancellation = control.cancellation orelse .none } };
+        return chunkTextWithConfigJsonAndProvider(alloc, text, config_json, provider);
+    }
+    return chunkTextWithConfigJson(alloc, text, config_json);
+}
+
 pub fn chunkTextWithConfigJsonAndProvider(
     alloc: Allocator,
     text: []const u8,

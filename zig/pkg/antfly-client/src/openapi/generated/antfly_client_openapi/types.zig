@@ -3172,6 +3172,7 @@ pub const BatchRequest = struct {
     deletes: ?[]const []const u8 = null,
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add or remove array values ($addToSet, $pull) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
+    commit_requires: ?CommitRequires = null,
     sync_level: ?SyncLevel = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -3179,6 +3180,7 @@ pub const BatchRequest = struct {
         .{ "inserts", "inserts", true },
         .{ "deletes", "deletes", true },
         .{ "transforms", "transforms", true },
+        .{ "commit_requires", "commit_requires", true },
         .{ "sync_level", "sync_level", true },
     };
 
@@ -3202,6 +3204,10 @@ pub const BatchRequest = struct {
         }
         if (self.transforms) |value| {
             try jw.objectField("transforms");
+            try jw.write(value);
+        }
+        if (self.commit_requires) |value| {
+            try jw.objectField("commit_requires");
             try jw.write(value);
         }
         if (self.sync_level) |value| {
@@ -6859,6 +6865,32 @@ pub const CohereRerankerConfig = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Admission prerequisite independent of sync_level. Explicit none commits the source without precomputing enrichments. direct_enrichments requires eligible document-local producers to succeed, committing their outputs and coverage atomically with the source; producer failure rejects the whole batch. Artifact-source stages, committed graph/neighbor context, grouped producers, protected producers and PDF page-image embeddings remain asynchronous. Configured producers with no eligible request reject the requirement. Direct admission has an 8 MiB and 16384-row budget for the complete mutation, including source keys/values, artifact effects, deletions, coverage, revisions, counters and replay payload. Both the submitted source envelope and final physical effect set must fit; this is not an artifact-only allowance. Supported by embedded batches, server/Raft writes and distributed transactions. Raft prepares on the leader and replays immutable effects without inference. Transactions reserve the complete envelope before voting prepared; their conservative reservation can reject a batch below the final physical limit. Serverless supports source-local pipeline stages through conditional atomic WAL batches (at most 1024 mutations and 8 MiB including WAL framing). Backends without that capability reject before source admission. Omission retains legacy embedded precomputation for enrichments/full_index during the compatibility window; other surfaces retain their existing waits.
+pub const CommitRequires = enum {
+    none,
+    direct_enrichments,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .none => "none",
+            .direct_enrichments => "direct_enrichments",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "none", .none },
+            .{ "direct_enrichments", .direct_enrichments },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -43818,12 +43850,15 @@ pub const ModelRef = struct {
 
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
 pub const MultiBatchRequest = struct {
+    /// Default admission prerequisite for tables without an explicit commit_requires. A table-level value overrides this default. Staged transaction statements retain the strongest prerequisite selected for each table.
+    commit_requires: ?std.json.Value = null,
     /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
     tables: std.json.ArrayHashMap(BatchRequest),
     sync_level: ?SyncLevel = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "commit_requires", "commit_requires", true },
         .{ "tables", "tables", false },
         .{ "sync_level", "sync_level", true },
     };
@@ -43838,6 +43873,10 @@ pub const MultiBatchRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.commit_requires) |value| {
+            try jw.objectField("commit_requires");
+            try jw.write(value);
+        }
         try jw.objectField("tables");
         try jw.write(self.tables);
         if (self.sync_level) |value| {
@@ -58181,7 +58220,7 @@ pub const SuccessMessage = struct {
     }
 };
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for the write to be durably applied to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Precompute enrichments before committing the document. A synchronous producer failure rejects the write; post-commit worker failures retain the document and may return `committed_repair_required`. - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
 pub const SyncLevel = enum {
     propose,
     write,
@@ -60350,6 +60389,8 @@ pub const TransactionBeginResponse = struct {
 
 /// Stateless OCC (Optimistic Concurrency Control) transaction commit request. The client reads documents (capturing version tokens from the X-Antfly-Version response header on lookups), computes writes locally, then submits everything in this single commit request. The server validates that all read versions still match before executing writes atomically via 2PC. **No server-side state**: There is no "begin" endpoint. The client manages its own read set and submits the full transaction in one request.
 pub const TransactionCommitRequest = struct {
+    /// Default admission prerequisite for tables without an explicit commit_requires. A table-level value overrides this default. Staged transaction statements retain the strongest prerequisite selected for each table.
+    commit_requires: ?std.json.Value = null,
     /// Set of keys that were read during the transaction, with their observed versions. The server verifies these versions still match before committing writes.
     read_set: []const TransactionReadItem,
     /// Write set: map of table names to batch operations, same format as MultiBatchRequest.tables.
@@ -60358,6 +60399,7 @@ pub const TransactionCommitRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "commit_requires", "commit_requires", true },
         .{ "read_set", "read_set", false },
         .{ "tables", "tables", false },
         .{ "sync_level", "sync_level", true },
@@ -60373,6 +60415,10 @@ pub const TransactionCommitRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.commit_requires) |value| {
+            try jw.objectField("commit_requires");
+            try jw.write(value);
+        }
         try jw.objectField("read_set");
         try jw.write(self.read_set);
         try jw.objectField("tables");

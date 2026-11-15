@@ -92,6 +92,7 @@ test "distributed txn range guard wire preserves absent and exact counters" {
 }
 
 const PrepareExtensions = struct {
+    commit_requires: ?db_mod.types.CommitRequires = null,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
@@ -1266,6 +1267,7 @@ pub fn executeCrossGroup(
     if (req.range_guards.len != 0) return error.InvalidTxnRequest;
     const tables = [_]TableCommitRequest{.{
         .table_name = table_name,
+        .commit_requires = req.commit_requires,
         .row_policy_principal_proof = req.row_policy_principal_proof,
         .row_policy_database = req.row_policy_database,
         .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
@@ -1447,6 +1449,12 @@ fn executeMultiTableCommitOnce(
             if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
             participant.relational_index_maintenance = command;
         }
+        if (table.commit_requires == .direct_enrichments) {
+            const present = for (participants.items) |participant| {
+                if (std.mem.eql(u8, participant.table_name, table.table_name)) break true;
+            } else false;
+            if (!present) _ = try ensureParticipantTxn(alloc, &participants, table.table_name, routing.resolveGroupForKey("") orelse return error.UnknownGroup, topology_epoch);
+        }
         for (participants.items) |*participant| {
             if (!std.mem.eql(u8, participant.table_name, table.table_name)) continue;
             if (participant.row_policy_principal_proof.len != 0 and
@@ -1458,6 +1466,8 @@ fn executeMultiTableCommitOnce(
             participant.row_policy_database = table.row_policy_database;
             participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
             participant.normalized_graph_rows = table.normalized_graph_rows;
+            if (participant.commit_requires != null and table.commit_requires != null and participant.commit_requires != table.commit_requires) return error.InvalidTxnRequest;
+            if (table.commit_requires) |requirement| participant.commit_requires = requirement;
             if (participant.relational_schema_version) |existing| {
                 if (table.relational_schema_version) |requested| {
                     if (existing != requested) return error.InvalidTxnRequest;
@@ -2008,6 +2018,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
 }
 
 const ParticipantTxn = struct {
+    commit_requires: ?db_mod.types.CommitRequires = null,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
@@ -2149,6 +2160,7 @@ const PrepareFanoutTask = struct {
             .txn_id = txn_id,
             .topology_epoch = participant.topology_epoch,
             .req = .{
+                .commit_requires = participant.commit_requires,
                 .row_policy_principal_proof = participant.row_policy_principal_proof,
                 .row_policy_database = participant.row_policy_database,
                 .row_policy_admitted_at_seconds = participant.row_policy_admitted_at_seconds,
@@ -2432,7 +2444,8 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     defer out.deinit(alloc);
     const guarded = req.req.range_guards.len != 0;
     const row_semantics = @import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
-    if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
+    const gated = req.req.commit_requires == .direct_enrichments;
+    if (gated) try out.appendSlice(alloc, "[\"prepared-enrichments-prepare-v1\",") else if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"topology_epoch\":");
@@ -2542,6 +2555,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         defer alloc.free(field);
         try out.appendSlice(alloc, field);
     }
+    if (req.req.commit_requires) |requirement| try out.print(alloc, ",\"commit_requires\":\"{s}\"", .{@tagName(requirement)});
     inline for (.{ "row_policy_principal_proof", "row_policy_database", "row_policy_admitted_at_seconds", "normalized_graph_rows", "graph_writes", "graph_deletes" }) |field| {
         try out.appendSlice(alloc, ",\"" ++ field ++ "\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, @field(req.req, field), .{});
@@ -2564,7 +2578,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         try out.appendSlice(alloc, encoded);
     }
     try out.append(alloc, '}');
-    if (guarded or row_semantics) try out.append(alloc, ']');
+    if (gated or guarded or row_semantics) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2734,10 +2748,12 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     defer parsed.deinit();
     const wrapped = parsed.value == .array;
     var row_semantics = false;
+    var gated = false;
     const root = if (wrapped) blk: {
         const entries = parsed.value.array.items;
         if (entries.len != 2 or entries[0] != .string) return error.InvalidTxnRequest;
-        row_semantics = std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
+        gated = std.mem.eql(u8, entries[0].string, "prepared-enrichments-prepare-v1");
+        row_semantics = gated or std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
         if (!row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
         break :blk entries[1];
     } else parsed.value;
@@ -2748,6 +2764,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     var extensions = try std.json.parseFromValue(PrepareExtensions, alloc, root, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     errdefer extensions.deinit();
     const ext = extensions.value;
+    if (gated != (ext.commit_requires == .direct_enrichments)) return error.InvalidTxnRequest;
     if ((ext.row_policy_principal_proof.len == 0) != (ext.row_policy_database.len == 0) or
         (ext.row_policy_principal_proof.len == 0) != (ext.row_policy_admitted_at_seconds == 0) or
         ext.row_policy_admitted_at_seconds < 0) return error.InvalidTxnRequest;
@@ -2801,6 +2818,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .req = .{
+            .commit_requires = ext.commit_requires,
             .row_policy_principal_proof = ext.row_policy_principal_proof,
             .row_policy_database = ext.row_policy_database,
             .row_policy_admitted_at_seconds = ext.row_policy_admitted_at_seconds,

@@ -17,6 +17,7 @@ from .client import (
     antfly_embedder,
 )
 from .client_generated.models import (
+    CommitRequires,
     CreateAlgebraicIndexRequest,
     CreateAlgebraicIndexRequestType,
     CreatedAlgebraicIndex,
@@ -154,6 +155,7 @@ __version__ = "0.3.0"
 from .read_requirements import read_after_write
 
 __all__ = [
+    "CommitRequires",
     "GraphCatalogEntry",
     "GraphDefinition",
     "GraphLabelMapping",

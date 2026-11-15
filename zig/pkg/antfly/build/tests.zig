@@ -260,6 +260,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const admission_api_tests = b.addTest(.{
         .root_module = admission_api_root,
         .filters = &.{
+            "commit requirements",
+            "http handler honors public serverless sync levels",
             "public table create index preserves permanent inference budget",
             "public artifact enrichment preserves permanent inference budget",
             "PDF embedding input public contract",
@@ -5845,6 +5847,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const inference_host_tests = b.addTest(.{
         .root_module = test_imports.runtime.inference_host,
         .filters = &.{
+            "commit requirements sparse host operation preserves execution revision",
             "local generate message conversion preserves tool history and admission",
             "local generate message conversion gives video its own field and rejects mixed media",
             "local generate video reaches a Gemma 4 model through the linked provider",
@@ -7639,6 +7642,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_graph_publication.",
             "storage.db.artifact_inventory.",
             "storage.db.artifact_native_stream.",
+            "storage.db.prepared_producer_acceptance.",
             "storage.db.artifact_producer_context.",
             "storage.db.artifact_producer_dispatch.",
             "storage.db.artifact_producer_input.",
@@ -7872,6 +7876,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.text_memory_stats.",
             "storage.db.transform.",
             "storage.db.mutation_commit_disposition_test.",
+            "storage.db.commit_requirements.",
             "storage.db.mutation_plan.",
             "storage.db.transform_read_plan.",
             "storage.db.typed_doc_values_coverage.",

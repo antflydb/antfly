@@ -1139,10 +1139,12 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             }
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
-        .embed_sparse_texts => blk: {
+        .embed_sparse_texts, .embed_sparse_texts_with_context => blk: {
             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const result = try state.node.embedSparseTextsDirectWithControl(alloc, parsed.value.model, parsed.value.texts, execution_control);
+            var identity_handle = if (parsed.value.model_identity) |expected| try state.node.pinEmbeddingModelIdentity(alloc, state.io, parsed.value.model, expected, execution_control) else null;
+            defer if (identity_handle) |*handle| handle.release();
+            const result = try state.node.embedSparseTextsDirectWithControlAndRevision(alloc, parsed.value.model, parsed.value.texts, execution_control, if (operation == .embed_sparse_texts_with_context) parsed.value.model_revision else null);
             defer {
                 for (result) |*item| item.deinit(alloc);
                 alloc.free(result);
@@ -5006,4 +5008,15 @@ test "content security snapshot startup owns policy credentials and runtime stri
     try std.testing.expectEqualStrings("owned-endpoint", state.s3_credentials.?.value.endpoint.?);
     try std.testing.expectEqualStrings("OWNED_NAME", state.runtime_config.value.worker_environment[0].name);
     try std.testing.expectEqualStrings("owned-value", state.runtime_config.value.worker_environment[0].value);
+}
+
+test "commit requirements sparse host operation preserves execution revision" {
+    const a = std.testing.allocator;
+    const revision: [32]u8 = @splat(7);
+    const metadata = try std.json.Stringify.valueAlloc(a, ModelTextsRequest{ .model = "sparse", .texts = &.{"source"}, .model_revision = revision }, .{});
+    defer a.free(metadata);
+    var parsed = try std.json.parseFromSlice(ModelTextsRequest, a, metadata, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(revision, parsed.value.model_revision.?);
+    try std.testing.expectEqual(@as(c_int, 25), @backingInt(inference_bridge.ProviderOperation.embed_sparse_texts_with_context));
 }

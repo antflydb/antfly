@@ -101,6 +101,12 @@ pub const TextDispatchAccounting = struct {
 };
 
 pub const DenseEmbedder = struct {
+    pub fn withRequestContext(self: DenseEmbedder, context: ?RequestContext) DenseEmbedder {
+        var copy = self;
+        if (context) |value| copy.part_request_context = value;
+        return copy;
+    }
+
     /// Reconstruct from a retained catalog while sharing external services.
     clone_for_indexes_fn: ?*const fn (*anyopaque, Allocator, []const u8, RequestContext) anyerror!DenseEmbedder = null,
     ptr: *anyopaque,
@@ -203,6 +209,7 @@ pub const DenseEmbedder = struct {
     }
 
     pub fn embedDense(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
+        if (self.part_request_context) |context| return self.embedDenseWithContext(alloc, embedding_name, text, dims, context);
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
         defer sanitized.deinit(alloc);
         return try self.dense_embed_fn(self.ptr, alloc, embedding_name, sanitized.text, dims);
@@ -466,6 +473,7 @@ pub const DenseEmbedder = struct {
         parts: []const template_mod.ContentPart,
         dims: u32,
     ) ![]f32 {
+        if (self.part_request_context) |context| return self.embedDensePartsWithContext(alloc, embedding_name, parts, dims, context);
         if (parts.len == 1 and parts[0] == .text and self.textPartsEquivalent(embedding_name)) {
             const vectors = try self.embedDenseBatch(alloc, embedding_name, &.{parts[0].text}, dims);
             return takeSingleDenseVector(alloc, vectors);
@@ -777,6 +785,72 @@ fn contentPartPreparationBytes(parts: []const template_mod.ContentPart) !usize {
 }
 
 pub const SparseEmbedder = struct {
+    pub fn withRequestContext(self: SparseEmbedder, context: ?RequestContext) SparseEmbedder {
+        var copy = self;
+        if (context) |value| copy.request_context = value;
+        return copy;
+    }
+
+    pub const Generation = DenseEmbedder.TextGeneration;
+    pub fn captureGeneration(self: SparseEmbedder, a: Allocator, name: []const u8) !Generation {
+        if (self.request_context) |context| try context.check();
+        if (self.captured_generation) |generation| return generation;
+        if (self.resolve_generation_fn) |resolve| {
+            const generation = try resolve(self.ptr, a, name, self.request_context);
+            if (self.request_context) |context| try context.check();
+            return generation;
+        }
+        return .{ .revision = try self.captureUnpinnedRevision(a, name) };
+    }
+
+    pub fn withGeneration(self: SparseEmbedder, generation: Generation) SparseEmbedder {
+        var copy = self;
+        copy.captured_generation = if (generation.lease == null and generation.revision == null) null else generation;
+        return copy;
+    }
+
+    fn embedPlannedBatch(self: SparseEmbedder, a: Allocator, name: []const u8, texts: []const []const u8) anyerror![]SparseEmbedding {
+        const generation = self.captured_generation.?;
+        const execute = self.sparse_embed_batch_planned_fn orelse {
+            // Observing a revision is insufficient to stamp an alias-bound
+            // execution. Legacy providers remain usable without a revision.
+            if (generation.revision != null) return error.CommitRequirementUnavailable;
+            var unpinned = self;
+            unpinned.captured_generation = null;
+            return unpinned.embedSparseBatch(a, name, texts);
+        };
+        var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(a, texts);
+        defer sanitized.deinit(a);
+        const safe = sanitized.texts();
+        const limit = if (generation.lease) |lease| if (lease.capabilities) |caps| @min(@max(safe.len, 1), caps.batch.max_items) else @max(safe.len, 1) else @max(safe.len, 1);
+        if (limit == 0) return error.InvalidInferenceCapabilities;
+        const output = try a.alloc(SparseEmbedding, safe.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (output[0..initialized]) |*vector| vector.deinit(a);
+            a.free(output);
+        }
+        while (initialized < safe.len) {
+            if (self.request_context) |context| try context.check();
+            const end = initialized + @min(limit, safe.len - initialized);
+            const batch = try execute(self.ptr, a, name, safe[initialized..end], self.request_context, generation);
+            if (batch.len != end - initialized) {
+                freeSparseEmbeddingBatch(a, batch);
+                return error.InvalidEmbeddingResponse;
+            }
+            @memcpy(output[initialized..end], batch);
+            a.free(batch);
+            initialized = end;
+            if (self.request_context) |context| try context.check();
+        }
+        return output;
+    }
+
+    captured_generation: ?Generation = null,
+    resolve_generation_fn: ?*const fn (*anyopaque, Allocator, []const u8, ?RequestContext) anyerror!Generation = null,
+    sparse_embed_batch_planned_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const []const u8, ?RequestContext, Generation) anyerror![]SparseEmbedding = null,
+
+    request_context: ?RequestContext = null,
     ptr: *anyopaque,
     sparse_embed_fn: SparseEmbedFn,
     sparse_embed_batch_fn: ?SparseEmbedBatchFn = null,
@@ -785,21 +859,50 @@ pub const SparseEmbedder = struct {
     deinit_fn: ?SparseEmbedDeinitFn = null,
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
     set_progress_fn: ?EmbedSetProgressFn = null,
+    cache_revision_with_context_fn: ?*const fn (*anyopaque, Allocator, []const u8, RequestContext) anyerror!?[32]u8 = null,
     cache_revision_fn: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?[32]u8 = null,
     recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     foreground_bounded: bool = false,
 
     /// The provider generation behind this name, when it can report one.
     pub fn captureRevision(self: SparseEmbedder, a: Allocator, name: []const u8) !?[32]u8 {
+        if (self.captured_generation) |generation| return generation.revision;
+        if (self.resolve_generation_fn != null) return (try self.captureGeneration(a, name)).revision;
+        return self.captureUnpinnedRevision(a, name);
+    }
+
+    fn captureUnpinnedRevision(self: SparseEmbedder, a: Allocator, name: []const u8) !?[32]u8 {
+        if (self.request_context) |context| {
+            try context.check();
+            if (self.cache_revision_with_context_fn) |resolve| {
+                const revision = try resolve(self.ptr, a, name, context);
+                try context.check();
+                return revision;
+            }
+            // A provider with no revision contract has nothing to discover.
+            if (self.cache_revision_fn != null) return error.UncancellableInferenceProvider;
+            return null;
+        }
         const resolve = self.cache_revision_fn orelse return null;
-        return resolve(self.ptr, a, name);
+        const revision = try resolve(self.ptr, a, name);
+        if (self.request_context) |context| try context.check();
+        return revision;
     }
 
     pub fn requireRevision(self: SparseEmbedder, a: Allocator, name: []const u8, revision: ?[32]u8) !void {
-        if (!std.meta.eql(revision, try self.captureRevision(a, name))) return error.EnrichmentSourceChanged;
+        var current = self;
+        current.captured_generation = null;
+        if (!std.meta.eql(revision, try current.captureRevision(a, name))) return error.EnrichmentSourceChanged;
     }
 
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
+        if (self.captured_generation != null) {
+            const batch = try self.embedPlannedBatch(alloc, embedding_name, &.{text});
+            const result = batch[0];
+            alloc.free(batch);
+            return result;
+        }
+        if (self.request_context) |context| return self.embedSparseWithContext(alloc, embedding_name, text, context);
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");
         defer sanitized.deinit(alloc);
         return try self.sparse_embed_fn(self.ptr, alloc, embedding_name, sanitized.text);
@@ -811,6 +914,8 @@ pub const SparseEmbedder = struct {
         embedding_name: []const u8,
         texts: []const []const u8,
     ) ![]SparseEmbedding {
+        if (self.captured_generation != null) return self.embedPlannedBatch(alloc, embedding_name, texts);
+        if (self.request_context) |context| return self.embedSparseBatchWithContext(alloc, embedding_name, texts, context);
         var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
         defer sanitized.deinit(alloc);
         const safe_texts = sanitized.texts();
@@ -825,6 +930,7 @@ pub const SparseEmbedder = struct {
         text: []const u8,
         context: RequestContext,
     ) !SparseEmbedding {
+        if (self.captured_generation != null) return self.withRequestContext(context).embedSparse(alloc, embedding_name, text);
         try context.check();
         const embed = self.sparse_embed_with_context_fn orelse return error.UncancellableInferenceProvider;
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");
@@ -844,6 +950,7 @@ pub const SparseEmbedder = struct {
         texts: []const []const u8,
         context: RequestContext,
     ) ![]SparseEmbedding {
+        if (self.captured_generation != null) return self.withRequestContext(context).embedPlannedBatch(alloc, embedding_name, texts);
         try context.check();
         var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
         defer sanitized.deinit(alloc);
@@ -1889,4 +1996,80 @@ test "dense grouped parts fence revisions and consume the captured lease" {
             try std.testing.expectEqual(planned, state.planned);
         }
     }
+}
+
+test "commit requirements sparse revision discovery carries control and rejects legacy resolvers" {
+    const Probe = struct {
+        seen: bool = false,
+        fn embed(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !SparseEmbedding {
+            return error.UnexpectedInference;
+        }
+        fn legacy(_: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            return error.UnexpectedLegacyDiscovery;
+        }
+        fn controlled(ptr: *anyopaque, _: Allocator, _: []const u8, context: RequestContext) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), context.deadline_ns);
+            self.seen = true;
+            return @as([32]u8, @splat(7));
+        }
+    };
+    var probe = Probe{};
+    const context: RequestContext = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) };
+    var provider = SparseEmbedder{ .ptr = &probe, .sparse_embed_fn = Probe.embed, .cache_revision_fn = Probe.legacy, .cache_revision_with_context_fn = Probe.controlled };
+    try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(7))), try provider.withRequestContext(context).captureRevision(std.testing.allocator, "model"));
+    try std.testing.expect(probe.seen);
+    provider.cache_revision_with_context_fn = null;
+    try std.testing.expectError(error.UncancellableInferenceProvider, provider.withRequestContext(context).captureRevision(std.testing.allocator, "model"));
+}
+
+test "commit requirements sparse execution pins one generation across partitions and ABA" {
+    const Probe = struct {
+        revision: u8 = 1,
+        calls: usize = 0,
+        fn alias(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !SparseEmbedding {
+            return error.UnexpectedScalarInference;
+        }
+        fn resolve(ptr: *anyopaque, _: Allocator, _: []const u8, _: ?RequestContext) !SparseEmbedder.Generation {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .revision = @splat(self.revision), .lease = .{ .capabilities = .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .item, .output = .embedding, .batch = .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, .model_revision = @splat(self.revision) } } };
+        }
+        fn execute(ptr: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8, context: ?RequestContext, generation: SparseEmbedder.Generation) ![]SparseEmbedding {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(texts.len <= 2);
+            try std.testing.expectEqual(@as(u8, 1), generation.revision.?[0]);
+            self.calls += 1;
+            self.revision = 2;
+            const out = try a.alloc(SparseEmbedding, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |*v| v.deinit(a);
+                a.free(out);
+            }
+            for (out) |*v| {
+                const indices = try a.dupe(u32, &.{7});
+                errdefer a.free(indices);
+                v.* = .{ .indices = indices, .values = try a.dupe(f32, &.{@floatFromInt(generation.revision.?[0])}) };
+                initialized += 1;
+            }
+            return out;
+        }
+    };
+    const a = std.testing.allocator;
+    var probe = Probe{};
+    const provider = (SparseEmbedder{ .ptr = &probe, .sparse_embed_fn = Probe.alias, .resolve_generation_fn = Probe.resolve, .sparse_embed_batch_planned_fn = Probe.execute }).withRequestContext(.{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) });
+    const generation = try provider.captureGeneration(a, "sparse");
+    const pinned = provider.withGeneration(generation);
+    const vectors = try pinned.embedSparseBatch(a, "sparse", &.{ "a", "b", "c", "d", "e" });
+    defer freeSparseEmbeddingBatch(a, vectors);
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    for (vectors) |v| try std.testing.expectEqual(@as(f32, 1), v.values[0]);
+    try std.testing.expectError(error.EnrichmentSourceChanged, pinned.requireRevision(a, "sparse", generation.revision));
+    probe.revision = 1;
+    try pinned.requireRevision(a, "sparse", generation.revision);
+    var unqualified = pinned;
+    unqualified.sparse_embed_batch_planned_fn = null;
+    try std.testing.expectError(error.CommitRequirementUnavailable, unqualified.embedSparse(a, "sparse", "reject"));
 }
