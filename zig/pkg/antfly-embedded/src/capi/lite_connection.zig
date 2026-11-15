@@ -2402,6 +2402,21 @@ pub const Owner = struct {
             },
             else => return err,
         };
+        // perf/lwa-grouped-stall: same drain the handoff branches above
+        // perform before handing their lease to maintenance (see
+        // `ensureDurableForReuse`'s own doc comment: its two callers are
+        // this function and `tryWriterLeaseAssumeLocked`, handing the
+        // lease to a *different*, detached `NativeFile` instance than the
+        // one any ride-along work queued against). A fresh kernel
+        // acquisition still hands the same detached instance a lease
+        // next, so it needs the same drain; this branch was the one case
+        // that skipped it, confirmed live alongside
+        // `refreshIfWriterBaseStale`'s own fix (storage/lite/native.zig)
+        // as part of the grouped-source background-maintenance stall --
+        // handoff never actually fires under this owner's own polling
+        // cadence, so this fresh path is not the rare fallback its name
+        // implies here, it is the *common* one.
+        if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
         errdefer held.close();
         stats.recordAcquired(if (held.contended) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
         wal_trace.recordOp(.maintenance_lease_acquired);
@@ -2446,6 +2461,13 @@ pub const Owner = struct {
             break :blk held;
         } else blk: {
             const held = try native.tryFairWriterLockWithIo(alloc, h.handleLockIo(), self.path);
+            // Same drain as the handoff branches above, and
+            // `acquireMaintenancePathLeaseAssumeLocked`'s own fresh-kernel
+            // branch: a fresh acquisition still hands this lease to the
+            // same detached `self.current` instance next, which needs any
+            // still-queued ride-along work on the file physically written
+            // first so its own next commit's sequence check sees it.
+            if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
             stats.recordAcquired(.uncontended, 0);
             break :blk held;
         };
@@ -7681,13 +7703,26 @@ test "capi native parked writer lease releases for a foreign waiter within the f
         fn run(self: *@This()) void {
             const wio = h.handleLockIo();
             const deadline = std.Io.Clock.now(.awake, wio).addDuration(.fromSeconds(2));
-            self.acquired = self.region.acquireWriterFairBounded(wio, self.pid, deadline, null) catch false;
-            if (self.acquired) self.region.releaseWriter();
+            // `acquireWriterFairBounded`'s own return value says whether
+            // *this particular* acquisition was contended (it took a real
+            // ticket) versus winning the uncontended ticketless fast path
+            // -- not whether it succeeded at all, which is exactly
+            // "didn't error" (see its own doc comment). Discarding the
+            // bool here and keying `acquired` off the absence of an error
+            // is deliberate: both outcomes mean the foreign waiter got
+            // served, and which one happens is itself a race between this
+            // task's own scheduling delay and `maintainParkedLease`'s
+            // release (see this test's own comment below for why that
+            // race is exactly what made the bug below only ever surface
+            // under `io.concurrent`, never under `std.Thread.spawn`).
+            _ = self.region.acquireWriterFairBounded(wio, self.pid, deadline, null) catch return;
+            self.acquired = true;
+            self.region.releaseWriter();
         }
     };
     // `started` precedes spawning the foreign waiter: by the time it
     // calls `acquireWriterFairBounded`, test setup overhead (opening a
-    // second `Region` mapping, thread spawn) may already exceed
+    // second `Region` mapping, task spawn) may already exceed
     // `foreign_fairness_quantum_ns` on its own, so `maintainParkedLease`
     // can release the instant the foreign ticket is claimed -- the
     // claim-then-release round trip can finish faster than any poll
@@ -7695,25 +7730,24 @@ test "capi native parked writer lease releases for a foreign waiter within the f
     // The bound below is what actually matters: the lease is released
     // and the waiter served promptly, not on the much longer idle window.
     //
-    // Deliberately `std.Thread.spawn`, not `io.concurrent`: tried converting
-    // this to `io.concurrent` (both on a dedicated `std.Io.Threaded` and on
-    // `std.testing.io`) and measured genuine, reproducible flakiness --
-    // `foreign.acquired` false roughly 1 run in 3, meaning the spawned
-    // task's own bounded `acquireWriterFairBounded` call (a generous 2s
-    // deadline) sometimes never succeeded at all, not just slower timing.
-    // `h.handleLockIo()` ("the process-wide threaded Io, whose waits block
-    // the calling OS thread") is explicitly for blocking waits from
-    // arbitrary foreign threads; `io.concurrent` on it fails outright
-    // (`ConcurrencyUnavailable`/`OutOfMemory`), and routing the spawn
-    // through a different `Io` while the waiter's own blocking call still
-    // goes through `handleLockIo()` did not resolve the flakiness within
-    // the time available to root-cause it. A real OS thread remains the
-    // reliable way to simulate a genuinely concurrent, independent waiter
-    // here; revisit if `io.concurrent`'s interaction with `handleLockIo()`
-    // from a pool-spawned task is understood and fixed.
+    // This test was briefly flaky (~1/3 of runs) when first converted from
+    // `std.Thread.spawn` to `io.concurrent`, with `foreign.acquired` false
+    // despite `acquireWriterFairBounded` never actually erroring. Root
+    // cause: the bug above was already latent under `std.Thread.spawn` too
+    // -- `self.acquired = ... catch false` conflated "did this error" with
+    // "did this take the contended ticket path" -- but real OS thread
+    // creation happened to always take longer than `maintainParkedLease`'s
+    // own release, so the foreign call always lost the race to
+    // `tryAcquireWriter`'s own uncontended CAS and took a ticket (`true`),
+    // masking the bug. `io.concurrent`'s task dispatch has no such
+    // consistent floor: sometimes the foreign task's first
+    // `tryAcquireWriter` attempt runs *after* the parked lease is already
+    // released, winning the fast, uncontended path (a legitimate, even
+    // faster, success that the old assertion wrongly treated as a
+    // failure).
     const started = std.Io.Clock.awake.now(io).nanoseconds;
     var foreign: Foreign = .{ .region = &foreign_region, .pid = foreign_pid };
-    const thread = try std.Thread.spawn(.{}, Foreign.run, .{&foreign});
+    var foreign_task = try std.testing.io.concurrent(Foreign.run, .{&foreign});
 
     const deadline_ns = started + 3 * std.time.ns_per_s;
     while (owner.writer_lane.parked != null) {
@@ -7721,7 +7755,7 @@ test "capi native parked writer lease releases for a foreign waiter within the f
         io.sleep(.fromMilliseconds(5), .awake) catch {};
     }
     try std.testing.expect(owner.writer_lane.parked == null);
-    thread.join();
+    foreign_task.await(std.testing.io);
     try std.testing.expect(foreign.acquired);
     const elapsed_ns = std.Io.Clock.awake.now(io).nanoseconds - started;
     // Served well within the fairness quantum plus this loop's own poll
