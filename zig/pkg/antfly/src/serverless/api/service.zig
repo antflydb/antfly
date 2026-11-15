@@ -101,18 +101,28 @@ pub const Service = struct {
     /// The complete primary and direct-output postimages cross one durable
     /// visibility boundary. A stale optimistic read set publishes no prefix.
     pub fn ingestPreparedBatch(self: *Service, req: api_types.IngestBatchRequest, fence: wal_mod.types.CatalogFence) !api_types.IngestBatchResult {
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(self.alloc, 64 * 1024 * 1024);
+        defer quota.deinit();
+        return self.ingestPreparedBatchBounded(req, fence, quota.allocator()) catch |err| {
+            if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
+            return err;
+        };
+    }
+
+    fn ingestPreparedBatchBounded(self: *Service, req: api_types.IngestBatchRequest, fence: wal_mod.types.CatalogFence, backing: Allocator) !api_types.IngestBatchResult {
         if (!self.wal.supportsCatalogFences()) return error.CommitRequirementUnavailable;
         const operation = req.operation_id orelse return error.InvalidWalOperationId;
         if (req.mutations.len == 0) return .{ .namespace = try self.alloc.dupe(u8, req.namespace), .mutation_count = 0, .start_lsn = 0, .end_lsn = 0 };
         if (req.mutations.len > 1024) return error.CommitRequirementTooLarge;
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        var arena = std.heap.ArenaAllocator.init(backing);
         defer arena.deinit();
         const a = arena.allocator();
         const payloads = try a.alloc([]const u8, req.mutations.len);
         var bytes: usize = 0;
         for (req.mutations, payloads) |mutation, *payload| {
             if (mutation.kind == .prepared) {
-                _ = try @import("../build/document_facts.zig").parseEnrichedBody(mutation.body orelse return error.InvalidDocumentMutation);
+                const prepared = try @import("../build/document_facts.zig").parseEnrichedBody(mutation.body orelse return error.InvalidDocumentMutation);
+                try @import("../enrichment/worker.zig").validateDirectBody(a, prepared.body);
             } else if (mutation.kind != .delete or mutation.body != null) return error.InvalidDocumentMutation;
             payload.* = try api_codec.encodeMutationAlloc(a, mutation);
             bytes = std.math.add(usize, bytes, payload.len + 32) catch return error.CommitRequirementTooLarge;
@@ -412,6 +422,10 @@ test "commit requirements serverless prepared batch commits source outputs and d
     defer a.free(prepared);
     const request: api_types.IngestBatchRequest = .{ .namespace = "docs", .timestamp_ns = 2, .operation_id = "gate", .mutations = &.{ .{ .kind = .prepared, .doc_id = "new", .body = prepared }, .{ .kind = .delete, .doc_id = "victim" } } };
     try std.testing.expectError(error.VersionConflict, service.ingestPreparedBatch(request, .{ .latest_lsn = 0 }));
+    try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
+    const invalid_body = try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(a, "{\"text\":\"source\",\"chunk_embeddings\":[4]}", 6);
+    defer a.free(invalid_body);
+    try std.testing.expectError(error.InvalidDocumentBody, service.ingestPreparedBatch(.{ .namespace = "docs", .timestamp_ns = 2, .operation_id = "invalid", .mutations = &.{.{ .kind = .prepared, .doc_id = "poison", .body = invalid_body }} }, .{ .latest_lsn = 1 }));
     try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
     var result = try service.ingestPreparedBatch(request, .{ .latest_lsn = 1 });
     defer result.deinit(a);

@@ -225,6 +225,32 @@ fn normalizeServerlessCreateIndexConfig(
     );
 }
 
+fn validateDirectBatchBounds(req: db_types.BatchRequest) !void {
+    if (req.writes.len +| req.deletes.len +| req.transforms.len > 1024) return error.CommitRequirementTooLarge;
+    var bytes: usize = 0;
+    var operations: usize = 0;
+    const Budget = struct {
+        fn add(total: *usize, size: usize) !void {
+            total.* = std.math.add(usize, total.*, size) catch return error.CommitRequirementTooLarge;
+            if (total.* > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
+        }
+    };
+    for (req.writes) |write| {
+        try Budget.add(&bytes, write.key.len);
+        try Budget.add(&bytes, write.value.len +| 32);
+    }
+    for (req.deletes) |key| try Budget.add(&bytes, key.len +| 32);
+    for (req.transforms) |transform| {
+        try Budget.add(&bytes, transform.key.len +| 32);
+        for (transform.operations) |operation| {
+            operations += 1;
+            if (operations > 16384) return error.CommitRequirementTooLarge;
+            try Budget.add(&bytes, operation.path.len);
+            if (operation.value_json) |value| try Budget.add(&bytes, value.len);
+        }
+    }
+}
+
 pub const HttpHandler = struct {
     alloc: Allocator,
     api: *api_service.Service,
@@ -5827,6 +5853,47 @@ pub const HttpHandler = struct {
         return docs;
     }
 
+    /// Check submitted work before source reads, then bound every allocation
+    /// in transform resolution independently of the provider scratch quota.
+    fn resolveDirectTableBatchMutationsAlloc(self: *HttpHandler, namespace: []const u8, req: db_types.BatchRequest, request: api_operation.RequestContext) ![]api_types.DocumentMutation {
+        try validateDirectBatchBounds(req);
+        try request.ensureActive();
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(self.alloc, 64 * 1024 * 1024);
+        defer quota.deinit();
+        var scoped = self.*;
+        scoped.alloc = quota.allocator();
+        const Control = struct {
+            fn canceled(ptr: *const anyopaque) bool {
+                const control: *const api_operation.RequestContext = @ptrCast(@alignCast(ptr));
+                control.ensureActive() catch return true;
+                return false;
+            }
+        };
+        const mutations = scoped.resolveTableBatchMutationsAlloc(namespace, req, .{ .ptr = &request, .is_cancelled_fn = Control.canceled }) catch |err| {
+            try request.ensureActive();
+            if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
+            return err;
+        };
+        defer freeDocumentMutations(scoped.alloc, mutations);
+        try request.ensureActive();
+        var bytes: usize = 0;
+        for (mutations) |mutation| {
+            bytes = std.math.add(usize, bytes, mutation.doc_id.len + (if (mutation.body) |body| body.len else 0) + 32) catch return error.CommitRequirementTooLarge;
+            if (bytes > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
+        }
+        const output = try self.alloc.alloc(api_types.DocumentMutation, mutations.len);
+        errdefer self.alloc.free(output);
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |*mutation| mutation.deinit(self.alloc);
+        for (mutations, output) |mutation, *out| {
+            const id = try self.alloc.dupe(u8, mutation.doc_id);
+            errdefer self.alloc.free(id);
+            out.* = .{ .kind = mutation.kind, .doc_id = id, .body = if (mutation.body) |body| try self.alloc.dupe(u8, body) else null };
+            initialized += 1;
+        }
+        return output;
+    }
+
     fn resolveTableBatchMutationsAlloc(self: *HttpHandler, namespace: []const u8, req: db_types.BatchRequest, cancellation: CancellationToken) ![]api_types.DocumentMutation {
         try cancellation.check();
         var live: ?*query_mod.LiveSession = null;
@@ -5842,6 +5909,9 @@ pub const HttpHandler = struct {
                 else => return err,
             };
         };
+        // Gated transforms require bounded point reads. A legacy layout must
+        // migrate its facts instead of turning a small write into a table scan.
+        if (req.commit_requires == .direct_enrichments and req.transforms.len > 0 and live == null) return error.CommitRequirementUnavailable;
         // Full replacements and deletes do not depend on any existing body.
         const latest_docs = if (req.transforms.len > 0 and live == null)
             try self.allocLatestDocumentsAlloc(namespace)
@@ -5866,7 +5936,7 @@ pub const HttpHandler = struct {
             const fetched = if (live) |session| try session.lookupAlloc(transform.key) else null;
             defer if (fetched) |body| self.alloc.free(body);
             const existing_body = if (live != null) fetched else findMaterializedDocumentBody(latest_docs, transform.key);
-            const resolved = try db_transform.resolveDocumentTransform(self.alloc, existing_body, transform) orelse continue;
+            const resolved = try db_transform.resolveDocumentTransformWithCancellation(self.alloc, existing_body, transform, cancellation) orelse continue;
             errdefer self.alloc.free(resolved);
 
             removeDocumentMutationById(self.alloc, &deletes, transform.key);
@@ -5978,7 +6048,12 @@ pub const HttpHandler = struct {
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
         try self.preflightPublicTableBatchSyncLevel(req.sync_level, status);
 
-        const mutations = self.resolveTableBatchMutationsAlloc(namespace, req, request.cancellation) catch |err| switch (err) {
+        const mutations = (if (gated)
+            self.resolveDirectTableBatchMutationsAlloc(namespace, req, request)
+        else
+            self.resolveTableBatchMutationsAlloc(namespace, req, request.cancellation)) catch |err| switch (err) {
+            error.CommitRequirementTooLarge => return error.InvalidBatchRequest,
+            error.CommitRequirementUnavailable => return error.Unavailable,
             error.InvalidArgument => return error.InvalidBatchRequest,
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
@@ -6011,7 +6086,7 @@ pub const HttpHandler = struct {
         else
             self.api.ingestBatch(.{ .namespace = namespace, .timestamp_ns = timestamp, .mutations = mutations })) catch |err| {
             if (err == error.VersionConflict) return error.Conflict;
-            if (err == error.CommitRequirementTooLarge) return error.InvalidBatchRequest;
+            if (err == error.CommitRequirementTooLarge or err == error.InvalidDocumentBody or err == error.InvalidDocumentMutation) return error.InvalidBatchRequest;
             std.log.err("serverless public table batch ingest failed table={s} namespace={s} err={}", .{ table_name, namespace, err });
             return error.InternalFailure;
         };
@@ -15477,4 +15552,15 @@ test "highlight query operational errors preserve public deadline and cancellati
         }
     }
     try std.testing.expect((try queryOperationalFailureResponse(a, error.OutOfMemory)) == null);
+}
+
+test "commit requirements serverless raw bounds precede resolution allocation and reads" {
+    var failed = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var handler: HttpHandler = undefined;
+    handler.alloc = failed.allocator();
+    const writes: [1025]db_types.BatchWrite = @splat(.{ .key = "same", .value = "{}" });
+    try std.testing.expectError(error.CommitRequirementTooLarge, handler.resolveDirectTableBatchMutationsAlloc("docs", .{ .writes = &writes, .commit_requires = .direct_enrichments }, .{}));
+    const operations: [16385]db_types.TransformOp = @splat(.{ .op = .unset, .path = "x" });
+    try std.testing.expectError(error.CommitRequirementTooLarge, handler.resolveDirectTableBatchMutationsAlloc("docs", .{ .transforms = &.{.{ .key = "same", .operations = &operations }}, .commit_requires = .direct_enrichments }, .{}));
+    try std.testing.expect(!failed.has_induced_failure);
 }

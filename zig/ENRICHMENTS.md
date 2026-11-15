@@ -241,14 +241,30 @@ without atomic source/catalog fencing reject before inference or source admissio
 Each document uses a 64 MiB scratch allocation quota; remaining output limits are
 checked between stages and predictable vector amplification is rejected before
 inference. Direct stages preserve the complete submitted source postimage and
-overlay only the outputs owned by active eligible producers. A separate text
-projection excludes active derived inputs, including old chunk previews, without
+overlay only the outputs owned by active eligible producers. A separate validated
+input projection excludes active derived inputs, including old chunk previews, without
 removing unrelated source fields such as transcripts or user-authored vectors.
+Terminal no-output clears the active producer's old fields; later stages consume
+only fresh intermediates from this attempt (including sparse weights for rerank).
+Preserved fields with typed projection names must satisfy the publication reader's
+existing shape contract. Preparation and WAL admission validate that projection
+before durability, so malformed preserved vectors cannot poison publication.
 Source numeric tokens retain their original precision. Vector preflight counts
-the retained postimage, not just the smaller producer input projection. An empty
-pipeline preserves scalar source values too. Empty gated requests still reach catalog capability validation.
+the retained postimage, including source fields outside the producer input. An
+empty pipeline preserves scalar source values too. Empty gated requests still
+reach catalog capability validation.
 Request-owned provider handles avoid the background runtime's configuration and
-publication locks. Media/model-source stages requiring artifact context remain
+publication locks. Serverless inference uses windows of 32 documents / 256 KiB,
+with dense chunk and sparse text batches additionally bounded to 32 items / 256 KiB.
+A 64 MiB window quota bounds provider results and request-local memoization; caches
+are retired between windows and cannot cross attempts or provider generations.
+Raw write/delete/transform counts and bytes are checked before source resolution;
+transform operations have a 16,384-operation cap. Resolution has its own 64 MiB
+scratch quota and checks request cancellation/deadlines between transform operations.
+Gated transforms require bounded live point reads; legacy layouts needing a
+namespace scan reject before reading source data and require facts migration.
+WAL encoding and full projection validation also share a 64 MiB scratch quota.
+Media/model-source stages requiring artifact context remain
 asynchronous. Prepared completion markers bind the canonical producer catalog;
 configuration changes reopen their pending facts and prevent fingerprint reuse
 from skipping the replacement work. Available model revisions are recorded and

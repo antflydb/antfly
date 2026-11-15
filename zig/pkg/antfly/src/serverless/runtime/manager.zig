@@ -513,23 +513,57 @@ pub const ManagedRuntime = struct {
         var initialized: usize = 0;
         errdefer for (output[0..initialized]) |*mutation| mutation.deinit(self.alloc);
         var bytes: usize = 0;
-        for (mutations, output) |mutation, *out| {
-            try context.check();
-            const id = try self.alloc.dupe(u8, mutation.doc_id);
-            errdefer self.alloc.free(id);
-            const body = if (mutation.kind == .upsert) blk: {
-                const source = mutation.body orelse return error.InvalidDocumentBody;
-                if (source.len > 8 * 1024 * 1024 -| bytes) return error.CommitRequirementTooLarge;
-                if (enricher) |*value| value.direct_output_limit = 8 * 1024 * 1024 -| bytes -| id.len -| 64;
-                const prepared = if (enricher) |*value| try value.prepareDirectBody(source, policy, exclude_model_sources) else try self.alloc.dupe(u8, source);
-                defer self.alloc.free(prepared);
-                break :blk try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(self.alloc, prepared, source.len);
-            } else if (mutation.kind == .delete) null else return error.InvalidDocumentMutation;
-            errdefer if (body) |value| self.alloc.free(value);
-            bytes = std.math.add(usize, bytes, id.len + (if (body) |value| value.len else @as(usize, 0)) + 32) catch return error.CommitRequirementTooLarge;
-            if (bytes > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
-            out.* = .{ .kind = if (body != null) .prepared else .delete, .doc_id = id, .body = body };
-            initialized += 1;
+        var window_start: usize = 0;
+        while (window_start < mutations.len) {
+            var window_end = window_start;
+            var window_bytes: usize = 0;
+            var bodies: [32][]const u8 = undefined;
+            var body_count: usize = 0;
+            while (window_end < mutations.len and window_end - window_start < 32) {
+                const mutation = mutations[window_end];
+                const size = mutation.doc_id.len + (if (mutation.body) |body| body.len else 0);
+                if (window_end != window_start and size > 256 * 1024 -| window_bytes) break;
+                window_bytes +|= size;
+                if (mutation.body) |body| {
+                    bodies[body_count] = body;
+                    body_count += 1;
+                }
+                window_end += 1;
+            }
+            var quota = @import("antfly_platform").allocator.reclamation.Quota.init(self.alloc, 64 * 1024 * 1024);
+            defer quota.deinit();
+            var cache = if (enricher) |*value| blk: {
+                value.direct_output_limit = 8 * 1024 * 1024 -| bytes;
+                break :blk value.prewarmDirectWindow(quota.allocator(), bodies[0..body_count], policy, exclude_model_sources) catch |err| {
+                    try context.check();
+                    if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
+                    return err;
+                };
+            } else null;
+            defer if (cache) |*value| value.deinit();
+            if (enricher) |*value| value.direct_cache = if (cache) |*memo| memo else null;
+            defer if (enricher) |*value| {
+                value.direct_cache = null;
+            };
+            for (mutations[window_start..window_end], output[window_start..window_end]) |mutation, *out| {
+                try context.check();
+                const id = try self.alloc.dupe(u8, mutation.doc_id);
+                errdefer self.alloc.free(id);
+                const body = if (mutation.kind == .upsert) blk: {
+                    const source = mutation.body orelse return error.InvalidDocumentBody;
+                    if (source.len > 8 * 1024 * 1024 -| bytes) return error.CommitRequirementTooLarge;
+                    if (enricher) |*value| value.direct_output_limit = 8 * 1024 * 1024 -| bytes -| id.len -| 64;
+                    const prepared = if (enricher) |*value| try value.prepareDirectBody(source, policy, exclude_model_sources) else try self.alloc.dupe(u8, source);
+                    defer self.alloc.free(prepared);
+                    break :blk try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(self.alloc, prepared, source.len);
+                } else if (mutation.kind == .delete) null else return error.InvalidDocumentMutation;
+                errdefer if (body) |value| self.alloc.free(value);
+                bytes = std.math.add(usize, bytes, id.len + (if (body) |value| value.len else @as(usize, 0)) + 32) catch return error.CommitRequirementTooLarge;
+                if (bytes > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
+                out.* = .{ .kind = if (body != null) .prepared else .delete, .doc_id = id, .body = body };
+                initialized += 1;
+            }
+            window_start = window_end;
         }
         if (enricher) |*value| {
             if (value.chunk_embedder) |provider| if (value.prepared_dense_generation) |generation| try provider.requireTextGeneration(self.alloc, value.chunk_embedding_name.?, generation);
