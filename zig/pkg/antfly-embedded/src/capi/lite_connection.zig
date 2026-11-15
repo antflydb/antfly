@@ -23,6 +23,7 @@ const api = @import("db.zig");
 const std = h.std;
 const native = h.lite_backend.native;
 const inode_lock = @import("../storage/lite/inode_lock.zig");
+const shared_lock_region = @import("../storage/lite/shared_lock_region.zig");
 const antfly_platform = @import("antfly_platform");
 const alloc = std.heap.c_allocator;
 
@@ -1106,6 +1107,13 @@ pub const WriterLane = struct {
     /// "nothing has replaced the generation since" by pointer identity
     /// alone -- see `checkout`'s fast path.
     last_root: ?*h.Handle = null,
+    /// When `parked` was last set (by `checkinImpl`), so `maintainParkedLease`
+    /// can tell how long it has sat with nobody checking it out at all.
+    /// Refreshed on every park, including a same-process reuse's own
+    /// checkout+checkin round trip -- back-to-back local writers keep
+    /// resetting this exactly like they keep the lease itself warm.
+    /// Meaningless while `parked` is `null`.
+    parked_since_ns: i96 = 0,
 
     const poll_initial_ns: i96 = 50 * std.time.ns_per_us;
     const poll_max_ns: i96 = 2 * std.time.ns_per_ms;
@@ -1425,6 +1433,23 @@ pub const WriterLane = struct {
     /// the fairness window the old per-call handoff used.
     const foreign_fairness_quantum_ns: i96 = 20 * std.time.ns_per_ms;
 
+    /// How long a lease may sit parked with nobody ever checking it out
+    /// again before this process gives it up even with no foreign waiter
+    /// in sight -- mirrors `NativeFile.OpenOptions.redo_idle_checkpoint_ns`'s
+    /// default (`Store.redo_idle_checkpoint_ns`, 1s): an idle process
+    /// should hold no cross-process writer lease. Parking itself is only
+    /// ever an optimization for *back-to-back* same-process writers;
+    /// without this bound, a process that writes once and then goes idle
+    /// would hold the lease forever, since nothing else (`checkin`'s own
+    /// foreign-waiter check included) ever runs again to let it go --
+    /// `maintainParkedLease`, driven by `Owner.maintenanceLoop`, is what
+    /// actually enforces this bound, since an idle holder makes no more
+    /// `checkin` calls of its own for `checkin` itself to react on. A
+    /// named constant of its own, not a shared one, because the two
+    /// concepts (redo-log checkpoint cadence and this lane's idle-park
+    /// timeout) are free to diverge; they just happen to agree today.
+    const parked_idle_release_ns: i96 = 1 * std.time.ns_per_s;
+
     /// Release `connection`'s hold on this lane once it no longer needs
     /// `root` (it has staged its write, or failed before staging): detach
     /// `connection`, then either hand the lease straight to an
@@ -1481,25 +1506,103 @@ pub const WriterLane = struct {
         // `acquirePathLeaseAssumeLocked` call originally acquired it.
         if (lease.reader_registration_batch) |batch| batch.end();
         lease.reader_registration_batch = null;
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
         if (self.waiting != 0) {
             self.parked = lease;
+            self.parked_since_ns = now;
             self.checked_out = false;
             self.mutex.unlock(io);
+            // A local waiter takes this immediately (its own poll, not
+            // `maintainParkedLease`), so no wake is needed for its sake --
+            // but see the doc comment below for why one still happens.
+            self.wakeOwnerForParkedLease(io);
             return;
         }
         const own_pid = antfly_platform.process.currentId() orelse 0;
-        const now = std.Io.Clock.awake.now(io).nanoseconds;
         const foreign_overdue = force_release or (lease.othersWaitingAcrossProcesses(own_pid) and now - lease.acquired_ns >= foreign_fairness_quantum_ns);
         if (!foreign_overdue) {
             self.parked = lease;
+            self.parked_since_ns = now;
             self.checked_out = false;
             self.mutex.unlock(io);
+            // Bare `self.wake.set(io)` isn't enough: `Owner.maintenanceLoop`
+            // may currently be parked indefinitely (no durable consumer
+            // registered -- `no_scheduled_wait`), and nothing else ever
+            // wakes it to start the bounded poll `maintainParkedLease`
+            // needs to eventually release this lease on its own. See
+            // `parked_idle_release_ns`'s own doc comment: without this,
+            // a process that writes once and then goes idle keeps the
+            // cross-process writer lease forever, since this exact
+            // `checkin` call -- the only place that ever reacted to the
+            // foreign-waiter/idle conditions before -- never runs again.
+            self.wakeOwnerForParkedLease(io);
             return;
         }
         self.checked_out = false;
         self.mutex.unlock(io);
         store.sync() catch {};
         lease.close();
+    }
+
+    /// `WriterLane` is embedded by value in `Owner` (`owner.writer_lane`),
+    /// so its address recovers the owning `Owner` without a stored
+    /// back-pointer (see `metadata_pool.zig`'s `Node.payload` for the same
+    /// pattern). Called right after parking, outside `self.mutex`, so
+    /// `Owner.maintenanceLoop` wakes promptly to run `maintainParkedLease`
+    /// on this lane.
+    fn wakeOwnerForParkedLease(self: *WriterLane, io: std.Io) void {
+        const owner: *Owner = @fieldParentPtr("writer_lane", self);
+        owner.wake.set(io);
+    }
+
+    /// Bounded-release check for the lease `checkin`/`checkinForSuspend`
+    /// park (see `checkin`'s own doc comment): called every tick of
+    /// `Owner.maintenanceLoop` so a parked lease can never outlive
+    /// `foreign_fairness_quantum_ns` once a genuinely foreign waiter
+    /// queues, or `parked_idle_release_ns` with nobody ever checking it
+    /// out again -- `checkin` itself only reacts to those conditions on
+    /// its *own* next call, which an idle holder never makes.
+    ///
+    /// `current_root` is the owner's own `current` (a hint, not
+    /// dereferenced unless it still matches `last_root`): see
+    /// `takeParkedAnyRoot`'s own doc comment for why a mismatch means the
+    /// parked lease's cached root may already be retired by a same-process
+    /// replacement the lane itself never noticed (`checkout`'s "no
+    /// self-replacement" fast path deliberately does not chase every
+    /// refresh). On that rare mismatch this still releases the kernel
+    /// lease -- holding it any longer serves nothing -- just skips the
+    /// store sync a retired `NativeStore` could no longer safely take.
+    ///
+    /// Returns the nanoseconds until this should be called again (bounding
+    /// `Owner.maintenanceLoop`'s own sleep), or `null` once there is
+    /// nothing parked left to check -- including right after this call
+    /// releases it, so a released lease stops the loop from polling at
+    /// all rather than spinning on an empty `parked`.
+    pub fn maintainParkedLease(self: *WriterLane, current_root: ?*h.Handle) ?i96 {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        var lease = self.parked orelse {
+            self.mutex.unlock(io);
+            return null;
+        };
+        const own_pid = antfly_platform.process.currentId() orelse 0;
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+        const foreign_overdue = lease.othersWaitingAcrossProcesses(own_pid) and now - lease.acquired_ns >= foreign_fairness_quantum_ns;
+        const idle_overdue = now - self.parked_since_ns >= parked_idle_release_ns;
+        if (!foreign_overdue and !idle_overdue) {
+            self.mutex.unlock(io);
+            const quantum_remaining = lease.acquired_ns + foreign_fairness_quantum_ns - now;
+            const idle_remaining = self.parked_since_ns + parked_idle_release_ns - now;
+            return @max(1 * std.time.ns_per_ms, @min(quantum_remaining, idle_remaining));
+        }
+        self.parked = null;
+        const root_matches = self.last_root != null and self.last_root == current_root;
+        self.mutex.unlock(io);
+        if (root_matches) {
+            if (current_root.?.owned_lite_backend.?.native_docstore) |store| store.sync() catch {};
+        }
+        lease.close();
+        return null;
     }
 };
 
@@ -2163,17 +2266,20 @@ pub const Owner = struct {
     /// same self-deadlock `takeParkedForStore` already guards the
     /// regular write path against.
     ///
-    /// NOTE (perf/lwa-go-busy): a same-process self-conflict here (
-    /// `takeParkedForRoot(self.current)` missing because a commit just
-    /// moved `self.current` while the lane's own `last_root` lagged, and
-    /// this call's own gate-holding block then waiting out the fresh
-    /// acquisition's full budget with every other admission on this path
-    /// stuck behind it) is real and still open -- see `WriterLane.
-    /// takeParkedAnyRoot`. A first attempt at fixing it here (trying
-    /// `takeParkedAnyRoot` before falling through, and dropping
-    /// `self.gate.mutex` around the fresh acquisition) regressed
-    /// `TestConcurrentCallsOnOneHandle` badly enough to revert before
-    /// root-causing why; not reapplied. Left as follow-up work.
+    /// NOTE (perf/lwa-go-busy, fixed by perf/lwa-park-release): the
+    /// same-process self-conflict described here -- `takeParkedForRoot
+    /// (self.current)` missing because a commit just moved `self.current`
+    /// while the lane's own `last_root` lagged, and this call's own
+    /// gate-holding block then waiting out the fresh acquisition's full
+    /// budget with every other admission on this path stuck behind it --
+    /// is now covered by the `takeParkedAnyRoot` fallback below. The
+    /// go-busy attempt additionally dropped `self.gate.mutex` around the
+    /// fresh acquisition fallback and regressed `TestConcurrentCallsOnOneHandle`;
+    /// this fix does not touch the gate at all, only adds the one
+    /// same-process-safe fallback lookup `takeParkedAnyRoot` itself exists
+    /// for (see its own doc comment: the kernel lease is valid regardless
+    /// of which in-memory generation it was parked against -- only the
+    /// lane's own cached root metadata can be stale, never the lease).
     fn acquireMaintenancePathLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         if (self.stopping.load(.acquire)) return error.Canceled;
         const io = h.handleLockIo();
@@ -2204,6 +2310,22 @@ pub const Owner = struct {
             // holds the owner gate), resolves that write's ticket itself
             // and leaves nothing for its own wait to ever need to drive.
             if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
+            stats.recordAcquired(.handoff, 0);
+            wal_trace.recordOp(.maintenance_lease_acquired);
+            lease.startHold(stats);
+            return self.withReadRegistrationBatch(lease);
+        }
+        if (self.writer_lane.takeParkedAnyRoot()) |held| {
+            var lease = held;
+            // `last_root` missed `self.current` above (the rare generation
+            // -swap-while-parked case `takeParkedAnyRoot`'s own doc comment
+            // describes), so there is no root this call can safely drain a
+            // ride-along queue against -- the writer that parked this
+            // lease staged any such work on a generation already
+            // superseded, not on `self.current`. Skip the drain; this is a
+            // same-process handoff either way, never a fresh kernel
+            // acquisition that would otherwise self-conflict with the
+            // lease this exact process is already holding.
             stats.recordAcquired(.handoff, 0);
             wal_trace.recordOp(.maintenance_lease_acquired);
             lease.startHold(stats);
@@ -2254,6 +2376,15 @@ pub const Owner = struct {
             // group itself while this call is concurrently using the
             // same file.
             if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
+            stats.recordAcquired(.handoff, 0);
+            break :blk held;
+        } else if (self.writer_lane.takeParkedAnyRoot()) |held| blk: {
+            // Same same-process self-conflict fix as
+            // `acquireMaintenancePathLeaseAssumeLocked`: `last_root`
+            // missed `self.current`, so skip the ride-along drain (no
+            // root here is safe to dereference) but still prefer this
+            // same-process handoff over a fresh, self-conflicting kernel
+            // acquisition attempt.
             stats.recordAcquired(.handoff, 0);
             break :blk held;
         } else blk: {
@@ -3214,6 +3345,18 @@ pub const Owner = struct {
         var next_wait_ms: i64 = if (self.registeredDemand().any()) 1000 else no_scheduled_wait;
         var earliest_turn_ns: i96 = 0;
         while (!self.stopping.load(.acquire)) {
+            // Bound the wait while `WriterLane.checkin` still has a lease
+            // parked: `maintainParkedLease` is what actually enforces
+            // `foreign_fairness_quantum_ns`/`parked_idle_release_ns` for an
+            // idle holder (see its own doc comment) -- but only while this
+            // loop keeps calling it. Once it returns `null` (nothing
+            // parked, including right after it releases one), this stops
+            // influencing the wait at all, so an idle Owner goes back to
+            // its ordinary demand-driven schedule instead of polling
+            // forever on an empty lane.
+            if (self.maintainParkedWriterLaneMs()) |parked_wait_ms| {
+                next_wait_ms = if (next_wait_ms < 0) parked_wait_ms else @min(next_wait_ms, parked_wait_ms);
+            }
             if (next_wait_ms < 0) {
                 self.wake.waitUncancelable(io);
             } else {
@@ -3267,6 +3410,23 @@ pub const Owner = struct {
     pub fn maintenanceWaitMillisForTest(self: *Owner, pending: bool) i64 {
         std.debug.assert(h.builtin.is_test);
         return self.maintenanceWaitMillis(pending);
+    }
+
+    /// Drives `WriterLane.maintainParkedLease` from `maintenanceLoop`,
+    /// converting its nanosecond bound to the milliseconds
+    /// `maintenanceLoop`'s own wait is expressed in. `self.current` is
+    /// read without the gate, same as `WriterLane.checkout`'s own
+    /// "no self-replacement" comparison -- `maintainParkedLease` only
+    /// ever uses it as a hint (an `==` check against `last_root`), never
+    /// dereferenced on a stale read.
+    fn maintainParkedWriterLaneMs(self: *Owner) ?i64 {
+        const remaining_ns = self.writer_lane.maintainParkedLease(self.current) orelse return null;
+        return @intCast(@divCeil(remaining_ns, std.time.ns_per_ms));
+    }
+
+    pub fn maintainParkedWriterLaneMsForTest(self: *Owner) ?i64 {
+        std.debug.assert(h.builtin.is_test);
+        return self.maintainParkedWriterLaneMs();
     }
 
     /// Caller holds the owner gate, path lease and proof mutex. Return with
@@ -3690,6 +3850,24 @@ pub const Connection = struct {
             // `null` and `checked_out` is its own -- waiting here would
             // just be waiting on itself.
             if (!skip_lane_wait) if (self.owner.writer_lane.waitParkedForStore(self, deadline)) |held| {
+                var lease = held;
+                stats.recordAcquired(.handoff, 0);
+                lease.startHold(stats);
+                return self.owner.withReadRegistrationBatch(lease);
+            };
+            // `waitParkedForStore`'s exact-root match can miss the same way
+            // `acquireMaintenancePathLeaseAssumeLocked`'s own
+            // `takeParkedForRoot` can (see its doc comment, and
+            // `WriterLane.takeParkedAnyRoot`'s): a same-process generation
+            // swap left the lane's `last_root` naming a root this call's
+            // own `self.owner.current` has already moved past. Without
+            // this, the fresh acquisition below self-conflicts with the
+            // lease this exact process is still holding parked, for the
+            // whole of this call's own `busy_timeout_ms` -- observed live
+            // as `TestSQLConformance`/`test_sql_conformance`'s
+            // `dbapi execute` -> `open_cursor` stalling tens of seconds
+            // before failing `FileBusy` on a single-process database.
+            if (!skip_lane_wait) if (self.owner.writer_lane.takeParkedAnyRoot()) |held| {
                 var lease = held;
                 stats.recordAcquired(.handoff, 0);
                 lease.startHold(stats);
@@ -7060,6 +7238,137 @@ test "capi native cold lane checkout never waits on its own checkout" {
     const elapsed_ns = std.Io.Clock.awake.now(io).nanoseconds - started;
     owner.writer_lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
     try std.testing.expect(elapsed_ns < 100 * std.time.ns_per_ms);
+}
+
+// Cross-process writer starvation (perf/lwa-park-release): `WriterLane.
+// checkin` parks the kernel-level path lease instead of releasing it, so a
+// same-Store writer can reclaim it for free. Before this fix, nothing ever
+// released a parked lease again except the lane's own next `checkin` or
+// `Owner.deinit`: a process that wrote once and then went idle held the
+// cross-process writer lease forever, and every other process's writer
+// failed `FileBusy` once its own `busy_timeout_ms` ran out (observed live:
+// Python `tests/test_concurrency.py::test_cross_process_writers_do_not_lose_each_others_rows`).
+// Fixed by `WriterLane.maintainParkedLease`, driven every tick of
+// `Owner.maintenanceLoop` (woken promptly by `checkinImpl`'s own park --
+// see `wakeOwnerForParkedLease` -- rather than waiting for a durable
+// consumer's already-scheduled poll, which may never come at all). This
+// test leaves the maintenance worker running (unlike the cold-checkout
+// test above): it is what has to actually perform the release.
+test "capi native parked writer lease releases itself after the idle window with nobody checking out" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var tmp = try api.TestDirectory.init("parked-lease-idle-release");
+    defer tmp.cleanup();
+    const io = h.handleLockIo();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/database.aflite", .{tmp.path()});
+    defer std.testing.allocator.free(path);
+
+    const handle = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 10_000 }, true);
+    defer h.closeHandle(handle);
+    const connection = handle.lite_connection.?;
+    const owner = connection.owner;
+
+    const root = try owner.writer_lane.checkout(connection, .mutation);
+    owner.writer_lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+    // Parked, exactly like the old (buggy) behavior: nobody has reclaimed
+    // it yet, and nothing else is checking out.
+    try std.testing.expect(owner.writer_lane.parked != null);
+
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    const deadline = started + 3 * std.time.ns_per_s;
+    while (owner.writer_lane.parked != null) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) break;
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    const elapsed_ns = std.Io.Clock.awake.now(io).nanoseconds - started;
+    try std.testing.expect(owner.writer_lane.parked == null);
+    // Bounded well above `WriterLane.parked_idle_release_ns` (1s) to
+    // absorb scheduling jitter, but far below the 3s deadline above: a
+    // regression back to "never releases" would time out instead of
+    // passing, not just run slow.
+    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
+}
+
+// Same bug as the idle-release test above, the other half of the bound:
+// `checkin`'s own foreign-waiter release only ever runs on that lane's
+// *next* `checkin` call, which an idle holder never makes again. A
+// genuinely foreign waiter (a different process, or -- as simulated here,
+// matching `shared_lock_region.zig`'s own "othersWaitingAcrossProcesses
+// distinguishes a foreign ticket from this process's own" test -- a
+// different pid's ticket on the same region) must still be served within
+// `WriterLane.foreign_fairness_quantum_ns` of queuing, not only once the
+// much longer idle window (`parked_idle_release_ns`) elapses.
+test "capi native parked writer lease releases for a foreign waiter within the fairness quantum" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var tmp = try api.TestDirectory.init("parked-lease-foreign-waiter");
+    defer tmp.cleanup();
+    const io = h.handleLockIo();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/database.aflite", .{tmp.path()});
+    defer std.testing.allocator.free(path);
+
+    const handle = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 10_000 }, true);
+    defer h.closeHandle(handle);
+    const connection = handle.lite_connection.?;
+    const owner = connection.owner;
+
+    const root = try owner.writer_lane.checkout(connection, .mutation);
+    owner.writer_lane.checkin(connection, root.owned_lite_backend.?.native_docstore.?);
+    try std.testing.expect(owner.writer_lane.parked != null);
+    _ = owner.writer_lane.parked.?.region orelse return error.SkipZigTest;
+
+    const own_pid = antfly_platform.process.currentId() orelse 0;
+    const foreign_pid = own_pid +% 0x5a5a_5a5a;
+
+    // A genuinely foreign process would hold its own independent mapping
+    // of the same shared region file, not this process's own `*Region`:
+    // `maintainParkedLease`'s release races to `PathWriterLock.close()`
+    // the holder's mapping (unmap *and* free the heap `Region`) the
+    // moment it is served, which would otherwise pull this simulated
+    // waiter's still-running `acquireWriterFairBounded` out from under
+    // it. Open a second mapping instead, exactly like a second process
+    // opening the same path would.
+    var foreign_region = try shared_lock_region.Region.open(std.testing.allocator, io, path);
+    defer foreign_region.close();
+
+    const Foreign = struct {
+        region: *shared_lock_region.Region,
+        pid: u32,
+        acquired: bool = false,
+        fn run(self: *@This()) void {
+            const wio = h.handleLockIo();
+            const deadline = std.Io.Clock.now(.awake, wio).addDuration(.fromSeconds(2));
+            self.acquired = self.region.acquireWriterFairBounded(wio, self.pid, deadline) catch false;
+            if (self.acquired) self.region.releaseWriter();
+        }
+    };
+    // `started` precedes spawning the foreign waiter: by the time it
+    // calls `acquireWriterFairBounded`, test setup overhead (opening a
+    // second `Region` mapping, thread spawn) may already exceed
+    // `foreign_fairness_quantum_ns` on its own, so `maintainParkedLease`
+    // can release the instant the foreign ticket is claimed -- the
+    // claim-then-release round trip can finish faster than any poll
+    // interval could reliably observe the intermediate "queued" state.
+    // The bound below is what actually matters: the lease is released
+    // and the waiter served promptly, not on the much longer idle window.
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    var foreign: Foreign = .{ .region = &foreign_region, .pid = foreign_pid };
+    const thread = try std.Thread.spawn(.{}, Foreign.run, .{&foreign});
+
+    const deadline_ns = started + 3 * std.time.ns_per_s;
+    while (owner.writer_lane.parked != null) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline_ns) break;
+        io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(owner.writer_lane.parked == null);
+    thread.join();
+    try std.testing.expect(foreign.acquired);
+    const elapsed_ns = std.Io.Clock.awake.now(io).nanoseconds - started;
+    // Served well within the fairness quantum plus this loop's own poll
+    // granularity, not the much longer idle window -- a regression that
+    // only released on the idle timer would still pass the idle-release
+    // test above but blow well past this bound.
+    try std.testing.expect(elapsed_ns < 500 * std.time.ns_per_ms);
 }
 
 // docs/design/lite-performance/throughput-profile.md §6: a sustained
