@@ -74,7 +74,7 @@ pub fn coverage(a: A, table: catalog.types.Table) !u64 {
     return std.fmt.parseInt(u64, try catalog.metadata.str(value), 10);
 }
 fn matchesPrevious(previous: Batch, batch: Batch) bool {
-    return std.mem.eql(u8, previous.source, batch.source) and std.mem.eql(u8, previous.epoch, batch.epoch) and batch.expected_checkpoint != null and std.mem.eql(u8, previous.checkpoint, batch.expected_checkpoint.?);
+    return batch.follows(previous);
 }
 /// The caller must supply a stable complete transaction and opaque source
 /// checkpoint. A stale/out-of-order predecessor is rejected before admission.
@@ -96,8 +96,7 @@ pub fn accept(a: A, binding: Binding, unresolved_options: Options, context: Cont
     defer queue_arena.deinit();
     const scratch = queue_arena.allocator();
     const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null };
-    const identity = try std.json.Stringify.valueAlloc(scratch, .{ batch.source, batch.epoch, batch.batch_id }, .{});
-    const operation_id = &catalog.types.digestHex(identity);
+    const operation_id = &std.fmt.bytesToHex(try batch.identity(scratch), .lower);
     var admission = try store.beginAdmission(scratch, operation_id, payload);
     defer admission.deinit();
     if (admission.observation.accepted) |accepted| {

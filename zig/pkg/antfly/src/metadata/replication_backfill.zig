@@ -163,6 +163,10 @@ fn classifyReplicationError(err: anyerror) []const u8 {
         error.UnknownColumn,
         error.InvalidQueryRequest,
         error.UnsupportedReplicationStreaming,
+        error.UnsupportedReplicationTruncate,
+        error.UnsupportedReplicationMessage,
+        error.InvalidReplicationTransaction,
+        error.InvalidReplicationCheckpoint,
         error.StoredDestinationAuthorizationMissing,
         error.StoredDestinationAuthorizationInvalid,
         error.StoredDestinationAuthorizationRevoked,
@@ -1832,7 +1836,9 @@ pub const StreamingReplicationRunner = struct {
             return summary;
         }
 
-        for (result.changes) |change| {
+        var transactions: foreign_mod.ReplicationTransactions = .{ .changes = result.changes };
+        while (try transactions.next()) |transaction| {
+            const change = transaction[transaction.len - 1];
             try self.checkpointWork();
             if (existing_status) |status| {
                 try callCheckCutoverAuthority(
@@ -1843,15 +1849,22 @@ pub const StreamingReplicationRunner = struct {
             }
             // Streaming apply happens outside any bulk-ingest window, so the
             // enrichment runtime can always see the row being waited on here.
-            const apply_summary = try applyReplicationChange(self.alloc, self.write_source, table.name, change, parsed, cdc_apply_sync_level);
-            try self.reachLifecycle(
-                .stream_change_applied,
-                table.table_id,
-                source_ordinal,
-                @intCast(snapshot_offset),
-                if (existing_status) |status| status.cutover_authority_id else 0,
-                change.checkpoint,
-            );
+            var apply_summary: ReplicationApplySummary = .{};
+            for (transaction) |member| {
+                try self.checkpointWork();
+                if (existing_status) |status| try callCheckCutoverAuthority(status_sink, table.replication_sources_json, status);
+                const applied = try applyReplicationChange(self.alloc, self.write_source, table.name, member, parsed, cdc_apply_sync_level);
+                apply_summary.writes_applied += applied.writes_applied;
+                apply_summary.deletes_applied += applied.deletes_applied;
+                try self.reachLifecycle(
+                    .stream_change_applied,
+                    table.table_id,
+                    source_ordinal,
+                    @intCast(snapshot_offset),
+                    if (existing_status) |status| status.cutover_authority_id else 0,
+                    member.checkpoint,
+                );
+            }
             try self.checkpointWork();
             if (existing_status) |status| {
                 try callCheckCutoverAuthority(
@@ -1867,7 +1880,10 @@ pub const StreamingReplicationRunner = struct {
                 @intCast(@max(@as(i64, 0), @as(i64, @intCast(applied_at_ms)) - @as(i64, @intCast(change.commit_timestamp_ms))))
             else if (result.lag_millis > 0) result.lag_millis else 0;
 
-            summary.changes_applied += 1;
+            // Only the complete source transaction grants a resume frontier.
+            // A failed later member leaves the previous durable checkpoint,
+            // so a retry replays the transaction instead of losing its suffix.
+            summary.changes_applied += transaction.len;
             summary.last_checkpoint_len = change.checkpoint.len;
             summary.writes_applied += apply_summary.writes_applied;
             summary.deletes_applied += apply_summary.deletes_applied;
@@ -6920,6 +6936,111 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
     // The provider mismatch is rejected before another durable authority
     // record or any provider mutation.
     try std.testing.expectEqual(@as(usize, 2), status_sink.durable_calls);
+}
+
+test "metadata replication stream resumes a whole transaction after a later member fails" {
+    const alloc = std.testing.allocator;
+    const State = struct {
+        const Self = @This();
+        calls: usize = 0,
+        failed: bool = false,
+        polls: usize = 0,
+        resumed: bool = false,
+
+        fn batch(ptr: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (!self.failed and self.calls == 3) {
+                self.failed = true;
+                return error.InjectedDestinationFailure;
+            }
+            return {};
+        }
+
+        const Provider = struct {
+            state: *Self,
+            fn destroy(ptr: *anyopaque, a: Allocator) void {
+                a.destroy(@as(*@This(), @ptrCast(@alignCast(ptr))));
+            }
+            fn query(_: *anyopaque, _: Allocator, _: foreign_mod.QueryParams) !foreign_mod.QueryResult {
+                return .{ .rows = &.{}, .total = 0 };
+            }
+            fn statistics(_: *anyopaque, _: []const u8) !foreign_mod.TableStatistics {
+                return .{};
+            }
+            fn poll(ptr: *anyopaque, a: Allocator, params: foreign_mod.ReplicationPollParams) !foreign_mod.ReplicationPollResult {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.state.polls += 1;
+                const resumed = params.checkpoint != null and std.mem.eql(u8, params.checkpoint.?, "first-commit");
+                self.state.resumed = resumed;
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const changes = try a.alloc(foreign_mod.ReplicationChange, if (resumed) 2 else 3);
+                var initialized: usize = 0;
+                errdefer {
+                    for (changes[0..initialized]) |*change| change.deinit(a);
+                    a.free(changes);
+                }
+                for (changes, 0..) |*change, i| {
+                    const id = i + @as(usize, if (resumed) 1 else 0);
+                    const body = try std.fmt.allocPrint(arena.allocator(), "{{\"id\":\"row-{d}\"}}", .{id});
+                    change.* = .{
+                        .op = .insert,
+                        .checkpoint = try a.dupe(u8, if (id == 0) "first-commit" else "second-commit"),
+                    };
+                    initialized += 1;
+                    change.row = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
+                }
+                return .{ .changes = changes };
+            }
+        };
+        fn factory(ptr: *anyopaque, a: Allocator, config: foreign_mod.Config) !foreign_mod.Source {
+            var owned = config;
+            defer owned.deinit(a);
+            const provider = try a.create(Provider);
+            provider.* = .{ .state = @ptrCast(@alignCast(ptr)) };
+            return .{ .ptr = provider, .vtable = &.{ .deinit = Provider.destroy, .query = Provider.query, .statistics = Provider.statistics, .poll_changes = Provider.poll } };
+        }
+    };
+    const Sink = struct {
+        alloc: Allocator,
+        records: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
+        fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            const owned = try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, record);
+            errdefer metadata_table_manager.freeReplicationSourceStatus(self.alloc, owned);
+            try self.records.append(self.alloc, owned);
+        }
+        fn deinit(self: *@This()) void {
+            for (self.records.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
+            self.records.deinit(self.alloc);
+        }
+    };
+    var state: State = .{};
+    var registry: foreign_mod.Registry = .{};
+    defer registry.deinit(alloc);
+    try registry.registerWithContext(alloc, .postgres, &state, State.factory, null);
+    var sink: Sink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var runner: StreamingReplicationRunner = .{
+        .alloc = alloc,
+        .registry = &registry,
+        .write_source = .{ .ptr = &state, .vtable = &.{ .batch = State.batch } },
+    };
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 11,
+        .name = "docs",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":\"id\"}]",
+    };
+    try std.testing.expectError(error.InjectedDestinationFailure, runner.runTableSourceFromCheckpoint(&sink, table, 0, 0, "", "initial", null));
+    const failed = sink.records.items[sink.records.items.len - 1];
+    try std.testing.expectEqualStrings("streaming_failed", failed.phase);
+    try std.testing.expectEqualStrings("first-commit", failed.checkpoint);
+    for (sink.records.items) |record| try std.testing.expect(!std.mem.eql(u8, record.checkpoint, "second-commit"));
+    const resumed = try runner.runTableSourceFromCheckpoint(&sink, table, 0, 0, "", failed.checkpoint, null);
+    try std.testing.expect(state.resumed);
+    try std.testing.expectEqual(@as(usize, 2), resumed.changes_applied);
+    try std.testing.expectEqual(@as(usize, 5), state.calls);
+    try std.testing.expectEqualStrings("second-commit", sink.records.items[sink.records.items.len - 1].checkpoint);
 }
 
 test "metadata replication stream applies insert update and delete through bound write source" {

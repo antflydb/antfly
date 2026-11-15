@@ -26,16 +26,7 @@ const iceberg = @import("../iceberg_avro.zig");
 const bucket = @import("bucket.zig");
 const A = std.mem.Allocator;
 const V = std.json.Value;
-pub const Batch = struct {
-    batch_id: []const u8,
-    source: []const u8,
-    epoch: []const u8,
-    checkpoint: []const u8,
-    expected_checkpoint: ?[]const u8 = null,
-    key_fields: []const []const u8,
-    changes: []const Change,
-    pub const Change = struct { op: enum { upsert, delete }, row: V };
-};
+pub const Batch = @import("../../../storage/source_transaction.zig").Batch;
 pub const Files = struct { client: objectstore.Client, bucket: []const u8, prefix: []const u8, uri: []const u8, context: types.Context = .{} };
 pub const Prepared = struct { body: []const u8, snapshot_id: i64 };
 fn object(a: A) V {
@@ -70,10 +61,7 @@ pub fn schema(a: A, metadata: V) !V {
 pub const stable_key = @import("stable_key.zig");
 const Rows = struct { data: []const V, keys: []const V, key_schema: V, ids: V };
 fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
-    if (batch.batch_id.len == 0 or batch.batch_id.len > 256 or batch.source.len == 0 or batch.source.len > 256 or batch.epoch.len == 0 or batch.epoch.len > 256 or batch.checkpoint.len == 0 or batch.checkpoint.len > 1024 or batch.key_fields.len == 0 or batch.key_fields.len > 32 or batch.changes.len == 0 or batch.changes.len > parquet.max_rows) return error.InvalidLakeChangeBatch;
-    if (batch.expected_checkpoint) |previous| {
-        if (previous.len > 1024 or std.mem.eql(u8, previous, batch.checkpoint)) return error.InvalidLakeChangeBatch;
-    }
+    batch.validateHeader(parquet.max_rows) catch return error.InvalidLakeChangeBatch;
     var fields = array(a);
     var ids = array(a);
     for (batch.key_fields, 0..) |name, index| {

@@ -2386,8 +2386,7 @@ pub const Executor = struct {
             const row: c_int = @intCast(row_idx);
             if (self.pqgetisnull(result, row, 0) != 0 or self.pqgetisnull(result, row, 1) != 0) continue;
             const lsn = try copyCellAlloc(alloc, self.pqgetvalue(result, row, 0), @intCast(self.pqgetlength(result, row, 0)));
-            if (observed_checkpoint) |value| alloc.free(value);
-            observed_checkpoint = lsn;
+            defer alloc.free(lsn);
             const data_hex = self.pqgetvalue(result, row, 1)[0..@intCast(self.pqgetlength(result, row, 1))];
             const data = try decodeByteaHexAlloc(alloc, data_hex);
             defer alloc.free(data);
@@ -2395,9 +2394,11 @@ pub const Executor = struct {
             switch (try parsePgoutputMessageAlloc(alloc, data, &relation_cache)) {
                 .none => {},
                 .begin => {
+                    if (current_txn_first_change_idx != null) return error.InvalidReplicationTransaction;
                     current_txn_first_change_idx = changes.items.len;
                 },
                 .commit => |commit_timestamp_ms| {
+                    if (current_txn_first_change_idx == null) return error.InvalidReplicationTransaction;
                     if (current_txn_first_change_idx) |start_idx| {
                         const computed_lag_ms: u64 = if (commit_timestamp_ms > 0 and poll_now_ms > 0)
                             @intCast(@max(@as(i64, 0), poll_now_ms - @as(i64, @intCast(commit_timestamp_ms))))
@@ -2405,23 +2406,29 @@ pub const Executor = struct {
                             0;
                         for (changes.items[start_idx..]) |*change| {
                             change.commit_timestamp_ms = commit_timestamp_ms;
+                            const committed_checkpoint = try alloc.dupe(u8, lsn);
                             alloc.free(change.checkpoint);
-                            change.checkpoint = try alloc.dupe(u8, lsn);
+                            change.checkpoint = committed_checkpoint;
                         }
                         lag_millis = @max(lag_millis, computed_lag_ms);
                     }
+                    const committed_checkpoint = try alloc.dupe(u8, lsn);
+                    if (observed_checkpoint) |value| alloc.free(value);
+                    observed_checkpoint = committed_checkpoint;
                     current_txn_first_change_idx = null;
                 },
                 .change => |parsed_change| {
                     var change_without_checkpoint = parsed_change;
                     errdefer change_without_checkpoint.deinit(alloc);
-                    alloc.free(change_without_checkpoint.checkpoint);
-                    change_without_checkpoint.checkpoint = try alloc.dupe(u8, lsn);
+                    if (current_txn_first_change_idx == null) return error.InvalidReplicationTransaction;
                     change_without_checkpoint.lag_records = 0;
                     try changes.append(alloc, change_without_checkpoint);
                 },
             }
         }
+        // A source position may only acknowledge complete transactions. Never
+        // publish a BEGIN/row LSN if a provider response ends before COMMIT.
+        if (current_txn_first_change_idx != null) return error.IncompleteReplicationTransaction;
 
         if (rows_len > 0 or changes.items.len > 0) {
             std.log.info(
@@ -4310,7 +4317,7 @@ fn parsePgoutputMessageAlloc(
         'O' => return .none,
         'Y' => return .none,
         'M' => return .none,
-        'T' => return .none,
+        'T' => return error.UnsupportedReplicationTruncate,
         'R' => {
             const relation_id = try readU32(data, &pos);
             const namespace = try readCStringAlloc(alloc, data, &pos);
@@ -4391,7 +4398,7 @@ fn parsePgoutputMessageAlloc(
                 .row = row,
             } };
         },
-        else => return .none,
+        else => return error.UnsupportedReplicationMessage,
     }
 }
 
@@ -5908,6 +5915,14 @@ test "postgres libpq created replication snapshot cloning is allocation-failure 
     };
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "postgres libpq parser rejects truncate and unknown effects rather than acknowledging lost mutations" {
+    const alloc = std.testing.allocator;
+    var relations = std.AutoHashMapUnmanaged(u32, PgoutputRelation).empty;
+    defer deinitPgoutputRelationCache(alloc, &relations);
+    try std.testing.expectError(error.UnsupportedReplicationTruncate, parsePgoutputMessageAlloc(alloc, "T", &relations));
+    try std.testing.expectError(error.UnsupportedReplicationMessage, parsePgoutputMessageAlloc(alloc, "?", &relations));
 }
 
 test "postgres libpq parser decodes pgoutput relation and row changes" {

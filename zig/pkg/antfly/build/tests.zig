@@ -378,6 +378,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_imports.configure(b, test_mod.*, true, true);
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
+    const source_transaction_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_transaction.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const replication_transaction_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[7],
+        .filters = &.{
+            "metadata replication stream",
+            "replication transactions group opaque checkpoints",
+            "postgres libpq parser rejects truncate",
+            "postgres libpq parser decodes pgoutput",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const source_transaction_step = b.step("source-transaction-test", "Verify shared source envelopes and complete CDC transaction checkpoints");
+    const run_source_transaction_tests = b.addRunArtifact(source_transaction_tests);
+    source_transaction_step.dependOn(&run_source_transaction_tests.step);
+    source_transaction_step.dependOn(&b.addRunArtifact(replication_transaction_tests).step);
     const media_status_step = b.step("antfly-media-status-test", "Verify output counters and rolling runtime status profiles");
     const cypher_owner_readiness = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "selected owner readiness", "system catalog baseline resumes after snapshot and activates atomically before sparse updates" } });
     const cypher_owner_readiness_step = b.step("cypher-owner-readiness-test", "Verify compact selected-owner report and namespace readiness");
@@ -1560,6 +1581,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "postgres libpq idle reclamation transfers only missing capacity",
         "postgres libpq reclamation leaves permit scheduling responsive",
         "postgres libpq connection-error sanitizer",
+        "postgres libpq parser rejects truncate",
+        "postgres libpq parser decodes pgoutput",
+        "replication transactions group opaque checkpoints",
         "query embedding cache owns results and coalesces misses",
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
@@ -3333,6 +3357,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, lake_scaffold_test_mod, true, true);
     lake_scaffold_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const source_transaction_lake_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, source_transaction_lake_mod, true, true);
+    const source_transaction_lake_source = source_transaction_lake_mod.import_table.get("antfly_local_sources").?;
+    const source_transaction_lake_selection = b.addOptions();
+    source_transaction_lake_selection.addOption([]const []const u8, "names", &.{"serverless_external_source_mod"});
+    source_transaction_lake_source.addOptions("antfly_local_test_sources", source_transaction_lake_selection);
+    const source_transaction_lake_tests = b.addTest(.{
+        .root_module = source_transaction_lake_source,
+        .filters = &.{ "lake native row commit", "serverless external source module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    source_transaction_step.dependOn(&b.addRunArtifact(source_transaction_lake_tests).step);
     const lake_scaffold_tests = b.addTest(.{
         // Measured macOS ReleaseSafe partition peak: 15.67 GB. Reserve headroom
         // for native lake API codegen rather than failing scheduler admission.
@@ -8594,6 +8634,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Runtime exclusions above give explicit API filters first ownership,
     // storage second ownership, and module-sharded metadata third ownership.
     dependOnAll(unit_test_step, &.{
+        &run_source_transaction_tests.step,
         &run_common_http_tests.step,
         &run_api_json_helpers_tests.step,
         &run_antfly_client_pkg_tests.step,

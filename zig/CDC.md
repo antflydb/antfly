@@ -171,6 +171,27 @@ Real Postgres CDC E2E coverage exists in `e2e/antfly/test_cdc.py` for:
 
 ## Provider-neutral lake transaction ingress
 
+The complete row-transaction envelope lives in
+`pkg/antfly-embedded/src/storage/source_transaction.zig`, independently of
+Iceberg. The Iceberg row writer aliases that type and continues to own typed
+schema validation. Its retry identity retains the existing source/epoch/batch
+hash, so extracting the contract does not change durable queue identities.
+
+PostgreSQL poll results expose only complete committed transactions. All rows
+in one transaction have the same opaque commit checkpoint and occur
+contiguously. The streaming coordinator advances durable source progress only
+after every member has applied. A failure midway leaves the prior transaction's
+checkpoint and replays the incomplete transaction on resume. This protects the
+resume frontier; the existing per-row destination apply still does not provide
+atomic visibility of the entire source transaction. Unknown mutation messages
+and unsupported TRUNCATE fail instead of silently advancing past their effects.
+
+This shared envelope and checkpoint boundary do not yet connect managed
+PostgreSQL orchestration to writable Iceberg, retain outbound before-images, or
+implement public changefeeds/pgoutput. Those remain tracked by
+[#1698](https://github.com/antflydb/antfly/issues/1698) and
+[#1639](https://github.com/antflydb/antfly/issues/1639).
+
 Writable native Iceberg tables also accept complete provider-neutral CDC
 transactions at `POST /db/v1/tables/{tableName}/lake/changes`. This push boundary
 uses stable source epochs, batch IDs, key definitions, and predecessor
