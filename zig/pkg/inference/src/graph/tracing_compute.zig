@@ -227,6 +227,7 @@ pub const TracingCompute = struct {
         return .{
             .ptr = @ptrCast(self),
             .vtable = &vtable,
+            .arithmetic_publication_dtype = if (self.precision == .bf16) .bf16 else .f32,
         };
     }
 

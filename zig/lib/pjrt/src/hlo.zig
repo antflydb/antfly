@@ -122,6 +122,9 @@ pub const Builder = struct {
     base_id: Id = 1,
     /// Explicit mixed-precision dot operands; result type controls accumulation.
     matrix_operand_type: ?ElementType = null,
+    /// Retain the source evaluation order and finite negative tail before a
+    /// reduced-precision publication. The default keeps the existing F32 graph.
+    gelu_schedule: enum { cube_first, coefficient_first_stable_tail } = .cube_first,
 
     const Instruction = struct {
         id: Id,
@@ -836,13 +839,28 @@ pub const Builder = struct {
         const c_sqrt2pi = try self.constantScalarF32(0.7978845608028654); // sqrt(2/pi)
         const c_half = try self.constantScalarF32(0.5);
         const c_one = try self.constantScalarF32(1.0);
-        const c_three = try self.constantScalarF32(3.0);
-
-        const x3 = try self.power(x, c_three);
-        const inner = try self.add(x, try self.multiply(c_044715, x3));
+        const correction = switch (self.gelu_schedule) {
+            .cube_first => try self.multiply(c_044715, try self.power(x, try self.constantScalarF32(3.0))),
+            .coefficient_first_stable_tail => try self.multiply(try self.multiply(try self.multiply(c_044715, x), x), x),
+        };
+        const inner = try self.add(x, correction);
         const scaled = try self.multiply(c_sqrt2pi, inner);
-        const tanh_val = try self.tanh(scaled);
+        var tanh_val = try self.tanh(scaled);
+        if (self.gelu_schedule == .coefficient_first_stable_tail) {
+            // GPU intrinsic tanh can saturate before libdevice tanhf. Evaluate
+            // its tail explicitly so cancellation in 1+tanh retains the source
+            // F32 value before the BF16 store. All arithmetic remains F32.
+            const magnitude = try self.abs(scaled);
+            const e = try self.exponential(try self.multiply(try self.constantScalarF32(-2), magnitude));
+            const tail = try self.subtract(c_one, try self.divide(try self.multiply(try self.constantScalarF32(2), e), try self.add(c_one, e)));
+            const shape = self.getInst(scaled).shape;
+            const zero = try self.broadcast(try self.constantScalarF32(0), &.{}, shape);
+            const threshold = try self.broadcast(try self.constantScalarF32(3), &.{}, shape);
+            const signed_tail = try self.select(try self.compare(scaled, zero, "LT"), try self.negate(tail), tail);
+            tanh_val = try self.select(try self.compare(magnitude, threshold, "GT"), signed_tail, tanh_val);
+        }
         const one_plus_tanh = try self.add(c_one, tanh_val);
+        if (self.gelu_schedule == .coefficient_first_stable_tail) return self.multiply(try self.multiply(c_half, x), one_plus_tanh);
         return self.multiply(c_half, try self.multiply(x, one_plus_tanh));
     }
 

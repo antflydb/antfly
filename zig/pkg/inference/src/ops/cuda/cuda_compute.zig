@@ -15197,7 +15197,7 @@ const Bf16MatmulProgram = struct {
 };
 
 fn embeddingGemma2Matmul(self: *CudaCompute, module: *embedding_gemma2_cuda.Module, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize, program: Bf16MatmulProgram) !void {
-    if (program.arithmetic == .bf16_reduced) {
+    if (program.arithmetic != .full_f32) {
         if (rows == 0 or in_dim == 0 or out_dim == 0 or dst.ptr == 0 or input.ptr == 0 or weight.ptr == 0 or dst.len < try checkedMul(try checkedMul(rows, out_dim), 2) or input.len < try checkedMul(try checkedMul(rows, in_dim), 2) or weight.len < try checkedMul(try checkedMul(out_dim, in_dim), 2)) return error.InvalidCublasShape;
         const blas = if (self.bf16_blas) |*value| value else return error.CublasBf16Unavailable;
         try blas.linearBf16(self.ctx.stream, @ptrFromInt(dst.ptr), @ptrFromInt(input.ptr), @ptrFromInt(weight.ptr), rows, in_dim, out_dim, program.arithmetic, if (program.workspace.ptr == 0) null else @ptrFromInt(program.workspace.ptr), program.workspace.len, self.ctx.info.compute_major, .{});
@@ -20967,7 +20967,7 @@ const SourceLinearTemporary = struct {
 fn sourceScalarStorageOp(ctx: *anyopaque, program: ops.SourceScalarProgram) ops.SourceScalarStorage {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     return switch (program) {
-        .linear => if (self.bf16_blas != null and self.embedding_gemma2_policy.matmul_arithmetic == .bf16_reduced) .bf16 else .full_f32,
+        .linear => if (self.bf16_blas != null and self.embedding_gemma2_policy.matmul_arithmetic != .full_f32) .bf16 else .full_f32,
         .audio => if (self.bf16_blas != null and self.cublaslt != null and self.vendor_convolution != null and self.embedding_gemma2_policy.audio_arithmetic == .source_bf16) .bf16 else .full_f32,
     };
 }

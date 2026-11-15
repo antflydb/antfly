@@ -2055,6 +2055,9 @@ pub const ComputeBackend = struct {
     }
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Arithmetic publication contract, independent of an F32 transport view.
+    /// Scalar materialization and algebraic rewrites preserve this dtype.
+    arithmetic_publication_dtype: GraphDType = .f32,
     /// Borrowed for one synchronous request. Architecture sessions install it
     /// on their request-local backend wrapper, making weight acquisition a
     /// universal bounded checkpoint even for architectures without a bespoke

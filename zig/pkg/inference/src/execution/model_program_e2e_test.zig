@@ -197,6 +197,38 @@ test "model program real EG2 public loaders preserve explicit BF16 precision" {
         break :reference try a.dupe(f32, outputs[0].asFloat32());
     };
     defer a.free(expected);
+    {
+        // Cross-backend BF16 smoke uses cosine >= .999, as in vLLM's
+        // tests/models/utils.py check_embeddings_close. Task-quality release
+        // gates remain separate; the F32 coordinate tests above stay strict.
+        const reference = try factory.createNativeSession(a, model);
+        defer reference.close();
+        var backend = try factory.getComputeBackend(reference, a);
+        defer backend.deinit();
+        const cfg = factory.getEmbeddingGemma2Config(reference) orelse return error.WrongModelArchitecture;
+        const pooled = try encoder.forwardPooledCT(&backend, a, cfg, ids.asInt64(), mask.asInt64(), 1, 3, 128);
+        defer backend.free(pooled);
+        const full = try backend.toFloat32(pooled, a);
+        defer a.free(full);
+        try std.testing.expectEqual(expected.len, full.len);
+        var dot: f64 = 0;
+        var norm_bf16: f64 = 0;
+        var norm_f32: f64 = 0;
+        var largest_difference: f32 = 0;
+        for (expected, full) |reduced, original| {
+            try std.testing.expect(std.math.isFinite(reduced) and std.math.isFinite(original));
+            dot += @as(f64, reduced) * original;
+            norm_bf16 += @as(f64, reduced) * reduced;
+            norm_f32 += @as(f64, original) * original;
+            largest_difference = @max(largest_difference, @abs(reduced - original));
+        }
+        try std.testing.expectApproxEqAbs(@as(f64, 1), norm_bf16, 1e-5);
+        try std.testing.expectApproxEqAbs(@as(f64, 1), norm_f32, 1e-5);
+        try std.testing.expect(dot / @sqrt(norm_bf16 * norm_f32) >= 0.999);
+        // Comparing public loaders only to each other could let all of them
+        // silently ignore BF16. This independent F32 result catches that.
+        try std.testing.expect(largest_difference > 1e-6);
+    }
     var manager = @import("../backends/backends.zig").SessionManager.init(a);
     manager.required_backend = .pjrt;
     manager.pjrt_memory_policy = .cpu;

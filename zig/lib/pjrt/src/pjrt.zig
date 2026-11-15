@@ -35,6 +35,18 @@ const strict_compile_options = blk: {
     break :blk build_options ++ [_]u8{ 0x3a, entry.len } ++ entry;
 };
 
+const vendor_gemm_compile_options = blk: {
+    const key = "xla_gpu_enable_triton_gemm";
+    const entry = [_]u8{ 0x0a, key.len } ++ key.* ++ [_]u8{ 0x12, 0x02, 0x10, 0x00 };
+    break :blk strict_compile_options ++ [_]u8{ 0x3a, entry.len } ++ entry;
+};
+
+pub const CompileOptions = struct {
+    /// BF16 publications can distinguish the F32 accumulation schedules of
+    /// Triton and vendor GEMM. Select the qualified source schedule explicitly.
+    gpu_gemm: enum { provider_default, vendor } = .provider_default,
+};
+
 pub const PjrtError = error{
     PjrtApiError,
     PluginLoadFailed,
@@ -649,6 +661,10 @@ pub const Client = struct {
     /// Compile an HLO program targeting a specific device.
     /// `num_outputs` is the number of output buffers the program produces.
     pub fn compileForDevice(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice) PjrtError!LoadedExecutable {
+        return self.compileWithOptions(hlo_bytes, num_outputs, target_device, .{});
+    }
+
+    pub fn compileWithOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, options: CompileOptions) PjrtError!LoadedExecutable {
         const format = "hlo";
         var program = c.Program{
             .struct_size = @sizeOf(c.Program),
@@ -659,14 +675,17 @@ pub const Client = struct {
             .format_size = format.len,
         };
 
-        const compile_options = strict_compile_options;
+        const compile_options: []const u8 = switch (options.gpu_gemm) {
+            .provider_default => &strict_compile_options,
+            .vendor => &vendor_gemm_compile_options,
+        };
 
         var args = c.ClientCompileArgs{
             .struct_size = @sizeOf(c.ClientCompileArgs),
             .extension_start = null,
             .client = self.handle,
             .program = &program,
-            .compile_options = &compile_options,
+            .compile_options = compile_options.ptr,
             .compile_options_size = compile_options.len,
             .executable = null,
         };
@@ -953,6 +972,37 @@ test "end-to-end: compile and execute HLO add via PJRT CPU plugin" {
     defer alloc.free(after);
     for (x_data, before) |x, value| try std.testing.expectEqual(x * @sqrt(@as(f32, 512)), value);
     try std.testing.expectEqualSlices(f32, &.{ 22.625, 45.25, 68.0, 90.5 }, after);
+}
+
+test "end-to-end: reduced-precision GELU retains finite extrema and negative tails" {
+    const alloc = std.testing.allocator;
+    var client = Client.initFromEnvWithMemoryPolicy(alloc, .cpu) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    // Frozen native CUDA BF16 publications, including values where intrinsic
+    // tanh saturates too early and x*(1+tanh) overflows before the half factor.
+    const inputs = [_]u16{ 0, 0x8000, 0x3f80, 0xbf80, 0xc09c, 0xc0a0, 0x7f00, 0x7f7f, 0xff7f };
+    const expected = [_]u16{ 0, 0x8000, 0x3f57, 0xbe23, 0xb51c, 0xb4a0, 0x7f00, 0x7f7f, 0x8000 };
+    const dims = [_]i64{inputs.len};
+    var b = hlo.Builder.init(alloc, "gelu_publication");
+    defer b.deinit();
+    b.gelu_schedule = .coefficient_first_stable_tail;
+    const x = try b.parameter(0, hlo.Shape.init(.bf16, &dims), "x");
+    _ = try b.convertType(try b.gelu(try b.convertType(x, .f32)), .bf16);
+    const bytes = try hlo.Module.init("gelu_publication", b.build()).serialize(alloc);
+    defer alloc.free(bytes);
+    var executable = try client.compile(bytes, 1);
+    defer executable.deinit();
+    var input = try client.bufferFromHostBytes(std.mem.sliceAsBytes(&inputs), .bfloat16, &dims);
+    defer input.deinit();
+    const outputs = try executable.execute(&.{input}, alloc);
+    defer alloc.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    const actual = try outputs[0].toTypedWithShapeAndScratch(u16, .bfloat16, alloc, alloc, &dims);
+    defer alloc.free(actual);
+    try std.testing.expectEqualSlices(u16, &expected, actual);
 }
 
 test "end-to-end: serialize and deserialize HLO add executable when PJRT plugin supports it" {
@@ -1259,25 +1309,29 @@ test "compile and deserialize reject native output arity with balanced ownership
         var loaded_destroyed: usize = 0;
         var executable_destroyed: usize = 0;
         var strict_compiles: usize = 0;
+        var vendor_expected = false;
         fn checkOptions(bytes: []const u8) !void {
             const wire = @import("protobuf").wire;
             var pos: usize = 0;
             try std.testing.expectEqual(@as(u32, 3), (try wire.readTag(bytes, &pos)).field);
             const build = try wire.readLengthDelimited(bytes, &pos);
             try std.testing.expectEqualSlices(u8, &.{ 0x20, 1, 0x28, 1 }, build);
-            try std.testing.expectEqual(@as(u32, 7), (try wire.readTag(bytes, &pos)).field);
-            const entry = try wire.readLengthDelimited(bytes, &pos);
+            const keys: []const []const u8 = if (vendor_expected) &.{ "xla_allow_excess_precision", "xla_gpu_enable_triton_gemm" } else &.{"xla_allow_excess_precision"};
+            for (keys) |key| {
+                try std.testing.expectEqual(@as(u32, 7), (try wire.readTag(bytes, &pos)).field);
+                const entry = try wire.readLengthDelimited(bytes, &pos);
+                var cursor: usize = 0;
+                try std.testing.expectEqual(@as(u32, 1), (try wire.readTag(entry, &cursor)).field);
+                try std.testing.expectEqualStrings(key, try wire.readLengthDelimited(entry, &cursor));
+                try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(entry, &cursor)).field);
+                const value = try wire.readLengthDelimited(entry, &cursor);
+                try std.testing.expectEqual(entry.len, cursor);
+                cursor = 0;
+                try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(value, &cursor)).field);
+                try std.testing.expectEqual(@as(u64, 0), try wire.readVarint(value, &cursor));
+                try std.testing.expectEqual(value.len, cursor);
+            }
             try std.testing.expectEqual(bytes.len, pos);
-            pos = 0;
-            try std.testing.expectEqual(@as(u32, 1), (try wire.readTag(entry, &pos)).field);
-            try std.testing.expectEqualStrings("xla_allow_excess_precision", try wire.readLengthDelimited(entry, &pos));
-            try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(entry, &pos)).field);
-            const value = try wire.readLengthDelimited(entry, &pos);
-            try std.testing.expectEqual(entry.len, pos);
-            pos = 0;
-            try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(value, &pos)).field);
-            try std.testing.expectEqual(@as(u64, 0), try wire.readVarint(value, &pos));
-            try std.testing.expectEqual(value.len, pos);
         }
         fn compile(args: *c.ClientCompileArgs) callconv(.c) ?*c.PjrtError {
             checkOptions(args.compile_options.?[0..args.compile_options_size]) catch @panic("invalid precision compile options");
@@ -1321,10 +1375,13 @@ test "compile and deserialize reject native output arity with balanced ownership
     Fake.strict_compiles = 0;
     try std.testing.expectError(error.OutputCountMismatch, client.compile("hlo", 2));
     try std.testing.expectError(error.OutputCountMismatch, client.compileForDevice("hlo", 2, @ptrFromInt(1)));
+    Fake.vendor_expected = true;
+    defer Fake.vendor_expected = false;
+    try std.testing.expectError(error.OutputCountMismatch, client.compileWithOptions("hlo", 2, @ptrFromInt(1), .{ .gpu_gemm = .vendor }));
     try std.testing.expectError(error.OutputCountMismatch, client.deserializeExecutable("serialized", 2));
-    try std.testing.expectEqual(@as(usize, 2), Fake.strict_compiles);
-    try std.testing.expectEqual(@as(usize, 3), Fake.loaded_destroyed);
-    try std.testing.expectEqual(@as(usize, 3), Fake.executable_destroyed);
+    try std.testing.expectEqual(@as(usize, 3), Fake.strict_compiles);
+    try std.testing.expectEqual(@as(usize, 4), Fake.loaded_destroyed);
+    try std.testing.expectEqual(@as(usize, 4), Fake.executable_destroyed);
 }
 
 test "float32 downloads use logical host bytes and reject invalid type size and shape" {

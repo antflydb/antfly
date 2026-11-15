@@ -80,6 +80,8 @@ pub const CublasLtMatmulHeuristicResult = extern struct {
 pub const MatmulArithmetic = enum {
     full_f32,
     bf16_reduced,
+    /// BF16 inputs/output, with F32 partial reductions as well as accumulation.
+    bf16_f32_accumulate,
 
     /// Cold capability selection. Explicit off and optional unavailable
     /// libraries retain the old full-F32 Lt/scalar contract; required fails.
@@ -503,11 +505,16 @@ pub const Cublas = struct {
         const k = std.math.cast(c_int, width) orelse return error.InvalidCublasShape;
         const n = std.math.cast(c_int, columns) orelse return error.InvalidCublasShape;
         if (m <= 0 or k <= 0 or n <= 0) return error.InvalidCublasShape;
-        if (arithmetic != .bf16_reduced) return error.InvalidCublasArithmetic;
+        if (arithmetic == .full_f32) return error.InvalidCublasArithmetic;
         const required = try arithmetic.workspaceBytes(compute_major);
         if (workspace == null or @intFromPtr(workspace.?) % 256 != 0 or workspace_bytes < required) return error.InvalidCublasWorkspace;
         try self.requireBf16();
         try self.bindStream(stream); // setStream resets workspace, so bind FIRST.
+        // Register restoration before attempting a possibly partial SDK update.
+        // The ordinary reduced profile keeps its existing math-mode call path.
+        const strict = arithmetic == .bf16_f32_accumulate;
+        defer if (strict and self.library.fns.setMathMode(self.handle, 0) != CUBLAS_STATUS_SUCCESS) @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (strict) try check(self.library.fns.setMathMode(self.handle, 16)); // CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION
         const set_workspace = self.library.fns.setWorkspace.?;
         // Register cleanup BEFORE attempted SDK publication: even a rejected
         // binding may have changed handle state before returning its error.
@@ -677,6 +684,15 @@ test "classic BF16 arithmetic requires explicit funded workspace and clears its 
         var fail_bind: bool = false;
         var column_major: bool = false;
         var add_output: bool = false;
+        var strict_expected = false;
+        var math_mode: c_int = 0;
+        var math_calls: usize = 0;
+        var fail_math: bool = false;
+        fn mathMode(_: CublasHandle, mode: c_int) callconv(.c) CublasStatus {
+            math_calls += 1;
+            math_mode = mode;
+            return if (mode == 16 and fail_math) 13 else 0;
+        }
         fn workspace(_: CublasHandle, ptr: ?*anyopaque, bytes: usize) callconv(.c) CublasStatus {
             sets += 1;
             if (ptr) |_| {
@@ -687,6 +703,7 @@ test "classic BF16 arithmetic requires explicit funded workspace and clears its 
         }
         fn gemm(_: CublasHandle, ta: c_int, tb: c_int, m: c_int, n: c_int, k: c_int, alpha: *const f32, _: *const anyopaque, at: c_int, lda: c_int, _: *const anyopaque, bt: c_int, ldb: c_int, beta: *const f32, _: *anyopaque, ct: c_int, ldc: c_int, compute: c_int, algo: c_int) callconv(.c) CublasStatus {
             calls += 1;
+            if (strict_expected and math_mode != 16) bad = true;
             if (bound == null or ta != CUBLAS_OP_T or tb != (if (column_major) CUBLAS_OP_T else CUBLAS_OP_N) or m != 512 or n != 15 or k != 2048 or alpha.* != 1 or beta.* != (if (add_output) @as(f32, 1) else 0) or at != CUDA_R_16BF or bt != CUDA_R_16BF or ct != CUDA_R_16BF or lda != 2048 or ldb != (if (column_major) @as(c_int, 15) else 2048) or ldc != 512 or compute != CUBLAS_COMPUTE_32F or algo != 99) bad = true;
             return if (fail) 13 else 0;
         }
@@ -745,6 +762,32 @@ test "classic BF16 arithmetic requires explicit funded workspace and clears its 
     try std.testing.expectEqual(@as(usize, 8), Probe.sets);
     try std.testing.expectEqual(@as(usize, 3), Probe.calls);
     try std.testing.expectEqual(@as(u64, 2), blas.calls);
+    try std.testing.expect(Probe.bound == null and !Probe.bad);
+    // Restore the shared handle after success, GEMM rejection, and partial
+    // math-mode publication; the ordinary profile retains its original path.
+    blas.library.fns.setMathMode = &Probe.mathMode;
+    Probe.column_major = false;
+    Probe.add_output = false;
+    Probe.strict_expected = true;
+    Probe.math_mode = 0;
+    Probe.math_calls = 0;
+    Probe.fail_math = false;
+    try blas.linearBf16(null, output, input, weight, 15, 2048, 512, .bf16_f32_accumulate, workspace, 32 * 1024 * 1024, 12, .{});
+    try std.testing.expectEqual(@as(usize, 2), Probe.math_calls);
+    try std.testing.expectEqual(@as(c_int, 0), Probe.math_mode);
+    try std.testing.expect(Probe.bound == null and !Probe.bad);
+    Probe.fail = true;
+    try std.testing.expectError(error.CublasError, blas.linearBf16(null, output, input, weight, 15, 2048, 512, .bf16_f32_accumulate, workspace, 32 * 1024 * 1024, 12, .{}));
+    try std.testing.expectEqual(@as(usize, 4), Probe.math_calls);
+    try std.testing.expectEqual(@as(c_int, 0), Probe.math_mode);
+    try std.testing.expect(Probe.bound == null and !Probe.bad);
+    Probe.fail = false;
+    Probe.fail_math = true;
+    const calls = Probe.calls;
+    try std.testing.expectError(error.CublasError, blas.linearBf16(null, output, input, weight, 15, 2048, 512, .bf16_f32_accumulate, workspace, 32 * 1024 * 1024, 12, .{}));
+    try std.testing.expectEqual(calls, Probe.calls);
+    try std.testing.expectEqual(@as(usize, 6), Probe.math_calls);
+    try std.testing.expectEqual(@as(c_int, 0), Probe.math_mode);
     try std.testing.expect(Probe.bound == null and !Probe.bad);
 }
 

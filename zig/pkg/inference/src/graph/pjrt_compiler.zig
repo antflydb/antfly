@@ -167,7 +167,10 @@ pub fn compilePartitionWithOptions(
     max_reducer_comp.id = max_reducer_comp_id;
 
     var b = hlo.Builder.init(allocator, "main");
-    if (options.precision == .bf16) b.matrix_operand_type = .bf16;
+    if (options.precision == .bf16) {
+        b.matrix_operand_type = .bf16;
+        b.gelu_schedule = .coefficient_first_stable_tail;
+    }
     defer b.deinit();
 
     var next_param: u32 = 0;

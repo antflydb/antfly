@@ -57,6 +57,7 @@ pub fn main(init: std.process.Init) !void {
     var output: ?[]const u8 = null;
     var backend: Backend = .metal;
     var pjrt_precision: internal.architectures.session_factory.PjrtSessionOptions.Precision = .f32;
+    var cuda_f32_reduction = false;
     var pjrt_capacity: usize = 0;
     var pjrt_device_bytes: usize = 0;
     var warmups: usize = 2;
@@ -68,10 +69,13 @@ pub fn main(init: std.process.Init) !void {
         if (i + 1 >= args.len) return error.MissingArgument;
         const key = args[i];
         const value = args[i + 1];
-        if (std.mem.eql(u8, key, "--pjrt-precision")) pjrt_precision = std.meta.stringToEnum(@TypeOf(pjrt_precision), value) orelse return error.InvalidPjrtPrecision else if (std.mem.eql(u8, key, "--pjrt-capacity-bytes")) pjrt_capacity = try positivePolicyBytes(value) else if (std.mem.eql(u8, key, "--pjrt-device-bytes")) pjrt_device_bytes = try positivePolicyBytes(value) else if (std.mem.eql(u8, key, "--model")) model = value else if (std.mem.eql(u8, key, "--suite")) suite_path = value else if (std.mem.eql(u8, key, "--output")) output = value else if (std.mem.eql(u8, key, "--case")) try selected.append(a, value) else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--iterations")) iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--long-iterations")) long_iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--backend")) {
+        if (std.mem.eql(u8, key, "--cuda-f32-reduction")) {
+            if (std.mem.eql(u8, value, "true")) cuda_f32_reduction = true else if (std.mem.eql(u8, value, "false")) cuda_f32_reduction = false else return error.InvalidCudaReduction;
+        } else if (std.mem.eql(u8, key, "--pjrt-precision")) pjrt_precision = std.meta.stringToEnum(@TypeOf(pjrt_precision), value) orelse return error.InvalidPjrtPrecision else if (std.mem.eql(u8, key, "--pjrt-capacity-bytes")) pjrt_capacity = try positivePolicyBytes(value) else if (std.mem.eql(u8, key, "--pjrt-device-bytes")) pjrt_device_bytes = try positivePolicyBytes(value) else if (std.mem.eql(u8, key, "--model")) model = value else if (std.mem.eql(u8, key, "--suite")) suite_path = value else if (std.mem.eql(u8, key, "--output")) output = value else if (std.mem.eql(u8, key, "--case")) try selected.append(a, value) else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--iterations")) iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--long-iterations")) long_iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--backend")) {
             backend = std.meta.stringToEnum(Backend, value) orelse return error.InvalidBackend;
         } else return error.UnknownArgument;
     }
+    if (cuda_f32_reduction and backend != .cuda) return error.InvalidCudaReduction;
     if (backend != .pjrt and pjrt_precision != .f32) return error.InvalidPjrtPrecision;
     if ((pjrt_capacity == 0) != (pjrt_device_bytes == 0) or (backend != .pjrt and pjrt_capacity != 0)) return error.InvalidPjrtMemoryPolicy;
     if (iterations == 0 or iterations > 100 or long_iterations == 0 or long_iterations > 100 or warmups > 100) return error.InvalidIterations;
@@ -94,6 +98,17 @@ pub fn main(init: std.process.Init) !void {
         .pjrt => try factory.createPjrtSessionWithOptions(std.heap.c_allocator, model orelse return error.MissingModel, .{ .precision = pjrt_precision, .memory_policy = if (pjrt_capacity != 0) .{ .cuda = .{ .capacity_bytes = pjrt_capacity, .device_bytes = pjrt_device_bytes } } else null }),
     };
     defer session.close();
+    // Offline comparison: keep BF16 storage/vendor geometry, but use the same
+    // F32 partial-reduction contract as PJRT BF16. Report the selected profile.
+    if (cuda_f32_reduction) {
+        if (comptime @import("build_options").enable_cuda) {
+            var cb = try factory.getComputeBackend(session, a);
+            defer cb.deinit();
+            const compute: *internal.native_compute.cuda.CudaCompute = @ptrCast(@alignCast(cb.ptr));
+            if (compute.bf16_blas == null or compute.embedding_gemma2_policy.matmul_arithmetic != .bf16_reduced) return error.CudaReductionUnavailable;
+            compute.embedding_gemma2_policy.matmul_arithmetic = .bf16_f32_accumulate;
+        } else return error.CudaNotEnabled;
+    }
     if (!metal) factory.attachIo(session, init.io);
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.WrongArchitecture;
     var measurements = std.ArrayList(Measurement).empty;

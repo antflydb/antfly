@@ -913,6 +913,23 @@ pub fn validateTextInputs(cfg: Config, ids: []const i64, mask: []const i64, batc
     return rows;
 }
 
+fn tokenEmbeddingScale(dtype: ops.GraphDType, hidden: usize) f32 {
+    const scale = @sqrt(@as(f32, @floatFromInt(hidden)));
+    // The checkpoint's embedding normalizer is materialized in the embedding
+    // dtype. Keep this distinct from the F32 scale in the PLE projection.
+    return switch (dtype) {
+        .bf16 => @import("antfly_tile").fexpr.roundBf16Value(scale),
+        .f16 => @floatCast(@as(f16, @floatCast(scale))),
+        else => scale,
+    };
+}
+
+test "token embedding normalizer retains its scalar storage precision" {
+    try std.testing.expectEqual(@as(f32, 22.625), tokenEmbeddingScale(.bf16, 512));
+    try std.testing.expectEqual(@as(f32, 22.625), tokenEmbeddingScale(.f16, 512));
+    try std.testing.expectEqual(@sqrt(@as(f32, 512)), tokenEmbeddingScale(.f32, 512));
+}
+
 fn textEmbeddings(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
     _ = allocator;
     if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm and cb.kind() != .graph) return error.UnsupportedEmbeddingGemma2Backend;
@@ -922,7 +939,7 @@ fn textEmbeddings(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: 
     defer cb.free(ew);
     const raw = try cb.embeddingLookup(ew, ids, rows, cfg.hidden_size);
     defer cb.free(raw);
-    return scaled(cb, raw, @sqrt(@as(f32, @floatFromInt(cfg.hidden_size))));
+    return scaled(cb, raw, tokenEmbeddingScale(cb.arithmetic_publication_dtype, cfg.hidden_size));
 }
 
 pub fn forwardCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
@@ -1316,7 +1333,10 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
         @min(cfg.num_hidden_layers, @max(@as(usize, 1), (16 * 1024 * 1024) / (rows * cfg.per_layer_input_dim * @sizeOf(f32))))
     else
         1;
-    const whole_packed = cb.kind() == .metal and packPerLayerInputs(cfg, rows);
+    // The reduced-precision source publishes the whole projection bank before
+    // scaling and normalization. Preserve that GEMM geometry during capture.
+    const rounded_capture = cb.kind() == .graph and (cb.arithmetic_publication_dtype == .bf16 or cb.arithmetic_publication_dtype == .f16);
+    const whole_packed = rounded_capture or (cb.kind() == .metal and packPerLayerInputs(cfg, rows));
     var packed_first: usize = 0;
     var packed_ple: ?CT = if (whole_packed and cfg.num_hidden_layers <= frame_batch.slices.len)
         try packedPerLayerInputs(cb, cfg, embeddings, pw, rows, shared_frame)
@@ -1419,6 +1439,15 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
 }
 
 fn poolCompactProjectNormalize(cb: *const ComputeBackend, cfg: Config, normalized: CT, projection: CT, offsets: []const usize, dimensions: usize) !CT {
+    if (cb.arithmetic_publication_dtype == .bf16 or cb.arithmetic_publication_dtype == .f16) {
+        const projected = try cb.linearNoBias(normalized, projection, offsets[offsets.len - 1], cfg.hidden_size, cfg.embedding_dim);
+        defer cb.free(projected);
+        const mean = cb.vtable.maskedMeanSegments orelse return error.EmbeddingGemma2OperationUnavailable;
+        const pooled = (try mean(cb.ptr, projected, offsets, cfg.embedding_dim)) orelse return error.EmbeddingGemma2OperationUnavailable;
+        defer cb.free(pooled);
+        const normalize = cb.vtable.maskedMeanBatch orelse return error.EmbeddingGemma2OperationUnavailable;
+        return (try normalize(cb.ptr, pooled, null, offsets.len - 1, 1, cfg.embedding_dim, dimensions, true)) orelse error.EmbeddingGemma2OperationUnavailable;
+    }
     const pooled = (try cb.vtable.maskedMeanSegments.?(cb.ptr, normalized, offsets, cfg.hidden_size)) orelse return error.EmbeddingGemma2OperationUnavailable;
     defer cb.free(pooled);
     const projected = try cb.linearNoBias(pooled, projection, offsets.len - 1, cfg.hidden_size, cfg.embedding_dim);
@@ -1426,8 +1455,17 @@ fn poolCompactProjectNormalize(cb: *const ComputeBackend, cfg: Config, normalize
     return (try cb.vtable.maskedMeanBatch.?(cb.ptr, projected, null, offsets.len - 1, 1, cfg.embedding_dim, dimensions, true)) orelse error.EmbeddingGemma2OperationUnavailable;
 }
 
-/// Mean commutes only with the final linear projection, never with token RMSNorm.
+/// Mean can precede an unrounded final projection; reduced publications and
+/// token RMSNorm retain their original token order.
 fn poolProjectNormalize(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, normalized: CT, projection: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
+    // Per-token publication rounding breaks the linear/mean interchange.
+    // Preserve the token projection before the F32 pooling and normalization.
+    if (cb.arithmetic_publication_dtype == .bf16 or cb.arithmetic_publication_dtype == .f16) {
+        const projected = try cb.linearNoBias(normalized, projection, batch * seq, cfg.hidden_size, cfg.embedding_dim);
+        defer cb.free(projected);
+        const pool = cb.vtable.maskedMeanBatch orelse return error.EmbeddingGemma2OperationUnavailable;
+        return (try pool(cb.ptr, projected, mask, batch, seq, cfg.embedding_dim, dimensions, true)) orelse error.EmbeddingGemma2OperationUnavailable;
+    }
     if (cb.kind() == .metal or cb.kind() == .graph) {
         if (cb.vtable.maskedMeanBatch) |pool| {
             if (try pool(cb.ptr, normalized, mask, batch, seq, cfg.hidden_size, cfg.hidden_size, false)) |pooled| {
@@ -2139,4 +2177,66 @@ test "Gemma text metadata and validation share the full exact registered checkpo
     try visitTextWeights(.{}, &inventory, Store.visit);
     try std.testing.expectEqual(declaration.entries, inventory.names.count());
     try std.testing.expectEqual(declaration.name_bytes, inventory.bytes);
+}
+
+test "projected pooling preserves per-token reduced-precision publication" {
+    const native = @import("../ops/native_compute.zig");
+    const round = @import("antfly_tile").fexpr.roundBf16Value;
+    const Rounded = struct {
+        fn pool(ctx: *anyopaque, input: CT, mask: ?[]const i64, batch: usize, sequence: usize, width: usize, dimensions: usize, normalize: bool) anyerror!?CT {
+            const compute: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+            if (!normalize) return error.ExpectedNormalization;
+            const cb = compute.computeBackend();
+            const values = try cb.toFloat32(input, compute.allocator);
+            defer compute.allocator.free(values);
+            const output = try compute.allocator.alloc(f32, batch * dimensions);
+            defer compute.allocator.free(output);
+            try @import("embedding_gemma2_reference.zig").maskedMeanL2(output, values, mask orelse return error.ExpectedMask, batch, sequence, width);
+            return cb.fromFloat32Shape(output, &.{ @intCast(batch), @intCast(dimensions) });
+        }
+        fn linear(ctx: *anyopaque, x: CT, w: CT, rows: usize, input: usize, output: usize) anyerror!CT {
+            const compute: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+            const cb = compute.computeBackend();
+            const result = try cb.linearNoBias(x, w, rows, input, output);
+            defer cb.free(result);
+            const values = try cb.toFloat32(result, compute.allocator);
+            defer compute.allocator.free(values);
+            for (values) |*value| value.* = @import("antfly_tile").fexpr.roundBf16Value(value.*);
+            return cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(output) });
+        }
+    };
+    const a = std.testing.allocator;
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var table = cb.vtable.*;
+    table.linearNoBias = Rounded.linear;
+    table.maskedMeanBatch = Rounded.pool;
+    cb.vtable = &table;
+    cb.arithmetic_publication_dtype = .bf16;
+    const x = [_]f32{ 1.015625, 0.88671875, 1.046875, -0.3984375 };
+    const w = [_]f32{ 0.3515625, 0.9765625, 0.232421875, -0.359375 };
+    const input = try cb.fromFloat32Shape(&x, &.{ 2, 2 });
+    defer cb.free(input);
+    const projection_weight = try cb.fromFloat32Shape(&w, &.{ 2, 2 });
+    defer cb.free(projection_weight);
+    for ([_][2]i64{ .{ 1, 1 }, .{ 1, 0 } }) |mask| {
+        var expected: [2]f32 = @splat(0);
+        var count: f32 = 0;
+        for (mask, 0..) |active, row| {
+            if (active == 0) continue;
+            count += 1;
+            for (0..2) |col| expected[col] += round(x[2 * row] * w[2 * col] + x[2 * row + 1] * w[2 * col + 1]);
+        }
+        for (&expected) |*value| value.* /= count;
+        const inv = 1 / @sqrt(expected[0] * expected[0] + expected[1] * expected[1]);
+        for (&expected) |*value| value.* *= inv;
+        const result = try poolProjectNormalize(&cb, a, .{ .hidden_size = 2, .embedding_dim = 2 }, input, projection_weight, &mask, 1, 2, 2);
+        defer cb.free(result);
+        const actual = try cb.toFloat32(result, a);
+        defer a.free(actual);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    }
 }

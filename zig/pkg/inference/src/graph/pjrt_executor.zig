@@ -485,7 +485,11 @@ pub fn createExecutorWithOptions(
     defer result.deinit();
 
     // 2. Compile HLO via PJRT
-    var executable = try client.compile(result.hlo_bytes, result.output_node_ids.len);
+    // Retain the source vendor accumulation before BF16 publication. A
+    // mathematically equivalent Triton GEMM can cross a BF16 midpoint.
+    var executable = try client.compileWithOptions(result.hlo_bytes, result.output_node_ids.len, client.device, .{
+        .gpu_gemm = if (options.precision == .bf16 and std.ascii.eqlIgnoreCase(try client.platformName(), "cuda")) .vendor else .provider_default,
+    });
     var executable_owned = true;
     errdefer if (executable_owned) executable.deinit();
 

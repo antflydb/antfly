@@ -624,6 +624,18 @@ fn fuseLinearPairs(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult
     var num_rewrites: u32 = 0;
 
     const count = work.nodeCount();
+    // Changing a GEMM's output geometry can change F32 accumulation and flip
+    // a subsequent low-precision rounding decision. Such publications retain
+    // their independent projections until a grouped schedule is qualified.
+    const rounded = try allocator.alloc(bool, count);
+    defer allocator.free(rounded);
+    @memset(rounded, false);
+    for (work.nodes.items) |node| if (node.op == .convert_dtype and
+        (node.op.convert_dtype.target == .bf16 or node.op.convert_dtype.target == .f16))
+    {
+        const input = node.inputs[0];
+        if (input != null_node and input < count) rounded[input] = true;
+    };
 
     // Group by (input_id, rows, in_dim) — out_dim is intentionally NOT
     // part of the key so GQA-style Q/K/V (with different out_dim) end
@@ -650,6 +662,7 @@ fn fuseLinearPairs(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult
         const n = work.node(@intCast(i));
         switch (n.op) {
             .fused_linear_no_bias => |attrs| {
+                if (rounded[i]) continue;
                 const key = GroupKey{
                     .input_id = n.inputs[0],
                     .rows = attrs.rows,
@@ -5726,4 +5739,32 @@ fn expectPrecisionInput(g: *const Graph, input: NodeId, dtype: DType) !void {
         try std.testing.expectEqual(.convert_dtype, std.meta.activeTag(narrow.op));
         try std.testing.expectEqual(dtype, narrow.op.convert_dtype.target);
     }
+}
+
+test "rounded linear publications preserve independent GEMM geometry" {
+    const a = std.testing.allocator;
+    for ([_]DType{ .f16, .bf16 }) |dtype| for ([_]usize{ 2, 3 }) |count| {
+        var g = Graph.init(a);
+        defer g.deinit();
+        var b = Builder.init(&g);
+        const x = try b.parameter("x", Shape.init(.f32, &.{ 3, 8 }));
+        const names = [_][]const u8{ "q", "k", "v" };
+        for (names[0..count]) |name| {
+            const w = try b.parameter(name, Shape.init(.f32, &.{ 8, 8 }));
+            const projection = try addBareFusedLinearNoBias(&g, x, w, 3, 8, 8);
+            try g.markOutput(try b.convertDtype(try b.convertDtype(projection, dtype), .f32));
+        }
+        var result = try fuse(a, &g);
+        defer result.deinit();
+        var projections: usize = 0;
+        for (result.graph.nodes.items) |node| switch (node.op) {
+            .fused_linear_no_bias_pair => return error.UnexpectedRoundedProjectionPair,
+            .fused_linear_no_bias => |attrs| {
+                try std.testing.expectEqual(@as(u32, 8), attrs.out_dim);
+                projections += 1;
+            },
+            else => {},
+        };
+        try std.testing.expectEqual(count, projections);
+    };
 }
