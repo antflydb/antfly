@@ -4034,17 +4034,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // repointed `replay_payload` at its own decoded copy).
                     if (maybe_record != null and record_matches_replay_payload) {
                         const record = maybe_record.?;
-                        var kept_hints_buf: [8]change_journal_mod.TargetHint = undefined;
-                        var kept_len: usize = 0;
+                        // `record.target_hints` is built per-document by
+                        // `recordFromDerivedBatch` (one append per matching
+                        // `doc.targets` entry, across every document in the
+                        // batch) and is NOT deduplicated like the encoded
+                        // on-disk bitmask is -- a batch of more than
+                        // `TargetHint`'s 8 variants can carry more than 8
+                        // (duplicate) hints. A fixed `[8]TargetHint` buffer
+                        // here (one slot per variant, matching the *decoded*
+                        // invariant, not this in-memory one) silently assumed
+                        // that bound and overflowed it. `Dropper.drop` only
+                        // ever filters this same slice down, never adds to
+                        // it, so `kept_hints` can never exceed
+                        // `record.target_hints.len` -- size it from that
+                        // real input instead, the same way the sibling
+                        // decode-path branch below already does.
+                        var kept_hints: std.ArrayListUnmanaged(change_journal_mod.TargetHint) = .empty;
                         for (record.target_hints) |hint| {
-                            if (!Dropper.drop(hint, suppress_full_text, suppress_graph, suppress_sparse, suppress_dense, suppress_algebraic)) {
-                                kept_hints_buf[kept_len] = hint;
-                                kept_len += 1;
-                            }
+                            if (!Dropper.drop(hint, suppress_full_text, suppress_graph, suppress_sparse, suppress_dense, suppress_algebraic)) try kept_hints.append(group_alloc, hint);
                         }
-                        if (kept_len != record.target_hints.len) {
+                        if (kept_hints.items.len != record.target_hints.len) {
                             var suppressed_record = record;
-                            suppressed_record.target_hints = kept_hints_buf[0..kept_len];
+                            suppressed_record.target_hints = kept_hints.items;
                             const encoded = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, suppressed_record);
                             suppressed_replay_payload = encoded;
                             replay_append = .{ .sequence = entry.sequence, .payload = encoded };
