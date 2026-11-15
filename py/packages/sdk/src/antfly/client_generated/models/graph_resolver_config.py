@@ -52,6 +52,9 @@ class GraphResolverConfig:
             suppressed keys are rejected. Runtime suppressions are additive and outlive index versions.
         scorer_json (str | Unset):
         candidate_search (GraphResolverConfigCandidateSearch | Unset):
+        candidate_key_prefix (str | Unset): Optional canonical key namespace ending in /. Prefix and ANN blocking apply
+            it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target
+            table. Empty preserves unrestricted native matching.
         candidate_ann_index (str | Unset):
         candidate_limit (int | Unset):
         name_embedding (str | Unset):
@@ -83,6 +86,7 @@ class GraphResolverConfig:
     suppress: GraphResolverSuppressionConfig | Unset = UNSET
     scorer_json: str | Unset = UNSET
     candidate_search: GraphResolverConfigCandidateSearch | Unset = UNSET
+    candidate_key_prefix: str | Unset = UNSET
     candidate_ann_index: str | Unset = UNSET
     candidate_limit: int | Unset = UNSET
     name_embedding: str | Unset = UNSET
@@ -142,6 +146,8 @@ class GraphResolverConfig:
         if not isinstance(self.candidate_search, Unset):
             candidate_search = self.candidate_search.value
 
+        candidate_key_prefix = self.candidate_key_prefix
+
         candidate_ann_index = self.candidate_ann_index
 
         candidate_limit = self.candidate_limit
@@ -195,6 +201,8 @@ class GraphResolverConfig:
             field_dict["scorer_json"] = scorer_json
         if candidate_search is not UNSET:
             field_dict["candidate_search"] = candidate_search
+        if candidate_key_prefix is not UNSET:
+            field_dict["candidate_key_prefix"] = candidate_key_prefix
         if candidate_ann_index is not UNSET:
             field_dict["candidate_ann_index"] = candidate_ann_index
         if candidate_limit is not UNSET:
@@ -288,6 +296,8 @@ class GraphResolverConfig:
         else:
             candidate_search = GraphResolverConfigCandidateSearch(_candidate_search)
 
+        candidate_key_prefix = d.pop("candidate_key_prefix", UNSET)
+
         candidate_ann_index = d.pop("candidate_ann_index", UNSET)
 
         candidate_limit = d.pop("candidate_limit", UNSET)
@@ -329,6 +339,7 @@ class GraphResolverConfig:
             suppress=suppress,
             scorer_json=scorer_json,
             candidate_search=candidate_search,
+            candidate_key_prefix=candidate_key_prefix,
             candidate_ann_index=candidate_ann_index,
             candidate_limit=candidate_limit,
             name_embedding=name_embedding,

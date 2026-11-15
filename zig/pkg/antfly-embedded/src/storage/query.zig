@@ -241,13 +241,11 @@ pub fn executeStorageKernelGraphEdges(
     };
     try checkQueryDeadline(control_req);
     try local_graph.validateGraphEdgesTensorAccessPath(alloc, req);
-    const result = try db.graphEdgesForInternalReadBoundedAt(alloc, req.index_name, req.key, req.edge_types, req.direction, req.identity_read_generation, req.ttl_now_ns, req.max_edges, req.max_owned_bytes, req.max_scanned_rows);
-    errdefer {
-        graph_mod.GraphIndex.freeEdges(alloc, result.edges);
-    }
+    var result = try db.graphEdgesForInternalRead(alloc, req);
+    errdefer result.deinit(alloc);
     try checkQueryDeadline(control_req);
     try raw_graph.check();
-    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
+    return result;
 }
 
 pub fn validateGraphHydrateIncomingIndexIdentity(
@@ -323,7 +321,7 @@ pub fn collectTextStatsFromDbForRequest(
                     .resolved_doc_filter = if (parsed.resolved_doc_filter) |filter| filter.resolved_doc_filter else null,
                 };
             }
-            break :blk try db.collectExplicitTextStats(alloc, explicit);
+            break :blk try db.collectExplicitTextStatsWithPrivacyPolicy(alloc, explicit, parsed.privacy_policy_version);
         },
         .background_fields => return error.InvalidQueryRequest,
     };
@@ -354,7 +352,7 @@ pub fn collectBackgroundTextStatsFromDbForRequest(
                     .resolved_doc_filter = if (parsed.resolved_doc_filter) |filter| filter.resolved_doc_filter else null,
                 };
             }
-            break :blk try db.collectExplicitBackgroundTextStats(alloc, explicit);
+            break :blk try db.collectExplicitBackgroundTextStatsWithPrivacyPolicy(alloc, explicit, parsed.privacy_policy_version);
         },
         else => return error.InvalidQueryRequest,
     };

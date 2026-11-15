@@ -3101,6 +3101,26 @@ pub const Store = struct {
     }
 };
 
+/// A short read-only probe opens the current inode and pins its checkpoint
+/// with a reader lock. It neither refreshes the caller's runtime nor reserves
+/// the path writer lease.
+const AuthorityProbe = struct {
+    file: native.NativeFile,
+    prefix: []const u8,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn get(self: *AuthorityProbe, key: []const u8) ![]const u8 {
+        const a = self.arena.allocator();
+        const physical = if (self.prefix.len == 0) key else try std.mem.concat(a, u8, &.{ self.prefix, key });
+        return (try self.file.getDocumentAlloc(a, physical)) orelse error.NotFound;
+    }
+
+    pub fn abort(self: *AuthorityProbe) void {
+        self.file.close();
+        self.arena.deinit();
+    }
+};
+
 const RuntimeStore = struct {
     store: *Store,
     prefix: []const u8 = "",
@@ -3111,6 +3131,21 @@ const RuntimeStore = struct {
 
     pub fn beginRead(self: *RuntimeStore) !Txn {
         return try Txn.openReadWithPrefix(self.store, self.prefix);
+    }
+
+    pub fn beginAuthorityProbe(self: *RuntimeStore) !AuthorityProbe {
+        const store = self.store;
+        const io = store.file.runtime();
+        if (!store.generation_lock.tryLockShared(io)) return error.WouldBlock;
+        defer store.generation_lock.unlockShared(io);
+        var file = try native.NativeFile.openWithIo(store.allocator, io, store.file.path, .{ .read_only = true });
+        errdefer file.close();
+        // An independently restored path can reuse a replay generation. Its
+        // checkpoint cannot certify visibility for the retained namespace.
+        if ((try file.file.stat(io)).inode != (try store.file.file.stat(io)).inode)
+            return error.EnrichmentSourceChanged;
+        file.page_cache_policy = .metadata_only;
+        return .{ .file = file, .prefix = self.prefix, .arena = .init(store.allocator) };
     }
 
     pub fn beginWrite(self: *RuntimeStore) !Txn {

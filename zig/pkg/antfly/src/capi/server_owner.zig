@@ -146,6 +146,11 @@ pub const StorageOwnerContext = struct {
     backend_runtime: db_mod.background_runtime.BackendRuntimeHandle,
     inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
     remote_content_source: ?kernel_runtime_services.RemoteContentSource = null,
+    remote_content_acquire_if_changed: ?kernel_runtime_services.CachedRemoteContentSource.AcquireIfChanged = null,
+    remote_content_probe: ?kernel_runtime_services.CachedRemoteContentSource.Probe = null,
+    remote_content_snapshot: ?*RemoteContentSnapshot = null,
+    remote_content_snapshot_mutex: std.atomic.Mutex = .unlocked,
+    remote_content_build_mutex: std.atomic.Mutex = .unlocked,
     remote_content_security: ?std.json.Parsed(scraping.ContentSecurityConfig) = null,
     // An unconfigured facade denies destinations; acquisition errors propagate.
     remote_content: scraping.RemoteContentConfig = .{ .security = .{ .allowed_hosts = &.{}, .allowed_paths = &.{} } },
@@ -250,6 +255,7 @@ pub const StorageOwnerContext = struct {
         if (self.auth_backend) |*backend| backend.close();
         if (self.lite_backend) |*backend| backend.deinit();
         if (self.remote_content_security) |*parsed| parsed.deinit();
+        if (self.remote_content_snapshot) |snapshot| RemoteContentSnapshot.release(snapshot);
         self.clearInferenceDefaults();
         if (self.native_queries) |repository| {
             self.backend_runtime.ptr().query_cut_repository = null;
@@ -1063,12 +1069,22 @@ pub fn storageOwnerContextConfigureRemoteContentSource(
     source: *const kernel_runtime_services.RemoteContentSource,
 ) callconv(.c) kernel_owner_abi.Status {
     const owner = asStorageOwnerContext(context) orelse return .invalid_argument;
-    if ((source.version != 1 and source.version != 2) or source._reserved != 0) return .invalid_argument;
+    if ((source.version != 1 and source.version != 2 and source.version != 3) or source._reserved != 0) return .invalid_argument;
     owner.lock();
     defer owner.mutex.unlock();
     if (owner.active_owners != 0) return .busy;
     if (owner.remote_content_security) |*previous| previous.deinit();
     owner.remote_content_security = null;
+    if (owner.remote_content_snapshot) |snapshot| RemoteContentSnapshot.release(snapshot);
+    owner.remote_content_snapshot = null;
+    owner.remote_content_acquire_if_changed = if (source.version == 3)
+        @as(*const kernel_runtime_services.CachedRemoteContentSource, @ptrCast(source)).acquire_if_changed
+    else
+        null;
+    owner.remote_content_probe = if (source.version == 3)
+        @as(*const kernel_runtime_services.CachedRemoteContentSource, @ptrCast(source)).probe
+    else
+        null;
     owner.remote_content.security = .{ .allowed_hosts = &.{}, .allowed_paths = &.{} };
     owner.remote_content_source = source.*;
     owner.remote_content.runtime = .{ .context = owner, .acquire_fn = acquireRemoteContent };
@@ -1076,11 +1092,18 @@ pub fn storageOwnerContextConfigureRemoteContentSource(
 }
 
 const RemoteContentSnapshot = struct {
+    refs: std.atomic.Value(usize) = .init(1),
+    revision: [32]u8 = @splat(0),
     parsed: std.json.Parsed(scraping.RemoteContentSnapshotData),
     config: scraping.RemoteContentConfig,
+    fn acquire(self: *@This()) scraping.RemoteContentConfig.Snapshot {
+        _ = self.refs.fetchAdd(1, .monotonic);
+        return .{ .config = &self.config, .revision = self.revision, .context = self, .release_fn = release };
+    }
     fn release(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        self.config.gcs_connections.deinit(std.heap.smp_allocator);
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        scraping.RemoteContentSnapshotData.deinitConfig(&self.config, std.heap.smp_allocator);
         self.parsed.deinit();
         std.heap.smp_allocator.destroy(self);
     }
@@ -1099,19 +1122,73 @@ fn acquireRemoteContent(raw: *anyopaque, output: *scraping.RemoteContentConfig.S
 fn acquireRemoteContentImpl(raw: *anyopaque) !scraping.RemoteContentConfig.Snapshot {
     const owner: *StorageOwnerContext = @ptrCast(@alignCast(raw));
     const source = owner.remote_content_source.?;
+    if (owner.remote_content_acquire_if_changed) |acquire_if_changed| {
+        // A probe may refresh a file-backed publisher. Never hold a consumer
+        // lock across it: other readers must be able to acquire the publisher's
+        // current publication while one request checks a slow replacement.
+        var revision: kernel_runtime_services.CachedRemoteContentSource.Revision = .{};
+        try remoteContentSourceStatus(owner.remote_content_probe.?(source.context, &revision));
+        if (revision.known > 1) return error.InvalidRemoteContentConfig;
+        if (revision.known == 1) {
+            antfly.platform_sync.lockYielding(&owner.remote_content_snapshot_mutex);
+            defer owner.remote_content_snapshot_mutex.unlock();
+            if (owner.remote_content_snapshot) |held| {
+                if (std.mem.eql(u8, &held.revision, &revision.value)) return held.acquire();
+            }
+        }
+        // Only cold or changed revisions wait for the builder. The second
+        // acquisition checks the latest publication, so a delayed probe cannot
+        // overwrite a newer cached revision with its older observation.
+        antfly.platform_sync.lockYielding(&owner.remote_content_build_mutex);
+        defer owner.remote_content_build_mutex.unlock();
+        const previous_revision: ?[32]u8 = blk: {
+            antfly.platform_sync.lockYielding(&owner.remote_content_snapshot_mutex);
+            defer owner.remote_content_snapshot_mutex.unlock();
+            break :blk if (owner.remote_content_snapshot) |held| held.revision else null;
+        };
+        var update: kernel_runtime_services.CachedRemoteContentSource.Update = .{};
+        try remoteContentSourceStatus(acquire_if_changed(source.context, if (previous_revision) |*held| held else null, &update));
+        if (update.bytes.ptr == null) {
+            if (update.bytes.len != 0) return error.InvalidRemoteContentConfig;
+            antfly.platform_sync.lockYielding(&owner.remote_content_snapshot_mutex);
+            defer owner.remote_content_snapshot_mutex.unlock();
+            const held = owner.remote_content_snapshot orelse return error.InvalidRemoteContentConfig;
+            if (!std.mem.eql(u8, &held.revision, &update.revision)) return error.InvalidRemoteContentConfig;
+            return held.acquire();
+        }
+        defer source.release(source.context, update.bytes);
+        const next = try parseRemoteContentSnapshot(source.version, update.bytes);
+        next.revision = update.revision;
+        antfly.platform_sync.lockYielding(&owner.remote_content_snapshot_mutex);
+        const previous = owner.remote_content_snapshot;
+        owner.remote_content_snapshot = next;
+        const lease = next.acquire();
+        owner.remote_content_snapshot_mutex.unlock();
+        if (previous) |held| RemoteContentSnapshot.release(held);
+        return lease;
+    }
     var bytes: kernel_owner_abi.OwnedBytes = .{};
-    switch (source.acquire(source.context, &bytes)) {
+    try remoteContentSourceStatus(source.acquire(source.context, &bytes));
+    defer source.release(source.context, bytes);
+    const snapshot = try parseRemoteContentSnapshot(source.version, bytes);
+    return .{ .config = &snapshot.config, .context = snapshot, .release_fn = RemoteContentSnapshot.release };
+}
+
+fn remoteContentSourceStatus(status: kernel_owner_abi.Status) !void {
+    switch (status) {
         .ok => {},
         .out_of_memory => return error.OutOfMemory,
         .timeout => return error.Timeout,
         .cancelled => return error.Canceled,
         else => return error.ResourceTemporarilyUnavailable,
     }
-    defer source.release(source.context, bytes);
+}
+
+fn parseRemoteContentSnapshot(version: u32, bytes: kernel_owner_abi.OwnedBytes) !*RemoteContentSnapshot {
     const alloc = std.heap.smp_allocator;
     const snapshot = try alloc.create(RemoteContentSnapshot);
     errdefer alloc.destroy(snapshot);
-    var parsed = if (source.version == 1) blk: {
+    var parsed = if (version == 1) blk: {
         const legacy = try std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, bytes.slice(), .{ .allocate = .alloc_always });
         break :blk std.json.Parsed(scraping.RemoteContentSnapshotData){
             .arena = legacy.arena,
@@ -1120,7 +1197,7 @@ fn acquireRemoteContentImpl(raw: *anyopaque) !scraping.RemoteContentConfig.Snaps
     } else try std.json.parseFromSlice(scraping.RemoteContentSnapshotData, alloc, bytes.slice(), .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     snapshot.* = .{ .parsed = parsed, .config = try parsed.value.configAlloc(alloc) };
-    return .{ .config = &snapshot.config, .context = snapshot, .release_fn = RemoteContentSnapshot.release };
+    return snapshot;
 }
 
 pub fn storageOwnerContextConfigureRemoteContentSecurity(
@@ -1145,6 +1222,10 @@ pub fn storageOwnerContextConfigureRemoteContentSecurity(
     }
     var previous = owner_context.remote_content_security;
     owner_context.remote_content_source = null;
+    owner_context.remote_content_acquire_if_changed = null;
+    owner_context.remote_content_probe = null;
+    if (owner_context.remote_content_snapshot) |snapshot| RemoteContentSnapshot.release(snapshot);
+    owner_context.remote_content_snapshot = null;
     owner_context.remote_content.runtime = null;
     owner_context.remote_content_security = parsed;
     owner_context.remote_content.security = if (owner_context.remote_content_security) |*value| value.value else null;
@@ -2481,6 +2562,24 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.reportBaselineProgressForKey(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .owner_readiness => |input| {
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
+                    const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{
+                        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+                        .cancellation = ownerQueryCancellation(&request.control),
+                    };
+                    const value = handle.store.ownerReadiness(a, group_id, input, budget) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .owner_readiness_transitions => |input| {
+                    if (request.control.version != kernel_owner_abi.query_abi_version) break :blk .invalid_abi;
+                    const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{
+                        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+                        .cancellation = ownerQueryCancellation(&request.control),
+                    };
+                    const value = handle.store.ownerReadinessTransitions(a, group_id, input, budget) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .read_control_stores => |groups| {
                     const value = handle.store.readControlStores(a, group_id, groups) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -2526,6 +2625,24 @@ pub fn metadataApplyStoreProjection(
                 .sql_policy_definition_command => |input| {
                     const value = handle.store.sqlPolicyDefinitionCommandJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .has_index_aliases => {
+                    const value = handle.store.hasIndexAliases(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .has_index_alias_lifecycle_state => {
+                    const value = handle.store.hasIndexAliasLifecycleState(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .validate_table_index_mutation => |input| {
+                    const Validation = @import("../metadata/storage/raft_apply_contract.zig").TableIndexMutationValidation;
+                    const result: Validation = result: {
+                        handle.store.validateTableIndexMutation(group_id, input.before, input.after) catch |err| {
+                            break :result Validation.fromError(err) orelse break :blk storageOwnerStatusFromError(err);
+                        };
+                        break :result .valid;
+                    };
+                    break :blk metadataProjectionJson(alloc, out_json, result);
                 },
                 .require_policy_index_mutation_allowed => |input| {
                     handle.store.requirePolicyIndexMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
@@ -4652,6 +4769,24 @@ pub fn storageOwnerPreflightWriteAdmission(
     var batch = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer batch.deinit(handle.alloc);
     local_write.validateGroupedSourceBatch(handle.alloc, &handle.db, batch.req.writes, batch.req.deletes, batch.req.transforms) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerPrepareEnrichments(owner: ?*anyopaque, request: *const kernel_owner_abi.WriteAdmissionRequest, out_command: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_command.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var owned = batch_api.parseOwnerBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+    const Adapter = struct {
+        fn canceled(ptr: *const anyopaque) bool {
+            const input: *const kernel_owner_abi.WriteAdmissionRequest = @ptrCast(@alignCast(ptr));
+            return if (input.cancellation_fn) |callback| callback(input.cancellation_ctx) != 0 else false;
+        }
+    };
+    const command = handle.db.prepareDirectEnrichmentsWithContext(handle.alloc, owned.req, .{ .io = handle.db.backend_runtime.io() orelse return storageOwnerStatusFromError(error.BackendRuntimeIoUnavailable), .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else null, .cancellation = .{ .ptr = request, .is_cancelled_fn = Adapter.canceled } }) catch |err| return storageOwnerStatusFromError(err);
+    out_command.* = .{ .ptr = command.ptr, .len = @intCast(command.len) };
     return .ok;
 }
 
@@ -7433,7 +7568,7 @@ pub fn replicatedBatchStorageKernelJsonAtRaftEntry(
         if (bundle.len == 0 or bundle.len > 4 * 1024 * 1024) return .invalid_argument;
         const receipt = handle.db.applyReplicatedRowPolicyPublication(bundle, publication, raft_entry) catch |err| {
             std.log.warn("native row policy phase apply failed table_id={} err={s}", .{ publication.table_id, @errorName(err) });
-            return storageOwnerStatusFromError(err);
+            return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
         };
         var result = owned.result();
         result.row_policy_receipt = receipt;

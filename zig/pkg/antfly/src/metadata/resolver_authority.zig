@@ -176,7 +176,10 @@ pub fn mutateOnService(svc: anytype, a: A, write: Write, context: local.api_oper
     errdefer a.free(bytes);
     const result = try std.json.parseFromSlice(View, a, bytes, .{});
     defer result.deinit();
-    if (!result.value.receipt) return error.ResolverCurationConflict;
+    if (!result.value.receipt) {
+        if (try store.writeValidationRevision(svc.metadata_group_id) != write.catalog_revision.?) return error.CatalogGenerationChanged;
+        return error.ResolverCurationConflict;
+    }
     try context.ensureActive();
     var response = result.value;
     const identity = try svc.catalogIdentity();

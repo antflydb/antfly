@@ -26,7 +26,10 @@ pytestmark = pytest.mark.model_integration
 # instruction. This keeps the smoke test fast while requiring the public answer
 # channel to produce user-visible content.
 CHAT_SMOKE_PROMPT = "/no_think\nReply with one short greeting."
-CHAT_SMOKE_MAX_TOKENS = 64
+# These assert the response and SSE contracts, not long-form generation. Eight
+# tokens leave room for a greeting and exercise the length finish path; longer
+# decode and context behavior are covered in test_generate.py.
+CHAT_SMOKE_MAX_TOKENS = 8
 
 
 def _first_generator_model(api):
@@ -44,6 +47,7 @@ def test_chat_basic(api):
         [{"role": "user", "content": CHAT_SMOKE_PROMPT}],
         model=model,
         max_tokens=CHAT_SMOKE_MAX_TOKENS,
+        chat_template_kwargs={"enable_thinking": False},
         request_timeout=FIRST_USE_REQUEST_TIMEOUT,
     )
     assert isinstance(resp.get("id"), str) and resp["id"].startswith("chatcmpl-"), resp
@@ -64,6 +68,7 @@ def test_chat_streaming(api):
         [{"role": "user", "content": CHAT_SMOKE_PROMPT}],
         model=model,
         max_tokens=CHAT_SMOKE_MAX_TOKENS,
+        chat_template_kwargs={"enable_thinking": False},
         stream=True,
         request_timeout=FIRST_USE_REQUEST_TIMEOUT,
     )

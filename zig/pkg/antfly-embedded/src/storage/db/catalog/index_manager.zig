@@ -1349,7 +1349,10 @@ pub const GraphMetricNotify = struct {
 /// Embeds documents' source text with an index's document embedder. Fills
 /// `out[i * dims ..]` and sets `found[i]` for each request; documents without
 /// source text stay not found.
+const LeannRecoverySession = @import("../../leann_recovery.zig").Session;
+
 pub const DenseReembedder = struct {
+    embed_session_fn: ?*const fn (*anyopaque, Allocator, []const enrichment_types.GeneratedEnrichmentRequest, u32, []f32, []bool, *LeannRecoverySession) anyerror!void = null,
     ctx: *anyopaque,
     embed_fn: *const fn (
         ctx: *anyopaque,
@@ -1402,6 +1405,9 @@ pub const IndexManager = struct {
     /// absent (for example without an enrichment runtime), reads of elided
     /// vectors fail with `error.ReembedUnavailable`.
     dense_reembedder: ?DenseReembedder = null,
+    /// Recently re-embedded vectors of transient LEANN indexes (32 MiB).
+    leann_reembed_cache: leann_store_mod.ManagedReembedCache = .{ .limit_bytes = 32 << 20 },
+    leann_range_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     text_main_backend: persistent_mod.MainBackend,
     text_lsm_storage: ?lsm_backend_mod.Storage,
     text_main_lsm_options: lsm_backend_mod.Options,
@@ -2306,10 +2312,16 @@ pub const IndexManager = struct {
         metric: vector_mod.DistanceMetric,
         external: bool,
         managed_direct_field: bool = false,
-        /// LEANN with `vector_storage: transient`: covered embeddings are
-        /// stored as elided stubs, and exact vectors are re-embedded from the
-        /// document through `IndexManager.dense_reembedder`.
+        /// LEANN with `vector_storage: transient` or `auto`: covered
+        /// embeddings are stored as elided stubs, and exact vectors are
+        /// re-embedded from the document through
+        /// `IndexManager.dense_reembedder`.
         leann_transient: bool = false,
+        /// `vector_storage: auto`: only embeddings marked `text_input` become
+        /// stubs; media-derived ones stay stored.
+        leann_text_only: bool = false,
+        /// `media_vectors: int8` (see `LeannDenseOptions.media_int8`).
+        leann_media_int8: bool = false,
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
         /// Terminal embedding artifact streams unioned into this index. This
@@ -2482,7 +2494,10 @@ pub const IndexManager = struct {
         native_vector_locations: std.AutoHashMapUnmanaged(u64, CachedNativeProjection) = .empty,
         native_vector_projection_bytes: std.ArrayListUnmanaged(u8) = .empty,
         native_projection_borrows: vector_block_store_mod.ProjectionBorrowScope = .{},
-        native_projection_borrow_budget: ?resource_manager_mod.BudgetedAllocator = null,
+        native_projection_budget: ?resource_manager_mod.BudgetedAllocator = null,
+        native_projection_peak_vectors: usize = 0,
+        native_projection_peak_copy_bytes: usize = 0,
+        native_projection_completed_waves: usize = 0,
         /// Bounded payload destinations and request descriptors owned only
         /// while one native positional-read wave is active. This makes the
         /// concurrency experiment visible to the same dense-search resource
@@ -2512,7 +2527,11 @@ pub const IndexManager = struct {
         working_slice: resource_manager_mod.Slice = .dense_apply_working_set,
         recycle_raw_reads: bool = true,
         cache_raw_values: bool = true,
+        /// Request-local copies and shared decoded residency have independent
+        /// purposes. Candidate-only exact queries can reuse shared residency
+        /// without retaining a second copy of every vector in the request.
         cache_vectors: bool = true,
+        cache_decoded_vectors: bool = true,
         block_cache_admission: backend_types.Namespace.BlockCacheAdmission = .retain,
         decoded_residency_lease: ?hbc_mod.DecodedVectorResidencyLease = null,
 
@@ -2554,10 +2573,10 @@ pub const IndexManager = struct {
             while (vector_it.next()) |entry| self.context.manager.alloc.free(entry.value_ptr.*);
             self.vector_cache.deinit(self.context.manager.alloc);
             self.clearNativeVectorLocations();
-            self.native_vector_locations.deinit(self.context.manager.alloc);
-            self.native_vector_projection_bytes.deinit(self.context.manager.alloc);
-            self.native_projection_borrows.deinit(self.projectionBorrowAllocator());
-            if (self.native_projection_borrow_budget) |*budget| budget.deinit();
+            self.native_vector_locations.deinit(self.projectionAllocator());
+            self.native_vector_projection_bytes.deinit(self.projectionAllocator());
+            self.native_projection_borrows.deinit(self.projectionAllocator());
+            if (self.native_projection_budget) |*budget| budget.deinit();
             if (self.residual_arena) |*arena| arena.deinit();
             if (self.residual_budget) |*budget| budget.deinit();
             self.context.manager.observeDenseWorkingBytes(self.working_slice, &self.working_bytes_current, 0);
@@ -2568,12 +2587,21 @@ pub const IndexManager = struct {
         }
 
         fn clearNativeVectorLocations(self: *@This()) void {
-            self.native_vector_locations.clearRetainingCapacity();
-            self.native_vector_projection_bytes.clearRetainingCapacity();
-            self.native_projection_borrows.clear();
+            self.clearNativeVectorProjections();
             if (self.native_vector_generation) |generation| generation.release();
             self.native_vector_generation = null;
             self.native_vector_source_sequence = null;
+        }
+
+        fn clearNativeVectorProjections(self: *@This()) void {
+            // A wave only grows until completion. Sampling at its boundary
+            // records its peak without adding a counter/lock per candidate.
+            self.native_projection_peak_vectors = @max(self.native_projection_peak_vectors, self.native_vector_locations.count());
+            self.native_projection_peak_copy_bytes = @max(self.native_projection_peak_copy_bytes, self.native_vector_projection_bytes.capacity);
+            if (self.native_vector_locations.count() > 0 or self.native_projection_borrows.leases.items.len > 0) self.native_projection_completed_waves += 1;
+            self.native_vector_locations.clearRetainingCapacity();
+            self.native_vector_projection_bytes.clearRetainingCapacity();
+            self.native_projection_borrows.clear();
             self.observeWorkingBytes();
         }
 
@@ -2596,7 +2624,7 @@ pub const IndexManager = struct {
         ) void {
             if (self.native_vector_locations.contains(vector_id)) return;
             if (projection.borrowed) {
-                self.native_vector_locations.put(self.context.manager.alloc, vector_id, .{
+                self.native_vector_locations.put(self.projectionAllocator(), vector_id, .{
                     .location = projection.located,
                     .byte_offset = 0,
                     .byte_len = projection.value.bytes.len,
@@ -2606,10 +2634,10 @@ pub const IndexManager = struct {
             }
             const old_len = self.native_vector_projection_bytes.items.len;
             self.native_vector_projection_bytes.appendSlice(
-                self.context.manager.alloc,
+                self.projectionAllocator(),
                 projection.value.bytes,
             ) catch return;
-            self.native_vector_locations.put(self.context.manager.alloc, vector_id, .{
+            self.native_vector_locations.put(self.projectionAllocator(), vector_id, .{
                 .location = projection.located,
                 .byte_offset = old_len,
                 .byte_len = projection.value.bytes.len,
@@ -2642,19 +2670,23 @@ pub const IndexManager = struct {
             return .{ .located = cached.location, .value = value };
         }
 
-        fn projectionBorrowAllocator(self: *@This()) Allocator {
-            if (self.native_projection_borrow_budget == null) {
-                if (self.context.manager.resource_manager) |manager| self.native_projection_borrow_budget = resource_manager_mod.BudgetedAllocator.init(manager, self.working_slice, self.context.manager.alloc, 1);
+        fn projectionAllocator(self: *@This()) Allocator {
+            if (self.native_projection_budget == null) {
+                if (self.context.manager.resource_manager) |manager| self.native_projection_budget = resource_manager_mod.BudgetedAllocator.init(manager, self.working_slice, self.context.manager.alloc, 1);
             }
-            return if (self.native_projection_borrow_budget) |*budget| budget.allocator() else self.context.manager.alloc;
+            return if (self.native_projection_budget) |*budget| budget.allocator() else self.context.manager.alloc;
         }
 
         fn cacheDecodedVector(self: *@This(), index: *hbc_mod.HBCIndex, vector_id: u64, vector: []const f32) void {
+            if (!self.cache_decoded_vectors) return;
             const lease = if (self.decoded_residency_lease) |*value| value else return;
             _ = index.cacheVectorForResidencyLease(lease, vector_id, vector) catch {};
         }
 
         fn ensureDecodedResidencyCapacity(self: *@This(), vector_count: usize, dims: usize) void {
+            // Exhaustive HBC scans disable decoded residency. Candidate-only
+            // exact batches may fill their admitted shared-cache lease.
+            if (!self.cache_decoded_vectors) return;
             const lease = if (self.decoded_residency_lease) |*value| value else return;
             const required_bytes = @as(u64, @intCast(vector_count)) *| hbc_mod.estimateDecodedVectorResidencyBytes(dims);
             if (lease.ensureCapacity(required_bytes)) return;
@@ -2670,7 +2702,12 @@ pub const IndexManager = struct {
             if (self.decoded_residency_lease) |*lease| lease.deinit();
             self.decoded_residency_lease = null;
             if (self.block_cache_admission == .retain) return;
-            self.recycleRawReadState();
+            // Changing residency may retire a current-tip probe, but must
+            // never change the visibility cut of an already captured snapshot.
+            // That snapshot keeps its original admission policy until it ends;
+            // future transactions use the new policy.
+            const snapshot_pinned = if (self.read_txn) |txn| txn.read != null else false;
+            if (!snapshot_pinned) self.recycleRawReadState();
             self.block_cache_admission = .retain;
         }
 
@@ -2683,7 +2720,7 @@ pub const IndexManager = struct {
 
         fn rawWorkingBytes(self: *const @This()) u64 {
             return self.vector_cache_bytes +| self.raw_cache_key_bytes +| self.raw_read_value_bytes +|
-                @as(u64, @intCast(self.native_vector_projection_bytes.capacity)) +| self.native_vector_io_bytes;
+                (if (self.native_projection_budget == null) @as(u64, @intCast(self.native_vector_projection_bytes.capacity)) else 0) +| self.native_vector_io_bytes;
         }
 
         fn setNativeVectorIoBytes(self: *@This(), bytes: u64) void {
@@ -2752,6 +2789,44 @@ pub const IndexManager = struct {
             self.observeWorkingBytes();
         }
 
+        const ScoringPolicy = enum { best_effort, exact_candidates, complete_snapshot };
+        const ScoringScope = struct {
+            session: *DenseVectorLoadSession,
+            cache_vectors: bool,
+            cache_decoded_vectors: bool,
+
+            fn deinit(scope: *@This()) void {
+                scope.session.clearNativeVectorLocations();
+                scope.session.cache_vectors = scope.cache_vectors;
+                scope.session.cache_decoded_vectors = scope.cache_decoded_vectors;
+            }
+        };
+
+        /// All query entry points share one visibility/retention transition.
+        /// Keep existing snapshots, retire probes at the query boundary, and
+        /// acquire a primary snapshot lazily only if scoring needs fallback.
+        fn beginScoring(self: *@This(), policy: ScoringPolicy) ScoringScope {
+            const scope = ScoringScope{ .session = self, .cache_vectors = self.cache_vectors, .cache_decoded_vectors = self.cache_decoded_vectors };
+            self.clearNativeVectorLocations();
+            if (policy != .best_effort) {
+                if (self.txn_override == null) {
+                    if (self.read_txn) |*txn| if (txn.probe != null) {
+                        self.recycleRawReadState();
+                        // These independent copies came from the old probe;
+                        // they cannot substitute for the new visibility cut.
+                        var it = self.vector_cache.iterator();
+                        while (it.next()) |entry| self.context.manager.alloc.free(entry.value_ptr.*);
+                        self.vector_cache.clearRetainingCapacity();
+                        self.vector_cache_bytes = 0;
+                        self.observeWorkingBytes();
+                    };
+                }
+                self.cache_vectors = false;
+                if (policy == .complete_snapshot) self.cache_decoded_vectors = false;
+            }
+            return scope;
+        }
+
         fn recycleRawReadStateIfNeeded(self: *@This()) !void {
             if (!self.recycle_raw_reads) return;
             if (self.raw_cache_key_bytes +| self.raw_read_value_bytes >= self.rawReadLimitBytes()) {
@@ -2772,7 +2847,9 @@ pub const IndexManager = struct {
         fn getTxn(self: *@This(), store: *docstore_mod.DocStore) !*docstore_mod.DocStore.Txn {
             if (self.snapshot_native_only) return error.DenseSnapshotNeedsPrimary;
             if (self.read_txn == null) {
-                self.read_txn = switch (self.read_txn_kind) {
+                // Exact queries retain one snapshot but release vector read buffers
+                // at every scoring wave. A probe cannot provide scoped reads.
+                self.read_txn = switch (if (self.working_slice == .dense_search_working_set and !self.cache_vectors) ReadTxnKind.snapshot else self.read_txn_kind) {
                     .probe => try store.beginProbeTxnWithBlockCacheAdmission(self.block_cache_admission),
                     .snapshot => try store.beginReadTxnWithBlockCacheAdmission(self.block_cache_admission),
                 };
@@ -2823,6 +2900,21 @@ pub const IndexManager = struct {
             self.noteRawValuesLoaded(&.{@as(?[]const u8, value)});
             try self.maybeCacheRawValue(key, value);
             return value;
+        }
+
+        /// Scoring views live only through this wave. Preserve the primary
+        /// snapshot and source lease, but own payloads in admitted wave scratch.
+        /// Mutation callers retain their existing transaction-owned read policy.
+        fn getManySortedForScoring(self: *@This(), store: *docstore_mod.DocStore, alloc: Allocator, keys: []const []const u8, values: []?[]const u8) !void {
+            if (keys.len != values.len) return error.InvalidArgument;
+            if (self.cache_vectors or self.working_slice != .dense_search_working_set or self.txn_override != null)
+                return self.getManySorted(store, keys, values);
+            const txn = try self.getTxn(store);
+            const owned = try alloc.alloc(?[]u8, keys.len);
+            try txn.getManySortedOwnedScoped(alloc, keys, owned);
+            for (owned, values) |value, *raw| raw.* = value;
+            self.raw_batch_reads += 1;
+            self.raw_cache_misses += keys.len;
         }
 
         pub fn getManySorted(self: *@This(), store: *docstore_mod.DocStore, keys: []const []const u8, values: []?[]const u8) !void {
@@ -4077,6 +4169,16 @@ pub const IndexManager = struct {
         return try std.fs.path.join(self.alloc, &.{ self.base_path, "vector-blocks" });
     }
 
+    /// Whether a dense index's exact vectors belong in the shared vector-block
+    /// plane. LEANN indexes keep only a graph and codes and re-read (or
+    /// re-embed) exact vectors themselves, so mirroring them there would keep
+    /// a float32 copy of every embedding that transient storage drops, and
+    /// its artifact scan would trip over the stubs. HBC posting readiness
+    /// never applies to them either.
+    fn denseIndexUsesVectorBlocks(entry: *const DenseIndex) bool {
+        return entry.index.leann == null;
+    }
+
     fn denseVectorArtifactNameCount(entry: *const DenseIndex) usize {
         return if (entry.embedding_names.len != 0) entry.embedding_names.len else 1;
     }
@@ -4160,12 +4262,14 @@ pub const IndexManager = struct {
     fn vectorBlockArtifactScopeHashesAlloc(self: *const IndexManager) ![]u64 {
         var scope_count: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             scope_count = std.math.add(usize, scope_count, denseVectorArtifactNameCount(entry)) catch
                 return error.OutOfMemory;
         }
         const hashes = try self.alloc.alloc(u64, scope_count);
         var offset: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             for (0..denseVectorArtifactNameCount(entry)) |index| {
                 hashes[offset] = denseVectorArtifactScopeHashAt(entry, index);
                 offset += 1;
@@ -4185,6 +4289,7 @@ pub const IndexManager = struct {
         var scopes = std.ArrayListUnmanaged(vector_block_store_mod.ArtifactScope).empty;
         errdefer scopes.deinit(self.alloc);
         for (self.dense_indexes.items) |*entry| {
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             for (0..denseVectorArtifactNameCount(entry)) |index| try scopes.append(self.alloc, .{
                 .name_hash = internal_keys.embeddingArtifactScopeHashForName(denseVectorArtifactNameAt(entry, index)),
                 .dimensions = entry.dims,
@@ -4213,7 +4318,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         snapshot_sequence: u64,
     ) !void {
-        if (self.vector_block_storage == null) return;
+        if (self.vector_block_storage == null or !denseIndexUsesVectorBlocks(entry)) return;
         if (try self.tryPrepareFreshDenseVectorCaptureBase(entry, snapshot_sequence)) return;
         try self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, snapshot_sequence);
         if (!try self.tryPrepareFreshDenseVectorCaptureBase(entry, snapshot_sequence))
@@ -4226,6 +4331,7 @@ pub const IndexManager = struct {
         snapshot_sequence: u64,
     ) !bool {
         const storage = self.vector_block_storage orelse return true;
+        if (!denseIndexUsesVectorBlocks(entry)) return true;
         self.lockAtomicWithBackoff(&self.vector_block_build_mu);
         defer self.vector_block_build_mu.unlock();
 
@@ -4262,7 +4368,7 @@ pub const IndexManager = struct {
         // index owns vectors. Otherwise the missing generation is repair debt
         // and the caller must rebuild it from the pinned primary boundary.
         for (self.dense_indexes.items) |*dense_entry| {
-            if (dense_entry == entry) continue;
+            if (dense_entry == entry or !denseIndexUsesVectorBlocks(dense_entry)) continue;
             if (dense_entry.index.stats().active_count != 0) return false;
         }
         var writer = try vector_block_store_mod.Store.open(self.alloc, storage, root);
@@ -4459,6 +4565,7 @@ pub const IndexManager = struct {
     }
 
     pub fn vectorBlockReadyForDenseIndex(self: *IndexManager, name: []const u8) bool {
+        if (self.denseIndex(name)) |leann_entry| if (!denseIndexUsesVectorBlocks(leann_entry)) return true;
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         const entry = self.denseIndex(name) orelse return false;
         if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
@@ -4483,11 +4590,13 @@ pub const IndexManager = struct {
     /// look incomplete.
     pub fn vectorBlockProjectionRequiredForDenseIndex(self: *IndexManager, name: []const u8) bool {
         const entry = self.denseIndex(name) orelse return false;
+        if (!denseIndexUsesVectorBlocks(entry)) return false;
         return entry.index.experimentalPostingWalAuthoritative();
     }
 
     pub fn denseNativeStoragePhase(self: *IndexManager, name: []const u8) types.DenseNativeStoragePhase {
         const entry = self.denseIndex(name) orelse return .legacy;
+        if (!denseIndexUsesVectorBlocks(entry)) return .legacy;
         const posting_authoritative = entry.index.experimentalPostingWalAuthoritative();
         if (posting_authoritative and self.vectorBlockReadyForDenseIndex(name)) return .native_authoritative;
         if (posting_authoritative or entry.index.experimentalPostingReadsEnabled()) return .native_validating;
@@ -4507,6 +4616,7 @@ pub const IndexManager = struct {
         source_sequence: u64,
         expected_count: u64,
     ) bool {
+        if (self.denseIndex(name)) |leann_entry| if (!denseIndexUsesVectorBlocks(leann_entry)) return true;
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         const entry = self.denseIndex(name) orelse return false;
         if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
@@ -4530,6 +4640,7 @@ pub const IndexManager = struct {
             // same table-wide base and starves the repair that can resolve it.
             // Serviceable operator rebuilds are not skipped because
             // repairUnavailable() is false for their retained generation.
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             if (self.repairUnavailable(entry.config.name)) continue;
             if (self.vectorBlockReadyForDenseIndex(entry.config.name)) continue;
             const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence();
@@ -4570,6 +4681,7 @@ pub const IndexManager = struct {
     pub fn vectorBlockProjectionPending(self: *IndexManager) bool {
         if (self.vector_block_storage == null) return false;
         for (self.dense_indexes.items) |*entry| {
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             if (!entry.index.experimentalPostingWalAuthoritative()) continue;
             if (!self.vectorBlockReadyForDenseIndex(entry.config.name)) return true;
         }
@@ -4767,7 +4879,7 @@ pub const IndexManager = struct {
         source_read: ?*docstore_mod.DocStore.Txn,
     ) !bool {
         const started_ns = platform_time.monotonicNs();
-        if (mutations.len == 0) return false;
+        if (mutations.len == 0 or !denseIndexUsesVectorBlocks(entry)) return false;
         const storage = self.vector_block_storage orelse return false;
         const current = self.acquireVectorBlockGeneration() orelse return false;
         defer current.release();
@@ -5067,6 +5179,7 @@ pub const IndexManager = struct {
         if (self.vector_block_storage == null) return;
         const converting = require_storage_encoding and !self.vectorBlockUsesDesiredEncoding();
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        if (!denseIndexUsesVectorBlocks(entry)) return;
         if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
             // A stable source snapshot may legitimately be ahead of the last
             // flattened posting generation. Publish that exact-vector plane
@@ -5441,6 +5554,7 @@ pub const IndexManager = struct {
     ) !void {
         if (self.vector_block_storage == null) return;
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        if (!denseIndexUsesVectorBlocks(entry)) return;
         if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
             return error.VectorBlockGenerationReservationLost;
         self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
@@ -5574,6 +5688,7 @@ pub const IndexManager = struct {
     }
 
     fn denseNativeAuthorityPermitted(self: *const IndexManager, entry: *const DenseIndex) bool {
+        if (entry.index.leann != null) return false;
         return self.denseNativeAuthorityTransitionPermitted(
             entry.native_physical_v2,
             entry.native_candidate_build_authorized,
@@ -5627,6 +5742,7 @@ pub const IndexManager = struct {
             if (!source.authorityPermitted()) return false;
         }
         const entry = self.denseIndex(name) orelse return false;
+        if (entry.index.leann != null) return false;
         return !entry.native_physical_v2;
     }
 
@@ -6100,6 +6216,8 @@ pub const IndexManager = struct {
         /// generation numbers borrowed from the mutable manager.
         artifact_catalogs: ?@import("../artifact_inventory.zig").Catalogs = null,
         catalog_empty: [3]bool = @splat(false),
+        publication_catalog_digests: [8][32]u8 = undefined,
+        publication_catalog_digest_count: usize = 0,
         /// Artifact-only text indexes consume generated records, not base rows.
         has_text_consumers: bool = false,
         text_requires_root: bool = true,
@@ -6112,6 +6230,8 @@ pub const IndexManager = struct {
         /// Per-row planning only substitutes the document identity and removes
         /// consumers already satisfied by explicit/direct vectors.
         generated_templates: []enrichment_types.GeneratedEnrichmentRequest,
+        /// Constant-time publication membership, compiled once per catalog.
+        generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
         /// Catalog-wide completion requirements include projections and
         /// resolver/promotion work that never appears in the provider queue.
         completion_plan: ?@import("../artifact_completion_plan.zig").Plan = null,
@@ -6131,6 +6251,7 @@ pub const IndexManager = struct {
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
+            self.generated_definitions.deinit(self.alloc);
             for (self.text_fields) |field| self.alloc.free(field);
             if (self.text_fields.len != 0) self.alloc.free(self.text_fields);
             for (self.dense_fields) |field| {
@@ -6182,6 +6303,36 @@ pub const IndexManager = struct {
                 } else if (!std.mem.eql(u8, bytes, @field(actual, field))) return false;
             }
             return true;
+        }
+
+        /// Exact catalog identity, including legacy absent encodings of empty
+        /// catalogs. Hashing happens once when the immutable plan is compiled.
+        pub fn publicationCatalogDigest(self: *const WritePlanSnapshot, txn: anytype) ![32]u8 {
+            const inventory = @import("../artifact_inventory.zig");
+            if (try inventory.publicationIdentity(txn)) |identity| {
+                for (self.publication_catalog_digests[0..self.publication_catalog_digest_count]) |digest|
+                    if (std.mem.eql(u8, &identity.digest, &digest)) return digest;
+                return error.EnrichmentSourceChanged;
+            }
+            const current = try inventory.catalogs(txn);
+            if (!self.matchesArtifactInventory(current)) return error.EnrichmentSourceChanged;
+            return current.digest();
+        }
+
+        fn compilePublicationCatalogDigests(self: *WritePlanSnapshot) void {
+            for (0..8) |mask| {
+                var catalogs = self.artifact_catalogs.?;
+                var valid = true;
+                inline for (.{ "indexes", "enrichments", "resolvers" }, 0..) |field, i| {
+                    if (mask & (@as(usize, 1) << i) != 0) {
+                        if (!self.catalog_empty[i]) valid = false;
+                        @field(catalogs, field) = "";
+                    }
+                }
+                if (!valid) continue;
+                self.publication_catalog_digests[self.publication_catalog_digest_count] = catalogs.digest();
+                self.publication_catalog_digest_count += 1;
+            }
         }
 
         fn cloneDense(alloc: Allocator, entry: DenseIndex) !DenseFieldWritePlan {
@@ -6290,7 +6441,7 @@ pub const IndexManager = struct {
         /// Validate against the same immutable catalog used to prepare this row.
         /// The caller owns scratch allocation and the parsed document lifetime.
         pub fn validateExternalVectorSpacesParsed(self: WritePlanSnapshot, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
-            try validateExternalVectorSpacesInPlan(&self, alloc, embeddings, document);
+            try validateExternalVectorSpacesInPlan(alloc, &self, embeddings, document);
         }
 
         pub fn appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(
@@ -6506,6 +6657,18 @@ pub const IndexManager = struct {
             doc_key: []const u8,
             extracted: mapper.ExtractedWrite,
         ) !BorrowedGeneratedRowPlan {
+            return self.planGeneratedEnrichmentsForRowBounded(alloc, doc_key, extracted, null, null);
+        }
+
+        pub fn planGeneratedEnrichmentsForRowBounded(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            extracted: mapper.ExtractedWrite,
+            budget: ?*@import("../commit_requirements.zig").OutputBudget,
+            context: ?@import("antfly_inference_execution_context").RequestContext,
+        ) !BorrowedGeneratedRowPlan {
+            if (context) |control| try control.check();
             var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
             errdefer {
                 for (requests.items) |request| {
@@ -6516,7 +6679,12 @@ pub const IndexManager = struct {
                 requests.deinit(alloc);
             }
             for (self.generated_templates, 0..) |template, template_index| {
+                if (context) |control| try control.check();
                 if (!self.generatedTemplateRequired(extracted, template_index) or !enrichment_types.appliesToDocument(template, doc_key)) continue;
+                // Charge request/coverage/pending bookkeeping before any
+                // descriptor or consumer-list allocation, including deferred
+                // producers whose work still has to be represented in replay.
+                if (budget) |account| try account.reserve(doc_key.len + template.index_name.len + template.artifact_name.len + template.embedding_name.len + 128, 1);
                 var request = template;
                 request.doc_key = doc_key;
                 if (request.kind == .dense_embedding or request.kind == .sparse_embedding) {
@@ -6525,7 +6693,9 @@ pub const IndexManager = struct {
                         var consumers = std.ArrayListUnmanaged([]u8).empty;
                         errdefer consumers.deinit(alloc);
                         for (template.consumer_indexes) |consumer| {
+                            if (context) |control| try control.check();
                             if (generatedConsumerSatisfied(extracted, request.kind, consumer)) continue;
+                            if (budget) |account| try account.reserve(consumer.len + 64, 1);
                             try consumers.append(alloc, consumer);
                         }
                         request.consumer_indexes = try consumers.toOwnedSlice(alloc);
@@ -6697,7 +6867,10 @@ pub const IndexManager = struct {
             errdefer alloc.free(identity);
             try external_spaces.put(alloc, name, identity);
         }
-        return .{
+        var generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+        errdefer generated_definitions.deinit(alloc);
+        for (generated_templates) |template| try generated_definitions.put(alloc, @import("../artifact_producer_input.zig").definitionDigest(template), {});
+        var result: WritePlanSnapshot = .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
             .external_vector_spaces = external_spaces,
@@ -6713,12 +6886,15 @@ pub const IndexManager = struct {
             .sparse_fields = sparse_fields,
             .graph_fields = graph_fields,
             .generated_templates = generated_templates,
+            .generated_definitions = generated_definitions,
             .group_sources = group_sources,
             .completion_plan = completion_plan,
             .chunk_dependents = chunk_dependents,
             .text_requires_root = text_requires_root,
             .text_fields = try text_fields.toOwnedSlice(alloc),
         };
+        result.compilePublicationCatalogDigests();
+        return result;
     }
 
     const WritePlanSnapshotEpoch = struct {
@@ -7396,6 +7572,7 @@ pub const IndexManager = struct {
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
         self.waitForGraphMetricSchedulePins();
+        self.leann_reembed_cache.deinit(self.alloc);
         if (self.write_plan_cache) |cached| {
             self.write_plan_cache = null;
             cached.release();
@@ -8890,6 +9067,32 @@ pub const IndexManager = struct {
     pub fn updateRange(self: *IndexManager, byte_range: docstore_mod.ByteRange) void {
         self.byte_range = byte_range;
         for (self.graph_indexes.items) |*entry| entry.index.reconcileOwnershipRange(byte_range.start, byte_range.end);
+        self.leann_range_pending.store(true, .release);
+        self.dropLeannKeysOutOfRange() catch |err| {
+            std.log.warn("leann range drop deferred err={s}", .{@errorName(err)});
+        };
+    }
+
+    /// LEANN graphs are not partitioned by key range: after a split narrows
+    /// this shard, keys that moved away would stay in the graph (taking
+    /// result slots and failing to re-embed). Drop them. Replicated stores
+    /// only mark them; the leader deletes them through the log, so every
+    /// replica, which runs this at the same apply position, agrees.
+    /// Idempotent, so reopening with the same range is harmless. Takes only
+    /// the LEANN records mutex (callers may hold the catalog lock).
+    pub fn dropLeannKeysOutOfRange(self: *IndexManager) !void {
+        self.lockAtomicWithBackoff(&self.leann_records_mutex);
+        defer self.leann_records_mutex.unlock();
+        try self.dropLeannKeysOutOfRangeLocked();
+    }
+
+    fn dropLeannKeysOutOfRangeLocked(self: *IndexManager) !void {
+        for (self.dense_indexes.items) |*entry| {
+            const store = entry.index.leann orelse continue;
+            const dropped = try store.dropKeysWhere(@as(*const IndexManager, self), IndexManager.leannKeyInRange);
+            if (dropped > 0) std.log.info("leann range drop index={s} keys={d}", .{ entry.config.name, dropped });
+        }
+        self.leann_range_pending.store(false, .release);
     }
 
     pub fn validateRangeTransition(self: *IndexManager, byte_range: docstore_mod.ByteRange) !void {
@@ -8927,6 +9130,7 @@ pub const IndexManager = struct {
         // Keep it while any consumer still needs stored vectors; the catalog
         // is the same on every replica, so all of them decide alike.
         if (self.embeddingHasPersistentConsumer(index_name, embedding_name)) return 0;
+        const keep_media_full = !entry.leann_media_int8 or self.embeddingHasFullMediaConsumer(index_name, embedding_name);
         var written: usize = 0;
         for (entries) |e| {
             if (e.key.len == 0) continue;
@@ -8944,10 +9148,20 @@ pub const IndexManager = struct {
             // Caller-supplied vectors cannot be reproduced by the embedder;
             // re-embedding would silently replace them.
             if (header.flags.authored) continue;
+            // `auto` keeps anything not embedded from text alone, unless
+            // `media_vectors: int8` keeps an int8 copy of it in the stub
+            // instead. The header is replicated data, so every replica
+            // decides alike.
+            const media = !header.flags.text_input;
+            if (media and keep_media_full) continue;
+            if (!media and !header.flags.has_source_hash) continue;
             const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(self.alloc, raw) catch continue;
             defer self.alloc.free(vector);
             if (vector.len != entry.dims or leann_store_mod.vectorDigest(vector) != e.digest) continue;
-            const stub = try enrichment_artifact_codec.encodeElidedDenseEmbeddingAlloc(self.alloc, header, @intCast(vector.len), e.digest);
+            const stub = if (media and entry.leann_media_int8)
+                try enrichment_artifact_codec.encodeInt8ElidedDenseEmbeddingAlloc(self.alloc, header, vector, e.digest)
+            else
+                try enrichment_artifact_codec.encodeElidedDenseEmbeddingAlloc(self.alloc, header, @intCast(vector.len), e.digest);
             defer self.alloc.free(stub);
             try txn.put(artifact_key, stub);
             written += 1;
@@ -8994,15 +9208,26 @@ pub const IndexManager = struct {
     /// The artifact key names the embedding, which covers `sources`
     /// indexes reading several of them.
     fn elidedArtifactOwner(self: *IndexManager, entry: *const DenseIndex, artifact_key: []const u8, doc_key: []const u8) ?struct { embedding_name: []const u8, doc_key: []const u8 } {
-        if (internal_keys.parseEmbeddingArtifactKeyView(artifact_key) catch null) |parsed| {
-            if (self.transientLeannOwns(parsed.artifact_name)) return .{ .embedding_name = parsed.artifact_name, .doc_key = parsed.doc_key };
+        for (entry.embedding_names) |name| {
+            if (embeddingArtifactKeyMatchesAnySource(artifact_key, &.{name}) and self.transientLeannOwns(name))
+                return .{ .embedding_name = name, .doc_key = doc_key };
         }
         if (entry.embedding_name) |name| if (self.transientLeannOwns(name)) return .{ .embedding_name = name, .doc_key = doc_key };
         return null;
     }
 
-    /// Whether an index other than `index_name` consumes `embedding_name` and
-    /// reads stored vectors (anything but another transient LEANN index).
+    /// An int8 rewrite must respect every other consumer's media policy.
+    fn embeddingHasFullMediaConsumer(self: *IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
+        for (self.dense_indexes.items) |*other| {
+            if (std.mem.eql(u8, other.config.name, index_name)) continue;
+            const consumes = if (other.embedding_name) |name| std.mem.eql(u8, name, embedding_name) else false;
+            if (consumes and !other.leann_media_int8) return true;
+            for (other.embedding_names) |name| if (std.mem.eql(u8, name, embedding_name) and !other.leann_media_int8) return true;
+        }
+        return false;
+    }
+
+    /// Whether another consumer requires the full stored artifact.
     fn embeddingHasPersistentConsumer(self: *IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
         for (self.dense_indexes.items) |*other| {
             if (std.mem.eql(u8, other.config.name, index_name)) continue;
@@ -9029,6 +9254,22 @@ pub const IndexManager = struct {
         _ = try self.elideLeannVectorsTxn(txn, index_name, entries);
     }
 
+    /// Whether a local transient LEANN index has covered vectors waiting to
+    /// become stubs, so callers can skip the exclusive apply lock that
+    /// `elideLocalLeannVectors` needs. Call with the apply lock held (shared
+    /// is enough).
+    pub fn localLeannElisionPending(self: *IndexManager) bool {
+        if (self.leann_replication or self.primary_store == null) return false;
+        if (self.leann_range_pending.load(.acquire)) return true;
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.leann_transient) continue;
+            const leann_store = entry.index.leann orelse continue;
+            if (leann_store.isReplicated()) continue;
+            if (leann_store.pendingElideCount() > 0) return true;
+        }
+        return false;
+    }
+
     /// Local (unreplicated) transient LEANN indexes: replaces stored vectors
     /// their synced graphs cover by stubs. Call after `syncAll` while holding
     /// the DB apply lock.
@@ -9037,11 +9278,12 @@ pub const IndexManager = struct {
         const store = self.primary_store orelse return;
         var guard = self.lockLeannRecords();
         defer guard.unlock();
+        if (self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRangeLocked();
         for (self.dense_indexes.items) |*entry| {
             if (!entry.leann_transient) continue;
             const leann_store = entry.index.leann orelse continue;
             if (leann_store.isReplicated()) continue;
-            const pending = try leann_store.pendingElideAlloc(self.alloc);
+            const pending = try leann_store.pendingElideAlloc(self.alloc, 128);
             defer leann_store_mod.LeannStore.freeElide(self.alloc, pending);
             if (pending.len == 0) continue;
             var txn = try store.beginWriteTxn();
@@ -9049,6 +9291,7 @@ pub const IndexManager = struct {
             _ = try self.elideLeannVectorsTxn(&txn, entry.config.name, pending);
             try txn.commit();
             leann_store.clearElided(pending.len);
+            return; // Release the apply lock before processing another batch.
         }
     }
 
@@ -9060,7 +9303,7 @@ pub const IndexManager = struct {
         return switch (kind) {
             .full_text => @tagName(self.text_main_backend),
             .dense_vector => if (self.denseIndex(name)) |entry|
-                if (entry.index.experimentalPostingWalAuthoritative()) dense_native_backup_backend_id else @tagName(self.dense_storage_backend)
+                if (entry.index.nativeBackupUsesPostingFiles()) dense_native_backup_backend_id else @tagName(self.dense_storage_backend)
             else
                 @tagName(self.dense_storage_backend),
             .sparse_vector => @tagName(self.sparse_backend),
@@ -9078,10 +9321,12 @@ pub const IndexManager = struct {
         return switch (kind) {
             .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveTextMainStorage()),
             .dense_vector => if (self.denseIndex(name)) |entry|
-                if (entry.index.leann != null)
-                    // The LEANN file is not part of HBC's native checkpoint;
-                    // backups use the logical path and restore rebuilds from
-                    // stored embeddings.
+                if (entry.index.leann != null and entry.index.leann.?.isReplicated())
+                    // Replicated LEANN state carries the source group's Raft
+                    // positions (applied index, record keys); a restored
+                    // group's log can restart below them. Until restore
+                    // resets that domain, backups use the logical path.
+                    // Local LEANN files are pinned with the checkpoint.
                     false
                 else if (entry.index.experimentalPostingWalAuthoritative())
                     // Native postings are the projection authority. Shared
@@ -9300,10 +9545,25 @@ pub const IndexManager = struct {
         }
         for (self.dense_indexes.items) |*entry| {
             if (!selectedIndex(selected, entry.config.name)) continue;
+            // A LEANN index's graph lives in one file next to its HBC files.
+            // It was synced under the capture fence, and every write replaces
+            // it (temp + rename), so pinning the current file is stable.
+            // Restore installs it at the same path.
+            if (entry.index.leann) |leann_store| if (try leann_store.nativeBackupPath()) |host_path| {
+                const relative = try self.retainNativeBackupAllocation(
+                    &native_owned,
+                    try std.fmt.allocPrint(self.alloc, "indexes/{s}/{s}", .{ entry.config.name, std.fs.path.basename(host_path) }),
+                );
+                const source = try self.retainNativeBackupAllocation(&native_owned, try self.alloc.dupe(u8, host_path));
+                try native_specs.append(self.alloc, .{
+                    .relative_path = relative,
+                    .source = .{ .immutable_file = source },
+                });
+            };
             if (try entry.index.nativeBackupGeneration(self.alloc, capture_target_sequence)) |generation_value| {
                 var generation = generation_value;
                 defer generation.deinit();
-                has_native_dense = true;
+                has_native_dense = has_native_dense or entry.index.leann == null;
                 const current_relative = try self.retainNativeBackupAllocation(
                     &native_owned,
                     try std.fmt.allocPrint(self.alloc, "indexes/{s}/posting-segments/CURRENT", .{entry.config.name}),
@@ -10057,6 +10317,9 @@ pub const IndexManager = struct {
         const entry = for (self.dense_indexes.items) |*candidate| {
             if (std.mem.eql(u8, candidate.config.name, index_name)) break candidate;
         } else return null;
+        // LEANN's file and generic replay checkpoint own its durability;
+        // the empty HBC wrapper cannot certify a posting generation.
+        if (entry.index.leann != null) return null;
         const checkpoint = entry.index.projectionCheckpointMetadata();
         const applied_sequence = if (entry.index.experimentalPostingWalAuthoritative())
             // Once authority is sticky, an absent live HBC generation is an
@@ -11936,6 +12199,7 @@ pub const IndexManager = struct {
     pub fn runVectorBlockMaintenance(self: *IndexManager) !usize {
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             if (self.repairUnavailable(entry.config.name)) continue;
             if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
             self.lockAtomicWithBackoff(entry.apply_mutex);
@@ -11991,6 +12255,7 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |*entry| {
             if (options.cancel_check) |check| if (check.requested()) return .{ .published = published, .deferred = true };
             if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             if (self.repairUnavailable(entry.config.name) and
                 !(options.covered_rebuilding_index != null and std.mem.eql(u8, options.covered_rebuilding_index.?, entry.config.name))) continue;
             const healthy = self.vectorBlockReadyForDenseIndex(entry.config.name);
@@ -12081,6 +12346,7 @@ pub const IndexManager = struct {
             // intentionally stale, so using it to validate the shared vector
             // base creates a dependency inversion: projection maintenance
             // fails before posting repair is allowed to run.
+            if (!denseIndexUsesVectorBlocks(entry)) continue;
             if (self.repairUnavailable(entry.config.name)) continue;
             self.lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
@@ -12149,6 +12415,7 @@ pub const IndexManager = struct {
 
     pub fn load(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, true, false);
+        try self.dropLeannKeysOutOfRange();
     }
 
     /// Restore activation deliberately stays single-threaded. Individual
@@ -12166,6 +12433,7 @@ pub const IndexManager = struct {
         defer self.load_parallelism = previous_parallelism;
         self.load_parallelism = 1;
         try self.loadWithBackfill(store, true, false);
+        try self.dropLeannKeysOutOfRange();
     }
 
     fn resetRestoreLoadAttempt(self: *IndexManager) void {
@@ -12194,6 +12462,7 @@ pub const IndexManager = struct {
 
     pub fn loadDeferredBackfill(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, false, false);
+        try self.dropLeannKeysOutOfRange();
     }
 
     fn selectedIndex(names: ?[]const []const u8, name: []const u8) bool {
@@ -12235,10 +12504,12 @@ pub const IndexManager = struct {
         }
         self.status_only_index_configs = try retained.toOwnedSlice(self.alloc);
         try self.refreshGeneratedEnrichmentTargetCache();
+        try self.dropLeannKeysOutOfRange();
     }
 
     pub fn loadNoBackfill(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, false, true);
+        try self.dropLeannKeysOutOfRange();
     }
 
     fn loadWithBackfill(self: *IndexManager, store: anytype, allow_backfill: bool, read_only: bool) !void {
@@ -13031,7 +13302,7 @@ pub const IndexManager = struct {
         }
 
         const create_fresh_native_v2 = if (comptime @TypeOf(store) == *docstore_mod.DocStore and builtin.os.tag != .freestanding)
-            self.freshDenseNativeV2Permitted(stored_cfg)
+            try self.freshDenseNativeV2Permitted(stored_cfg)
         else
             false;
         var fresh_native_generation: ?FreshDenseNativeGeneration = if (create_fresh_native_v2)
@@ -14244,6 +14515,38 @@ pub const IndexManager = struct {
             return err;
         };
         if (previous) |*old| old.deinit(self.alloc);
+    }
+
+    /// Discovery compares source routing and revision clocks, never executes a
+    /// resolver. Keep its per-window allocation independent of static aliases,
+    /// curation receipts and provider configuration. Include private/staged
+    /// definitions exactly as listResolvers does; they still own replay debt.
+    pub fn listResolverBackfillDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        var result: std.ArrayList(ResolverConfig) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(alloc);
+            result.deinit(alloc);
+        }
+        try result.ensureTotalCapacityPrecise(alloc, self.resolvers.items.len);
+        for (self.resolvers.items) |cfg| {
+            result.appendAssumeCapacity(try ResolverConfig.clone(alloc, .{
+                .name = cfg.name,
+                .table = cfg.table,
+                .key_template = cfg.key_template,
+                .source_artifact = cfg.source_artifact,
+                .source_artifact_kind = cfg.source_artifact_kind,
+                .resolution_artifact = cfg.resolution_artifact,
+                .labels = cfg.labels,
+                .retired = cfg.retired,
+                .replacement_index = cfg.replacement_index,
+                .config_generation = cfg.config_generation,
+                .merge_generation = cfg.merge_generation,
+                .resolution_generation = cfg.resolution_generation,
+            }));
+        }
+        return result.toOwnedSlice(alloc);
     }
 
     pub fn listResolvers(self: *const IndexManager, alloc: Allocator) ![]resolver_catalog.ResolverConfig {
@@ -17352,6 +17655,7 @@ pub const IndexManager = struct {
     pub fn planLeannRecords(self: *IndexManager, alloc: Allocator) ![]LeannProposal {
         var guard = self.lockLeannRecords();
         defer guard.unlock();
+        if (self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRangeLocked();
         return self.planLeannRecordsLocked(alloc);
     }
 
@@ -17361,6 +17665,7 @@ pub const IndexManager = struct {
         var guard = self.lockLeannRecords();
         defer guard.unlock();
         try self.drainLeannRecordsLocked(store);
+        if (self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRangeLocked();
         return self.planLeannRecordsLocked(alloc);
     }
 
@@ -17606,16 +17911,49 @@ pub const IndexManager = struct {
         }
     };
 
-    /// LEANN indexes cannot be split yet: their graph is not partitioned by
-    /// key range. Fail the split before any state moves.
-    fn rejectLeannSplit(self: *IndexManager) !void {
-        for (self.dense_indexes.items) |*entry| {
-            if (entry.index.leann != null) return error.UnsupportedLeannSplit;
+    /// Keeps a LEANN key on the left (parent) side of a local split.
+    const LeannSplitLeft = struct {
+        split_key: []const u8,
+
+        fn keep(self: *const LeannSplitLeft, key: []const u8) bool {
+            if (!internal_keys.isInternalUserKey(key)) return std.mem.order(u8, key, self.split_key) == .lt;
+            const end = internal_keys.findComponentTerminator(key, 1) orelse return true;
+            const body = key[1..end];
+            var i: usize = 0;
+            var j: usize = 0;
+            while (i < body.len and j < self.split_key.len) : (j += 1) {
+                const b = body[i];
+                i += if (b == 0) @as(usize, 2) else 1;
+                if (b != self.split_key[j]) return b < self.split_key[j];
+            }
+            return i == body.len and j < self.split_key.len;
         }
+    };
+
+    test "leann split compares long encoded chunk keys" {
+        const alloc = std.testing.allocator;
+        const doc = try alloc.alloc(u8, 1024);
+        defer alloc.free(doc);
+        @memset(doc, 'z');
+        doc[100] = 0;
+        const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, doc, "chunks", 0);
+        defer alloc.free(chunk);
+        const left = LeannSplitLeft{ .split_key = "m" };
+        try std.testing.expect(!left.keep(chunk));
+        const right = LeannSplitLeft{ .split_key = "zz{" };
+        try std.testing.expect(right.keep(chunk));
+        // The range predicate decodes long binary document components without
+        // allocating and honors inclusive starts and exclusive ends.
+        var manager: IndexManager = undefined;
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        manager.alloc = failing.allocator();
+        manager.byte_range = .{ .start = doc, .end = "" };
+        try std.testing.expect(manager.leannKeyInRange(chunk));
+        manager.byte_range = .{ .start = "", .end = doc };
+        try std.testing.expect(!manager.leannKeyInRange(chunk));
     }
 
     pub fn handoffDenseFrom(self: *IndexManager, src: *IndexManager, dest_store: *docstore_mod.DocStore, split_key: []const u8, collect_skip_doc_keys: bool) ![]DenseSplitHandoff {
-        try src.rejectLeannSplit();
         const dense_split_batch_size = 1024;
         var handoffs = try self.alloc.alloc(DenseSplitHandoff, self.dense_indexes.items.len);
         errdefer {
@@ -17634,6 +17972,11 @@ pub const IndexManager = struct {
 
         for (self.dense_indexes.items, 0..) |*dest_entry, i| {
             const src_entry = src.denseIndex(dest_entry.config.name) orelse continue;
+            // LEANN graphs are not partitioned by key range. With no handoff
+            // the child indexes its documents itself (residual indexing),
+            // building its own graph; the parent drops them in
+            // pruneDenseSplitRange.
+            if (src_entry.index.leann != null) continue;
             const split_work = src_entry.index.estimateSplitRebuildWork(split_key) catch |err| switch (err) {
                 error.MissingSplitRange => continue,
                 else => return err,
@@ -18222,9 +18565,70 @@ pub const IndexManager = struct {
         }
     }
 
+    /// Reverse mappings survive primary range pruning. Use them as the
+    /// retry handle even when range adoption has already removed graph keys.
+    fn pruneLeannSplitMappings(self: *IndexManager, store: *docstore_mod.DocStore, entry: *DenseIndex, split_key: []const u8) !void {
+        var current = try denseMetadataPrefixAlloc(self.alloc, entry.config.name, "vector");
+        defer current.deinit(self.alloc);
+        const legacy = try std.fmt.allocPrint(self.alloc, "\x00\x00__metadata__:dense:{s}:vector:", .{entry.config.name});
+        defer self.alloc.free(legacy);
+        const keep = LeannSplitLeft{ .split_key = split_key };
+        for ([_][]const u8{ current.items, legacy }, 0..) |prefix, format| {
+            var after: ?[]u8 = null;
+            defer if (after) |key| self.alloc.free(key);
+            while (true) {
+                const page = try store.scanPrefixPage(self.alloc, prefix, after, 128);
+                defer docstore_mod.DocStore.freeResults(self.alloc, page);
+                if (page.len == 0) break;
+                const next = try self.alloc.dupe(u8, page[page.len - 1].key);
+                errdefer self.alloc.free(next);
+                const has_moved = for (page) |row| {
+                    if (!keep.keep(row.value)) break true;
+                } else false;
+                if (!has_moved) {
+                    if (after) |key| self.alloc.free(key);
+                    after = next;
+                    continue;
+                }
+                const Removed = struct { id: u64, ordinal: ?doc_identity.DocOrdinal };
+                var removed = std.ArrayListUnmanaged(Removed).empty;
+                defer removed.deinit(self.alloc);
+                try removed.ensureTotalCapacity(self.alloc, page.len);
+                var batch = try store.beginWriteBatch();
+                errdefer batch.abort();
+                const txn = batch.asTxn();
+                for (page) |row| {
+                    if (keep.keep(row.value)) continue;
+                    const suffix = row.key[prefix.len..];
+                    const id = if (format == 0) blk: {
+                        if (suffix.len != 8) return error.Corrupted;
+                        break :blk std.mem.readInt(u64, suffix[0..8], .big);
+                    } else try std.fmt.parseInt(u64, suffix, 10);
+                    const ordinal = (try self.lookupDenseVectorOrdinalTxn(txn, entry.config.name, id)) orelse
+                        entry.vector_ordinals.get(id) orelse
+                        try doc_identity.lookupOrdinalTxn(self.alloc, txn, row.value);
+                    try self.clearDenseVectorMappingTxnWithOrdinal(txn, entry.config.name, row.value, id, ordinal);
+                    removed.appendAssumeCapacity(.{ .id = id, .ordinal = ordinal });
+                }
+                try batch.commit();
+                for (removed.items) |item| {
+                    _ = entry.vector_ordinals.remove(item.id);
+                    if (item.ordinal) |ordinal| _ = entry.ordinal_vector_ids.remove(ordinal);
+                }
+                if (after) |key| self.alloc.free(key);
+                after = next;
+            }
+        }
+    }
+
     pub fn pruneDenseSplitRange(self: *IndexManager, store: *docstore_mod.DocStore, split_key: []const u8) !void {
-        try self.rejectLeannSplit();
         for (self.dense_indexes.items) |*entry| {
+            if (entry.index.leann) |leann_store| {
+                try self.pruneLeannSplitMappings(store, entry, split_key);
+                const left = LeannSplitLeft{ .split_key = split_key };
+                _ = try leann_store.dropKeysWhere(&left, LeannSplitLeft.keep);
+                continue;
+            }
             var members = try entry.index.collectSplitMembers(split_key);
             defer members.deinit(self.alloc);
 
@@ -18519,6 +18923,7 @@ pub const IndexManager = struct {
     }
 
     fn densePostingStoreAvailableForEntry(self: *const IndexManager, entry: *const DenseIndex) bool {
+        if (entry.index.leann != null) return false;
         // Published v2 indexes open through HBC's dedicated native environment;
         // legacy/candidate indexes need a configured backend adapter that can
         // host the native WAL and immutable segment namespace.
@@ -18526,6 +18931,7 @@ pub const IndexManager = struct {
     }
 
     fn densePostingSidecarEnabledForEntry(self: *const IndexManager, entry: *const DenseIndex) bool {
+        if (entry.index.leann != null) return false;
         return entry.index.experimentalPostingWalAuthoritative() or
             (densePostingSidecarEnabled() and self.densePostingStoreAvailableForEntry(entry));
     }
@@ -19365,6 +19771,7 @@ pub const IndexManager = struct {
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
                 .cache_vectors = false,
+                .cache_decoded_vectors = false,
             },
         };
     }
@@ -19374,6 +19781,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         req: hbc_mod.SearchRequest,
     ) !hbc_mod.SearchResults {
+        if (entry.index.leann != null and self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRange();
         const previous_load_session = active_dense_vector_load_session;
         var vector_load_session: ?DenseVectorLoadSession = null;
         defer {
@@ -19382,25 +19790,26 @@ pub const IndexManager = struct {
         }
 
         if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
-            const decoded_residency_lease = entry.index.acquireDecodedVectorResidencyForSearch(req);
+            const decoded_residency_lease = if ((req.search_effort orelse 0) >= 1) null else entry.index.acquireDecodedVectorResidencyForSearch(req);
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
+                .cache_vectors = (req.search_effort orelse 0) < 1,
+                .cache_decoded_vectors = (req.search_effort orelse 0) < 1,
                 .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
                 .decoded_residency_lease = decoded_residency_lease,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
-        var native_location_session: ?*DenseVectorLoadSession = null;
+        var scoring_scope: ?DenseVectorLoadSession.ScoringScope = null;
         if (active_dense_vector_load_session) |session| {
             if (entry.vector_loader_context != null and session.context == entry.vector_loader_context.?) {
-                session.clearNativeVectorLocations();
-                native_location_session = session;
+                scoring_scope = session.beginScoring(if ((req.search_effort orelse 0) >= 1) .complete_snapshot else .best_effort);
             }
         }
-        defer if (native_location_session) |session| session.clearNativeVectorLocations();
+        defer if (scoring_scope) |*scope| scope.deinit();
 
         return try entry.index.searchWithRequest(req);
     }
@@ -19410,6 +19819,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         req: hbc_mod.SearchRequest,
     ) !hbc_mod.ProfiledSearchResults {
+        if (entry.index.leann != null and self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRange();
         const previous_load_session = active_dense_vector_load_session;
         var vector_load_session: ?DenseVectorLoadSession = null;
         defer {
@@ -19418,25 +19828,26 @@ pub const IndexManager = struct {
         }
 
         if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
-            const decoded_residency_lease = entry.index.acquireDecodedVectorResidencyForSearch(req);
+            const decoded_residency_lease = if ((req.search_effort orelse 0) >= 1) null else entry.index.acquireDecodedVectorResidencyForSearch(req);
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
+                .cache_vectors = (req.search_effort orelse 0) < 1,
+                .cache_decoded_vectors = (req.search_effort orelse 0) < 1,
                 .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
                 .decoded_residency_lease = decoded_residency_lease,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
-        var native_location_session: ?*DenseVectorLoadSession = null;
+        var scoring_scope: ?DenseVectorLoadSession.ScoringScope = null;
         if (active_dense_vector_load_session) |session| {
             if (entry.vector_loader_context != null and session.context == entry.vector_loader_context.?) {
-                session.clearNativeVectorLocations();
-                native_location_session = session;
+                scoring_scope = session.beginScoring(if ((req.search_effort orelse 0) >= 1) .complete_snapshot else .best_effort);
             }
         }
-        defer if (native_location_session) |session| session.clearNativeVectorLocations();
+        defer if (scoring_scope) |*scope| scope.deinit();
 
         return try entry.index.searchProfiledRequest(req);
     }
@@ -19446,6 +19857,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         req: hbc_mod.SearchRequest,
     ) !dense_exact.SearchOutcome {
+        if (entry.index.leann != null and self.leann_range_pending.load(.acquire)) try self.dropLeannKeysOutOfRange();
         try checkDenseSearchCancelled(req);
         if (entry.leann_transient) {
             // Exact scoring would re-embed every candidate. LEANN's own search
@@ -19519,11 +19931,8 @@ pub const IndexManager = struct {
             if (entry.vector_loader_context == null or session.context != entry.vector_loader_context.?) break :blk null;
             break :blk session;
         };
-        const previous_cache_vectors = if (exact_load_session) |session| session.cache_vectors else false;
-        if (exact_load_session) |session| session.cache_vectors = false;
-        defer {
-            if (exact_load_session) |session| session.cache_vectors = previous_cache_vectors;
-        }
+        var scoring_scope: ?DenseVectorLoadSession.ScoringScope = if (exact_load_session) |session| session.beginScoring(.exact_candidates) else null;
+        defer if (scoring_scope) |*scope| scope.deinit();
 
         var results = try hbc_mod.SearchResults.initCapacity(
             self.alloc,
@@ -19610,8 +20019,20 @@ pub const IndexManager = struct {
             }
         }
 
+        const has_residual = req.filter_prefix.len > 0 or req.key_predicate != null;
+        if (has_residual) {
+            const residual_start = platform_time.monotonicNs();
+            for (candidate_metadata, fallback_doc_keys, 0..) |*metadata, fallback, i| {
+                if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
+                metadata.* = metadata.* orelse fallback;
+            }
+            try dense_exact.filterMetadata(req, candidate_metadata);
+            exact_profile.residual_filter_ns = platform_time.monotonicNs() - residual_start;
+        }
+
         const query_measure = vector_mod.norm(req.query);
         var vectors_scored: u64 = 0;
+        var matching_vectors: usize = 0;
         const vectors_stored_externally = entry.vector_loader_context != null and
             self.primary_store != null and
             entry.index.hasExternalVectorLoader();
@@ -19627,8 +20048,7 @@ pub const IndexManager = struct {
                 const key_scan_end = @min(key_scan_start + exact_dense_score_batch_size, unique_candidate_ids.len);
                 var batch_key_bytes: u64 = 0;
                 for (candidate_metadata[key_scan_start..key_scan_end], fallback_doc_keys[key_scan_start..key_scan_end]) |maybe_metadata, fallback_doc_key| {
-                    const doc_key = maybe_metadata orelse fallback_doc_key orelse continue;
-                    if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
+                    const doc_key = (if (has_residual) maybe_metadata else maybe_metadata orelse fallback_doc_key) orelse continue;
                     // Internal tuple encoding can escape every byte. Include
                     // fixed namespace/components plus arena alignment slack.
                     batch_key_bytes +|= @as(u64, @intCast(doc_key.len)) *| 2 +| @as(u64, @intCast(artifact_name.len)) +| 64;
@@ -19677,8 +20097,7 @@ pub const IndexManager = struct {
                 const candidate_end = @min(candidate_start + exact_dense_score_batch_size, unique_candidate_ids.len);
                 var batch_len: usize = 0;
                 for (unique_candidate_ids[candidate_start..candidate_end], candidate_metadata[candidate_start..candidate_end], fallback_doc_keys[candidate_start..candidate_end]) |vector_id, maybe_metadata, fallback_doc_key| {
-                    const doc_key = maybe_metadata orelse fallback_doc_key orelse continue;
-                    if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
+                    const doc_key = (if (has_residual) maybe_metadata else maybe_metadata orelse fallback_doc_key) orelse continue;
                     batch_ids[batch_len] = vector_id;
                     batch_metadata[batch_len] = doc_key;
                     batch_distances[batch_len] = std.math.inf(f32);
@@ -19709,6 +20128,7 @@ pub const IndexManager = struct {
                         if (req.distance_over) |threshold| if (distance <= threshold) continue;
                         if (req.distance_under) |threshold| if (distance >= threshold) continue;
                         const owned_metadata = if (maybe_doc_key) |doc_key| try self.alloc.dupe(u8, doc_key) else null;
+                        matching_vectors += 1;
                         results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
                     }
                 }
@@ -19732,16 +20152,17 @@ pub const IndexManager = struct {
             defer self.alloc.free(vector_scratch);
             for (unique_candidate_ids, candidate_metadata, fallback_doc_keys, 0..) |vector_id, maybe_metadata, fallback_doc_key, i| {
                 if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
-                const doc_key = maybe_metadata orelse fallback_doc_key;
-                if (req.filter_prefix.len > 0) {
-                    const resolved_doc_key = doc_key orelse continue;
-                    if (!std.mem.startsWith(u8, resolved_doc_key, req.filter_prefix)) continue;
-                }
-                const distance_start_ns = platform_time.monotonicNs();
-                const vector = (if (vector_cursor) |*cursor|
+                const doc_key = if (has_residual) maybe_metadata else maybe_metadata orelse fallback_doc_key;
+                if (has_residual and doc_key == null) continue;
+                const lookup_start = platform_time.monotonicNs();
+                exact_profile.raw_scalar_reads += 1;
+                const loaded_vector = if (vector_cursor) |*cursor|
                     entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
                 else
-                    entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
+                    entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch);
+                const distance_start_ns = platform_time.monotonicNs();
+                exact_profile.native_lookup_ns += distance_start_ns - lookup_start;
+                const vector = loaded_vector catch |err| switch (err) {
                     error.NotFound => {
                         exact_profile.missing_vectors += 1;
                         continue;
@@ -19756,15 +20177,17 @@ pub const IndexManager = struct {
                 if (req.distance_over) |threshold| if (distance <= threshold) continue;
                 if (req.distance_under) |threshold| if (distance >= threshold) continue;
                 const owned_metadata = if (doc_key) |resolved_doc_key| try self.alloc.dupe(u8, resolved_doc_key) else null;
+                matching_vectors += 1;
                 results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
             }
         }
         if (exact_load_session) |session| {
             exact_profile.request_vector_cache_entries = session.vector_cache.count();
             exact_profile.raw_batch_reads = session.raw_batch_reads;
-            exact_profile.raw_scalar_reads = session.raw_scalar_reads;
+            exact_profile.raw_scalar_reads +|= session.raw_scalar_reads;
         }
         results.sort();
+        results.candidate_coverage = if (matching_vectors > results.getHits().len) .more else .exhausted;
         if (getenv("ANTFLY_BENCH_QUERY_PROFILE") != null) {
             std.log.info("antfly_bench_dense_exact_filter index={s} candidates={d} hits={d} batches={d} batch_reads={d} scalar_reads={d} missing={d}", .{
                 entry.config.name,
@@ -20042,16 +20465,18 @@ pub const IndexManager = struct {
         if (plan.plan().external_vector_spaces.count() == 0) return;
         const document = std.json.parseFromSlice(std.json.Value, alloc, document_json, .{}) catch return error.InvalidEmbedding;
         defer document.deinit();
-        try validateExternalVectorSpacesInPlan(plan.plan(), alloc, embeddings, document.value);
+        try validateExternalVectorSpacesInPlan(alloc, plan.plan(), embeddings, document.value);
     }
 
     pub fn validateExternalVectorSpacesParsed(self: *IndexManager, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
         var plan = try self.acquireWritePlanSnapshot();
         defer plan.release();
-        try validateExternalVectorSpacesInPlan(plan.plan(), plan.plan().alloc, embeddings, document);
+        try validateExternalVectorSpacesInPlan(plan.plan().alloc, plan.plan(), embeddings, document);
     }
 
-    fn validateExternalVectorSpacesInPlan(plan: *const WritePlanSnapshot, alloc: Allocator, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
+    /// Preparation borrows the pinned plan and parsed row before releasing its
+    /// scratch. Commit revalidates that plan's generation before using effects.
+    pub fn validateExternalVectorSpacesInPlan(alloc: Allocator, plan: *const WritePlanSnapshot, embeddings: []const mapper.DenseEmbeddingWrite, document: std.json.Value) !void {
         if (plan.external_vector_spaces.count() == 0) return;
         // A receipt is an assertion about this authored row. Omitting vectors
         // retains native bytes, but must not retain an assertion for a new row.
@@ -21670,7 +22095,7 @@ pub const IndexManager = struct {
         // encoded embedding artifact key for multi-source indexes so equal
         // document keys from different artifact streams remain distinct.
         for (self.dense_indexes.items) |*entry| {
-            try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options);
+            try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options, null);
         }
     }
 
@@ -21903,9 +22328,20 @@ pub const IndexManager = struct {
         writes: []const mapper.DenseEmbeddingWrite,
         batch_options: StoreBatchOptions,
     ) !void {
+        return self.applyDenseEmbeddingWritesByNameWithRecoverySession(store, index_name, writes, batch_options, null);
+    }
+
+    pub fn applyDenseEmbeddingWritesByNameWithRecoverySession(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        writes: []const mapper.DenseEmbeddingWrite,
+        batch_options: StoreBatchOptions,
+        recovery_session: ?*LeannRecoverySession,
+    ) !void {
         if (writes.len == 0) return;
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
-        try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options);
+        try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options, recovery_session);
     }
 
     fn validateDenseEmbeddingWriteSources(entry: *const DenseIndex, writes: []const mapper.DenseEmbeddingWrite) !void {
@@ -22556,8 +22992,11 @@ pub const IndexManager = struct {
         try ensureIndexDirDurable(self.alloc, self.io, self.base_path, path);
     }
 
-    fn freshDenseNativeV2Permitted(self: *const IndexManager, cfg: types.IndexConfig) bool {
+    fn freshDenseNativeV2Permitted(self: *const IndexManager, cfg: types.IndexConfig) !bool {
         if (cfg.kind != .dense_vector or builtin.os.tag == .freestanding) return false;
+        const dense_cfg = try parseDenseConfig(self.alloc, cfg.config_json);
+        defer dense_cfg.deinit(self.alloc);
+        if (dense_cfg.leann != null) return false;
         if (!densePostingWalMutationStoreEnabled()) return false;
         if (!self.configuredDenseNativePostingStoreSupported()) return false;
         // Fresh-v2 publication currently stages a host directory and commits
@@ -22581,7 +23020,7 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
     ) !FreshDenseNativeGeneration {
         if (builtin.os.tag == .freestanding) return error.DenseNativeV2NotPermitted;
-        if (!self.freshDenseNativeV2Permitted(cfg)) return error.DenseNativeV2NotPermitted;
+        if (!try self.freshDenseNativeV2Permitted(cfg)) return error.DenseNativeV2NotPermitted;
         try fs_paths.createDirPathPortable(self.checkpointIo(), self.base_path);
 
         for (0..64) |_| {
@@ -24067,9 +24506,8 @@ pub const IndexManager = struct {
                 configureDensePostingProjectionBuild(index, vector_loader_context);
                 self.attachVectorBlockResidencyPolicy(index);
                 if (dense_cfg.leann) |leann_opts| {
-                    // LEANN keeps its graph in a file beside the (empty) HBC
-                    // root; remote dense storage is not supported yet.
-                    if (self.effectiveDenseStorage() != null) return error.UnsupportedLeannStorage;
+                    // LEANN persists its graph beside the empty HBC root
+                    // through the configured storage provider.
                     const leann_store = try leann_store_mod.LeannStore.open(self.alloc, self.checkpointIo(), path, .{
                         .dims = dense_cfg.dims,
                         .metric = dense_cfg.metric,
@@ -24079,8 +24517,11 @@ pub const IndexManager = struct {
                         .search_ef = leann_opts.search_ef,
                         .bound_scale = leann_opts.bound_scale,
                         .batch_size = leann_opts.batch_size,
+                        .reembed_budget_ms = leann_opts.reembed_budget_ms,
+                        .storage = self.effectiveDenseStorage(),
                         .replicated = self.leann_replication,
-                        .transient = leann_opts.vector_storage == .transient,
+                        .transient = leann_opts.vector_storage.elides(),
+                        .media_int8 = leann_opts.vector_storage.elides() and leann_opts.media_int8,
                     });
                     index.attachLeann(leann_store) catch |err| {
                         leann_store.deinit();
@@ -24088,7 +24529,9 @@ pub const IndexManager = struct {
                     };
                     if (leann_store.loader) |base| {
                         var batched = base;
-                        batched.load_batch = loadDenseVectorsForLeann;
+                        batched.load_batch_timed = loadDenseVectorsForLeann;
+                        batched.load_batch_session = loadDenseVectorsForLeannSession;
+                        batched.validate_digest = validateLeannRetainedDigest;
                         leann_store.setLoader(batched);
                     }
                     // A replica that crashed between persisting records and
@@ -24176,10 +24619,15 @@ pub const IndexManager = struct {
                 {
                     try index.enableNativePostingMutationStore();
                 }
-                // Re-embedding needs the index's own generator with one
-                // unchunked vector per document.
-                const leann_transient = if (dense_cfg.leann) |leann_opts| leann_opts.vector_storage == .transient else false;
-                if (leann_transient and (dense_cfg.external or dense_generator == null or generatorHasChunking(dense_generator.?)))
+                // Re-embedding needs the index's own generator. Text chunks
+                // re-embed by re-chunking their parent; stored chunk inputs
+                // cannot, so only `auto` (which keeps their vectors) allows
+                // them.
+                const leann_storage: LeannVectorStorage = if (dense_cfg.leann) |leann_opts| leann_opts.vector_storage else .persistent;
+                const leann_transient = leann_storage.elides();
+                if (leann_transient and (dense_cfg.external or dense_generator == null))
+                    return error.InvalidIndexConfig;
+                if (leann_storage == .transient and embeddingInputKind(self, dense_generator.?) == .materialized_chunks)
                     return error.InvalidIndexConfig;
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
@@ -24195,6 +24643,8 @@ pub const IndexManager = struct {
                     .external = dense_cfg.external,
                     .managed_direct_field = !dense_cfg.external and dense_generator == null and referenced_embedding == null and dense_cfg.embedding_names.len == 0,
                     .leann_transient = leann_transient,
+                    .leann_text_only = leann_storage == .auto,
+                    .leann_media_int8 = leann_transient and if (dense_cfg.leann) |leann_opts| leann_opts.media_int8 else false,
                     .chunk_name = if (dense_generator) |generator|
                         if (generatorHasChunking(generator)) try self.alloc.dupe(u8, generator.artifact_name) else null
                     else if (referenced_embedding) |embedding_cfg|
@@ -29776,6 +30226,7 @@ pub const IndexManager = struct {
         entry: *DenseIndex,
         writes: []const mapper.DenseEmbeddingWrite,
         batch_options: StoreBatchOptions,
+        recovery_session: ?*LeannRecoverySession,
     ) !void {
         try validateDenseEmbeddingWriteSources(entry, writes);
         const keep_write = try self.alloc.alloc(bool, writes.len);
@@ -29866,10 +30317,10 @@ pub const IndexManager = struct {
         )) {
             if (unreadable_artifact_keys.items.len > 0) return error.ArtifactRepairRequired;
         }
-        const elided_digests = try self.alloc.alloc(?u64, writes.len);
-        defer self.alloc.free(elided_digests);
-        @memset(elided_digests, null);
-        for (elided_artifacts.items) |elided| elided_digests[elided.write_index] = elided.vector_digest;
+        const stubs = try self.alloc.alloc(?*const ElidedDenseArtifact, if (elided_artifacts.items.len == 0) 0 else writes.len);
+        defer self.alloc.free(stubs);
+        @memset(stubs, null);
+        for (elided_artifacts.items) |*elided| stubs[elided.write_index] = elided;
         for (preloaded_artifact_vectors) |maybe_vector| {
             if (maybe_vector) |vector| preloaded_vector_bytes += @as(u64, @intCast(vector.len * @sizeOf(f32)));
         }
@@ -29890,6 +30341,141 @@ pub const IndexManager = struct {
         defer self.alloc.free(prefetched_ordinals);
         const prefetched_mappings = try self.lookupDenseVectorMappingsTxnAlloc(store_txn, entry.config.name, mapping_doc_keys);
         defer self.alloc.free(prefetched_mappings);
+        // Recover missing transient vectors as a batch. In particular, a
+        // chunked document must be reconstructed once per batch, not once per
+        // chunk. Existing graph members need no inference at all.
+        var recovery_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer recovery_keys.deinit(self.alloc);
+        var recovery_hashes: std.ArrayListUnmanaged(?u64) = .empty;
+        defer recovery_hashes.deinit(self.alloc);
+        var recovery_digests: std.ArrayListUnmanaged(?u64) = .empty;
+        defer recovery_digests.deinit(self.alloc);
+        var recovery_slots: std.ArrayListUnmanaged(usize) = .empty;
+        defer recovery_slots.deinit(self.alloc);
+        const recovered = try self.alloc.alloc(?[]const f32, if (elided_artifacts.items.len > 0) writes.len else 0);
+        defer self.alloc.free(recovered);
+        @memset(recovered, null);
+        if (entry.leann_transient and elided_artifacts.items.len > 0) if (entry.index.leann) |leann_store| {
+            for (elided_artifacts.items) |stub| {
+                const i = stub.write_index;
+                const write = writes[i];
+                if (prefetched_mappings[i]) |mapping| if (leann_store.holdsElided(mapping.vector_id)) continue;
+                if (try enrichment_artifact_codec.int8ElidedDenseEmbeddingAlloc(self.alloc, stub.raw)) |vector| {
+                    if (!entry.leann_media_int8 or vector.len != entry.dims) {
+                        self.alloc.free(vector);
+                        return error.ArtifactRepairRequired;
+                    }
+                    errdefer self.alloc.free(vector);
+                    try reembedded_vectors.append(self.alloc, vector);
+                    recovered[i] = vector;
+                    continue;
+                }
+                try recovery_keys.append(self.alloc, write.doc_key);
+                try recovery_hashes.append(self.alloc, stub.source_hash);
+                try recovery_digests.append(self.alloc, stub.vector_digest);
+                try recovery_slots.append(self.alloc, i);
+            }
+        };
+        // Persistent consumers may read several embedding producers. Recover
+        // each owner separately and cap temporary inference buffers per batch.
+        var persistent_session: LeannRecoverySession = .{};
+        defer persistent_session.deinit();
+        if (!entry.leann_transient and elided_artifacts.items.len > 0) {
+            // Resolve pending writes once; only owners with work get batches.
+            var owners: std.StringHashMapUnmanaged(*DenseIndex) = .empty;
+            defer owners.deinit(self.alloc);
+            for (self.dense_indexes.items) |*owner| {
+                if (!owner.leann_transient or owner.dims != entry.dims) continue;
+                const name = owner.embedding_name orelse continue;
+                const result = try owners.getOrPut(self.alloc, name);
+                if (!result.found_existing) result.value_ptr.* = owner;
+            }
+            var sources: std.StringHashMapUnmanaged(*DenseIndex) = .empty;
+            defer sources.deinit(self.alloc);
+            for (entry.embedding_names) |name| {
+                if (owners.get(name)) |owner| try sources.put(self.alloc, name, owner);
+            }
+            const fallback_owner = if (entry.embedding_name) |name| owners.get(name) else null;
+            var groups: std.AutoArrayHashMapUnmanaged(*DenseIndex, std.ArrayListUnmanaged(usize)) = .empty;
+            defer {
+                for (groups.values()) |*slots| slots.deinit(self.alloc);
+                groups.deinit(self.alloc);
+            }
+            for (elided_artifacts.items) |stub| {
+                const i = stub.write_index;
+                const write = writes[i];
+                var resolved: ?*DenseIndex = null;
+                if (try internal_keys.artifactNameView(write.artifact_key.?)) |name| {
+                    resolved = sources.get(name);
+                } else {
+                    if (try internal_keys.artifactNameAlloc(self.alloc, write.artifact_key.?)) |name| {
+                        defer self.alloc.free(name);
+                        resolved = sources.get(name);
+                    }
+                }
+                const owner = resolved orelse fallback_owner orelse return error.VectorElided;
+                const group = try groups.getOrPut(self.alloc, owner);
+                if (!group.found_existing) group.value_ptr.* = .empty;
+                try group.value_ptr.append(self.alloc, i);
+            }
+            for (groups.keys(), groups.values()) |owner, slots| {
+                var cursor: usize = 0;
+                while (cursor < slots.items.len) {
+                    recovery_keys.clearRetainingCapacity();
+                    recovery_hashes.clearRetainingCapacity();
+                    recovery_digests.clearRetainingCapacity();
+                    recovery_slots.clearRetainingCapacity();
+                    const end = @min(cursor + 128, slots.items.len);
+                    for (slots.items[cursor..end]) |i| {
+                        const write = writes[i];
+                        const stub = stubs[i].?;
+                        try recovery_keys.append(self.alloc, write.doc_key);
+                        try recovery_hashes.append(self.alloc, stub.source_hash);
+                        try recovery_digests.append(self.alloc, stub.vector_digest);
+                        try recovery_slots.append(self.alloc, i);
+                    }
+                    cursor = end;
+                    if (recovery_slots.items.len == 0) continue;
+                    const vectors = try self.alloc.alloc(f32, recovery_slots.items.len * @as(usize, entry.dims));
+                    defer self.alloc.free(vectors);
+                    const found = try self.alloc.alloc(bool, recovery_slots.items.len);
+                    defer self.alloc.free(found);
+                    @memset(found, false);
+                    try self.reembedDenseDocumentsSession(self.alloc, owner, recovery_keys.items, recovery_hashes.items, recovery_digests.items, vectors, found, recovery_session orelse &persistent_session);
+                    for (recovery_slots.items, 0..) |slot, i| {
+                        if (!found[i]) return error.ReembedProvenanceUnavailable;
+                        const vector = try self.alloc.dupe(f32, vectors[i * entry.dims ..][0..entry.dims]);
+                        errdefer self.alloc.free(vector);
+                        try reembedded_vectors.append(self.alloc, vector);
+                        recovered[slot] = vector;
+                    }
+                }
+            }
+            recovery_keys.clearRetainingCapacity();
+            recovery_hashes.clearRetainingCapacity();
+            recovery_digests.clearRetainingCapacity();
+            recovery_slots.clearRetainingCapacity();
+        }
+        const recovery_vectors = try self.alloc.alloc(f32, recovery_keys.items.len * @as(usize, entry.dims));
+        defer self.alloc.free(recovery_vectors);
+        if (recovery_keys.items.len > 0) {
+            var local_session: LeannRecoverySession = .{};
+            defer local_session.deinit();
+            var found: [128]bool = undefined;
+            var start: usize = 0;
+            while (start < recovery_keys.items.len) {
+                const end = @min(start + found.len, recovery_keys.items.len);
+                const batch_found = found[0 .. end - start];
+                @memset(batch_found, false);
+                const batch_vectors = recovery_vectors[start * entry.dims .. end * entry.dims];
+                try self.reembedDenseDocumentsSession(self.alloc, entry, recovery_keys.items[start..end], recovery_hashes.items[start..end], recovery_digests.items[start..end], batch_vectors, batch_found, recovery_session orelse &local_session);
+                for (recovery_slots.items[start..end], batch_found, start..) |slot, ok, i| {
+                    if (!ok) return error.ReembedProvenanceUnavailable;
+                    recovered[slot] = recovery_vectors[i * entry.dims ..][0..entry.dims];
+                }
+                start = end;
+            }
+        }
         {
             var existing_index_write_txn = try entry.index.beginRuntimeWriteTxn();
             defer existing_index_write_txn.abort();
@@ -29951,36 +30537,22 @@ pub const IndexManager = struct {
                         // Replaying a transient LEANN write whose vector is
                         // already a stub: keep the existing vector id bound
                         // when the graph holds it, otherwise re-embed.
-                        const digest = elided_digests[write_index] orelse continue;
+                        if (stubs.len == 0) continue;
+                        const stub = stubs[write_index] orelse continue;
                         if (!entry.leann_transient) {
                             // A persistent index added after a transient
                             // LEANN index elided this shared embedding: the
                             // owner re-embeds it.
-                            const owner = self.elidedArtifactOwner(entry, write.artifact_key.?, write.doc_key) orelse return error.VectorElided;
-                            const reembedded = self.reembedElidedDocument(self.alloc, owner.embedding_name, owner.doc_key, entry.dims) catch |err| switch (err) {
-                                error.NotFound => return error.VectorElided,
-                                else => return err,
-                            };
-                            errdefer self.alloc.free(reembedded);
-                            // Store the vector again: this index reads it
-                            // from storage in every scoring path, and elision
-                            // now skips embeddings it consumes.
+                            const reembedded = recovered[write_index] orelse return error.VectorElided;
                             try restoreElidedArtifactTxn(self.alloc, store_txn, write.artifact_key.?, reembedded);
-                            try reembedded_vectors.append(self.alloc, reembedded);
                             break :blk reembedded;
                         }
                         const leann_store = entry.index.leann orelse continue;
                         if (prefetched_mappings[write_index]) |mapping| if (leann_store.holdsElided(mapping.vector_id)) {
-                            try leann_store.noteElided(mapping.vector_id, member_key, digest);
+                            try leann_store.noteElided(mapping.vector_id, member_key, stub.vector_digest);
                             continue;
                         };
-                        const reembedded = self.reembedOneDenseDocument(self.alloc, entry, write.doc_key) catch |err| switch (err) {
-                            error.NotFound => continue,
-                            else => return err,
-                        };
-                        errdefer self.alloc.free(reembedded);
-                        try reembedded_vectors.append(self.alloc, reembedded);
-                        break :blk reembedded;
+                        break :blk recovered[write_index] orelse return error.ReembedProvenanceUnavailable;
                     };
                     const vector_fingerprint = denseVectorFingerprint(vector);
                     const assignment = try self.replaceDenseVectorIdFromPrefetchedState(
@@ -30100,7 +30672,22 @@ pub const IndexManager = struct {
 
     /// A stored embedding read as an elided stub (transient LEANN): the
     /// graph already holds the vector with `vector_digest`.
-    const ElidedDenseArtifact = struct { write_index: usize, vector_digest: u64 };
+    const ElidedDenseArtifact = struct {
+        write_index: usize,
+        vector_digest: u64,
+        source_hash: ?u64,
+        // Borrowed from the same read transaction as preloaded full vectors.
+        raw: []const u8,
+    };
+
+    fn validateLeannArtifactPrecision(self: *IndexManager, index_name: []const u8, raw: []const u8) !void {
+        const header = try enrichment_artifact_codec.decodeHeader(raw);
+        if (!header.flags.int8_payload) return;
+        const consumer = self.denseIndex(index_name) orelse return error.IndexNotFound;
+        // Quantization is irreversible. Do not relabel an int8 approximation
+        // as the original full vector; reprocess the producer before retrying.
+        if (!consumer.leann_media_int8) return error.ArtifactRepairRequired;
+    }
 
     fn preloadDenseEmbeddingArtifactVectorsFromSession(
         self: *IndexManager,
@@ -30161,7 +30748,10 @@ pub const IndexManager = struct {
                 }
                 fallback_count += 1;
             } else |err| {
-                if (err == error.VectorElided and elided != null) continue;
+                if (err == error.VectorElided and elided != null) {
+                    try self.validateLeannArtifactPrecision(index_name, raw);
+                    continue;
+                }
                 if (isRecoverableEmbeddingArtifactError(err)) {
                     try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                     continue;
@@ -30197,7 +30787,13 @@ pub const IndexManager = struct {
                         try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                         continue;
                     }
-                    try list.append(self.alloc, .{ .write_index = item.write_index, .vector_digest = stub.vector_digest });
+                    const header = try enrichment_artifact_codec.decodeHeader(raw);
+                    try list.append(self.alloc, .{
+                        .write_index = item.write_index,
+                        .vector_digest = stub.vector_digest,
+                        .source_hash = if (header.flags.has_source_hash) header.source_hash else null,
+                        .raw = raw,
+                    });
                     continue;
                 };
                 if (isRecoverableEmbeddingArtifactError(err)) {
@@ -30282,7 +30878,10 @@ pub const IndexManager = struct {
                 }
                 fallback_count += 1;
             } else |err| {
-                if (err == error.VectorElided and elided != null) continue;
+                if (err == error.VectorElided and elided != null) {
+                    try self.validateLeannArtifactPrecision(index_name, raw);
+                    continue;
+                }
                 if (isRecoverableEmbeddingArtifactError(err)) {
                     try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                     continue;
@@ -30318,7 +30917,13 @@ pub const IndexManager = struct {
                         try unreadable_artifact_keys.append(self.alloc, item.artifact_key);
                         continue;
                     }
-                    try list.append(self.alloc, .{ .write_index = item.write_index, .vector_digest = stub.vector_digest });
+                    const header = try enrichment_artifact_codec.decodeHeader(raw);
+                    try list.append(self.alloc, .{
+                        .write_index = item.write_index,
+                        .vector_digest = stub.vector_digest,
+                        .source_hash = if (header.flags.has_source_hash) header.source_hash else null,
+                        .raw = raw,
+                    });
                     continue;
                 };
                 if (isRecoverableEmbeddingArtifactError(err)) {
@@ -32775,17 +33380,19 @@ pub const IndexManager = struct {
         if (scratch.bounded_projections.len != 0 and scratch.bounded_projections.len != vector_ids.len) return error.InvalidArgument;
         const required_batch_floats = std.math.mul(usize, vector_ids.len, dims) catch return error.BufferTooSmall;
         if (batch_scratch.len < required_batch_floats) return error.BufferTooSmall;
-        const bounded_query_norm = if (error_bounds != null) switch (metric) {
-            .inner_product => vector_mod.norm(query),
-            .cosine => query_measure,
-            .l2_squared => 0,
-        } else 0;
+        const bounded_query_norm = if (error_bounds != null)
+            scratch.query_norm_upper orelse vector_mod.projectionQueryNormUpper(query)
+        else
+            0;
 
         const load_session = blk: {
             const session = active_dense_vector_load_session orelse break :blk null;
             if (session.context != loader) break :blk null;
             break :blk session;
         };
+        if (error_bounds != null and scratch.projection_cache_scope == .wave) {
+            if (load_session) |session| session.clearNativeVectorProjections();
+        }
         var native_vector_io_accounted = false;
         defer if (native_vector_io_accounted) load_session.?.setNativeVectorIoBytes(0);
 
@@ -32842,7 +33449,7 @@ pub const IndexManager = struct {
         // primary-only key lookups retain their ordinary small-object allocator.
         var key_arena = std.heap.ArenaAllocator.init(if (vector_block_generation != null) std.heap.page_allocator else manager.alloc);
         defer key_arena.deinit();
-        const use_pool = pooled != null and vector_block_generation != null;
+        const use_pool = pooled != null;
         const key_alloc = if (use_pool) pooled.?.allocator() else key_arena.allocator();
         var vector_block_payload_scratch: []u8 = &.{};
         var vector_block_payload_stride: usize = 0;
@@ -33079,7 +33686,7 @@ pub const IndexManager = struct {
                 }
                 const borrow_enabled = if (manager.resource_manager) |resources| resources.dense_projection_borrow_enabled else false;
                 const read_stats = if (if (borrow_enabled) load_session else null) |session|
-                    try generation.opened.readProjectionsIntoBatchBorrowed(manager.io, projection_requests[0..request_count], &session.native_projection_borrows, session.projectionBorrowAllocator())
+                    try generation.opened.readProjectionsIntoBatchBorrowed(manager.io, projection_requests[0..request_count], &session.native_projection_borrows, session.projectionAllocator())
                 else
                     try generation.opened.readProjectionsIntoBatch(manager.io, projection_requests[0..request_count]);
                 if (profile) |p| {
@@ -33205,7 +33812,7 @@ pub const IndexManager = struct {
         const read_start = platform_time.monotonicNs();
         if (load_session) |session| {
             session.ensureDecodedResidencyCapacity(key_count, dims);
-            try session.getManySorted(store, artifact_keys, raw_values);
+            try session.getManySortedForScoring(store, key_alloc, artifact_keys, raw_values);
         } else {
             // This is a sorted point-read workload; avoid a broad primary LSM
             // snapshot and its mutable-state clone/rotation machinery. Keep
@@ -33407,10 +34014,10 @@ pub const IndexManager = struct {
         const cache_before = if (manager.lsm_cache) |cache| cache.snapshotStats() else null;
         const read_start = platform_time.monotonicNs();
         if (load_session) |session| {
-            // Primary-document fallback is not replaceable by decoded-vector
-            // residency, so retain its blocks and keep one reusable owner.
+            // Documents share the artifact scorer's bounded wave lifetime.
+            // Residency changes must preserve an existing primary snapshot.
             session.useLsmResidency();
-            try session.getManySorted(store, keys, values);
+            try session.getManySortedForScoring(store, key_alloc, keys, values);
         } else {
             var runtime_store = try initRuntimeStore(manager.alloc, store);
             defer runtime_store.deinit();
@@ -33520,14 +34127,7 @@ pub const IndexManager = struct {
             if (encoded.len != query.len) return error.InvalidVectorDimensions;
             if (value.quantization_error_norm) |error_norm| {
                 const decoded_norm = value.decoded_norm_lower_bound orelse return error.CorruptedVectorBlock;
-                const distance = vector_mod.distanceToQueryF16(query, query_measure, encoded, value.scale, metric);
-                return vector_mod.boundedDistanceFromProjectionMetadata(
-                    distance,
-                    query_norm,
-                    error_norm,
-                    decoded_norm,
-                    metric,
-                );
+                return vector_mod.certifiedDistanceToQueryF16(query, query_measure, query_norm, encoded, value.scale, error_norm, decoded_norm, metric);
             }
             return vector_mod.distanceToQueryF16BoundedWithQueryNorm(query, query_measure, query_norm, encoded, value.scale, metric);
         }
@@ -33537,9 +34137,46 @@ pub const IndexManager = struct {
         };
     }
 
+    fn validateLeannRetainedDigest(ctx: *anyopaque, alloc: Allocator, metadata: []const u8, digest: u64) anyerror!bool {
+        const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
+        const manager = loader.manager;
+        const store = manager.primary_store orelse return false;
+        const entry = manager.denseIndex(loader.index_name) orelse return error.IndexNotFound;
+        if (entry.embedding_name == null) return false;
+        const key = try denseVectorArtifactKeyForMetadataAlloc(alloc, entry, metadata);
+        defer alloc.free(key);
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        if (try enrichment_artifact_codec.elidedDenseEmbedding(raw)) |stub| {
+            const header = try enrichment_artifact_codec.decodeHeader(raw);
+            return !header.flags.int8_payload and stub.vector_digest == digest;
+        }
+        const view = enrichment_artifact_codec.denseEmbeddingVectorView(raw) catch |err| {
+            if (isRecoverableEmbeddingArtifactError(err)) return false;
+            return err;
+        };
+        if (view) |vector| return leann_store_mod.vectorDigest(vector) == digest;
+        const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, raw);
+        defer alloc.free(vector);
+        return leann_store_mod.vectorDigest(vector) == digest;
+    }
+
     /// LEANN batch loader: reads stored vectors, then re-embeds every
     /// document whose vector was elided in one embedder call.
-    fn loadDenseVectorsForLeann(ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool) anyerror!void {
+    fn loadDenseVectorsForLeann(ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64) anyerror!void {
+        return loadDenseVectorsForLeannImpl(ctx, alloc, vector_ids, metadata, out, found, reembed_ns, null);
+    }
+
+    fn loadDenseVectorsForLeannSession(ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64, session: *LeannRecoverySession) anyerror!void {
+        try session.check();
+        return loadDenseVectorsForLeannImpl(ctx, alloc, vector_ids, metadata, out, found, reembed_ns, session);
+    }
+
+    fn loadDenseVectorsForLeannImpl(ctx: *anyopaque, alloc: Allocator, vector_ids: []const u64, metadata: []const []const u8, out: []f32, found: []bool, reembed_ns: *u64, session: ?*LeannRecoverySession) anyerror!void {
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
         const manager = loader.manager;
         const store = manager.primary_store orelse return;
@@ -33550,19 +34187,86 @@ pub const IndexManager = struct {
         defer elided_slots.deinit(alloc);
         var elided_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer elided_keys.deinit(alloc);
+        var elided_digests = std.ArrayListUnmanaged(?u64).empty;
+        defer elided_digests.deinit(alloc);
+        var source_hashes = std.ArrayListUnmanaged(?u64).empty;
+        defer source_hashes.deinit(alloc);
+        const incarnation = leannIncarnation(entry.config);
+        const cache_enabled = manager.retainedVectorCacheEnabled();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const source_read = if (session) |active| active.source_read else null;
+        var read = if (source_read == null and entry.leann_transient and entry.embedding_name != null) try store.beginProbeTxn() else null;
+        defer if (read) |*txn| txn.abort();
+        const raw_by_slot = try scratch.alloc(?[]const u8, metadata.len);
+        @memset(raw_by_slot, null);
+        if (source_read != null or read != null) {
+            const Read = struct {
+                key: []const u8,
+                slot: usize,
+                fn less(_: void, a: @This(), b: @This()) bool {
+                    return std.mem.lessThan(u8, a.key, b.key);
+                }
+            };
+            var reads = std.ArrayListUnmanaged(Read).empty;
+            for (metadata, 0..) |meta, slot| {
+                if (meta.len == 0) continue;
+                try reads.append(scratch, .{ .key = try denseVectorArtifactKeyForMetadataAlloc(scratch, entry, meta), .slot = slot });
+            }
+            std.mem.sort(Read, reads.items, {}, Read.less);
+            const keys = try scratch.alloc([]const u8, reads.items.len);
+            const values = try scratch.alloc(?[]const u8, reads.items.len);
+            for (reads.items, keys) |item, *key| key.* = item.key;
+            if (source_read) |view| {
+                const owned = try scratch.alloc(?[]u8, keys.len);
+                try view.getManySortedOwned(scratch, keys, owned);
+                for (owned, values) |bytes, *value| value.* = bytes;
+            } else if (read) |*txn| {
+                try txn.getManySorted(keys, values);
+            } else @memset(values, null);
+            for (reads.items, values) |item, value| raw_by_slot[item.slot] = value;
+        }
         for (vector_ids, metadata, 0..) |vector_id, meta, i| {
             found[i] = false;
             if (meta.len == 0) continue;
             const loaded = blk: {
-                if (entry.leann_transient) if (entry.embedding_name) |embedding_name| {
-                    break :blk manager.loadDenseVectorArtifactForHbc(alloc, store, meta, embedding_name, null) catch |err| switch (err) {
+                if (entry.leann_transient) if (entry.embedding_name != null) {
+                    const raw_artifact = raw_by_slot[i] orelse continue;
+                    break :blk enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, raw_artifact) catch |err| switch (err) {
                         error.VectorElided => {
+                            try manager.validateLeannArtifactPrecision(loader.index_name, raw_artifact);
+                            // A hot candidate re-embedded by an earlier query
+                            // for this exact stub is served from the cache.
+                            // Media vectors kept as int8 copies read back
+                            // without embedding anything.
+                            if (try enrichment_artifact_codec.int8ElidedDenseEmbeddingAlloc(alloc, raw_artifact)) |copy| {
+                                defer alloc.free(copy);
+                                if (copy.len == d) {
+                                    @memcpy(out[i * d ..][0..d], copy);
+                                    found[i] = true;
+                                    continue;
+                                }
+                            }
+                            const stub = (try enrichment_artifact_codec.elidedDenseEmbedding(raw_artifact)) orelse return error.ReembedRevisionMismatch;
+                            const header = try enrichment_artifact_codec.decodeHeader(raw_artifact);
+                            const identity = .{ .digest = stub.vector_digest, .source_hash = if (header.flags.has_source_hash) @as(?u64, header.source_hash) else null };
+                            const digest = identity.digest;
+                            if (cache_enabled and manager.leann_reembed_cache.get(incarnation, meta, digest, out[i * d ..][0..d])) {
+                                found[i] = true;
+                                continue;
+                            }
+                            const source_hash = identity.source_hash;
                             try elided_slots.append(alloc, i);
                             try elided_keys.append(alloc, meta);
+                            try source_hashes.append(alloc, source_hash);
+                            try elided_digests.append(alloc, digest);
                             continue;
                         },
-                        error.NotFound => continue,
-                        else => return err,
+                        else => {
+                            if (isRecoverableEmbeddingArtifactError(err)) continue;
+                            return err;
+                        },
                     };
                 };
                 break :blk loadDenseVectorForHbc(ctx, alloc, vector_id, meta) catch |err| switch (err) {
@@ -33575,23 +34279,77 @@ pub const IndexManager = struct {
             @memcpy(out[i * d ..][0..d], loaded);
             found[i] = true;
         }
+        if (read) |*txn| txn.abort();
+        read = null;
         if (elided_keys.items.len == 0) return;
         const vectors = try alloc.alloc(f32, elided_keys.items.len * d);
         defer alloc.free(vectors);
         const ok = try alloc.alloc(bool, elided_keys.items.len);
         defer alloc.free(ok);
         @memset(ok, false);
-        try manager.reembedDenseDocuments(alloc, entry, elided_keys.items, vectors, ok);
+        {
+            const started = platform_time.monotonicNs();
+            defer if (session) |active| {
+                reembed_ns.* = active.elapsed_ns;
+            } else {
+                reembed_ns.* +|= platform_time.monotonicNs() -| started;
+            };
+            try manager.reembedDenseDocumentsSession(alloc, entry, elided_keys.items, source_hashes.items, elided_digests.items, vectors, ok, session);
+        }
         for (elided_slots.items, 0..) |slot, j| {
             if (!ok[j]) continue;
-            @memcpy(out[slot * d ..][0..d], vectors[j * d ..][0..d]);
+            const vector = vectors[j * d ..][0..d];
+            if (elided_digests.items[j]) |dg| {
+                if (cache_enabled) if (manager.resource_manager) |resources| {
+                    manager.leann_reembed_cache.put(manager.alloc, resources, incarnation, elided_keys.items[j], dg, vector) catch {};
+                };
+            }
+            @memcpy(out[slot * d ..][0..d], vector);
             found[slot] = true;
         }
     }
 
+    /// The int8 copy a `media_vectors: int8` stub keeps, dequantized; null for
+    /// a plain stub, a stored vector, or a missing artifact.
+    fn leannInt8StubVectorAlloc(alloc: Allocator, store: *docstore_mod.DocStore, doc_key: []const u8, embedding_name: []const u8) !?[]f32 {
+        const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
+            try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, doc_key, embedding_name)
+        else
+            try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, embedding_name);
+        defer alloc.free(artifact_key);
+        const raw = store.get(alloc, artifact_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        return enrichment_artifact_codec.int8ElidedDenseEmbeddingAlloc(alloc, raw) catch null;
+    }
+
+    /// Read vector and source identities from the same artifact revision.
+    fn leannStubIdentity(alloc: Allocator, store: *docstore_mod.DocStore, doc_key: []const u8, embedding_name: []const u8) !?struct { digest: u64, source_hash: ?u64 } {
+        const key = if (internal_keys.isInternalUserKey(doc_key))
+            try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, doc_key, embedding_name)
+        else
+            try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, embedding_name);
+        defer alloc.free(key);
+        const raw = store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        const stub = (try enrichment_artifact_codec.elidedDenseEmbedding(raw)) orelse return null;
+        const header = try enrichment_artifact_codec.decodeHeader(raw);
+        return .{ .digest = stub.vector_digest, .source_hash = if (header.flags.has_source_hash) header.source_hash else null };
+    }
+
     /// Embeds documents' source text the way the index's dense producer
     /// does, for a transient LEANN index whose stored vectors were elided.
-    fn reembedDenseDocuments(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_keys: []const []const u8, out: []f32, found: []bool) !void {
+    fn reembedDenseDocuments(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_keys: []const []const u8, source_hashes: []const ?u64, digests: []const ?u64, out: []f32, found: []bool) !void {
+        return self.reembedDenseDocumentsSession(alloc, entry, doc_keys, source_hashes, digests, out, found, null);
+    }
+
+    fn reembedDenseDocumentsSession(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_keys: []const []const u8, source_hashes: []const ?u64, digests: []const ?u64, out: []f32, found: []bool, session: ?*LeannRecoverySession) !void {
+        if (doc_keys.len == 0) return;
         const reembedder = self.dense_reembedder orelse return error.ReembedUnavailable;
         const generator = (try parseDenseGeneratorConfig(alloc, entry.config.config_json)) orelse return error.InvalidIndexConfig;
         defer generator.deinit(alloc);
@@ -33600,43 +34358,103 @@ pub const IndexManager = struct {
         const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
         const requests = try alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, doc_keys.len);
         defer alloc.free(requests);
-        for (doc_keys, requests) |doc_key, *request| request.* = .{
+        for (doc_keys, source_hashes, digests, requests) |doc_key, source_hash, digest, *request| request.* = .{
             .kind = .dense_embedding,
             .index_name = entry.config.name,
             .artifact_name = chunk_cfg.artifact_name,
             .embedding_name = embedding_name,
             .embedding_input = chunk_cfg.embedding_input,
             .input_kind = embeddingInputKind(self, generator),
+            // For chunked indexes this is a chunk key; the runtime re-chunks
+            // its parent document with the settings below.
             .doc_key = doc_key,
             .source_field = chunk_cfg.source_field,
             .source_template = chunk_cfg.source_template,
             .expected_dims = entry.dims,
+            .expected_source_hash = source_hash,
+            .expected_vector_digest = digest,
+            .chunk_size = chunk_cfg.chunk_size,
+            .chunk_overlap = chunk_cfg.chunk_overlap,
+            .chunker_json = chunk_cfg.chunker_json,
+            .full_text_index = chunk_cfg.full_text_index,
             .producer_json = embedding_cfg.producer_json,
             .execution_json = chunk_cfg.embedding_execution_json,
         };
-        try reembedder.embed_fn(reembedder.ctx, alloc, requests, entry.dims, out, found);
+        // Freeze the shared recipe once per batch, rather than copying its
+        // template/producer JSON for every candidate. Candidate keys are owned
+        // by the captured plan (or by the caller's replay batch).
+        var recipe = std.heap.ArenaAllocator.init(alloc);
+        defer recipe.deinit();
+        const frozen = try enrichment_types.cloneGeneratedRequest(recipe.allocator(), requests[0]);
+        for (requests) |*request| {
+            const key = request.doc_key;
+            const source_hash = request.expected_source_hash;
+            const vector_digest = request.expected_vector_digest;
+            request.* = frozen;
+            request.doc_key = key;
+            request.expected_source_hash = source_hash;
+            request.expected_vector_digest = vector_digest;
+        }
+        if (session != null and reembedder.embed_session_fn != null) {
+            try reembedder.embed_session_fn.?(reembedder.ctx, alloc, requests, entry.dims, out, found, session.?);
+        } else {
+            const started = if (session) |active| try active.beginDispatch() else 0;
+            defer if (session) |active| active.finishDispatch(started);
+            try reembedder.embed_fn(reembedder.ctx, alloc, requests, entry.dims, out, found);
+        }
     }
 
     /// Restore and rebuild scans: re-embeds the document behind an elided
     /// stub through the transient LEANN index that consumes `embedding_name`.
     /// Returns `error.NotFound` when no such index or source text exists.
     pub fn reembedElidedDocument(self: *IndexManager, alloc: Allocator, embedding_name: []const u8, doc_key: []const u8, dims: u32) ![]f32 {
+        return self.reembedElidedDocumentSession(alloc, embedding_name, doc_key, dims, null);
+    }
+
+    fn reembedElidedDocumentSession(self: *IndexManager, alloc: Allocator, embedding_name: []const u8, doc_key: []const u8, dims: u32, session: ?*LeannRecoverySession) ![]f32 {
+        if (self.primary_store) |store| if (try leannInt8StubVectorAlloc(alloc, store, doc_key, embedding_name)) |copy| {
+            if (self.embeddingHasFullMediaConsumer("", embedding_name)) {
+                alloc.free(copy);
+                return error.ArtifactRepairRequired;
+            }
+            if (copy.len == dims) return copy;
+            alloc.free(copy);
+        };
         for (self.dense_indexes.items) |*entry| {
             if (!entry.leann_transient or entry.dims != dims) continue;
             const name = entry.embedding_name orelse continue;
             if (!std.mem.eql(u8, name, embedding_name)) continue;
-            return self.reembedOneDenseDocument(alloc, entry, doc_key);
+            return self.reembedOneDenseDocumentSession(alloc, entry, doc_key, session);
         }
         return error.NotFound;
     }
 
     fn reembedOneDenseDocument(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_key: []const u8) ![]f32 {
+        return self.reembedOneDenseDocumentSession(alloc, entry, doc_key, null);
+    }
+
+    fn reembedOneDenseDocumentSession(self: *IndexManager, alloc: Allocator, entry: *const DenseIndex, doc_key: []const u8, session: ?*LeannRecoverySession) ![]f32 {
+        if (self.primary_store) |store| if (entry.embedding_name) |name| if (try leannInt8StubVectorAlloc(alloc, store, doc_key, name)) |copy| {
+            if (!entry.leann_media_int8) {
+                alloc.free(copy);
+                return error.ArtifactRepairRequired;
+            }
+            if (copy.len == entry.dims) return copy;
+            alloc.free(copy);
+        };
         const out = try alloc.alloc(f32, entry.dims);
         errdefer alloc.free(out);
         var found = [_]bool{false};
         const keys = [_][]const u8{doc_key};
-        try self.reembedDenseDocuments(alloc, entry, &keys, out, &found);
-        if (!found[0]) return error.NotFound;
+        const store = self.primary_store orelse return error.ReembedProvenanceUnavailable;
+        const name = entry.embedding_name orelse return error.ReembedProvenanceUnavailable;
+        const identity = (try leannStubIdentity(alloc, store, doc_key, name)) orelse return error.ReembedProvenanceUnavailable;
+        const hashes = [_]?u64{identity.source_hash};
+        const digests = [_]?u64{identity.digest};
+        try self.reembedDenseDocumentsSession(alloc, entry, &keys, &hashes, &digests, out, &found, session);
+        // A rebuild cannot silently skip an artifact whose source or legacy
+        // vector identity cannot be proven.
+        if (!found[0]) return error.ReembedProvenanceUnavailable;
         return out;
     }
 
@@ -34432,6 +35250,33 @@ pub const IndexManager = struct {
             vector_id
         else
             null;
+    }
+
+    /// Compare an encoded document component without allocating. Unknown or
+    /// malformed internal keys are retained so a parse failure cannot delete data.
+    fn leannKeyInRange(self: *const IndexManager, key: []const u8) bool {
+        if (!internal_keys.isInternalUserKey(key)) return self.byte_range.contains(key);
+        const end = internal_keys.findComponentTerminator(key, 1) orelse return true;
+        const body = key[1..end];
+        const Compare = struct {
+            fn order(encoded: []const u8, bound: []const u8) ?std.math.Order {
+                var i: usize = 0;
+                var j: usize = 0;
+                while (i < encoded.len and j < bound.len) : (j += 1) {
+                    const b = encoded[i];
+                    if (b == 0) {
+                        if (i + 1 >= encoded.len or encoded[i + 1] != 0xff) return null;
+                        i += 2;
+                    } else i += 1;
+                    if (b != bound[j]) return if (b < bound[j]) .lt else .gt;
+                }
+                if (i == encoded.len and j == bound.len) return .eq;
+                return if (i == encoded.len) .lt else .gt;
+            }
+        };
+        if (self.byte_range.start.len != 0 and (Compare.order(body, self.byte_range.start) orelse return true) == .lt) return false;
+        if (self.byte_range.end.len != 0 and (Compare.order(body, self.byte_range.end) orelse return true) != .lt) return false;
+        return true;
     }
 
     fn keyInRange(self: *const IndexManager, key: []const u8) bool {
@@ -35916,7 +36761,20 @@ fn parseEmbeddingSemanticProducerAlloc(alloc: Allocator, raw: []const u8) !?[]u8
     return try alloc.dupe(u8, value.string);
 }
 
-pub const LeannVectorStorage = enum { transient, persistent };
+/// `transient` drops every covered stored vector; `auto` drops only those the
+/// producer embedded from text (`Flags.text_input`) and keeps media-derived
+/// ones; `persistent` keeps all of them.
+pub const LeannVectorStorage = enum {
+    transient,
+    persistent,
+    auto,
+
+    /// Whether covered vectors may become stubs (and graphs rebuild from
+    /// codes).
+    pub fn elides(self: LeannVectorStorage) bool {
+        return self != .persistent;
+    }
+};
 
 const LeannDenseOptions = struct {
     max_degree: u32 = 30,
@@ -35928,6 +36786,10 @@ const LeannDenseOptions = struct {
     search_ef: u32 = 0,
     bound_scale: f32 = 1.0,
     batch_size: u32 = 0,
+    reembed_budget_ms: u32 = 0,
+    /// `media_vectors: int8`: vectors that cannot be re-embedded from text
+    /// keep an int8 copy in their stub instead of a full stored vector.
+    media_int8: bool = false,
 };
 
 /// Reads the internal `algorithm` / `leann` fields written by the managed
@@ -35950,6 +36812,13 @@ fn parseLeannDenseOptions(root: std.json.ObjectMap) !?LeannDenseOptions {
     if (try Int.get(value.object, "max_degree", 4, 128)) |v| out.max_degree = v;
     if (try Int.get(value.object, "search_ef", 0, 4096)) |v| out.search_ef = v;
     if (try Int.get(value.object, "batch_size", 0, 1024)) |v| out.batch_size = v;
+    if (try Int.get(value.object, "reembed_budget_ms", 0, 600_000)) |v| out.reembed_budget_ms = v;
+    if (value.object.get("media_vectors")) |v| {
+        if (v != .string) return error.InvalidIndexConfig;
+        if (std.mem.eql(u8, v.string, "int8")) {
+            out.media_int8 = true;
+        } else if (!std.mem.eql(u8, v.string, "full")) return error.InvalidIndexConfig;
+    }
     if (try Int.get(value.object, "quantization_bits", 0, 8)) |v| out.rabitq_bits = @intCast(v);
     if (value.object.get("quantizer")) |v| {
         if (v != .string) return error.InvalidIndexConfig;
@@ -35960,7 +36829,7 @@ fn parseLeannDenseOptions(root: std.json.ObjectMap) !?LeannDenseOptions {
         if (v != .string) return error.InvalidIndexConfig;
         out.vector_storage = std.meta.stringToEnum(LeannVectorStorage, v.string) orelse return error.InvalidIndexConfig;
     }
-    if (out.vector_storage == .transient and out.quantizer != .rabitq) return error.InvalidIndexConfig;
+    if (out.vector_storage.elides() and out.quantizer != .rabitq) return error.InvalidIndexConfig;
     if (value.object.get("bound_scale")) |v| {
         const f: f64 = switch (v) {
             .integer => |i| @floatFromInt(i),
@@ -36002,6 +36871,24 @@ test "leann dense options parse quantization_bits" {
             try std.testing.expectError(error.InvalidIndexConfig, parseLeannDenseOptions(parsed.value.object));
         }
     }
+}
+
+test "leann catalog elision modes require the dense artifact format protocol" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "auto", "transient" }) |mode| {
+        const json = try std.fmt.allocPrint(a, "{{\"field\":\"embedding\",\"dims\":8,\"algorithm\":\"leann\",\"leann\":{{\"vector_storage\":\"{s}\"}}}}", .{mode});
+        defer a.free(json);
+        try std.testing.expect(try denseArtifactFlagsRequired(a, .{ .name = "idx", .kind = .dense_vector, .config_json = json }));
+    }
+    try std.testing.expect(!try denseArtifactFlagsRequired(a, .{ .name = "idx", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":8,\"algorithm\":\"leann\",\"leann\":{\"vector_storage\":\"persistent\"}}" }));
+}
+
+/// Catalog activation for formats an older artifact reader cannot apply.
+pub fn denseArtifactFlagsRequired(alloc: Allocator, cfg: types.IndexConfig) !bool {
+    if (cfg.kind != .dense_vector) return false;
+    const dense = try parseDenseConfig(alloc, cfg.config_json);
+    defer dense.deinit(alloc);
+    return if (dense.leann) |leann| leann.vector_storage.elides() else false;
 }
 
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
@@ -46889,6 +47776,26 @@ test "production external scorers use bounded cache-first artifact batches" {
     // cannot serve this path and only adds allocation/cache-lock churn.
     try std.testing.expectEqual(metadata_insertions_before, entry.index.hbcCacheStats().metadata.insertions);
 
+    // Full-effort HBC scanning has the opposite shared-cache policy from
+    // candidate-only exact scoring: do not rotate decoded residency while
+    // streaming the corpus, even though primary reads remain cacheable.
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+    const scan_insertions_before = entry.index.hbcCacheStats().vector.insertions;
+    var complete_scan = try manager.searchDenseEntryProfiledWithRequest(entry, .{
+        .query = vectors[far_query_idx * dims ..][0..dims],
+        .k = 10,
+        .search_effort = 1,
+        .filter_ids = candidate_ids,
+        .load_metadata = false,
+    });
+    defer complete_scan.results.deinit();
+    try std.testing.expectEqual(@as(u64, candidate_count), complete_scan.profile.exact_vectors_scored);
+    try std.testing.expectEqual(scan_insertions_before, entry.index.hbcCacheStats().vector.insertions);
+    try std.testing.expectEqual(@as(u64, 0), hbc_cache.decoded_query_entitled_bytes.load(.acquire));
+    try std.testing.expectEqual(candidate_ids[far_query_idx], complete_scan.results.getHits()[0].vector_id);
+
+    const exact_metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
     // Missing/corrupt external artifacts are candidate-local failures. They
     // must not fail the whole request (the old scalar fallback did).
     const missing_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_keys[missing_candidate_idx], "semantic_idx");
@@ -46907,6 +47814,12 @@ test "production external scorers use bounded cache-first artifact batches" {
     hbc_mod.setTestGetVectorViewOrScratchHook(&vector_namespace_probes, VectorNamespaceProbeCounter.onLoad);
     defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
 
+    // Exact candidate scoring may populate shared decoded residency while
+    // keeping its request-local vector cache empty. Start cold so earlier
+    // rerank fills cannot hide an unused residency entitlement.
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+    const exact_insertions_before = entry.index.hbcCacheStats().vector.insertions;
     var outcome = try manager.exactScoreDenseEntryWithRequest(entry, .{
         .query = vectors[far_query_idx * dims ..][0..dims],
         .k = 10,
@@ -46921,9 +47834,11 @@ test "production external scorers use bounded cache-first artifact batches" {
     try std.testing.expectEqual(@as(u64, 2), outcome.profile.raw_batch_reads);
     try std.testing.expectEqual(@as(u64, 0), outcome.profile.raw_scalar_reads);
     try std.testing.expectEqual(@as(u64, 0), outcome.profile.request_vector_cache_entries);
+    try std.testing.expect(entry.index.hbcCacheStats().vector.insertions > exact_insertions_before);
+    try std.testing.expectEqual(@as(u64, 0), hbc_cache.decoded_query_entitled_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), vector_namespace_probes.count);
     try std.testing.expect(entry.index.hbcCacheStats().vector.used_bytes > 0);
-    try std.testing.expectEqual(metadata_insertions_before, entry.index.hbcCacheStats().metadata.insertions);
+    try std.testing.expectEqual(exact_metadata_insertions_before, entry.index.hbcCacheStats().metadata.insertions);
     try std.testing.expectEqual(@as(u64, 1), outcome.profile.missing_vectors);
     try std.testing.expect(outcome.profile.workspace_bytes > 0);
     try std.testing.expect(outcome.profile.artifact_read_ns > 0);
@@ -47083,6 +47998,35 @@ test "production external scorers use bounded cache-first artifact batches" {
         try std.testing.expectEqual(expected.vector_id, hit.vector_id);
         try std.testing.expectApproxEqRel(expected.distance, hit.distance, 0.000001);
     }
+
+    const Residual = struct {
+        key: []const u8,
+        calls: usize = 0,
+
+        fn allows(_: *anyopaque, _: []const u8) !bool {
+            return error.UnexpectedScalarPredicate;
+        }
+
+        fn many(raw: *anyopaque, keys: []const []const u8, allowed: []bool) !void {
+            const context: *@This() = @ptrCast(@alignCast(raw));
+            context.calls += 1;
+            try std.testing.expect(keys.len <= 128);
+            for (keys, allowed) |key, *keep| keep.* = std.mem.eql(u8, context.key, key);
+        }
+    };
+    var residual = Residual{ .key = doc_keys[far_query_idx] };
+    var filtered = try manager.exactScoreDenseEntryWithRequest(entry, .{
+        .query = vectors[far_query_idx * dims ..][0..dims],
+        .k = 10,
+        .filter_ids = candidate_ids,
+        .key_predicate = .{ .ptr = &residual, .allows = Residual.allows, .allows_many = Residual.many },
+    });
+    defer filtered.results.deinit();
+    try std.testing.expect(residual.calls > 1);
+    try std.testing.expectEqual(.exhausted, filtered.results.candidate_coverage);
+    try std.testing.expectEqual(@as(u64, 1), filtered.vectors_scored);
+    try std.testing.expectEqual(@as(usize, 1), filtered.results.getHits().len);
+    try std.testing.expectEqual(candidate_ids[far_query_idx], filtered.results.getHits()[0].vector_id);
 }
 
 test "external dense embedding writes persist deterministic vector mappings" {
@@ -48775,6 +49719,529 @@ test "native float16 residual rerank returns authoritative float32 score" {
     try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual)));
 }
 
+// Opt-in ReleaseFast A/B measurement of the production scorers. The old
+// decoded-admission policy is reproduced with its explicit switch; the scan
+// control disables only certified screening, keeping the exact source equal.
+test "benchmark exact search cache and certified scoring" {
+    if (getenv("ANTFLY_BENCH_EXACT_POLICY") == null) return error.SkipZigTest;
+    // Match standalone benchmarks, excluding DebugAllocator bookkeeping
+    // from allocation-heavy cold/uncached query timings.
+    const alloc = std.heap.c_allocator;
+    const count = if (getenv("ANTFLY_BENCH_EXACT_VECTORS")) |raw|
+        try std.fmt.parseInt(usize, std.mem.span(raw), 10)
+    else
+        4096;
+    const dims = 128;
+    const query_count = 8;
+    const samples = 24;
+    const rounds = 4;
+    const k = 20;
+    if (count < k) return error.InvalidArgument;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer primary.close();
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resources.deinit(alloc);
+    var cache = hbc_mod.Cache.init(alloc);
+    defer cache.deinit();
+    cache.attachResourceManager(&resources);
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var manager = try IndexManager.initWithOptions(alloc, path, .{ .resource_manager = &resources, .hbc_cache = &cache });
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&primary, &.{.{ .name = "bench", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":128,\"metric\":\"inner_product\",\"embedding_name\":\"bench\",\"external\":true}" }});
+    const vectors = try alloc.alloc(f32, count * dims);
+    defer alloc.free(vectors);
+    const writes = try alloc.alloc(mapper.DenseEmbeddingWrite, count);
+    defer alloc.free(writes);
+    const keys = try alloc.alloc([]u8, count);
+    defer alloc.free(keys);
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    const ids = try alloc.alloc(u64, count);
+    defer alloc.free(ids);
+    var random_state = std.Random.DefaultPrng.init(0xbe4c_2026);
+    for (writes, 0..) |*write, row| {
+        keys[row] = try std.fmt.allocPrint(alloc, "doc:{d:0>6}", .{row});
+        initialized += 1;
+        const vector = vectors[row * dims ..][0..dims];
+        for (vector) |*component| component.* = random_state.random().float(f32) * 2 - 1;
+        _ = vector_mod.normalize(vector);
+        ids[row] = deterministicDenseVectorId(keys[row]);
+        write.* = .{ .index_name = @constCast("bench"), .doc_key = keys[row], .vector = vector, .artifact_key = null };
+    }
+    try manager.applyDenseEmbeddingWritesByNameWithOptions(&primary, "bench", writes, .{ .mode = .bulk_ingest });
+    const entry = manager.denseIndex("bench").?;
+    manager.clearVectorBlockGenerationForTest();
+    entry.index.setRetainedVectorCacheEnabled(true);
+    var queries: [query_count][dims]f32 = undefined;
+    var oracle: [query_count]hbc_mod.SearchResults = undefined;
+    var oracle_count: usize = 0;
+    defer for (oracle[0..oracle_count]) |*result| result.deinit();
+    for (&queries, &oracle) |*query, *expected| {
+        for (query) |*component| component.* = random_state.random().float(f32) * 2 - 1;
+        _ = vector_mod.normalize(query);
+        expected.* = try hbc_mod.SearchResults.initCapacity(alloc, k, k, k);
+        oracle_count += 1;
+        for (ids, 0..) |id, row| expected.addResult(id, vector_mod.distanceToQuery(query, 0, vectors[row * dims ..][0..dims], .inner_product), 0);
+        expected.sort();
+    }
+    var cold: [2][rounds]u64 = undefined;
+    var warm: [2][rounds * (samples - 1)]u64 = undefined;
+    for (0..rounds) |round| for (0..2) |phase| {
+        const mode = (round + phase) % 2; // Alternate order to reduce drift.
+        for (ids) |id| entry.index.invalidateVectorCache(id);
+        entry.index.abortVectorCacheMutations();
+        for (0..samples) |sample| {
+            const q = sample % query_count;
+            const start = platform_time.monotonicNs();
+            var outcome = blk: {
+                const lease = entry.index.acquireDecodedVectorResidency(count) orelse return error.TestUnexpectedResult;
+                var session: IndexManager.DenseVectorLoadSession = .{
+                    .context = entry.vector_loader_context.?,
+                    .working_slice = .dense_search_working_set,
+                    .cache_vectors = false,
+                    .cache_decoded_vectors = mode == 1,
+                    .cache_raw_values = false,
+                    .recycle_raw_reads = false,
+                    .block_cache_admission = .transient,
+                    .decoded_residency_lease = lease,
+                };
+                defer session.deinit();
+                const previous = IndexManager.active_dense_vector_load_session;
+                IndexManager.active_dense_vector_load_session = &session;
+                defer IndexManager.active_dense_vector_load_session = previous;
+                break :blk try manager.exactScoreDenseEntryWithRequest(entry, .{ .query = &queries[q], .k = k, .filter_ids = ids, .load_metadata = false });
+            };
+            const elapsed = platform_time.monotonicNs() - start;
+            defer outcome.results.deinit();
+            try std.testing.expectEqual(oracle[q].getHits().len, outcome.results.getHits().len);
+            for (oracle[q].getHits(), outcome.results.getHits()) |want, got| {
+                try std.testing.expectEqual(want.vector_id, got.vector_id);
+                try std.testing.expectEqual(want.distance, got.distance);
+            }
+            if (sample == 0) cold[mode][round] = elapsed else warm[mode][round * (samples - 1) + sample - 1] = elapsed;
+        }
+    };
+    for (0..2) |mode| {
+        std.mem.sort(u64, &cold[mode], {}, std.sort.asc(u64));
+        std.mem.sort(u64, &warm[mode], {}, std.sort.asc(u64));
+        std.debug.print("exact_policy_bench mode={s} vectors={d} dims={d} k={d} cold_median_ns={d} warm_median_ns={d} checked_queries={d} exact_topk=true\n", .{ if (mode == 0) "before" else "fixed", count, dims, k, cold[mode][rounds / 2], warm[mode][warm[mode].len / 2], rounds * samples });
+    }
+
+    // Full-effort certified scan versus exhaustive source residual scoring.
+    _ = try entry.index.publishExperimentalPostingCheckpoint(9);
+    const sequence = entry.index.experimental_posting_read_generation.?.covered_source_sequence.load(.acquire);
+    var writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, sequence, .float16);
+    defer writer.deinit();
+    const artifacts = try alloc.alloc(IndexManager.DenseArtifactReadKey, count);
+    defer alloc.free(artifacts);
+    var artifact_count: usize = 0;
+    defer for (artifacts[0..artifact_count]) |artifact| alloc.free(artifact.key);
+    for (keys, 0..) |key, row| {
+        artifacts[row] = IndexManager.DenseArtifactReadKey.init(try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, key, "bench"), row);
+        artifact_count += 1;
+    }
+    std.mem.sort(IndexManager.DenseArtifactReadKey, artifacts, {}, struct {
+        fn less(_: void, lhs: IndexManager.DenseArtifactReadKey, rhs: IndexManager.DenseArtifactReadKey) bool {
+            const l = vector_block_mod.keyHash(lhs.key);
+            const r = vector_block_mod.keyHash(rhs.key);
+            return if (l == r) std.mem.lessThan(u8, lhs.key, rhs.key) else l < r;
+        }
+    }.less);
+    for (artifacts) |artifact| try writer.appendVector(artifact.key, sequence, 1, vectors[artifact.position * dims ..][0..dims]);
+    const block = try writer.build();
+    defer alloc.free(block);
+    var store = try vector_block_store_mod.Store.open(alloc, memory.storage(), "/exact-policy-bench");
+    defer store.deinit();
+    store.covered_source_sequence = sequence;
+    try store.publishGeneration(1, sequence, &.{.{ .shard_id = 0, .bytes = block }}, true);
+    manager.installVectorBlockGeneration(try SharedVectorBlockGeneration.create(alloc, try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), "/exact-policy-bench")));
+    const bounded_available = entry.index.external_vector_bounded_distance_available;
+    defer entry.index.external_vector_bounded_distance_available = bounded_available;
+    const Unscreened = struct {
+        fn available(_: *anyopaque, _: ?u64) bool {
+            return false;
+        }
+    };
+    var scans: [2][rounds * samples]u64 = undefined;
+    var pruned: [2]u64 = .{ 0, 0 };
+    var scored: [2]u64 = .{ 0, 0 };
+    for (0..rounds) |round| for (0..2) |phase| {
+        const mode = (round + phase) % 2;
+        entry.index.external_vector_bounded_distance_available = if (mode == 0) Unscreened.available else bounded_available;
+        for (0..samples) |sample| {
+            const q = sample % query_count;
+            const start = platform_time.monotonicNs();
+            var result = try manager.searchDenseEntryProfiledWithRequest(entry, .{ .query = &queries[q], .k = k, .search_effort = 1, .load_metadata = false });
+            scans[mode][round * samples + sample] = platform_time.monotonicNs() - start;
+            defer result.results.deinit();
+            try std.testing.expectEqual(oracle[q].getHits().len, result.results.getHits().len);
+            for (oracle[q].getHits(), result.results.getHits()) |want, got| {
+                try std.testing.expectEqual(want.vector_id, got.vector_id);
+                try std.testing.expectEqual(want.distance, got.distance);
+            }
+            pruned[mode] += result.profile.exact_vectors_pruned_by_bound;
+            scored[mode] += result.profile.exact_vectors_scored;
+        }
+    };
+    for (0..2) |mode| {
+        std.mem.sort(u64, &scans[mode], {}, std.sort.asc(u64));
+        std.debug.print("exact_scan_bench mode={s} vectors={d} dims={d} k={d} median_ns={d} exact_scored={d} pruned={d} checked_queries={d} exact_topk=true\n", .{ if (mode == 0) "unscreened" else "certified", count, dims, k, scans[mode][scans[mode].len / 2], scored[mode], pruned[mode], rounds * samples });
+    }
+}
+
+test "exact direct document fallback bounds waves and preserves transient snapshot" {
+    const alloc = std.testing.allocator;
+    const count = 384;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer primary.close();
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 8 * 1024 * 1024 };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resources.deinit(alloc);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{ .resource_manager = &resources });
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&primary, &.{.{
+        .name = "direct",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    }});
+    const entry = manager.denseIndex("direct").?;
+    try std.testing.expect(!entry.external and entry.embedding_name == null);
+    entry.index.setRetainedVectorCacheEnabled(false);
+    var vectors: [count][2]f32 = undefined;
+    var names: [count][32]u8 = undefined;
+    var items: [count]hbc_mod.BatchInsertItem = undefined;
+    var ids: [count]u64 = undefined;
+    const padding: [4096]u8 = @splat('x');
+    for (&items, &vectors, &names, 0..) |*item, *vector, *name, row| {
+        const doc_key = try std.fmt.bufPrint(name, "doc:{d:0>4}", .{row});
+        vector.* = .{ @floatFromInt(row), 0 };
+        ids[row] = row + 1;
+        item.* = .{ .vector_id = ids[row], .metadata = doc_key, .vector = vector };
+        const key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+        defer alloc.free(key);
+        const body = try std.fmt.allocPrint(alloc, "{{\"embedding\":[{d},0],\"padding\":\"{s}\"}}", .{ row, &padding });
+        defer alloc.free(body);
+        try primary.put(key, body);
+    }
+    // No embedding artifacts: every member must be read from its document.
+    try entry.index.batchInsertWithMetadataOptions(&items, .{ .skip_vector_store = true, .assume_absent_ids = true });
+    _ = try entry.index.publishExperimentalPostingCheckpoint(count);
+    manager.clearVectorBlockGenerationForTest();
+    var session: IndexManager.DenseVectorLoadSession = .{
+        .context = entry.vector_loader_context.?,
+        .working_slice = .dense_search_working_set,
+        .read_txn = try primary.beginReadTxnWithBlockCacheAdmission(.transient),
+        .block_cache_admission = .transient,
+        .recycle_raw_reads = false,
+        .cache_raw_values = false,
+        .cache_vectors = true,
+    };
+    defer session.deinit();
+    // A current-tip reader would lose the true nearest neighbor after this
+    // replacement. The query must continue using the captured document view.
+    const changed_key = try internal_keys.documentKeyAlloc(alloc, items[0].metadata);
+    defer alloc.free(changed_key);
+    try primary.put(changed_key, "{\"embedding\":[9999,0]}");
+    const previous = IndexManager.active_dense_vector_load_session;
+    IndexManager.active_dense_vector_load_session = &session;
+    defer IndexManager.active_dense_vector_load_session = previous;
+    const Routes = struct {
+        fn search(m: *IndexManager, dense: *IndexManager.DenseIndex, route: usize, candidates: []const u64) !hbc_mod.SearchResults {
+            const req = hbc_mod.SearchRequest{ .query = &.{ 0, 0 }, .k = 10, .search_effort = if (route == 2) 0.5 else 1, .filter_ids = candidates, .load_metadata = false };
+            return switch (route) {
+                0 => try m.searchDenseEntryWithRequest(dense, req),
+                1 => (try m.searchDenseEntryProfiledWithRequest(dense, req)).results,
+                2 => (try m.exactScoreDenseEntryWithRequest(dense, req)).results,
+                else => unreachable,
+            };
+        }
+    };
+    for (0..3) |route| {
+        var hits = try Routes.search(&manager, entry, route, &ids);
+        defer hits.deinit();
+        try std.testing.expectEqual(@as(usize, 10), hits.getHits().len);
+        for (hits.getHits(), 0..) |hit, row| {
+            try std.testing.expectEqual(@as(u64, row + 1), hit.vector_id);
+            try std.testing.expectEqual(@as(f32, @floatFromInt(row * row)), hit.distance);
+        }
+        try std.testing.expect(session.read_txn != null and session.read_txn.?.read != null);
+        try std.testing.expect(session.cache_vectors); // Caller policies restored.
+        try std.testing.expect(session.cache_decoded_vectors);
+        try std.testing.expectEqual(@as(u64, 0), session.raw_read_value_bytes);
+        try std.testing.expectEqual(@as(usize, 0), session.raw_cache.count());
+        try std.testing.expectEqual(@as(usize, 0), session.vector_cache.count());
+        try std.testing.expectEqual(backend_types.Namespace.BlockCacheAdmission.retain, session.block_cache_admission);
+    }
+    // Retire an existing current-tip probe for each entry point. Seed its
+    // request cache too: promoting the transaction alone must not allow an
+    // old cached vector to override the new snapshot's document value.
+    for (0..3) |route| {
+        try primary.put(changed_key, "{\"embedding\":[0,0]}");
+        var probe_session: IndexManager.DenseVectorLoadSession = .{
+            .context = entry.vector_loader_context.?,
+            .working_slice = .dense_search_working_set,
+            .read_txn = try primary.beginProbeTxn(),
+            .recycle_raw_reads = false,
+        };
+        defer probe_session.deinit();
+        _ = try probe_session.get(&primary, changed_key);
+        try probe_session.cacheVector(1, &vectors[0]);
+        try std.testing.expect(probe_session.raw_cache.count() > 0);
+        try primary.put(changed_key, "{\"embedding\":[9999,0]}");
+        const outer_session = IndexManager.active_dense_vector_load_session;
+        IndexManager.active_dense_vector_load_session = &probe_session;
+        defer IndexManager.active_dense_vector_load_session = outer_session;
+        var hits = try Routes.search(&manager, entry, route, &ids);
+        defer hits.deinit();
+        try std.testing.expectEqual(@as(usize, 10), hits.getHits().len);
+        for (hits.getHits(), 0..) |hit, row| {
+            try std.testing.expectEqual(@as(u64, row + 2), hit.vector_id);
+            try std.testing.expectEqual(@as(f32, @floatFromInt((row + 1) * (row + 1))), hit.distance);
+        }
+        try std.testing.expect(probe_session.read_txn != null and probe_session.read_txn.?.read != null);
+        try std.testing.expect(probe_session.cache_vectors and probe_session.cache_decoded_vectors);
+        try std.testing.expectEqual(@as(u64, 0), probe_session.raw_read_value_bytes);
+        try std.testing.expectEqual(@as(u64, 0), probe_session.vector_cache_bytes);
+        try std.testing.expectEqual(@as(usize, 0), probe_session.raw_cache.count());
+        try std.testing.expectEqual(@as(usize, 0), probe_session.vector_cache.count());
+    }
+}
+
+test "certified exact search streams real source projections within one admitted wave" {
+    const alloc = std.testing.allocator;
+    const count = 768;
+    const dims = 40;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer primary.close();
+    var search_budgets = resource_manager_mod.Options.defaultBudgets();
+    search_budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 8 * 1024 * 1024 };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = search_budgets });
+    defer resources.deinit(alloc);
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var manager = try IndexManager.initWithOptions(alloc, path, .{ .resource_manager = &resources });
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&primary, &.{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":40,\"metric\":\"inner_product\",\"embedding_name\":\"semantic_idx\",\"external\":true}",
+    }});
+    const vectors = try alloc.alloc(f32, count * dims);
+    defer alloc.free(vectors);
+    const writes = try alloc.alloc(mapper.DenseEmbeddingWrite, count);
+    defer alloc.free(writes);
+    const keys = try alloc.alloc([]u8, count);
+    defer alloc.free(keys);
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    var random_state = std.Random.DefaultPrng.init(0xc37e_900d);
+    for (writes, 0..) |*write, row| {
+        keys[row] = try std.fmt.allocPrint(alloc, "doc:{d}", .{row});
+        initialized += 1;
+        const vector = vectors[row * dims ..][0..dims];
+        for (vector) |*component| component.* = random_state.random().float(f32) * 2 - 1;
+        _ = vector_mod.normalize(vector);
+        write.* = .{ .index_name = @constCast("semantic_idx"), .doc_key = keys[row], .vector = vector, .artifact_key = null };
+    }
+    try manager.applyDenseEmbeddingWritesByNameWithOptions(&primary, "semantic_idx", writes, .{ .mode = .bulk_ingest });
+    const entry = manager.denseIndex("semantic_idx").?;
+    try std.testing.expect(!entry.index.external_vector_projection_build_retain);
+    _ = try entry.index.publishExperimentalPostingCheckpoint(9);
+    const posting_generation = entry.index.experimental_posting_read_generation.?;
+    const sequence = posting_generation.covered_source_sequence.load(.acquire);
+    var block_writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, sequence, .float16);
+    defer block_writer.deinit();
+    const artifacts = try alloc.alloc(IndexManager.DenseArtifactReadKey, count);
+    defer alloc.free(artifacts);
+    var artifact_count: usize = 0;
+    defer for (artifacts[0..artifact_count]) |artifact| alloc.free(artifact.key);
+    for (keys, 0..) |key, row| {
+        artifacts[row] = IndexManager.DenseArtifactReadKey.init(try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, key, "semantic_idx"), row);
+        artifact_count += 1;
+    }
+    std.mem.sort(IndexManager.DenseArtifactReadKey, artifacts, {}, struct {
+        fn less(_: void, lhs: IndexManager.DenseArtifactReadKey, rhs: IndexManager.DenseArtifactReadKey) bool {
+            const l = vector_block_mod.keyHash(lhs.key);
+            const r = vector_block_mod.keyHash(rhs.key);
+            return if (l == r) std.mem.lessThan(u8, lhs.key, rhs.key) else l < r;
+        }
+    }.less);
+    for (artifacts) |artifact| try block_writer.appendVector(artifact.key, sequence, 1, vectors[artifact.position * dims ..][0..dims]);
+    const block = try block_writer.build();
+    defer alloc.free(block);
+    var source_store = try vector_block_store_mod.Store.open(alloc, memory.storage(), "/certified-source");
+    defer source_store.deinit();
+    source_store.covered_source_sequence = sequence;
+    try source_store.publishGeneration(1, sequence, &.{.{ .shard_id = 0, .bytes = block }}, true);
+    const generation = try SharedVectorBlockGeneration.create(alloc, try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), "/certified-source"));
+    manager.installVectorBlockGeneration(generation);
+    // Prepare a different authority, then publish its real CURRENT pointer
+    // after the first bounded read and before that wave's exact completion.
+    var next_writer = try vector_block_mod.Writer.initWithEncoding(alloc, 2, 0, 1, sequence + 1, .float16);
+    defer next_writer.deinit();
+    const replacement: [dims]f32 = @splat(0);
+    for (artifacts) |artifact| try next_writer.appendVector(artifact.key, sequence + 1, 2, &replacement);
+    const next_block = try next_writer.build();
+    defer alloc.free(next_block);
+    const Publication = struct {
+        var writer: ?*vector_block_store_mod.Store = null;
+        var storage: ?*lsm_backend_mod.MemoryStorage = null;
+        var block_bytes: ?[]const u8 = null;
+        var next_sequence: u64 = 0;
+        var published = false;
+        fn bounded(raw: *anyopaque, ids: []const u64, metadata: []const ?[]const u8, query_vector: []const f32, measure: f32, metric: vector_mod.DistanceMetric, distances: []f32, bounds: []f32, batch: []f32, dimension_count: usize, scratch: hbc_mod.HBCIndex.ExternalVectorBatchDistanceScratch, profile: ?*hbc_mod.SearchProfile) !void {
+            try IndexManager.scoreDenseVectorsForHbcBatchBounded(raw, ids, metadata, query_vector, measure, metric, distances, bounds, batch, dimension_count, scratch, profile);
+            if (block_bytes) |bytes| {
+                block_bytes = null;
+                writer.?.covered_source_sequence = next_sequence;
+                try writer.?.publishGeneration(2, next_sequence, &.{.{ .shard_id = 0, .bytes = bytes }}, true);
+                const context: *IndexManager.DenseVectorLoadContext = @ptrCast(@alignCast(raw));
+                const opened = try vector_block_store_mod.Store.openWithBlocks(context.manager.alloc, storage.?.storage(), "/certified-source");
+                context.manager.installVectorBlockGeneration(try SharedVectorBlockGeneration.create(context.manager.alloc, opened));
+                published = true;
+            }
+        }
+    };
+    Publication.writer = &source_store;
+    Publication.storage = &memory;
+    Publication.block_bytes = next_block;
+    Publication.next_sequence = sequence + 1;
+    Publication.published = false;
+    defer {
+        Publication.writer = null;
+        Publication.storage = null;
+        Publication.block_bytes = null;
+        Publication.published = false;
+    }
+    entry.index.setExternalVectorBatchBoundedDistanceLoader(entry.vector_loader_context.?, Publication.bounded);
+    const query = vectors[0..dims];
+    var expected = hbc_mod.SearchResults.init(alloc, 10);
+    defer expected.deinit();
+    for (keys, 0..) |key, row| expected.addResult(deterministicDenseVectorId(key), vector_mod.distanceToQuery(query, 0, vectors[row * dims ..][0..dims], .inner_product), 0);
+    expected.sort();
+    var session: IndexManager.DenseVectorLoadSession = .{
+        .context = entry.vector_loader_context.?,
+        .working_slice = .dense_search_working_set,
+        .cache_vectors = false,
+        .cache_raw_values = false,
+        .recycle_raw_reads = false,
+    };
+    defer session.deinit();
+    const previous = IndexManager.active_dense_vector_load_session;
+    IndexManager.active_dense_vector_load_session = &session;
+    defer IndexManager.active_dense_vector_load_session = previous;
+    var result = try entry.index.searchProfiledRequest(.{ .query = query, .k = 10, .search_effort = 1, .load_metadata = false });
+    defer result.results.deinit();
+    for (expected.getHits(), result.results.getHits()) |want, got| {
+        try std.testing.expectEqual(want.vector_id, got.vector_id);
+        try std.testing.expectEqual(want.distance, got.distance);
+    }
+    try std.testing.expect(result.profile.exact_vectors_pruned_by_bound > 0);
+    try std.testing.expect(session.read_txn == null);
+    try std.testing.expectEqual(@as(u64, count), result.profile.exact_vectors_scored + result.profile.exact_vectors_pruned_by_bound);
+    // Every source projection and metadata row is read once. Only competitive
+    // vectors consume their lossless residuals; exact completion reuses the
+    // wave's pinned locations and compact bytes.
+    try std.testing.expectEqual(@as(u64, count), result.profile.rerank_vector_projection_reads);
+    try std.testing.expectEqual(@as(u64, count), result.profile.rerank_metadata_vectors_loaded);
+    try std.testing.expectEqual(result.profile.exact_vectors_scored, result.profile.rerank_vector_residual_reads);
+    try std.testing.expect(Publication.published);
+    const current_generation = manager.acquireVectorBlockGeneration().?;
+    defer current_generation.release();
+    try std.testing.expect(current_generation != generation);
+    try std.testing.expectEqual(sequence + 1, current_generation.opened.store.covered_source_sequence);
+    try std.testing.expect(session.native_vector_locations.count() <= 128);
+    try std.testing.expect(session.native_vector_locations.count() < count / 2);
+    try std.testing.expect(session.native_vector_projection_bytes.capacity < count * dims * 2);
+    try std.testing.expect(session.native_projection_budget.?.liveBytesThreadSafe() > 0);
+    try std.testing.expect(session.native_vector_generation == generation);
+    try std.testing.expect(!IndexManager.denseVectorBoundedProjectionAvailable(entry.vector_loader_context.?, sequence + 2));
+    session.clearNativeVectorProjections();
+    try std.testing.expect(session.native_projection_completed_waves >= 2);
+    try std.testing.expect(session.native_projection_peak_vectors <= 128);
+    try std.testing.expect(session.native_projection_peak_copy_bytes <= 2 * 128 * dims * @sizeOf(f16));
+    try std.testing.expectEqual(@as(usize, 0), session.native_vector_locations.count());
+    try std.testing.expect(session.native_vector_generation == generation);
+
+    // Optional retention must fail before allocating uncharged projection bytes.
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 1 };
+    var denied_resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer denied_resources.deinit(alloc);
+    const denied_path = try std.fs.path.join(alloc, &.{ path, "denied" });
+    defer alloc.free(denied_path);
+    var denied_manager = try IndexManager.initWithOptions(alloc, denied_path, .{ .resource_manager = &denied_resources });
+    defer denied_manager.deinit();
+    var denied_context: IndexManager.DenseVectorLoadContext = .{ .manager = &denied_manager, .index_name = @constCast("semantic_idx") };
+    var denied_session: IndexManager.DenseVectorLoadSession = .{ .context = &denied_context, .working_slice = .dense_search_working_set };
+    defer denied_session.deinit();
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, keys[0], "semantic_idx");
+    defer alloc.free(artifact);
+    const location = (try generation.opened.locateHashed(artifact, vector_block_mod.keyHash(artifact), sequence, null)).vector;
+    denied_session.cacheNativeVectorLocation(1, try generation.opened.viewProjection(location));
+    try std.testing.expect(denied_session.native_projection_budget.?.denied());
+    try std.testing.expectEqual(@as(usize, 0), denied_session.native_vector_locations.count());
+    try std.testing.expectEqual(@as(usize, 0), denied_session.native_vector_projection_bytes.capacity);
+    try std.testing.expectEqual(@as(u64, 0), denied_resources.sliceStats(.dense_search_working_set).used_bytes);
+    // A new HBC read still targets the old posting boundary. With its source
+    // lease released and CURRENT newer, bounded scoring must decline and the
+    // ordinary authoritative fallback must preserve the old query results.
+    session.clearNativeVectorLocations();
+    var fallback = try entry.index.searchProfiledRequest(.{ .query = query, .k = 10, .search_effort = 1, .load_metadata = false });
+    defer fallback.results.deinit();
+    try std.testing.expectEqual(@as(u64, 0), fallback.profile.exact_vectors_pruned_by_bound);
+    // The production policy disables recycling: every fallback wave must
+    // release its payloads without closing the captured primary snapshot.
+    try std.testing.expect(!session.recycle_raw_reads);
+    try std.testing.expect(session.read_txn != null and session.read_txn.?.read != null);
+    try std.testing.expectEqual(@as(u64, 0), session.raw_read_value_bytes);
+    try std.testing.expectEqual(@as(usize, 0), session.vector_cache.count());
+    for (expected.getHits(), fallback.results.getHits()) |want, got| {
+        try std.testing.expectEqual(want.vector_id, got.vector_id);
+        try std.testing.expectEqual(want.distance, got.distance);
+    }
+    // A reused caller session may normally cache vectors. The manager must
+    // suppress exact-scan retention without replacing its captured snapshot.
+    const changed_artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &replacement);
+    defer alloc.free(changed_artifact);
+    try primary.put(artifact, changed_artifact);
+    session.cache_vectors = true;
+    var reused = try manager.searchDenseEntryProfiledWithRequest(entry, .{ .query = query, .k = 10, .search_effort = 1, .load_metadata = false });
+    defer reused.results.deinit();
+    try std.testing.expect(session.cache_vectors);
+    try std.testing.expectEqual(@as(u64, 0), session.raw_read_value_bytes);
+    try std.testing.expectEqual(@as(usize, 0), session.vector_cache.count());
+    for (expected.getHits(), reused.results.getHits()) |want, got| {
+        try std.testing.expectEqual(want.vector_id, got.vector_id);
+        try std.testing.expectEqual(want.distance, got.distance);
+    }
+}
+
 test "native rerank exact completion reuses location and reads one residual" {
     try testNativeRerankLocationReuse(false, false);
 }
@@ -48842,7 +50309,7 @@ fn testNativeRerankLocationReuse(pooled_query: bool, borrow_pages: bool) !void {
         var requests = [_]vector_block_store_mod.ProjectionReadRequest{.{ .located = location, .scratch = &read_bytes }};
         _ = try generation.opened.readProjectionsIntoBatch(null, &requests);
         _ = try generation.opened.readProjectionsIntoBatch(null, &requests);
-        _ = try generation.opened.readProjectionsIntoBatchBorrowed(null, &requests, &session.native_projection_borrows, session.projectionBorrowAllocator());
+        _ = try generation.opened.readProjectionsIntoBatchBorrowed(null, &requests, &session.native_projection_borrows, session.projectionAllocator());
         try std.testing.expect(requests[0].borrowed);
         projection = .{ .located = location, .value = requests[0].value.?, .borrowed = true };
         try std.testing.expectEqual(@as(u64, 0), resource_manager_mod.ProjectionPageCache.Cache.reclaim(resources.projectionPageCache().?, std.math.maxInt(u64)));
@@ -48851,7 +50318,8 @@ fn testNativeRerankLocationReuse(pooled_query: bool, borrow_pages: bool) !void {
     const cached_projection = session.nativeVectorLocation(17, 9) orelse return error.TestExpectedCachedProjection;
     try std.testing.expectEqual(borrow_pages, cached_projection.value.bytes.ptr == projection.value.bytes.ptr);
     if (borrow_pages) try std.testing.expectEqual(@as(usize, 0), session.native_vector_projection_bytes.items.len);
-    try std.testing.expect(session.working_bytes_current >= session.native_vector_projection_bytes.capacity);
+    const projection_bytes = if (session.native_projection_budget) |*budget| budget.liveBytesThreadSafe() else 0;
+    try std.testing.expect(session.working_bytes_current + projection_bytes >= session.native_vector_projection_bytes.capacity);
 
     const previous_session = IndexManager.active_dense_vector_load_session;
     IndexManager.active_dense_vector_load_session = &session;
@@ -52074,7 +53542,7 @@ test "inline resolver replacement public listing filters before cloning and unwi
     staged.name = "__antfly_replacement/new/1/concepts";
     staged.replacement_index = "new";
     staged.replacement_resolver = "concepts";
-    try manager.resolvers.append(a, try ResolverConfig.clone(a, staged));
+    manager.resolvers.appendAssumeCapacity(try ResolverConfig.clone(a, staged));
     const Check = struct {
         fn run(alloc: Allocator, target: *IndexManager) !void {
             const configs = try target.listPublicResolvers(alloc);
@@ -52936,11 +54404,13 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
             }
         }
 
-        try std.testing.expectError(error.UnsupportedLeannSplit, manager.pruneDenseSplitRange(&store, "doc:0150"));
-        try std.testing.expect(!manager.nativeBackupSupportsImmutableCheckpoint("leann_idx", .dense_vector));
         try manager.syncAll(true);
+        // Local LEANN files go into native backups with their checkpoint.
+        try std.testing.expect(manager.nativeBackupSupportsImmutableCheckpoint("leann_idx", .dense_vector));
+        try std.testing.expect((try entry.index.leann.?.nativeBackupPath()) != null);
     }
 
+    var split_removed_id: u64 = undefined;
     // Reopen: the graph and key map come back from the LEANN file.
     {
         var manager = try IndexManager.init(alloc, path);
@@ -52959,7 +54429,341 @@ test "leann dense index applies writes, searches, deletes, and reopens" {
         const doc = try manager.lookupDenseDocKey(&store, "leann_idx", best.vector_id);
         defer if (doc) |d| alloc.free(d);
         try std.testing.expectEqualStrings(keys[7], doc.?);
+
+        // A local split keeps only the parent's side (doc:0000..doc:0149,
+        // less the deleted doc:0123) and still finds what remains.
+        const moved_id = (try manager.lookupDenseVectorId(&store, "leann_idx", keys[220])).?;
+        split_removed_id = moved_id;
+        const legacy_id = (try manager.lookupDenseVectorId(&store, "leann_idx", keys[221])).?;
+        var long_parent: [1024]u8 = @splat('z');
+        long_parent[100] = 0;
+        const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, &long_parent, "chunks", 0);
+        defer alloc.free(chunk);
+        const orphan_id: u64 = 999999;
+        try std.testing.expect((try manager.lookupDenseDocKey(&store, "leann_idx", orphan_id)) == null);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try manager.writeDenseVectorMappingTxnWithOrdinal(&txn, "leann_idx", keys[220], moved_id, null, 777);
+            try manager.writeDenseVectorMappingTxnWithOrdinal(&txn, "leann_idx", keys[221], legacy_id, null, 778);
+            try manager.writeDenseVectorMappingTxnWithOrdinal(&txn, "leann_idx", chunk, orphan_id, null, 779);
+            const old_doc = try legacyDenseDocMappingKey(alloc, "leann_idx", keys[221]);
+            defer alloc.free(old_doc);
+            const old_reverse = try legacyDenseVectorIdMappingKey(alloc, "leann_idx", legacy_id);
+            defer alloc.free(old_reverse);
+            var value: [8]u8 = undefined;
+            std.mem.writeInt(u64, &value, legacy_id, .little);
+            try txn.put(old_doc, &value);
+            try txn.put(old_reverse, keys[221]);
+            const current_reverse = try denseVectorIdMappingKey(alloc, "leann_idx", legacy_id);
+            defer alloc.free(current_reverse);
+            try txn.delete(current_reverse);
+            try txn.commit();
+        }
+        try entry.ordinal_vector_ids.put(alloc, 777, moved_id);
+        try entry.vector_ordinals.put(alloc, moved_id, 777);
+        try entry.ordinal_vector_ids.put(alloc, 778, legacy_id);
+        try entry.vector_ordinals.put(alloc, legacy_id, 778);
+        try entry.ordinal_vector_ids.put(alloc, 779, orphan_id);
+        try entry.vector_ordinals.put(alloc, orphan_id, 779);
+        // Range adoption may already have removed graph keys before retry.
+        const left = IndexManager.LeannSplitLeft{ .split_key = "doc:0150" };
+        _ = try entry.index.leann.?.dropKeysWhere(&left, IndexManager.LeannSplitLeft.keep);
+        try manager.pruneDenseSplitRange(&store, "doc:0150");
+        try manager.pruneDenseSplitRange(&store, "doc:0150"); // retry is harmless
+        for ([_]u64{ moved_id, legacy_id, orphan_id }, [_]u32{ 777, 778, 779 }) |id, ordinal| {
+            const key = try denseVectorOrdinalMappingKey(alloc, "leann_idx", id);
+            defer alloc.free(key);
+            try std.testing.expectError(error.NotFound, store.get(alloc, key));
+            try std.testing.expect(!entry.vector_ordinals.contains(id));
+            try std.testing.expect(!entry.ordinal_vector_ids.contains(ordinal));
+        }
+        try std.testing.expect((try manager.lookupDenseVectorId(&store, "leann_idx", keys[220])) == null);
+        try std.testing.expect((try manager.lookupDenseVectorId(&store, "leann_idx", keys[221])) == null);
+        try std.testing.expect((try manager.lookupDenseVectorId(&store, "leann_idx", chunk)) == null);
+        try std.testing.expect((try manager.lookupDenseDocKey(&store, "leann_idx", legacy_id)) == null);
+        try manager.syncAll(true);
+        try std.testing.expectEqual(@as(u64, 149), entry.index.stats().active_count);
+        var after = try entry.index.searchWithRequest(.{ .query = &vectors[220], .k = 10 });
+        defer after.deinit();
+        try std.testing.expect(after.items.items.len > 0);
+        for (after.items.items) |item| {
+            const kept = try manager.lookupDenseDocKey(&store, "leann_idx", item.vector_id);
+            defer if (kept) |d| alloc.free(d);
+            if (kept) |d| try std.testing.expect(std.mem.order(u8, d, "doc:0150") == .lt);
+        }
     }
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "doc:0150" });
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
+        try std.testing.expect((try manager.lookupDenseDocKey(&store, "leann_idx", split_removed_id)) == null);
+        try std.testing.expect((try manager.lookupDenseDocKey(&store, "leann_idx", 999999)) == null);
+        try std.testing.expect((try manager.lookupDenseVectorId(&store, "leann_idx", keys[220])) == null);
+        const kept = (try manager.lookupDenseVectorId(&store, "leann_idx", keys[7])).?;
+        const doc = (try manager.lookupDenseDocKey(&store, "leann_idx", kept)).?;
+        defer alloc.free(doc);
+        try std.testing.expectEqualStrings(keys[7], doc);
+    }
+}
+
+test "auto leann stubs text-derived vectors and keeps media-derived ones" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    const dims = 8;
+    const n = 400;
+    const config_json =
+        \\{"field":"body","dims":8,"metric":"l2_squared","embedding_name":"leann_idx","generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"leann_idx_chunks","embedding_name":"leann_idx"},"algorithm":"leann","leann":{"max_degree":16,"quantizer":"rabitq","quantization_bits":4,"vector_storage":"auto","search_ef":0,"bound_scale":1,"batch_size":0}}
+    ;
+    var prng = std.Random.DefaultPrng.init(29);
+    const rand = prng.random();
+    var vectors: [n][dims]f32 = undefined;
+    for (&vectors, 0..) |*v, i| {
+        const c: f32 = @floatFromInt(i % 8);
+        for (v, 0..) |*x, j| x.* = c * 3 + @as(f32, @floatFromInt(j % 3)) + rand.floatNorm(f32) * 0.3;
+    }
+    var keys: [n][]u8 = undefined;
+    for (&keys, 0..) |*k, i| k.* = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
+    defer for (keys) |k| alloc.free(k);
+    // Even documents were embedded from text; odd ones from media, so the
+    // producer left them unmarked.
+    var artifact_keys: [n][]u8 = undefined;
+    for (&artifact_keys, 0..) |*k, i| {
+        k.* = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, keys[i], "leann_idx");
+        const payload = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, 1, i % 2 == 0, &vectors[i]);
+        defer alloc.free(payload);
+        try store.put(k.*, payload);
+    }
+    defer for (artifact_keys) |k| alloc.free(k);
+
+    const Embedder = struct {
+        keys: []const []const u8,
+        vectors: []const [dims]f32,
+        media_requests: usize = 0,
+
+        fn embed(ctx: *anyopaque, _: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, d: u32, out: []f32, found: []bool) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (requests, 0..) |request, i| {
+                for (self.keys, 0..) |k, j| if (std.mem.eql(u8, k, request.doc_key)) {
+                    if (j % 2 == 1) self.media_requests += 1;
+                    @memcpy(out[i * d ..][0..d], &self.vectors[j]);
+                    found[i] = true;
+                };
+            }
+        }
+    };
+    var embedder = Embedder{ .keys = &keys, .vectors = &vectors };
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.dense_reembedder = .{ .ctx = &embedder, .embed_fn = Embedder.embed };
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
+    const entry = manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
+    try std.testing.expect(entry.leann_transient and entry.leann_text_only);
+    // LEANN stays out of the shared vector-block plane: no scope to mirror
+    // (and scan past stubs), and nothing for its readiness to wait on.
+    {
+        const scopes = try manager.vectorBlockArtifactScopesAlloc();
+        defer alloc.free(scopes);
+        try std.testing.expectEqual(@as(usize, 0), scopes.len);
+        const hashes = try manager.vectorBlockArtifactScopeHashesAlloc();
+        defer alloc.free(hashes);
+        try std.testing.expectEqual(@as(usize, 0), hashes.len);
+        try std.testing.expect(manager.vectorBlockReadyForDenseIndex("leann_idx"));
+        try std.testing.expect(!manager.vectorBlockProjectionRequiredForDenseIndex("leann_idx"));
+    }
+
+    var writes: [n]mapper.DenseEmbeddingWrite = undefined;
+    for (&writes, 0..) |*w, i| w.* = .{ .index_name = @constCast("leann_idx"), .doc_key = keys[i], .vector = &.{}, .artifact_key = artifact_keys[i] };
+    var start: usize = 0;
+    while (start < n) : (start += 100) try manager.applyDenseEmbeddingWritesByName(&store, "leann_idx", writes[start..@min(start + 100, n)]);
+    try manager.syncAll(true);
+    try std.testing.expect(manager.localLeannElisionPending());
+    try manager.elideLocalLeannVectors();
+    // The same safety rule applies if a transient index receives media.
+    entry.leann_text_only = false;
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
+    try std.testing.expect(!manager.localLeannElisionPending());
+
+    for (artifact_keys, 0..) |k, i| {
+        const raw = try store.get(alloc, k);
+        defer alloc.free(raw);
+        const stubbed = try enrichment_artifact_codec.elidedDenseEmbedding(raw) != null;
+        try std.testing.expectEqual(i % 2 == 0, stubbed);
+    }
+
+    // Searches re-embed text documents only; media vectors are read.
+    for ([_]usize{ 10, 11, 250, 251 }) |id| {
+        var results = try entry.index.searchWithRequest(.{ .query = &vectors[id], .k = 5 });
+        defer results.deinit();
+        const doc = try manager.lookupDenseDocKey(&store, "leann_idx", results.items.items[0].vector_id);
+        defer if (doc) |d| alloc.free(d);
+        try std.testing.expectEqualStrings(keys[id], doc.?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), embedder.media_requests);
+}
+
+test "auto leann media_vectors int8 keeps an int8 copy of media vectors" {
+    try testLeannMediaRetention(false);
+}
+
+test "auto leann shared media honors every consumer retention policy" {
+    try testLeannMediaRetention(true);
+}
+
+fn testLeannMediaRetention(full_consumer: bool) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    const dims = 8;
+    const n = 400;
+    const config_json =
+        \\{"field":"body","dims":8,"metric":"l2_squared","embedding_name":"leann_idx","generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"leann_idx_chunks","embedding_name":"leann_idx"},"algorithm":"leann","leann":{"max_degree":16,"quantizer":"rabitq","quantization_bits":4,"vector_storage":"auto","media_vectors":"int8","search_ef":32,"bound_scale":1,"batch_size":0}}
+    ;
+    var prng = std.Random.DefaultPrng.init(29);
+    const rand = prng.random();
+    var vectors: [n][dims]f32 = undefined;
+    for (&vectors, 0..) |*v, i| {
+        const c: f32 = @floatFromInt(i % 8);
+        for (v, 0..) |*x, j| x.* = c * 3 + @as(f32, @floatFromInt(j % 3)) + rand.floatNorm(f32) * 0.3;
+    }
+    var keys: [n][]u8 = undefined;
+    for (&keys, 0..) |*k, i| k.* = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
+    defer for (keys) |k| alloc.free(k);
+    // Even documents were embedded from text; odd ones from media, so the
+    // producer left them unmarked.
+    var artifact_keys: [n][]u8 = undefined;
+    for (&artifact_keys, 0..) |*k, i| {
+        k.* = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, keys[i], "leann_idx");
+        const payload = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, 1, i % 2 == 0, &vectors[i]);
+        defer alloc.free(payload);
+        try store.put(k.*, payload);
+    }
+    defer for (artifact_keys) |k| alloc.free(k);
+
+    const Embedder = struct {
+        keys: []const []const u8,
+        vectors: []const [dims]f32,
+        media_requests: usize = 0,
+        text_requests: usize = 0,
+
+        fn embed(ctx: *anyopaque, _: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, d: u32, out: []f32, found: []bool) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (requests, 0..) |request, i| {
+                for (self.keys, 0..) |k, j| if (std.mem.eql(u8, k, request.doc_key)) {
+                    if (j % 2 == 1) self.media_requests += 1 else self.text_requests += 1;
+                    @memcpy(out[i * d ..][0..d], &self.vectors[j]);
+                    found[i] = true;
+                };
+            }
+        }
+    };
+    var embedder = Embedder{ .keys = &keys, .vectors = &vectors };
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.dense_reembedder = .{ .ctx = &embedder, .embed_fn = Embedder.embed };
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
+    if (full_consumer) {
+        const full_json = try std.mem.replaceOwned(u8, alloc, config_json, "\"media_vectors\":\"int8\"", "\"media_vectors\":\"full\"");
+        defer alloc.free(full_json);
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "full_media", .kind = .dense_vector, .config_json = full_json }});
+    }
+    const entry = manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
+    try std.testing.expect(entry.leann_transient and entry.leann_text_only and entry.leann_media_int8);
+    // LEANN stays out of the shared vector-block plane: no scope to mirror
+    // (and scan past stubs), and nothing for its readiness to wait on.
+    {
+        const scopes = try manager.vectorBlockArtifactScopesAlloc();
+        defer alloc.free(scopes);
+        try std.testing.expectEqual(@as(usize, 0), scopes.len);
+        const hashes = try manager.vectorBlockArtifactScopeHashesAlloc();
+        defer alloc.free(hashes);
+        try std.testing.expectEqual(@as(usize, 0), hashes.len);
+        try std.testing.expect(manager.vectorBlockReadyForDenseIndex("leann_idx"));
+        try std.testing.expect(!manager.vectorBlockProjectionRequiredForDenseIndex("leann_idx"));
+    }
+
+    var writes: [n]mapper.DenseEmbeddingWrite = undefined;
+    for (&writes, 0..) |*w, i| w.* = .{ .index_name = @constCast("leann_idx"), .doc_key = keys[i], .vector = &.{}, .artifact_key = artifact_keys[i] };
+    var start: usize = 0;
+    while (start < n) : (start += 100) try manager.applyDenseEmbeddingWritesByName(&store, "leann_idx", writes[start..@min(start + 100, n)]);
+    try manager.syncAll(true);
+    try std.testing.expect(manager.localLeannElisionPending());
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
+    try std.testing.expect(!manager.localLeannElisionPending());
+
+    for (artifact_keys, 0..) |k, i| {
+        const raw = try store.get(alloc, k);
+        defer alloc.free(raw);
+        // Every vector is a stub now; media ones keep an int8 copy.
+        try std.testing.expectEqual(!(full_consumer and i % 2 == 1), try enrichment_artifact_codec.elidedDenseEmbedding(raw) != null);
+        const copy = try enrichment_artifact_codec.int8ElidedDenseEmbeddingAlloc(alloc, raw);
+        defer if (copy) |c| alloc.free(c);
+        try std.testing.expectEqual(!full_consumer and i % 2 == 1, copy != null);
+        if (i < 2) {
+            const loader = entry.vector_loader_context orelse return error.TestUnexpectedResult;
+            const digest = leann_store_mod.vectorDigest(&vectors[i]);
+            try std.testing.expectEqual(copy == null, try IndexManager.validateLeannRetainedDigest(loader, alloc, keys[i], digest));
+        }
+    }
+
+    // A cold allowlist query scores a bounded shortlist across both kinds
+    // of artifacts and never submits a media copy to the provider.
+    var allowed: [n]u64 = undefined;
+    for (&allowed, keys) |*id, key| id.* = (try manager.lookupDenseVectorId(&store, "leann_idx", key)) orelse return error.TestUnexpectedResult;
+    {
+        var results = try entry.index.searchWithRequest(.{ .query = &vectors[10], .k = 5, .filter_ids = &allowed });
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 5), results.items.items.len);
+        try std.testing.expectEqual(allowed[10], results.items.items[0].vector_id);
+        try std.testing.expect(embedder.text_requests > 0 and embedder.text_requests <= 32);
+        try std.testing.expectEqual(@as(usize, 0), embedder.media_requests);
+    }
+
+    // Searches re-embed text documents only; media vectors come from their int8 copies.
+    for ([_]usize{ 10, 11, 250, 251 }) |id| {
+        var results = try entry.index.searchWithRequest(.{ .query = &vectors[id], .k = 5 });
+        defer results.deinit();
+        const doc = try manager.lookupDenseDocKey(&store, "leann_idx", results.items.items[0].vector_id);
+        defer if (doc) |d| alloc.free(d);
+        try std.testing.expectEqualStrings(keys[id], doc.?);
+    }
+    if (!full_consumer) {
+        const full_json = try std.mem.replaceOwned(u8, alloc, config_json, "\"media_vectors\":\"int8\"", "\"media_vectors\":\"full\"");
+        defer alloc.free(full_json);
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "late_full_media", .kind = .dense_vector, .config_json = full_json }});
+        const late = [_]mapper.DenseEmbeddingWrite{.{ .index_name = @constCast("late_full_media"), .doc_key = keys[11], .vector = &.{}, .artifact_key = artifact_keys[11] }};
+        try std.testing.expectError(error.ArtifactRepairRequired, manager.applyDenseEmbeddingWritesByName(&store, "late_full_media", &late));
+        try std.testing.expectError(error.ArtifactRepairRequired, manager.reembedElidedDocument(alloc, "leann_idx", keys[11], dims));
+        const persistent_json = try std.mem.replaceOwned(u8, alloc, full_json, "\"vector_storage\":\"auto\"", "\"vector_storage\":\"persistent\"");
+        defer alloc.free(persistent_json);
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "late_persistent", .kind = .dense_vector, .config_json = persistent_json }});
+        const persistent = [_]mapper.DenseEmbeddingWrite{.{ .index_name = @constCast("late_persistent"), .doc_key = keys[11], .vector = &.{}, .artifact_key = artifact_keys[11] }};
+        try std.testing.expectError(error.ArtifactRepairRequired, manager.applyDenseEmbeddingWritesByName(&store, "late_persistent", &persistent));
+        const raw = try store.get(alloc, artifact_keys[11]);
+        defer alloc.free(raw);
+        try std.testing.expect((try enrichment_artifact_codec.decodeHeader(raw)).flags.int8_payload);
+    }
+    try std.testing.expectEqual(@as(usize, 0), embedder.media_requests);
 }
 
 test "transient leann vectors become stubs and are re-embedded on demand" {
@@ -52978,7 +54782,7 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
     const dims = 8;
     const n = 400;
     const config_json =
-        \\{"field":"body","dims":8,"metric":"l2_squared","embedding_name":"leann_idx","generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"leann_idx_chunks","embedding_name":"leann_idx"},"algorithm":"leann","leann":{"max_degree":16,"quantizer":"rabitq","quantization_bits":4,"vector_storage":"transient","search_ef":0,"bound_scale":1,"batch_size":0}}
+        \\{"field":"body","dims":8,"metric":"l2_squared","embedding_name":"leann_idx","semantic_producer":"{}","generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"leann_idx_chunks","embedding_name":"leann_idx"},"algorithm":"leann","leann":{"max_degree":16,"quantizer":"rabitq","quantization_bits":4,"vector_storage":"transient","search_ef":0,"bound_scale":1,"batch_size":0}}
     ;
 
     var prng = std.Random.DefaultPrng.init(23);
@@ -53002,6 +54806,8 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         vectors: []const [dims]f32,
         calls: usize = 0,
         documents: usize = 0,
+        wrong_key: ?usize = null,
+        perturb_key: ?usize = null,
 
         fn embed(ctx: *anyopaque, _: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, d: u32, out: []f32, found: []bool) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -53011,6 +54817,8 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
                 try std.testing.expectEqualStrings("body", request.source_field);
                 for (self.keys, 0..) |k, j| if (std.mem.eql(u8, k, request.doc_key)) {
                     @memcpy(out[i * d ..][0..d], &self.vectors[j]);
+                    if (self.wrong_key == j) return error.ReembedRevisionMismatch;
+                    if (self.perturb_key == j) out[i * d] += 0.0001;
                     found[i] = true;
                 };
             }
@@ -53061,6 +54869,19 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_idx", .kind = .dense_vector, .config_json = config_json }});
         const entry = manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
         try std.testing.expect(entry.leann_transient);
+        {
+            var sources = [_][]u8{@constCast("leann_idx")};
+            var consumer = entry.*;
+            consumer.embedding_name = null;
+            consumer.embedding_names = &sources;
+            const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc\x00binary", "chunks", 3);
+            defer alloc.free(chunk_key);
+            const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "leann_idx");
+            defer alloc.free(artifact_key);
+            const owner = manager.elidedArtifactOwner(&consumer, artifact_key, chunk_key).?;
+            try std.testing.expectEqualStrings("leann_idx", owner.embedding_name);
+            try std.testing.expectEqualSlices(u8, chunk_key, owner.doc_key);
+        }
 
         var writes: [n]mapper.DenseEmbeddingWrite = undefined;
         for (&writes, 0..) |*w, i| w.* = .{ .index_name = @constCast("leann_idx"), .doc_key = keys[i], .vector = &.{}, .artifact_key = produced[i] };
@@ -53071,13 +54892,50 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
 
         // Sync, then elide: every covered vector becomes a stub.
         try manager.syncAll(true);
+        const before_batch = entry.index.leann.?.pendingElideCount();
+        try std.testing.expect(before_batch > 128);
         try manager.elideLocalLeannVectors();
+        try std.testing.expectEqual(before_batch - 128, entry.index.leann.?.pendingElideCount());
+        try std.testing.expectEqual(@as(usize, 128), try stubCount(alloc, &store, &keys));
+        while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
         try std.testing.expectEqual(@as(usize, n), try stubCount(alloc, &store, &keys));
-        try manager.elideLocalLeannVectors(); // idempotent
+        while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors(); // idempotent
         {
-            const pending = try entry.index.leann.?.pendingElideAlloc(alloc);
+            const pending = try entry.index.leann.?.pendingElideAlloc(alloc, 128);
             defer leann_store_mod.LeannStore.freeElide(alloc, pending);
             try std.testing.expectEqual(@as(usize, 0), pending.len);
+        }
+
+        // A query that sees source revision B while the durable stub still
+        // describes A must never cache B under A's digest. When A returns,
+        // the next query must recompute it before the cache can serve it.
+        {
+            var loader = IndexManager.DenseVectorLoadContext{ .manager = &manager, .index_name = @constCast("leann_idx") };
+            const ids = [_]u64{177};
+            const metadata = [_][]const u8{keys[177]};
+            var out: [dims]f32 = undefined;
+            var found = [_]bool{false};
+            var elapsed: u64 = 0;
+            embedder.wrong_key = 177;
+            try std.testing.expectError(error.ReembedRevisionMismatch, IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed));
+            try std.testing.expect(!found[0]);
+            const before = embedder.documents;
+            embedder.wrong_key = null;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed);
+            try std.testing.expectEqual(before + 1, embedder.documents);
+            try std.testing.expectEqualSlices(f32, &vectors[177], &out);
+            const after = embedder.documents;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed);
+            try std.testing.expectEqual(after, embedder.documents);
+            manager.leann_reembed_cache.deinit(alloc);
+            embedder.perturb_key = 177;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed);
+            try std.testing.expect(found[0] and out[0] != vectors[177][0]);
+            const perturbed_after = embedder.documents;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &ids, &metadata, &out, &found, &elapsed);
+            try std.testing.expectEqual(perturbed_after, embedder.documents);
+            embedder.perturb_key = null;
+            manager.leann_reembed_cache.deinit(alloc);
         }
 
         // Searches re-embed only the candidates the bounds cannot settle,
@@ -53089,6 +54947,150 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
             try std.testing.expect(embedder.documents - before < 64);
         }
         try std.testing.expect(embedder.calls < embedder.documents);
+        // Repeating a query serves its candidates from the re-embed cache.
+        {
+            const before = embedder.documents;
+            try expectTop(&manager, &store, entry, &vectors[177], keys[177]);
+            try std.testing.expectEqual(before, embedder.documents);
+            try std.testing.expect(manager.leann_reembed_cache.hits > 0);
+        }
+
+        // A hard opt-out bypasses an existing hot entry and creates no
+        // replacement owner after the old cache is torn down.
+        {
+            var loader = IndexManager.DenseVectorLoadContext{ .manager = &manager, .index_name = @constCast("leann_idx") };
+            var out: [dims]f32 = undefined;
+            var found = [_]bool{false};
+            var elapsed: u64 = 0;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &.{177}, &.{keys[177]}, &out, &found, &elapsed);
+            try std.testing.expect(manager.leann_reembed_cache.owner != null);
+            const previous = manager.retained_vector_cache_enabled;
+            manager.retained_vector_cache_enabled = false;
+            defer manager.retained_vector_cache_enabled = previous;
+            const before = embedder.documents;
+            const hits = manager.leann_reembed_cache.hits;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &.{177}, &.{keys[177]}, &out, &found, &elapsed);
+            try std.testing.expect(found[0]);
+            try std.testing.expectEqual(before + 1, embedder.documents);
+            try std.testing.expectEqual(hits, manager.leann_reembed_cache.hits);
+            manager.leann_reembed_cache.deinit(alloc);
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &.{177}, &.{keys[177]}, &out, &found, &elapsed);
+            try std.testing.expect(found[0]);
+            try std.testing.expectEqualSlices(f32, &vectors[177], &out);
+            try std.testing.expectEqual(before + 2, embedder.documents);
+            try std.testing.expect(manager.leann_reembed_cache.owner == null);
+        }
+
+        // Cross the tiny exact limit with a sparse allowlist of elided rows.
+        // The production loader must re-embed only selected candidates.
+        var allowlist: [17]u64 = undefined;
+        for (&allowlist, 0..) |*id, i| {
+            id.* = (try manager.lookupDenseVectorId(&store, "leann_idx", keys[i])) orelse return error.TestUnexpectedResult;
+        }
+        manager.leann_reembed_cache.deinit(alloc);
+        const before_filtered = embedder.documents;
+        var filtered = try entry.index.searchProfiledRequest(.{
+            .query = &vectors[5],
+            .k = 3,
+            .filter_ids = &allowlist,
+            .distance_under = 0.001,
+        });
+        defer filtered.results.deinit();
+        try std.testing.expectEqual(.exhausted, filtered.results.candidate_coverage);
+        try std.testing.expectEqual(@as(usize, 1), filtered.results.getHits().len);
+        try std.testing.expectEqual(allowlist[5], filtered.results.getHits()[0].vector_id);
+        try std.testing.expectEqual(@as(u64, 0), filtered.profile.nodes_visited);
+        try std.testing.expectEqual(@as(u64, allowlist.len), filtered.profile.approx_vectors_scored);
+        try std.testing.expect(embedder.documents > before_filtered);
+        try std.testing.expect(embedder.documents - before_filtered <= allowlist.len);
+
+        const query_exec = @import("../query/search_exec.zig");
+        const Paging = struct {
+            entry: *IndexManager.DenseIndex,
+            calls: usize = 0,
+
+            fn dense(raw: ?*anyopaque, _: ?[]const u8) !?*IndexManager.DenseIndex {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                return self.entry;
+            }
+            fn text(_: ?*anyopaque, _: ?[]const u8) !?*IndexManager.TextIndex {
+                return null;
+            }
+            fn docKey(_: ?*anyopaque, _: []const u8, _: u64) !?[]u8 {
+                return error.UnexpectedDocKeyLookup;
+            }
+            fn vectorId(_: ?*anyopaque, _: []const u8, _: []const u8) !?u64 {
+                return error.UnexpectedVectorIdLookup;
+            }
+            fn stored(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) ![]u8 {
+                return error.UnexpectedStoredLoad;
+            }
+            fn search(raw: ?*anyopaque, index: *IndexManager.DenseIndex, req: hbc_mod.SearchRequest) !hbc_mod.SearchResults {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.calls += 1;
+                return index.index.searchWithRequest(req);
+            }
+            fn profiled(raw: ?*anyopaque, index: *IndexManager.DenseIndex, req: hbc_mod.SearchRequest) !hbc_mod.ProfiledSearchResults {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.calls += 1;
+                return index.index.searchProfiledRequest(req);
+            }
+            fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
+                return result;
+            }
+        };
+        var paging = Paging{ .entry = entry };
+        const expected_documents = embedder.documents - before_filtered;
+        // Compare cold route work; warm-cache reuse is checked above.
+        manager.leann_reembed_cache.deinit(alloc);
+        const before_page_documents = embedder.documents;
+        const before_page_batches = embedder.calls;
+        const paging_executor: query_exec.DenseSearchExecutor = .{
+            .ctx = &paging,
+            .filter_candidate_presence = true,
+            .text_index_entry = Paging.text,
+            .dense_index = Paging.dense,
+            .lookup_doc_key = Paging.docKey,
+            .lookup_vector_id = Paging.vectorId,
+            .load_projected_document = Paging.stored,
+            .hbc_search = Paging.search,
+            .hbc_search_profiled = Paging.profiled,
+            .postprocess = Paging.postprocess,
+        };
+        var page = try query_exec.searchDenseProfiled(alloc, .{
+            .index_name = "leann_idx",
+            .limit = 3,
+            .include_stored = false,
+            .filter_ids = &allowlist,
+            .distance_under = 0.001,
+        }, .{ .vector = &vectors[5], .k = 3 }, paging_executor);
+        defer page.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), paging.calls);
+        try std.testing.expectEqual(@as(usize, 1), page.result.hits.len);
+        try std.testing.expectEqualStrings(keys[5], page.result.hits[0].id);
+        try std.testing.expectEqual(.exact, page.result.total_hits_relation);
+        try std.testing.expectEqual(@as(u64, 1), page.result.total_hits);
+        try std.testing.expectEqual(expected_documents, embedder.documents - before_page_documents);
+        try std.testing.expectEqual(filtered.profile.rerank_batches, embedder.calls - before_page_batches);
+
+        paging.calls = 0;
+        manager.leann_reembed_cache.deinit(alloc);
+        const before_graph_batches = embedder.calls;
+        var graph_page = try query_exec.searchDenseProfiled(alloc, .{
+            .index_name = "leann_idx",
+            .limit = 3,
+            .include_stored = false,
+            .profile = true,
+            .distance_under = 0.001,
+        }, .{ .vector = &vectors[5], .k = 3 }, paging_executor);
+        defer graph_page.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), paging.calls);
+        try std.testing.expectEqual(@as(usize, 1), graph_page.result.hits.len);
+        try std.testing.expectEqualStrings(keys[5], graph_page.result.hits[0].id);
+        try std.testing.expectEqual(.exact, graph_page.result.total_hits_relation);
+        try std.testing.expectEqual(@as(u64, n), graph_page.profile.hbc_nodes_visited);
+        try std.testing.expect(embedder.calls > before_graph_batches);
+        try std.testing.expectEqual(graph_page.profile.hbc_rerank_batches, embedder.calls - before_graph_batches);
 
         // Deleting a quarter rebuilds from codes on sync: nothing re-embedded.
         var deleted: [n / 4][]const u8 = undefined;
@@ -53114,9 +55116,94 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         try expectTop(&manager, &store, entry, &vectors[200], keys[200]);
         try std.testing.expect(embedder.documents > before);
 
-        // Without an embedder, reads of elided vectors fail cleanly.
+        // A spent budget still allows a real cache hit, but blocks a miss
+        // before dispatching the embedder.
+        {
+            const loader = entry.vector_loader_context orelse return error.TestUnexpectedResult;
+            var session: LeannRecoverySession = .{ .budget_ns = 1, .elapsed_ns = 1 };
+            defer session.deinit();
+            var elapsed: u64 = 1;
+            var loaded: [dims]f32 = undefined;
+            var found = [_]bool{false};
+            const calls = embedder.calls;
+            try IndexManager.loadDenseVectorsForLeannSession(loader, alloc, &.{0}, &.{keys[200]}, &loaded, &found, &elapsed, &session);
+            try std.testing.expect(found[0]);
+            try std.testing.expectEqualSlices(f32, &vectors[200], &loaded);
+            manager.leann_reembed_cache.deinit(alloc);
+            try std.testing.expectError(error.ReembedBudgetExceeded, IndexManager.loadDenseVectorsForLeannSession(loader, alloc, &.{0}, &.{keys[200]}, &loaded, &found, &elapsed, &session));
+            try std.testing.expectEqual(calls, embedder.calls);
+        }
+
+        // Without an embedder (and nothing cached), reads of elided vectors
+        // fail cleanly.
         manager.dense_reembedder = null;
+        manager.leann_reembed_cache.deinit(alloc);
         try std.testing.expectError(error.ReembedUnavailable, entry.index.searchWithRequest(.{ .query = &vectors[200], .k = 5 }));
+
+        // A new transient consumer has no graph nodes for existing stubs.
+        // Rebuilding a group uses bounded calls and publishes only on success.
+        manager.dense_reembedder = embedder.reembedder();
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "leann_copy", .kind = .dense_vector, .config_json = config_json }});
+        var writes: [192]mapper.DenseEmbeddingWrite = undefined;
+        for (&writes, 0..) |*write, i| write.* = .{ .index_name = @constCast("leann_copy"), .doc_key = keys[(i / 3) * 4 + (if (i % 3 == 0) @as(usize, 0) else i % 3 + 1)], .vector = &.{}, .artifact_key = produced[(i / 3) * 4 + (if (i % 3 == 0) @as(usize, 0) else i % 3 + 1)] };
+        embedder.wrong_key = 254;
+        try std.testing.expectError(error.ReembedRevisionMismatch, manager.applyDenseEmbeddingWritesByName(&store, "leann_copy", &writes));
+        embedder.wrong_key = null;
+        try std.testing.expectEqual(@as(u64, 0), manager.denseIndex("leann_copy").?.index.stats().active_count);
+        const before_calls = embedder.calls;
+        try manager.applyDenseEmbeddingWritesByName(&store, "leann_copy", &writes);
+        try std.testing.expectEqual(before_calls + 2, embedder.calls);
+        const persistent_config = "{\"field\":\"body\",\"dims\":8,\"metric\":\"l2_squared\",\"embedding_name\":\"leann_idx\",\"external\":true}";
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "persistent_copy", .kind = .dense_vector, .config_json = persistent_config }});
+        for (&writes) |*write| write.index_name = @constCast("persistent_copy");
+        // Failure in the second inference batch must leave both the graph
+        // and all source stubs untouched, including the completed first batch.
+        embedder.wrong_key = 254;
+        try std.testing.expectError(error.ReembedRevisionMismatch, manager.applyDenseEmbeddingWritesByName(&store, "persistent_copy", &writes));
+        embedder.wrong_key = null;
+        try std.testing.expectEqual(@as(u64, 0), manager.denseIndex("persistent_copy").?.index.stats().active_count);
+        const first_raw = try store.get(alloc, writes[0].artifact_key.?);
+        defer alloc.free(first_raw);
+        try std.testing.expect(try enrichment_artifact_codec.elidedDenseEmbedding(first_raw) != null);
+        const persistent_calls = embedder.calls;
+        try manager.applyDenseEmbeddingWritesByName(&store, "persistent_copy", &writes);
+        try std.testing.expectEqual(persistent_calls + 2, embedder.calls);
+
+        // Interleave two producers and include unrelated same-dimension
+        // owners. Only producers represented in the request may run inference.
+        const other_config = try std.mem.replaceOwned(u8, alloc, config_json, "leann_idx", "other_owner");
+        defer alloc.free(other_config);
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "other_owner", .kind = .dense_vector, .config_json = other_config }});
+        const other_artifacts = try seedProducedEmbeddings(alloc, &store, "other_owner", keys[0..writes.len], vectors[0..writes.len]);
+        defer freeProducedEmbeddings(alloc, other_artifacts);
+        // Seed the second producer's stubs directly so this exercises
+        // recovery independently of the graph's elision scheduling.
+        for (other_artifacts, 0..) |artifact_key, i| {
+            const raw = try store.get(alloc, artifact_key);
+            defer alloc.free(raw);
+            const header = try enrichment_artifact_codec.decodeHeader(raw);
+            const stub = try enrichment_artifact_codec.encodeElidedDenseEmbeddingAlloc(alloc, header, dims, leann_store_mod.vectorDigest(&vectors[i]));
+            defer alloc.free(stub);
+            try store.put(artifact_key, stub);
+        }
+        const unrelated_config = try std.mem.replaceOwned(u8, alloc, config_json, "leann_idx", "unrelated_owner");
+        defer alloc.free(unrelated_config);
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "unrelated_owner", .kind = .dense_vector, .config_json = unrelated_config }});
+        const mixed_config =
+            \\{"field":"body","dims":8,"metric":"l2_squared","sources":[{"artifact":"leann_idx"},{"artifact":"other_owner"}]}
+        ;
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "mixed_copy", .kind = .dense_vector, .config_json = mixed_config }});
+        var mixed: [256]mapper.DenseEmbeddingWrite = undefined;
+        for (0..64) |i| {
+            const original = 256 + (i / 3) * 4 + (if (i % 3 == 0) @as(usize, 0) else i % 3 + 1);
+            mixed[i * 2] = .{ .index_name = @constCast("mixed_copy"), .doc_key = keys[original], .vector = &.{}, .artifact_key = produced[original] };
+            mixed[i * 2 + 1] = .{ .index_name = @constCast("mixed_copy"), .doc_key = keys[i], .vector = &.{}, .artifact_key = other_artifacts[i] };
+        }
+        for (128..256) |i| mixed[i] = .{ .index_name = @constCast("mixed_copy"), .doc_key = keys[i - 64], .vector = &.{}, .artifact_key = other_artifacts[i - 64] };
+        const mixed_calls = embedder.calls;
+        try manager.applyDenseEmbeddingWritesByName(&store, "mixed_copy", &mixed);
+        try std.testing.expectEqual(mixed_calls + 3, embedder.calls);
+        try std.testing.expectEqual(@as(u64, mixed.len), manager.denseIndex("mixed_copy").?.index.stats().active_count);
     }
 }
 
@@ -53439,6 +55526,59 @@ test "replicated leann indexes converge from leader-planned records" {
     const leader_state = try leader.denseIndex("leann_idx").?.index.leann.?.replicated.?.replica.encodeState(alloc);
     defer alloc.free(leader_state);
     try std.testing.expectEqualSlices(u8, leader_state, caught_up);
+
+    // A split narrows this shard to keys before doc:0150 on every replica at
+    // the same log position. Moved keys leave each graph through
+    // leader-planned deletes, and the replicas still agree byte for byte.
+    leader.updateRange(.{ .start = "", .end = "doc:0150" });
+    follower.updateRange(.{ .start = "", .end = "doc:0150" });
+    // Crash before the delete records are committed. The persisted graph
+    // still contains moved keys, and range was installed before index open.
+    follower.deinit();
+    follower = try IndexManager.initWithOptions(alloc, path_b, .{ .leann_replication = true });
+    follower.updateRange(.{ .start = "", .end = "doc:0150" });
+    try follower.loadDeferredBackfill(&store_b);
+    try std.testing.expect(follower.denseIndex("leann_idx").?.index.leann.?.replicated.?.stats().dirty > 0);
+    while (true) {
+        const proposals = try leader.planLeannRecords(alloc);
+        defer IndexManager.freeLeannProposals(alloc, proposals);
+        if (proposals.len == 0) break;
+        for (proposals) |p| for (p.records) |record| {
+            raft_index += 1;
+            const key = try internal_keys.leannRecordKeyAlloc(alloc, p.index_name, raft_index);
+            defer alloc.free(key);
+            try store_a.put(key, record);
+            try store_b.put(key, record);
+        };
+        try leader.drainLeannRecords(&store_a);
+        try follower.drainLeannRecords(&store_b);
+    }
+    const split_a = leader.denseIndex("leann_idx").?;
+    const split_b = follower.denseIndex("leann_idx").?;
+    const narrowed_a = try split_a.index.leann.?.replicated.?.replica.encodeState(alloc);
+    defer alloc.free(narrowed_a);
+    const narrowed_b = try split_b.index.leann.?.replicated.?.replica.encodeState(alloc);
+    defer alloc.free(narrowed_b);
+    try std.testing.expectEqualSlices(u8, narrowed_a, narrowed_b);
+    // doc:0000..doc:0149 minus the deleted doc:0005.
+    try std.testing.expectEqual(@as(u64, 149), split_b.index.stats().active_count);
+    {
+        var results = try split_b.index.searchWithRequest(.{ .query = &vectors[220], .k = 10 });
+        defer results.deinit();
+        try std.testing.expect(results.items.items.len > 0);
+        for (results.items.items) |item| {
+            const doc = try follower.lookupDenseDocKey(&store_b, "leann_idx", item.vector_id);
+            defer if (doc) |d| alloc.free(d);
+            if (doc) |d| try std.testing.expect(std.mem.order(u8, d, "doc:0150") == .lt);
+        }
+    }
+    // Reopening with the same range drops nothing more.
+    leader.updateRange(.{ .start = "", .end = "doc:0150" });
+    {
+        const proposals = try leader.planLeannRecords(alloc);
+        defer IndexManager.freeLeannProposals(alloc, proposals);
+        try std.testing.expectEqual(@as(usize, 0), proposals.len);
+    }
 }
 
 test "recreated replicated leann index skips its previous incarnation's records" {
@@ -53559,7 +55699,7 @@ test "transient leann keeps vectors another index still reads" {
     try manager.applyDenseEmbeddingWritesByName(&store, "leann_idx", &writes);
     try std.testing.expect(manager.denseIndex("leann_idx").?.index.leann.?.index != null);
     try manager.syncAll(true);
-    try manager.elideLocalLeannVectors();
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
 
     // Every artifact still holds its vector.
     for (keys) |k| {
@@ -53635,7 +55775,7 @@ fn checkPersistentBackfillAfterElision(hbc_json: []const u8) !void {
     for (&writes, 0..) |*w, i| w.* = .{ .index_name = @constCast("leann_idx"), .doc_key = keys[i], .vector = &.{}, .artifact_key = produced[i] };
     try manager.applyDenseEmbeddingWritesByName(&store, "leann_idx", &writes);
     try manager.syncAll(true);
-    try manager.elideLocalLeannVectors();
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
 
     // Added later: its backfill reads the stubs and re-embeds them.
     try manager.addAllNoBackfill(&store, &.{.{ .name = "hbc_idx", .kind = .dense_vector, .config_json = hbc_json }});
@@ -53661,7 +55801,7 @@ fn checkPersistentBackfillAfterElision(hbc_json: []const u8) !void {
         defer alloc.free(stored);
         try std.testing.expectEqualSlices(f32, &vectors[i], stored);
     }
-    try manager.elideLocalLeannVectors(); // the HBC consumer keeps them stored
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors(); // the HBC consumer keeps them stored
     const after_backfill = embedder.documents;
     var results = try hbc.index.searchWithRequest(.{ .query = &vectors[42], .k = 3 });
     defer results.deinit();
@@ -53726,7 +55866,7 @@ test "transient leann persists at replay checkpoints and keeps authored vectors"
     defer alloc.free(authored);
     try store.put(authored_key, authored);
     try manager.syncAll(true);
-    try manager.elideLocalLeannVectors();
+    while (manager.localLeannElisionPending()) try manager.elideLocalLeannVectors();
     for (keys, 0..) |k, i| {
         const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, k, "leann_idx");
         defer alloc.free(artifact_key);
@@ -53750,7 +55890,7 @@ fn seedProducedEmbeddings(alloc: Allocator, store: *docstore_mod.DocStore, embed
     for (doc_keys, 0..) |doc_key, i| {
         out[i] = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, embedding_name);
         made += 1;
-        const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 1, &vectors[i]);
+        const payload = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, 1, true, &vectors[i]);
         defer alloc.free(payload);
         try store.put(out[i], payload);
     }
@@ -53778,4 +55918,367 @@ test "privacy text projection retains primary identity and removes private recei
     try std.testing.expect(std.mem.indexOf(u8, projected.stored_data, "private") == null);
     try std.testing.expect(projected.doc_ordinal == null and !projected.schema_less_fast_projection);
     try std.testing.expect(root.object.contains("_privacy"));
+}
+
+test "leann store: dirty transient buffer scores current vectors beyond default ef" {
+    var fixture = @import("../../test_allocator.zig").TestAllocator{};
+    defer fixture.deinit();
+    const alloc = fixture.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(dir);
+    const Primary = struct {
+        vectors: [128][2]f32 = @splat(.{ 1, 1 }),
+        reads: usize = 0,
+        fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            return a.dupe(f32, &self.vectors[@intCast(id)]);
+        }
+    };
+    var primary = Primary{};
+    var store = try leann_store_mod.LeannStore.open(alloc, std.testing.io, dir, .{ .dims = 2, .metric = .l2_squared, .transient = true, .replicated = true, .batch_size = 7 });
+    defer store.deinit();
+    store.setLoader(.{ .ctx = &primary, .load = Primary.load });
+    const Item = struct { vector_id: u64, vector: []const f32, metadata: []const u8 };
+    var keys: [128][8]u8 = undefined;
+    var items: [128]Item = undefined;
+    for (&items, 0..) |*item, id| item.* = .{ .vector_id = id, .vector = &primary.vectors[id], .metadata = try std.fmt.bufPrint(&keys[id], "key{d:0>3}", .{id}) };
+    try store.replicated.?.noteWrites(&items, &.{});
+    var raft: u64 = 1;
+    while (try store.planRecord(alloc)) |value| {
+        var planned = value;
+        defer planned.deinit(alloc);
+        _ = try store.applyRecord(planned.record, raft, null);
+        raft += 1;
+    }
+    try std.testing.expect(store.replicated.?.replica.index == null);
+    // The committed exact buffer contains old values; source writes have
+    // advanced without publishing another LEANN record yet.
+    for (&primary.vectors, 0..) |*vector, id| vector.* = .{ @floatFromInt(127 - id), 0 };
+    try store.replicated.?.noteWrites(&items, &.{});
+    primary.reads = 0;
+    var result = try store.search(alloc, .{ .query = &.{ 0, 0 }, .k = 3 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 128), primary.reads);
+    try std.testing.expectEqual(@as(usize, 3), result.items.items.len);
+    for (result.items.items, 0..) |item, rank| try std.testing.expectEqual(@as(u64, 127 - rank), item.vector_id);
+}
+
+test "leann pinned source loader batches sorted artifact keys and restores candidate slots" {
+    var fixture = @import("../../test_allocator.zig").TestAllocator{};
+    defer fixture.deinit();
+    const alloc = fixture.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "dense", .kind = .dense_vector, .config_json =
+        \\{"field":"embedding","dims":2,"metric":"l2_squared","embedding_name":"dense","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"dense"},"algorithm":"leann","leann":{"vector_storage":"transient"}}
+    }});
+    const Source = struct {
+        keys: [3][]const u8,
+        calls: usize = 0,
+        fn get(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedScalarRead;
+        }
+        fn many(raw: *anyopaque, a: Allocator, keys: []const []const u8, values: []?[]u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 3), keys.len);
+            for (keys, values, 0..) |key, *value, position| {
+                if (position > 0) try std.testing.expect(std.mem.lessThan(u8, keys[position - 1], key));
+                for (self.keys, 0..) |expected, slot| if (std.mem.eql(u8, key, expected)) {
+                    const coordinate: f32 = @floatFromInt(slot + 1);
+                    value.* = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 0, &.{ coordinate, coordinate + 10 });
+                    break;
+                };
+            }
+        }
+    };
+    const metadata = [_][]const u8{ "z", "a", "m" };
+    var source = Source{ .keys = undefined };
+    for (metadata, &source.keys) |key, *encoded| encoded.* = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, key, "dense");
+    defer for (source.keys) |key| alloc.free(key);
+    var session: LeannRecoverySession = .{ .source_read = .{ .ptr = &source, .get_owned = Source.get, .get_many_sorted_owned = Source.many } };
+    defer session.deinit();
+    const entry = manager.denseIndex("dense").?;
+    var out: [6]f32 = undefined;
+    var found: [3]bool = undefined;
+    var elapsed: u64 = 0;
+    try IndexManager.loadDenseVectorsForLeannSession(entry.vector_loader_context.?, alloc, &.{ 9, 8, 7 }, &metadata, &out, &found, &elapsed, &session);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &found);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 11, 2, 12, 3, 13 }, &out);
+}
+
+test "leann exact buffer publishes coverage for local replicated and mixed dirty rows" {
+    var fixture = @import("../../test_allocator.zig").TestAllocator{};
+    defer fixture.deinit();
+    const alloc = fixture.allocator();
+    for ([_]bool{ false, true }) |replicated| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+        defer alloc.free(dir);
+        const Primary = struct {
+            vectors: [96][2]f32 = undefined,
+            reads: usize = 0,
+            fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.reads += 1;
+                return a.dupe(f32, &self.vectors[@intCast(id)]);
+            }
+        };
+        var primary = Primary{};
+        var store = try leann_store_mod.LeannStore.open(alloc, std.testing.io, dir, .{ .dims = 2, .metric = .l2_squared, .transient = true, .replicated = replicated });
+        defer store.deinit();
+        store.setLoader(.{ .ctx = &primary, .load = Primary.load });
+        var stats: @import("antfly_vectorindex").leann.SearchStats = .{};
+        {
+            var empty = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 10 }, &stats);
+            defer empty.deinit();
+            try std.testing.expectEqual(.exhausted, empty.candidate_coverage);
+            try std.testing.expect(stats.matches.complete);
+            try std.testing.expectEqual(@as(usize, 0), stats.matches.verified);
+        }
+        const Item = struct { vector_id: u64, vector: []const f32, metadata: []const u8 };
+        var keys: [96][8]u8 = undefined;
+        var items: [96]Item = undefined;
+        for (&items, &primary.vectors, 0..) |*item, *vector, id| {
+            vector.* = .{ @floatFromInt(id), 0 };
+            item.* = .{ .vector_id = id, .vector = vector, .metadata = try std.fmt.bufPrint(&keys[id], "key{d:0>3}", .{id}) };
+        }
+        try store.apply(&items, &.{});
+        if (replicated) {
+            var raft: u64 = 1;
+            while (try store.planRecord(alloc)) |value| {
+                var planned = value;
+                defer planned.deinit(alloc);
+                _ = try store.applyRecord(planned.record, raft, null);
+                raft += 1;
+            }
+            try std.testing.expect(store.replicated.?.replica.index == null);
+        } else try std.testing.expect(store.index == null);
+        primary.reads = 0;
+        {
+            var selective = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 10, .distance_under = 2 }, &stats);
+            defer selective.deinit();
+            try std.testing.expectEqual(@as(usize, 2), selective.items.items.len);
+            try std.testing.expectEqual(.exhausted, selective.candidate_coverage);
+            try std.testing.expect(stats.matches.complete);
+            try std.testing.expectEqual(@as(usize, 2), stats.matches.verified);
+        }
+        {
+            var top = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 3 }, &stats);
+            defer top.deinit();
+            try std.testing.expectEqual(.more, top.candidate_coverage);
+            try std.testing.expectEqual(@as(usize, 96), stats.matches.verified);
+        }
+        {
+            var full = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 128, .search_effort = 1 }, &stats);
+            defer full.deinit();
+            try std.testing.expectEqual(.exhausted, full.candidate_coverage);
+            try std.testing.expect(stats.matches.complete);
+            try std.testing.expectEqual(@as(usize, 96), full.items.items.len);
+        }
+        {
+            var rejected = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 10, .filter_prefix = "absent" }, &stats);
+            defer rejected.deinit();
+            try std.testing.expectEqual(.exhausted, rejected.candidate_coverage);
+            try std.testing.expect(stats.matches.complete);
+            try std.testing.expectEqual(@as(usize, 0), stats.matches.verified);
+        }
+        {
+            var zero = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 0 }, &stats);
+            defer zero.deinit();
+            try std.testing.expectEqual(.unknown, zero.candidate_coverage);
+            try std.testing.expect(!stats.matches.complete);
+        }
+        try std.testing.expectEqual(@as(usize, 0), primary.reads);
+        if (replicated) {
+            primary.vectors[95] = .{ 0.5, 0 };
+            try store.replicated.?.noteWrites(items[95..], &.{});
+            var mixed = try store.searchWithStats(alloc, .{ .query = &.{ 0, 0 }, .k = 10, .distance_under = 2 }, &stats);
+            defer mixed.deinit();
+            try std.testing.expectEqual(@as(usize, 3), mixed.items.items.len);
+            try std.testing.expectEqual(.exhausted, mixed.candidate_coverage);
+            try std.testing.expect(stats.matches.complete);
+            try std.testing.expectEqual(@as(usize, 3), stats.matches.verified);
+            try std.testing.expectEqual(@as(usize, 1), primary.reads);
+        }
+    }
+}
+
+test "leann persistent local and replicated searches enforce scratch budgets and return independently owned results" {
+    var fixture = @import("../../test_allocator.zig").TestAllocator{};
+    defer fixture.deinit();
+    const alloc = fixture.allocator();
+    const Budget = @import("../../test_allocator.zig").BoundedAllocator;
+    for ([_]bool{ false, true }) |replicated| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+        defer alloc.free(path);
+        const Primary = struct {
+            vectors: [32][8]f32 = undefined,
+            expected: ?*Budget = null,
+            extra_scratch: usize = 0,
+            query_loads: usize = 0,
+            fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.expected) |expected| {
+                    self.query_loads += 1;
+                    const before = expected.live;
+                    const audit = try a.alloc(u8, 1);
+                    defer a.free(audit);
+                    try std.testing.expectEqual(before + 1, expected.live);
+                }
+                const scratch = try a.alloc(u8, self.extra_scratch);
+                defer a.free(scratch);
+                return a.dupe(f32, &self.vectors[@intCast(id)]);
+            }
+            fn batch(raw: *anyopaque, a: Allocator, ids: []const u64, _: []const []const u8, out: []f32, found: []bool) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.expected) |expected| {
+                    self.query_loads += 1;
+                    const before = expected.live;
+                    const audit = try a.alloc(u8, 1);
+                    defer a.free(audit);
+                    try std.testing.expectEqual(before + 1, expected.live);
+                }
+                const scratch = try a.alloc(u8, self.extra_scratch);
+                defer a.free(scratch);
+                for (ids, found, 0..) |id, *exists, i| {
+                    @memcpy(out[i * 8 ..][0..8], &self.vectors[@intCast(id)]);
+                    exists.* = true;
+                }
+            }
+        };
+        var primary = Primary{};
+        var store = try leann_store_mod.LeannStore.open(alloc, std.testing.io, path, .{ .dims = 8, .metric = .l2_squared, .replicated = replicated, .build_threshold = 16, .max_degree = 8 });
+        defer store.deinit();
+        store.setLoader(.{ .ctx = &primary, .load = Primary.load });
+        const Item = struct { vector_id: u64, vector: []const f32, metadata: []const u8 };
+        var keys: [32][8]u8 = undefined;
+        var items: [32]Item = undefined;
+        var ids: [32]u64 = undefined;
+        for (&items, &primary.vectors, &ids, 0..) |*item, *vector, *id, index| {
+            for (vector, 0..) |*coordinate, component| coordinate.* = @floatFromInt(index + component);
+            id.* = index;
+            item.* = .{ .vector_id = index, .vector = vector, .metadata = try std.fmt.bufPrint(&keys[index], "key{d:0>3}", .{index}) };
+        }
+        try store.apply(&items, &.{});
+        if (replicated) {
+            var raft: u64 = 1;
+            while (try store.planRecord(alloc)) |value| {
+                var planned = value;
+                defer planned.deinit(alloc);
+                _ = try store.applyRecord(planned.record, raft, null);
+                raft += 1;
+            }
+            try std.testing.expect(store.replicated.?.replica.index != null);
+        } else try std.testing.expect(store.index != null);
+        for ([_]bool{ false, true }) |batched| {
+            store.setLoader(.{ .ctx = &primary, .load = Primary.load, .load_batch = if (batched) Primary.batch else null });
+            const request: @import("antfly_vectorindex").search_types.SearchRequest = .{ .query = &primary.vectors[7], .k = 4, .search_effort = 1, .filter_ids = &ids };
+            try std.testing.expectError(error.OutOfMemory, store.searchWithWorkingAllocator(alloc, std.testing.failing_allocator, request));
+            {
+                var budget = Budget.init(std.heap.page_allocator, 32 * 1024);
+                defer std.debug.assert(budget.deinit() == 0);
+                primary.expected = &budget;
+                primary.extra_scratch = 64 * 1024;
+                primary.query_loads = 0;
+                try std.testing.expectError(error.OutOfMemory, store.searchWithWorkingAllocator(alloc, budget.allocator(), request));
+                try std.testing.expectEqual(@as(usize, 0), budget.live);
+                try std.testing.expect(primary.query_loads > 0);
+            }
+            var result = block: {
+                var budget = Budget.init(std.heap.page_allocator, 256 * 1024);
+                defer std.debug.assert(budget.deinit() == 0);
+                primary.expected = &budget;
+                primary.extra_scratch = 0;
+                const answer = try store.searchWithWorkingAllocator(alloc, budget.allocator(), request);
+                try std.testing.expectEqual(@as(usize, 0), budget.live);
+                break :block answer;
+            };
+            defer result.deinit();
+            primary.expected = null;
+            try std.testing.expectEqual(@as(usize, 4), result.items.items.len);
+            try std.testing.expectEqual(@as(u64, 7), result.items.items[0].vector_id);
+            try std.testing.expectEqualStrings("key007", result.items.items[0].metadata.?);
+        }
+    }
+}
+
+test "resolver backfill descriptors retain staged routing and revisions within policy independent memory" {
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    const aliases = try a.alloc(@import("antfly_resolver").KeyAlias, 1000);
+    defer a.free(aliases);
+    var initialized: usize = 0;
+    defer for (aliases[0..initialized]) |alias| {
+        a.free(alias.key);
+        a.free(alias.target);
+    };
+    for (aliases, 0..) |*alias, i| {
+        const key = try std.fmt.allocPrint(a, "entity/source-{d}", .{i});
+        errdefer a.free(key);
+        alias.* = .{ .key = key, .target = try std.fmt.allocPrint(a, "entity/target-{d}", .{i}) };
+        initialized += 1;
+    }
+    const cfg: ResolverConfig = .{
+        .name = "people",
+        .table = "entities",
+        .key_template = "entity/{{_key}}",
+        .source_artifact = "mentions",
+        .source_artifact_kind = .chunk,
+        .resolution_artifact = "resolved",
+        .labels = &.{"PERSON"},
+        .aliases = aliases,
+        .config_generation = 3,
+        .merge_generation = 5,
+        .resolution_generation = 7,
+    };
+    try manager.resolvers.ensureTotalCapacityPrecise(a, 2);
+    manager.resolvers.appendAssumeCapacity(try ResolverConfig.clone(a, cfg));
+    var staged = cfg;
+    staged.name = "__antfly_replacement/people";
+    staged.replacement_index = "next_graph";
+    try manager.resolvers.append(a, try ResolverConfig.clone(a, staged));
+    // Two full policy clones cannot fit here; routing/revision descriptors do.
+    var bytes: [4096]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    const selected = try manager.listResolverBackfillDescriptors(bounded.allocator());
+    defer {
+        for (selected) |*entry| entry.deinit(bounded.allocator());
+        bounded.allocator().free(selected);
+    }
+    try std.testing.expectEqual(@as(usize, 2), selected.len);
+    for (selected) |entry| {
+        try std.testing.expectEqualStrings("mentions", entry.source_artifact);
+        try std.testing.expectEqual(.chunk, entry.source_artifact_kind);
+        try std.testing.expectEqualStrings("resolved", entry.resolution_artifact);
+        try std.testing.expectEqual(@as(u64, 7), entry.effectiveGeneration());
+        try std.testing.expect(entry.resolvesLabel("PERSON"));
+        try std.testing.expect(!entry.resolvesLabel("ORG"));
+        try std.testing.expectEqual(@as(usize, 0), entry.aliases.len);
+    }
+    try std.testing.expect(!selected[0].sharesRoutingDomain(selected[1]));
+    try std.testing.expectEqualStrings("next_graph", selected[1].replacement_index);
 }

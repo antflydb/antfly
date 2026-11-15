@@ -867,7 +867,9 @@ pub const Aggregate = struct {
                 if (self.selected) |current| {
                     const order = try scalar.compareDatums(value, current.row.values[0]);
                     if (order != (if (self.kind == .min) std.math.Order.lt else .gt)) {
-                        self.count += 1;
+                        // Extrema retain presence even when the incoming value
+                        // does not replace the winner, including legacy weights.
+                        self.count = 1;
                         return;
                     }
                 }
@@ -6773,8 +6775,10 @@ fn groupedBitmapScenario(backing: Allocator, count: usize) !void {
 }
 
 test "SQL grouped bitmap growth spills before retaining rehashes and merges scalar inputs" {
-    try groupedBitmapScenario(std.testing.allocator, 512);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, groupedBitmapScenario, .{@as(usize, 2)});
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    try groupedBitmapScenario(checked.allocator(), 512);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(checked.allocator(), groupedBitmapScenario, .{@as(usize, 2)});
 }
 
 fn statisticBatchScenario(backing: Allocator, count: usize) !void {
@@ -6814,8 +6818,10 @@ fn statisticBatchScenario(backing: Allocator, count: usize) !void {
 }
 
 test "SQL statistic batches preserve sparse ownership and promoted bins through spill" {
-    try statisticBatchScenario(std.testing.allocator, 512);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, statisticBatchScenario, .{@as(usize, 2)});
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    try statisticBatchScenario(checked.allocator(), 512);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(checked.allocator(), statisticBatchScenario, .{@as(usize, 2)});
 }
 
 test "SQL finalized aggregate streams bypass hash retention and fence ownership and quotas" {

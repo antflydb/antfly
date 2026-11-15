@@ -3059,7 +3059,9 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(
         lambda current: current.get("head_version", 0) >= target_head_version,
         reason=f"serverless rebuild did not reach head version {target_head_version}",
     )
-    assert status["head_artifact_actions"]["document_segment"] == "rebuild"
+    # Incremental publication reuses the packed body cache; document facts
+    # carry the changed body. Verify visibility as well as reuse below.
+    assert status["head_artifact_actions"]["document_segment"] == "reuse"
     assert status["head_artifact_actions"]["full_text"] == "rebuild"
     assert status["head_artifact_actions"]["dense_vector"] == "reuse"
     assert status["head_artifact_actions"]["sparse_vector"] == "reuse"
@@ -3069,6 +3071,12 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(
     )
     assert _named_action(status, "head_vector_index_actions", "semantic_a") == "reuse"
     assert _named_action(status, "head_sparse_index_actions", "sparse_a") == "reuse"
+    published = serverless_api.query_published(table_name)
+    documents = {
+        item["doc_id"]: json.loads(item["body"]) for item in published["documents"]
+    }
+    assert documents["doc-1"]["text"] == "bravo", published
+    assert documents["doc-1"]["_embeddings"]["semantic_a"] == [1.0, 0.0, 0.0]
 
 
 def test_serverless_schema_migration_republishes_versioned_full_text_indexes(
@@ -3219,3 +3227,69 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(
     assert next_index["status"]["head_publication_action"] == "rebuild"
     assert ready_index_status(active_index, until="complete") is not None
     assert ready_index_status(next_index, until="complete") is not None
+
+
+@pytest.mark.parametrize("count", [32, 300], ids=["exact-buffer", "graph"])
+def test_leann_index_returns_exact_nearest_first(stateful_api, count):
+    """LEANN's exact buffer and built graph both rank the nearest first."""
+    table = f"leann_e2e_{time.time_ns()}"
+    index_name = "leann_vectors"
+    dims = 8
+    # Retain the graph case above the default build threshold of 256, and
+    # qualify the equally searchable exact buffer before a graph exists.
+    stateful_api.create_table(table, num_shards=1)
+    stateful_api.create_index(
+        table,
+        index_name,
+        {
+            "type": "embeddings",
+            "external": True,
+            "dimension": dims,
+            "algorithm": "leann",
+            "leann": {"max_degree": 16},
+        },
+    )
+
+    def vector(i: int) -> list[float]:
+        # Deterministic points over a few clusters; the last coordinate makes
+        # each one distinct.
+        base = [float((i * (j + 3)) % 17) + (i % 5) * 0.01 for j in range(dims - 1)]
+        return base + [i * 0.05]
+
+    docs = {
+        f"doc:{i:04d}": {
+            "body": f"leann {i}",
+            "_embeddings": {index_name: _pack_f32_le(vector(i))},
+        }
+        for i in range(count)
+    }
+    stateful_api.batch_write(table, inserts=docs, sync_level="full_index")
+
+    def ready():
+        status = ready_index_status(
+            stateful_api.get_index(table, index_name), until="complete"
+        )
+        if status is None:
+            return None
+        if status.get("total_indexed", status.get("doc_count")) != count:
+            return None
+        return status
+
+    assert wait_until(ready, timeout_s=60, interval_s=0.1), json.dumps(
+        stateful_api.get_index(table, index_name), indent=2
+    )
+
+    for i in (7, min(123, count // 2), count - 1):
+        result = stateful_api.query_table(
+            table,
+            {
+                "embeddings": {index_name: _pack_f32_le(vector(i))},
+                "indexes": [index_name],
+                "limit": 10,
+            },
+        )
+        hits = result["responses"][0]["hits"]["hits"]
+        assert hits, result
+        # The exact match comes first, not merely somewhere in the top 10.
+        assert hits[0]["_id"] == f"doc:{i:04d}", [hit["_id"] for hit in hits]
+        assert len({hit["_id"] for hit in hits}) == len(hits)

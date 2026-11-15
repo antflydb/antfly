@@ -515,6 +515,10 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lib_hash_test_step = b.step("lib-hash-test", "Run standalone lib/hash tests");
     lib_hash_test_step.dependOn(&run_lib_hash_tests.step);
 
+    const lib_compress_tests = b.addTest(.{ .root_module = antfly_imports.compress });
+    const run_lib_compress_tests = b.addRunArtifact(lib_compress_tests);
+    b.step("lib-compress-test", "Run bounded native compression and differential decoder tests").dependOn(&run_lib_compress_tests.step);
+
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
         .filters = buildArguments(b) orelse &.{},
@@ -522,6 +526,30 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_vectorindex_tests = b.addRunArtifact(lib_vectorindex_tests);
     const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
     lib_vectorindex_test_step.dependOn(&run_lib_vectorindex_tests.step);
+
+    const leann_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/leann_store.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    leann_storage_mod.addImport("antfly_vector", vector_mod);
+    leann_storage_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    leann_storage_mod.addImport("antfly_hash", hash_mod);
+    leann_storage_mod.addImport("antfly_runtime_fs", antfly_imports.runtime_fs);
+    const leann_storage_tests = b.addTest(.{ .root_module = leann_storage_mod });
+    b.step("leann-storage-test", "Run local and replicated LEANN storage tests")
+        .dependOn(&b.addRunArtifact(leann_storage_tests).step);
+
+    const leann_bench_mod = b.createModule(.{
+        .root_source_file = b.path("lib/vectorindex/src/leann_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    leann_bench_mod.addImport("antfly_vector", vector_mod);
+    leann_bench_mod.addImport("antfly_hash", hash_mod);
+    const leann_bench = b.addExecutable(.{ .name = "leann_bench", .root_module = leann_bench_mod });
+    b.step("leann-bench", "Build the LEANN search and churn benchmark")
+        .dependOn(&b.addInstallArtifact(leann_bench, .{}).step);
 
     const vector_kernel_mod = b.createModule(.{ .root_source_file = b.path("lib/vector/src/quantizer.zig"), .target = target, .optimize = optimize });
     vector_kernel_mod.addImport("protobuf", protobuf_mod);
@@ -621,6 +649,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .pdf_standard_fonts_mod = pdf_standard_fonts_mod,
         .font_mod = font_mod,
         .platform_mod = platform_mod,
+        .filters = buildArguments(b) orelse &.{},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
     const documents_tests = b.addTest(.{ .root_module = inference_runtime_build.sourceDocumentsModule(b, b.modules.get("antfly_documents").?, shared.pdf_mod) });
@@ -727,6 +757,8 @@ pub fn create(b: *std.Build) ?Artifacts {
 
     const owner_tests = antfly_tests_build.addTests(b, .{
         .native_inference = embedded.native_inference,
+        .strip = strip,
+        .inference_enable_cuda = inference_enable_cuda,
         .apple_bridge = if (install_apple_bridge) |install| install.source else null,
         .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,
@@ -871,6 +903,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);
+    lib_test_step.dependOn(&run_lib_compress_tests.step);
     lib_test_step.dependOn(&run_lib_resolver_tests.step);
     lib_test_step.dependOn(&run_vector_cancellation_tests.step);
     lib_test_step.dependOn(&run_lib_chunking_tests.step);

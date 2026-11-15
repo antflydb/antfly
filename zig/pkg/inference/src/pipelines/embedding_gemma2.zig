@@ -548,7 +548,6 @@ pub fn embedLiveWindow(out: std.mem.Allocator, session: Session, tokenizer: Toke
 /// before model execution and callback delivery. The hard ceiling still applies.
 pub const LiveAllocation = struct {
     backing: std.mem.Allocator,
-    session: Session,
     control: Control,
     owner_permit: RunPermit,
     admitted: @import("../backends/admitted_allocator.zig").AdmittedAllocator,
@@ -558,7 +557,7 @@ pub const LiveAllocation = struct {
         var permit = try admitHostPreprocess(session, @sizeOf(LiveAllocation), control);
         errdefer permit.deinit();
         const self = try a.create(LiveAllocation);
-        self.* = .{ .backing = a, .session = session, .control = control, .owner_permit = permit, .admitted = .{ .backing = a, .session = session, .trim_on_free = true }, .bounded = .{ .backing = undefined, .limit = 512 * 1024 * 1024 } };
+        self.* = .{ .backing = a, .control = control, .owner_permit = permit, .admitted = .{ .backing = a, .session = session, .trim_on_free = true }, .bounded = .{ .backing = undefined, .limit = 512 * 1024 * 1024 } };
         if (session.run_admission != null) {
             self.admitted.admission_context = self;
             self.admitted.admit = acquire;
@@ -568,7 +567,7 @@ pub const LiveAllocation = struct {
     }
     fn acquire(raw: *anyopaque, bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
         const self: *LiveAllocation = @ptrCast(@alignCast(raw));
-        return (try admitHostPreprocess(self.session, bytes, self.control)).lease orelse return error.ResourceLimitExceeded;
+        return (try admitHostPreprocess(self.admitted.session.?, bytes, self.control)).lease orelse return error.ResourceLimitExceeded;
     }
     pub fn allocator(self: *LiveAllocation) std.mem.Allocator {
         return self.bounded.allocator();
@@ -6091,4 +6090,34 @@ test "embeddinggemma2 video ready stage stays warm alone and hands off to a queu
     try std.testing.expectEqual(@as(usize, 1), timings.stage_acquisitions);
     try StageLane.yieldReady(&lane);
     try std.testing.expectEqual(@as(usize, 1), timings.stage_yields);
+}
+
+test "embeddinggemma2 live allocation retries preserve terminal admission diagnostics" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const limits = memory.Limits{ .host_limit_bytes = 100 * 1024 };
+    var weights = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = 90 * 1024 }, false);
+    defer weights.release();
+    var failure = memory.AdmissionFailure{};
+    var marker: u8 = 0;
+    const session = Session{ .ptr = &marker, .vtable = &PhaseTestSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = weights.amounts, .failure = &failure, .check_live_memory = false } };
+    const owner = try LiveAllocation.create(std.testing.allocator, session, .{});
+    defer owner.deinit();
+    const a = owner.allocator();
+    const first = try a.alloc(u8, 512);
+    defer a.free(first);
+    try std.testing.expect(failure.snapshot() == null);
+    const peer = memory.AdmissionAmounts.LimitExceeded{ .limit = .backend, .requested_bytes = 12, .limit_bytes = 10 };
+    failure.record(peer);
+    // Force a fresh growth attempt while retaining the first allocation.
+    try owner.trim();
+    const second = try a.alloc(u8, 512);
+    defer a.free(second);
+    try std.testing.expectEqualDeep(peer, failure.snapshot().?);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 20 * 1024));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, owner.failure(error.OutOfMemory));
+    try std.testing.expectEqual(.host, failure.snapshot().?.limit);
+    try std.testing.expect(failure.snapshot().?.requested_bytes > limits.host_limit_bytes);
+    try std.testing.expectEqual(limits.host_limit_bytes, failure.snapshot().?.limit_bytes);
 }

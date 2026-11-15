@@ -4462,12 +4462,14 @@ pub const ProvisionedTableReadSource = struct {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             return openCypherStatementAttempt(ptr, alloc, input) catch |err| {
-                if ((err != error.NotLeader and err != error.ReadUnavailable and err != error.Backpressured) or attempt == 3) return err;
+                if ((err != error.NotLeader and err != error.ReadUnavailable and err != error.Backpressured and err != error.StorageOwnerAdmissionPending and err != error.TopologyChanged) or attempt == 3) return err;
                 // A rejected owner has exposed no rows. Release the entire
                 // failed cohort, refresh routes, and acquire fresh capabilities.
                 // Never reuse or replay a cursor or a graph mutation.
                 try input.cancellation.check();
                 if (input.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+                // Rejected topology needs a fresh pinned generation.
+                if (err == error.TopologyChanged) continue;
                 const io = self.io_impl orelse return err;
                 try io.backend.sleep(.fromMilliseconds(250), .awake);
                 continue;
@@ -4479,6 +4481,14 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHotStandbyReadAllowed(.read_index);
         if (input.tables.len == 0 or input.tables.len > 64) return error.CypherOwnerBudgetExceeded;
+        const opts: db_mod.types.ScanOptions = .{ .execution_deadline_ns = input.deadline_ns, .cancellation = input.cancellation };
+        // One authoritative generation licenses every table/key selection in
+        // this attempt. Live topology validation still uses self.catalog.
+        var routing_budget = self.catalog.budget(provisionedConsistencyDeadline(self.catalog, .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }));
+        routing_budget.cancellation = input.cancellation;
+        var routing_session = try table_catalog.RoutingSession.initWithBudget(alloc, self.catalog, routing_budget);
+        defer routing_session.deinit();
+        const routing_catalog = routing_session.catalog();
         const factory = @import("graph_statement_source.zig");
         var plans: std.ArrayList(factory.Plan) = .empty;
         defer {
@@ -4500,18 +4510,24 @@ pub const ProvisionedTableReadSource = struct {
         defer alloc.free(prepared);
         var retained: usize = 0;
         defer for (prepared[0..retained]) |*value| value.deinit();
-        const opts: db_mod.types.ScanOptions = .{ .execution_deadline_ns = input.deadline_ns, .cancellation = input.cancellation };
         for (input.tables, prepared) |table, *owned| {
             try input.cancellation.check();
-            owned.* = try self.prepareRoutedSpanRead(alloc, table.name, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, .read_index, .general);
+            owned.* = try self.prepareRoutedDomainReadInCatalog(alloc, table.name, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, .read_index, .general, table.keys, routing_catalog);
             retained += 1;
             if (owned.table_id != table.table_id) return error.CatalogGenerationChanged;
             try certifyDelayedOwnerCut(owned.group_ids.len);
-            try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table.name, owned.group_ids.len);
+            if (owned.group_ids.len > 1) {
+                const owners = try alloc.alloc(metadata_api.OwnerReadinessRequest.Owner, owned.group_ids.len);
+                defer alloc.free(owners);
+                for (owned.group_ids, owners) |id, *owner| {
+                    const range = try routing_session.rangeForGroup(owned.table_id, id, routing_budget);
+                    owner.* = .{ .group_id = id, .shard_id = metadata_table_manager.rangeDocIdentityShardId(range.*), .range_id = metadata_table_manager.rangeDocIdentityRangeId(range.*) };
+                }
+                try table_catalog.validateOwnerReadiness(alloc, self.catalog, .{ .table_id = owned.table_id, .owners = owners }, routing_budget);
+            }
             owned.releaseActivity();
-            var routing = (try table_catalog.observedTableRoutingSnapshot(alloc, self.catalog, table.name, input.deadline_ns)) orelse return error.CatalogGenerationChanged;
-            defer routing.deinit(alloc);
-            if (routing.table_id != owned.table_id or routing.topology_epoch != owned.topology_epoch or !routing.coversKeyspace()) return error.TopologyChanged;
+            const routing = try routing_session.tableRoutingView(table.name, routing_budget);
+            if (routing.table_id != owned.table_id or routing.topology_epoch != owned.topology_epoch or !routing.covers_keyspace) return error.TopologyChanged;
             for (owned.group_ids, 0..) |group, i| {
                 if (plans.items.len >= 1024) return error.CypherOwnerBudgetExceeded;
                 var route: table_router.GroupRoute = if (self.distributed_router) |router|
@@ -4522,27 +4538,23 @@ pub const ProvisionedTableReadSource = struct {
                 const fence = owned.fenceAt(i, input.deadline_ns, input.cancellation);
                 try plans.ensureUnusedCapacity(alloc, 1);
                 try routes.ensureUnusedCapacity(alloc, 1);
-                var ranges: std.ArrayList(@import("cypher").distributed.KeyRange) = .empty;
-                errdefer {
-                    for (ranges.items) |range| {
-                        alloc.free(range.start);
-                        if (range.end) |end| alloc.free(end);
-                    }
-                    ranges.deinit(alloc);
-                }
-                for (routing.ranges) |range| if (range.group_id == group) {
-                    const start = try alloc.dupe(u8, range.start_key);
-                    errdefer alloc.free(start);
-                    const end = if (range.end_key) |end| try alloc.dupe(u8, end) else null;
-                    errdefer if (end) |value| alloc.free(value);
-                    try ranges.append(alloc, .{ .start = start, .end = end });
-                };
-                if (ranges.items.len == 0) return error.TopologyChanged;
-                try plans.append(alloc, .{ .table = table, .fence = fence, .ranges = try ranges.toOwnedSlice(alloc), .route = switch (route) {
+                const range = try routing_session.rangeForGroup(owned.table_id, group, routing_budget);
+                const start = try alloc.dupe(u8, range.start_key);
+                errdefer alloc.free(start);
+                const end = if (range.end_key) |value| try alloc.dupe(u8, value) else null;
+                errdefer if (end) |value| alloc.free(value);
+                const ranges = try alloc.alloc(@import("cypher").distributed.KeyRange, 1);
+                errdefer alloc.free(ranges);
+                ranges[0] = .{ .start = start, .end = end };
+                // Selection keys are no longer needed after routing. Do not
+                // duplicate an entire keyset in every retained owner plan.
+                var owner_table = table;
+                owner_table.keys = null;
+                plans.appendAssumeCapacity(.{ .table = owner_table, .fence = fence, .ranges = ranges, .route = switch (route) {
                     .local => .{ .local = self.groupLocalSourceWithFence(fence) },
                     .remote => |remote| .{ .remote = .{ .executor = self.distributedInternalExecutor(), .base_uri = remote.base_uri } },
                 } });
-                try routes.append(alloc, route);
+                routes.appendAssumeCapacity(route);
             }
         }
         return factory.Statement.create(alloc, input, plans.items, if (self.io_impl) |io| io.io() else null, if (self.io_impl) |io| ioAsyncLimitCap(io) else 1);
@@ -4893,13 +4905,43 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         kind: ReadPreparation.Kind,
     ) !PreparedSpanRead {
+        return self.prepareRoutedDomainRead(alloc, table_name, from_key, to_key, request, consistency, kind, null);
+    }
+
+    fn prepareRoutedDomainRead(
+        self: *ProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        request: ProvisionedConsistencyRequest,
+        consistency: raft_mod.ReadConsistency,
+        kind: ReadPreparation.Kind,
+        keys: ?[]const []const u8,
+    ) !PreparedSpanRead {
+        return self.prepareRoutedDomainReadInCatalog(alloc, table_name, from_key, to_key, request, consistency, kind, keys, null);
+    }
+
+    fn prepareRoutedDomainReadInCatalog(
+        self: *ProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        request: ProvisionedConsistencyRequest,
+        consistency: raft_mod.ReadConsistency,
+        kind: ReadPreparation.Kind,
+        keys: ?[]const []const u8,
+        pinned_catalog: ?table_catalog.CatalogSource,
+    ) !PreparedSpanRead {
         const deadline_ns = provisionedConsistencyDeadline(self.catalog, request);
+        const routing_catalog = pinned_catalog orelse self.catalog;
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             if (consistency == .stale) {
                 var activity = self.beginPreparedRead(table_name, kind);
                 errdefer if (activity) |*held| held.deinit();
-                const route = try requestRoutedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns);
+                const route = try requestRoutedDomainSnapshot(alloc, routing_catalog, table_name, from_key, to_key, request, deadline_ns, keys);
                 const routes = route.routes;
                 const group_ids = route.group_ids;
                 var route_owned = true;
@@ -4909,6 +4951,7 @@ pub const ProvisionedTableReadSource = struct {
                 };
                 if (activity == null) table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table_name, route.topology_epoch, deadline_ns) catch |err| switch (err) {
                     error.TopologyChanged => {
+                        if (pinned_catalog != null) return err;
                         if (activity) |*held| held.deinit();
                         activity = null;
                         if (attempt + 1 < topology_read_attempt_limit) continue;
@@ -4923,7 +4966,7 @@ pub const ProvisionedTableReadSource = struct {
                 }, .alloc = alloc, .routes = routes, .group_ids = group_ids, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = route.table_id, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .routing_deadline_ns = deadline_ns, .activity = activity };
             }
 
-            const route = try requestRoutedSpanSnapshot(alloc, self.catalog, table_name, from_key, to_key, request, deadline_ns);
+            const route = try requestRoutedDomainSnapshot(alloc, routing_catalog, table_name, from_key, to_key, request, deadline_ns, keys);
             const routes = route.routes;
             const group_ids = route.group_ids;
             var route_owned = true;
@@ -4936,6 +4979,7 @@ pub const ProvisionedTableReadSource = struct {
             errdefer if (activity) |*held| held.deinit();
             table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table_name, route.topology_epoch, deadline_ns) catch |err| switch (err) {
                 error.TopologyChanged => {
+                    if (pinned_catalog != null) return err;
                     if (activity) |*held| held.deinit();
                     activity = null;
                     if (attempt + 1 < topology_read_attempt_limit) continue;
@@ -5486,13 +5530,28 @@ pub const ProvisionedTableReadSource = struct {
             }
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
+            var meta: query_api.QueryResponseMeta = .{
+                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
+                .shard_count = logical_shard_count,
+                .merged = true,
+            };
+            defer meta.deinit(alloc);
             // Distributed graph execution can cross table boundaries. Do not
             // retain the source table's admission while acquiring a target
             // table: opposing A -> B and B -> A traversals can otherwise form
             // a lock-order cycle behind queued Raft apply operations. The base
             // result is fully materialized, so release its admission before
-            // fanout and let each worker hold exactly one table at a time.
+            // model calls and fanout and let each worker hold exactly one table at a time.
             prepared.releaseActivity();
+
+            // Resolve $query_results from the final ranked and pruned page.
+            try query_post_processing.applyHitPostProcessing(
+                alloc,
+                graph_req,
+                &merged,
+                &meta,
+                routed.managedReadRuntimeConfig().forTable(table_name),
+            );
 
             var worker_ctx = ProvisionedGraphWorkerContext.init(routed);
             const worker = worker_ctx.worker();
@@ -5513,12 +5572,6 @@ pub const ProvisionedTableReadSource = struct {
             // completed, preserving the single-table-at-a-time invariant.
             try routed.reacquirePinnedSpanRead(alloc, table_name, readPreparationKindForQuery(req), &prepared);
 
-            var meta: query_api.QueryResponseMeta = .{
-                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
-                .shard_count = logical_shard_count,
-                .merged = true,
-            };
-            defer meta.deinit(alloc);
             applyProvisionedQueryAggregations(routed, alloc, group_ids, table_name, graph_req, &merged, &meta, null, null, .stale) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
@@ -5528,13 +5581,8 @@ pub const ProvisionedTableReadSource = struct {
                 else => return err,
             };
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(
-                alloc,
-                graph_req,
-                &merged,
-                &meta,
-                routed.managedReadRuntimeConfig().forTable(table_name),
-            );
+            try query_post_processing.applyGraphPostProcessing(alloc, graph_req, &merged, &meta, routed.managedReadRuntimeConfig().forTable(table_name));
+            meta.took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms));
             return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, graph_req, meta, merged, delivery);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
@@ -8172,6 +8220,15 @@ pub const HostedProvisionedTableReadSource = struct {
             }
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
+            var meta: query_api.QueryResponseMeta = .{
+                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
+                .shard_count = logical_shard_count,
+                .merged = true,
+            };
+            defer meta.deinit(alloc);
+            // Resolve $query_results from the final ranked and pruned page.
+            try query_post_processing.applyHitPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
+
             const worker = hostedGraphWorker(self);
             const graph_results = distributed_graph.executeCrossRangeWithMatchAnchors(
                 alloc,
@@ -8185,15 +8242,10 @@ pub const HostedProvisionedTableReadSource = struct {
             ) catch |err| return normalizeDistributedQueryOperationalError(err);
             merged.graph_results = graph_results;
 
-            var meta: query_api.QueryResponseMeta = .{
-                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
-                .shard_count = logical_shard_count,
-                .merged = true,
-            };
-            defer meta.deinit(alloc);
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, null, consistency);
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
+            try query_post_processing.applyGraphPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
+            meta.took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms));
             return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, graph_req, meta, merged, delivery);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
@@ -11770,6 +11822,23 @@ fn isDocumentLookupBatch(req: db_mod.types.SearchRequest) bool {
         req.full_text == null and req.full_text_queries.len == 0 and req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.graph_queries.len == 0 and req.graph_metric_queries.len == 0 and req.graph_metric_rerank == null and req.hierarchy_children == null and !req.hierarchy_grouped_matches and req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and req.filter_text == null and req.exclusion_text == null and req.aggregations_json.len == 0 and !searchRequestHasResolvedDocFilter(req);
 }
 
+/// Select all key owners from one routing generation before read-index
+/// admission. RoutingSession provides indexed batched resolution; legacy
+/// catalogs retain exact generation checks in the shared keyset resolver.
+fn requestRoutedDomainSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, table: []const u8, from: []const u8, to: []const u8, request: ProvisionedConsistencyRequest, deadline: ?u64, keys: ?[]const []const u8) !table_catalog.RoutedSpanSnapshot {
+    var budget = catalog.budget(deadline);
+    budget.cancellation = switch (request) {
+        .search => |input| input.cancellation orelse .none,
+        .lookup => |input| input.opts.cancellation orelse .none,
+        .scan => |input| input.opts.cancellation orelse .none,
+    };
+    try budget.checkpoint();
+    if (keys) |selected| if (selected.len != 0 and selected.len <= @import("cypher").read_domains.max_keys) {
+        return table_catalog.routedDocumentKeysSnapshotWithBudget(alloc, catalog, table, selected, budget);
+    };
+    return requestRoutedSpanSnapshot(alloc, catalog, table, from, to, request, deadline);
+}
+
 fn requestRoutedSpanSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, from: []const u8, to: []const u8, request: ProvisionedConsistencyRequest, deadline: ?u64) !table_catalog.RoutedSpanSnapshot {
     if (request == .search) if (request.search.native_query_cut) |cut| if (cut.cover.len != 0) {
         var current = try table_catalog.routedSpanSnapshotUntil(alloc, catalog, table_name, "", "", deadline);
@@ -13148,7 +13217,7 @@ fn queryLocalDetailed(
                 .lease = lease_value,
                 .alloc = alloc,
             } };
-            return try queryDbDetailed(read_safety_barrier, alloc, group_id, owner, req, consistency);
+            return try queryDbDetailed(read_safety_barrier, alloc, group_id, owner, req, consistency, table_name, runtime_cfg);
         }
     }
 
@@ -13156,11 +13225,11 @@ fn queryLocalDetailed(
     defer alloc.free(path);
     if (cache) |cached| {
         const db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
-        return try queryDbDetailed(read_safety_barrier, alloc, group_id, .{ .cached = db_lease }, req, consistency);
+        return try queryDbDetailed(read_safety_barrier, alloc, group_id, .{ .cached = db_lease }, req, consistency, table_name, runtime_cfg);
     } else {
         const identity_namespace = try requireTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
         const db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog, table_name, null, null, lsm_root_generation, null, runtime_cfg, identity_namespace);
-        return try queryDbDetailed(read_safety_barrier, alloc, group_id, .{ .owned = db }, req, consistency);
+        return try queryDbDetailed(read_safety_barrier, alloc, group_id, .{ .owned = db }, req, consistency, table_name, runtime_cfg);
     }
 }
 
@@ -13171,6 +13240,8 @@ fn queryDbDetailed(
     db_owner: LocalQueryDbOwner,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
+    table_name: []const u8,
+    runtime_cfg: ManagedReadRuntimeConfig,
 ) !LocalQueryExecution {
     var owner = db_owner;
     errdefer owner.deinit();
@@ -13178,7 +13249,22 @@ fn queryDbDetailed(
     var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     try reads.reads.prepareSearchWithConsistency(group_id, req, consistency);
     if (req.native_query_cut) |cut| {
-        const retained = try db.openQueryCut(cut, req.cancellation orelse .none);
+        const retained = retained: {
+            var opened = try db.openQueryCut(cut, req.cancellation orelse .none);
+            errdefer opened.close();
+            // DB cuts already fork an attached recipe. A source with no
+            // current transient index still needs the historical recipe here.
+            if (opened.async_context.query_recovery_runtime == null) {
+                for (opened.core.index_manager.dense_indexes.items) |entry| {
+                    if (!entry.leann_transient) continue;
+                    const indexes_json = try retainedRecoveryIndexesJson(alloc, &opened);
+                    defer alloc.free(indexes_json);
+                    try attachProvisionedQueryRecovery(&opened, indexes_json, runtime_cfg.forTable(table_name));
+                    break;
+                }
+            }
+            break :retained opened;
+        };
         owner.deinit();
         owner = .{ .owned = retained };
         db = owner.db();
@@ -13458,10 +13544,6 @@ fn openProvisionedQueryDbForTableWithCache(
     };
     defer alloc.free(indexes_json);
 
-    // Query-readonly DBs never initialize optional enrichment runtimes: those
-    // workers produce derived artifacts and are exclusively writer-owned.
-    // Constructing producer/embedder state here was therefore both wasted work
-    // and an ownership trap—the successful DB open could not consume it.
     var db = try db_mod.DB.open(alloc, path, .{
         .open_mode = .query_readonly,
         .lsm_cache = lsm_cache,
@@ -13479,11 +13561,128 @@ fn openProvisionedQueryDbForTableWithCache(
 
     const summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
         .drain_resolver_backfill = false,
+        .embedding_options = queryRecoveryEmbeddingOptions(runtime_cfg.forTable(table_name), db.backend_runtime.io()),
     });
     // Query opens must never materialize metadata-defined indexes. Writers own
     // that catalog mutation under the root writer lock.
     if (summary.indexManagerCatalogChanged()) return error.ReadOnly;
+    for (db.core.index_manager.dense_indexes.items) |entry| {
+        if (!entry.leann_transient) continue;
+        try attachProvisionedQueryRecovery(&db, indexes_json, runtime_cfg.forTable(table_name));
+        break;
+    }
     return db;
+}
+
+/// Rebuild provider configuration from the retained catalog, including when
+/// forGroup consumed the coordinator recipe before the owner opened the cut.
+fn retainedRecoveryIndexesJson(alloc: std.mem.Allocator, db: *db_mod.DB) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var root: std.json.Value = .{ .object = .{} };
+    for (db.core.index_manager.dense_indexes.items) |entry| {
+        if (!entry.leann_transient) continue;
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, entry.config.config_json, .{});
+        if (value != .object) return error.InvalidManagedEmbeddingIndex;
+        try value.object.put(scratch, "type", .{ .string = "embeddings" });
+        if (value.object.get("dims")) |dims| try value.object.put(scratch, "dimension", dims);
+        if (value.object.get("generator")) |generator| {
+            if (generator != .object) return error.InvalidManagedEmbeddingIndex;
+            if (generator.object.get("source_template")) |template| try value.object.put(scratch, "template", template);
+            if (generator.object.get("chunker")) |chunker| try value.object.put(scratch, "chunker", chunker);
+        }
+        try root.object.put(scratch, entry.config.name, value);
+    }
+    return std.json.Stringify.valueAlloc(alloc, root, .{});
+}
+
+fn queryRecoveryEmbeddingOptions(cfg: ManagedReadRuntimeConfig, io: ?std.Io) managed_embedder.InitOptions {
+    return .{
+        .antfly_provider = providerWithCapabilityCache(cfg.antfly_provider, cfg.remote_capability_cache),
+        .provider_runtime = cfg.provider_runtime,
+        .remote_capability_cache = cfg.remote_capability_cache,
+        .io = io,
+        .bounded_http_request = true,
+        .secret_store = cfg.secret_store,
+        .remote_content = cfg.remote_content,
+        .inference_api_url = cfg.inference_api_url,
+        .inference_api_key = cfg.inference_api_key,
+        .source_table = cfg.source_table,
+    };
+}
+
+const ProvisionedQueryRecovery = struct {
+    arena: std.heap.ArenaAllocator,
+    indexes_json: []const u8,
+    cfg: ManagedReadRuntimeConfig,
+    io: std.Io,
+
+    fn create(raw: *anyopaque, control: managed_embedder.RequestContext) !db_mod.enrichment_runtime.Config {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const alloc = self.arena.child_allocator;
+        const indexes_json = self.indexes_json;
+        const cfg = self.cfg;
+        const io = self.io;
+        try control.check();
+        const provider = providerWithCapabilityCache(cfg.antfly_provider, cfg.remote_capability_cache);
+        var options = queryRecoveryEmbeddingOptions(cfg, io);
+        options.setup_context = control;
+        var recovery: db_mod.enrichment_runtime.Config = .{
+            .dense_embedder = (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, indexes_json, options)) orelse return error.ReembedUnavailable,
+        };
+        errdefer if (recovery.dense_embedder) |dense| dense.deinit(alloc);
+        try control.check();
+        recovery.chunk_provider = try @import("antfly_local_sources").api_local_table_writes.physical_local_write.chunkProviderForRuntime(
+            alloc,
+            provider,
+            io,
+            cfg.remote_capability_cache,
+            cfg.inference_api_url,
+            cfg.source_table,
+            cfg.inference_api_key,
+            cfg.secret_store,
+        );
+        errdefer if (recovery.chunk_provider) |*provider_value| provider_value.deinit();
+        try control.check();
+        return recovery;
+    }
+
+    fn fork(raw: *anyopaque, alloc: std.mem.Allocator, indexes_json: []const u8) !db_mod.DB.QueryRecoveryFactory {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return try provisionedQueryRecoveryFactory(alloc, indexes_json, self.cfg, self.io);
+    }
+
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var arena = self.arena;
+        arena.deinit();
+    }
+};
+
+fn attachProvisionedQueryRecovery(db: *db_mod.DB, indexes_json: []const u8, cfg: ManagedReadRuntimeConfig) !void {
+    const io = db.backend_runtime.io() orelse return;
+    const factory = try provisionedQueryRecoveryFactory(db.runtime_alloc, indexes_json, cfg, io);
+    errdefer factory.release(factory.ptr);
+    try db.attachLazyQueryRecovery(factory);
+}
+
+fn provisionedQueryRecoveryFactory(backing: std.mem.Allocator, indexes_json: []const u8, cfg: ManagedReadRuntimeConfig, io: std.Io) !db_mod.DB.QueryRecoveryFactory {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+    const owner = try alloc.create(ProvisionedQueryRecovery);
+    var owned_cfg = cfg;
+    owned_cfg.source_table = try alloc.dupe(u8, cfg.source_table);
+    owned_cfg.inference_api_url = if (cfg.inference_api_url) |url| try alloc.dupe(u8, url) else null;
+    owned_cfg.inference_api_key = if (cfg.inference_api_key) |key| try alloc.dupe(u8, key) else null;
+    owner.* = .{
+        .indexes_json = try alloc.dupe(u8, indexes_json),
+        .cfg = owned_cfg,
+        .io = io,
+        .arena = arena,
+    };
+    return .{ .fork = ProvisionedQueryRecovery.fork, .ptr = owner, .create = ProvisionedQueryRecovery.create, .release = ProvisionedQueryRecovery.release };
 }
 
 fn loadTableIndexesJson(
@@ -17318,6 +17517,7 @@ fn graphEdgesRemote(
     table_name: []const u8,
     req: distributed_graph.GraphEdgesRequest,
 ) !distributed_graph.GraphEdgesResponse {
+    if (req.physical_scan_observation) |observed| observed.* = 0;
     const scratch = req.scratch_allocator orelse alloc;
     var client = http_client.ApiHttpClient.init(scratch, executor);
     const body = try distributed_graph.encodeGraphEdgesRequest(scratch, req);
@@ -17327,10 +17527,12 @@ fn graphEdgesRemote(
     else
         null;
     if (req.keys.len != 0) {
+        if (req.physical_scan_observation) |observed| observed.* = null;
         var batch = client.fetchGroupGraphEdgesBatchWithControl(base_uri, group_id, table_name, body, req.timeout_ms, if (cancellation != null) &cancellation.? else null) catch |err| return if (req.allow_partial_keys and err == error.InvalidGraphEdgesWireRequest) error.GraphEdgesBatchUnsupported else err;
         defer batch.deinit(scratch);
-        return try distributed_graph.parseGraphEdgesResponseWithScratch(alloc, scratch, batch.body);
+        return decodeObservedGraphEdgesResponse(alloc, scratch, batch.body, req.physical_scan_observation);
     }
+    if (req.physical_scan_observation) |observed| observed.* = null;
     var result = client.fetchGroupGraphEdgesWithControl(
         base_uri,
         group_id,
@@ -17352,7 +17554,38 @@ fn graphEdgesRemote(
         );
     };
     defer result.deinit(scratch);
-    return try distributed_graph.parseGraphEdgesResponseWithScratch(alloc, scratch, result.body);
+    return decodeObservedGraphEdgesResponse(alloc, scratch, result.body, req.physical_scan_observation);
+}
+
+fn decodeObservedGraphEdgesResponse(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8, observation: ?*?usize) !distributed_graph.GraphEdgesResponse {
+    const response = distributed_graph.parseGraphEdgesResponseWithScratch(alloc, scratch, body) catch |err| {
+        if (err == error.OutOfMemory) if (observation) |observed| {
+            observed.* = distributed_graph.graphEdgesResponseScannedRows(body);
+        };
+        return err;
+    };
+    if (observation) |observed| observed.* = response.scanned_rows;
+    return response;
+}
+
+test "graph hydrate and edges remote retry legacy wire safely preserves failed decode observations" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var observed: ?usize = null;
+            var response = decodeObservedGraphEdgesResponse(a, a,
+                \\{"edges":[{"source":"root","target":"a","edge_type":"FRIEND","weight":1,"created_at":0,"updated_at":0,"metadata":"{}"}],"scanned_rows":23,"key_offsets":[0,1],"key_scanned_rows":[23]}
+            , &observed) catch |err| {
+                try std.testing.expectEqual(@as(?usize, 23), observed);
+                return err;
+            };
+            defer response.deinit(a);
+            try std.testing.expectEqual(@as(?usize, 23), observed);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    for ([_][]const u8{ "{}", "{\"scanned_rows\":1,\"scanned_rows\":2}", "{\"scanned_rows\":-1}", "{\"scanned_rows\":3} trailing", "{\"scanned_rows\":null}" }) |body| {
+        try std.testing.expect(distributed_graph.graphEdgesResponseScannedRows(body) == null);
+    }
 }
 
 test "graph hydrate and edges remote retry legacy wire safely" {
@@ -18176,6 +18409,345 @@ fn consumerTests() type {
             try std.testing.expectError(error.SqlProgramLimitExceeded, Cut.cloneGraphIndexes(std.testing.allocator, &excessive));
         }
 
+        test "certified graph point cohorts use selected readiness without administrative snapshots" {
+            const Fixture = struct {
+                status: @FieldType(metadata_api.OwnerReadiness, "status") = .ready,
+                calls: usize = 0,
+                fn capture(ptr: *anyopaque, request: metadata_api.OwnerReadinessRequest, budget: table_catalog.RoutingBudget) !metadata_api.OwnerReadiness {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try budget.checkpoint();
+                    self.calls += 1;
+                    try std.testing.expectEqual(@as(u64, 7), request.table_id);
+                    try std.testing.expectEqual(@as(usize, 2), request.owners.len);
+                    try std.testing.expectEqual(@as(u64, 1), request.owners[0].group_id);
+                    try std.testing.expectEqual(@as(u64, 2), request.owners[1].group_id);
+                    return .{ .status = self.status };
+                }
+            };
+            var fixture: Fixture = .{};
+            const catalog: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .owner_readiness = Fixture.capture } };
+            const request: metadata_api.OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{ .{ .group_id = 1, .shard_id = 1, .range_id = 1 }, .{ .group_id = 2, .shard_id = 2, .range_id = 2 } } };
+            var refusing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+            try table_catalog.validateOwnerReadiness(refusing.allocator(), catalog, request, .{});
+            fixture.status = .identity_unavailable;
+            try std.testing.expectError(error.DocIdentityNamespaceMismatch, table_catalog.validateOwnerReadiness(refusing.allocator(), catalog, request, .{}));
+            fixture.status = .topology_changed;
+            try std.testing.expectError(error.TopologyChanged, table_catalog.validateOwnerReadiness(refusing.allocator(), catalog, request, .{}));
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, table_catalog.validateOwnerReadiness(refusing.allocator(), catalog, request, .{ .deadline_ns = 0 }));
+            try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+            try std.testing.expectEqual(@as(usize, 0), refusing.allocations);
+        }
+
+        test "certified graph point cohorts refresh a generation changed during readiness" {
+            const a = std.testing.allocator;
+            const Fixture = struct {
+                current: *table_catalog.RoutingGeneration,
+                next: *table_catalog.RoutingGeneration,
+                acquisitions: usize = 0,
+                readiness_calls: usize = 0,
+                admitted: std.ArrayList(u64) = .empty,
+                fn acquire(raw: *anyopaque, _: table_catalog.RoutingBudget, _: bool) !*table_catalog.RoutingGeneration {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.acquisitions += 1;
+                    self.current.retain();
+                    return self.current;
+                }
+                fn snapshot(raw: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.current.indexed.snapshot.value;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+                fn ready(raw: *anyopaque, request: metadata_api.OwnerReadinessRequest, _: table_catalog.RoutingBudget) !metadata_api.OwnerReadiness {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.readiness_calls += 1;
+                    try std.testing.expectEqual(@as(usize, 2), request.owners.len);
+                    if (self.readiness_calls == 1) {
+                        try std.testing.expectEqual(@as(u64, 1), request.owners[0].group_id);
+                        // Publish a replacement after routing validation and
+                        // before a single owner cut has been opened.
+                        self.current = self.next;
+                        return .{ .status = .topology_changed };
+                    }
+                    try std.testing.expectEqual(@as(u64, 3), request.owners[0].group_id);
+                    try std.testing.expectEqual(@as(u64, 4), request.owners[1].group_id);
+                    // Stop before physical IO, while independently checking
+                    // that actual identity health failures remain fail-closed.
+                    return .{ .status = .identity_unavailable };
+                }
+                fn wait(raw: *anyopaque, id: u64, _: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.admitted.append(std.testing.allocator, id);
+                }
+            };
+            var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+            var before = [_]metadata_table_manager.RangeRecord{
+                .{ .table_id = 7, .group_id = 1, .start_key = "", .end_key = "m" },
+                .{ .table_id = 7, .group_id = 2, .start_key = "m" },
+            };
+            var after = before;
+            after[0].group_id = 3;
+            after[1].group_id = 4;
+            const old = try table_catalog.RoutingGeneration.create(a, .{ .tables = &tables, .ranges = &before }, .{});
+            defer old.release();
+            const fresh = try table_catalog.RoutingGeneration.create(a, .{ .tables = &tables, .ranges = &after }, .{});
+            defer fresh.release();
+            var fixture: Fixture = .{ .current = old, .next = fresh };
+            defer fixture.admitted.deinit(a);
+            const source: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .acquire_routing_generation = Fixture.acquire, .routing_snapshot = Fixture.snapshot, .linearizable_routing_snapshot = Fixture.snapshot, .free_routing_snapshot = Fixture.free, .owner_readiness = Fixture.ready } };
+            var provider = ProvisionedTableReadSource.init("unused", source, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait } });
+            const input: @import("antfly_local_sources").storage_statement_read_fence.GraphStatement = .{
+                .catalog_json = "",
+                .tables = &.{.{ .name = "docs", .table_id = 7, .schema_version = 1, .keys = &.{ "a", "z" } }},
+                .cut_id = @splat('a'),
+                .expires_ms = std.math.maxInt(u64),
+                .ttl_now_ns = 1,
+            };
+            try std.testing.expectError(error.DocIdentityNamespaceMismatch, ProvisionedTableReadSource.openCypherStatement(&provider, a, input));
+            try std.testing.expectEqual(@as(usize, 2), fixture.readiness_calls);
+            try std.testing.expect(fixture.acquisitions >= 2);
+            try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, fixture.admitted.items);
+        }
+
+        test "certified graph point cohorts borrow ranges without catalog-sized allocations" {
+            const a = std.testing.allocator;
+            for ([_]usize{ 1, 1000, 10000 }) |size| {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const own = arena.allocator();
+                const tables = try own.alloc(metadata_table_manager.TableRecord, size);
+                const ranges = try own.alloc(metadata_table_manager.RangeRecord, size);
+                for (tables, ranges, 0..) |*table, *range, i| {
+                    table.* = .{ .table_id = i + 1, .name = if (i == 0) "docs" else try std.fmt.allocPrint(own, "unrelated_{d}", .{i}) };
+                    range.* = .{ .table_id = i + 1, .group_id = i + 32, .range_id = i + 32, .start_key = "" };
+                }
+                const generation = try table_catalog.RoutingGeneration.create(a, .{ .tables = tables, .ranges = ranges }, .{});
+                var refusing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                var session = generation.session(refusing.allocator(), table_catalog.emptyCatalogSource(), true);
+                defer session.deinit();
+                const view = try session.tableRoutingView("docs", .{});
+                try std.testing.expect(view.covers_keyspace);
+                try std.testing.expectEqual(@as(u64, 1), view.table_id);
+                const range = try session.rangeForGroup(view.table_id, 32, .{});
+                try std.testing.expectEqualStrings("", range.start_key);
+                try std.testing.expect(range.end_key == null);
+                try std.testing.expectEqual(@as(usize, 0), refusing.allocations);
+                try std.testing.expectError(error.TopologyChanged, session.rangeForGroup(2, 32, .{}));
+                try std.testing.expectError(error.TableNotFound, session.tableRoutingView("missing", .{}));
+                try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, session.tableRoutingView("docs", .{ .deadline_ns = 0 }));
+            }
+            var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "docs" }};
+            var ranges = [_]metadata_table_manager.RangeRecord{
+                .{ .table_id = 1, .group_id = 32, .range_id = 32, .start_key = "", .end_key = "m" },
+                .{ .table_id = 1, .group_id = 33, .range_id = 33, .start_key = "m" },
+            };
+            for (0..4) |step| {
+                ranges[0].end_key = switch (step) {
+                    0 => "m",
+                    1 => "l",
+                    2 => "z",
+                    else => "",
+                };
+                const generation = try table_catalog.RoutingGeneration.create(a, .{ .tables = &tables, .ranges = &ranges }, .{});
+                var session = generation.session(a, table_catalog.emptyCatalogSource(), true);
+                defer session.deinit();
+                const view = try session.tableRoutingView("docs", .{});
+                try std.testing.expectEqual(step == 0, view.covers_keyspace);
+            }
+        }
+
+        test "certified graph point cohorts translate privacy deadlines before retained capture" {
+            const ns = std.time.ns_per_s;
+            const Fixture = struct {
+                now: u64,
+                last: ?u64 = null,
+                fn check(self: *@This(), deadline: ?u64) !void {
+                    self.last = deadline;
+                    if (deadline) |end| {
+                        if (end <= self.now) return error.CatalogRoutingSnapshotTimeout;
+                        try std.testing.expect(end <= self.now + 5 * ns);
+                    }
+                }
+                fn binding(raw: *anyopaque, _: []const u8, deadline: ?u64) !metadata_api.PrivacyPolicyBinding {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.check(deadline);
+                    return .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .policy_version = @splat('a') };
+                }
+                fn snapshot(raw: *anyopaque, _: []const u8, deadline: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.check(deadline);
+                    return .{ .tables = &.{}, .ranges = &.{} };
+                }
+                fn free(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+            };
+            var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = @intCast(platform_time.monotonicNs() + 1000 * ns) });
+            defer clock.deinit();
+            const io = clock.io();
+            var fixture: Fixture = .{ .now = @intCast(clock.monotonic_ns) };
+            const catalog: table_catalog.CatalogSource = .{ .ptr = &fixture, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io), .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .privacy_policy_binding = Fixture.binding } };
+            var provider = ProvisionedTableReadSource.init("unused", catalog, undefined);
+            const source = provider.source();
+            const deadline = platform_time.monotonicNs() + 5 * ns;
+            const version = try source.privacyPolicyVersion(std.testing.allocator, "docs", deadline);
+            try std.testing.expectEqual(@as([64]u8, @splat('a')), version);
+            try std.testing.expect(fixture.last.? > fixture.now);
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.privacyPolicyVersion(std.testing.allocator, "docs", 0));
+            _ = try source.privacyPolicyVersion(std.testing.allocator, "docs", null);
+            try std.testing.expect(fixture.last == null);
+            const compatibility: table_catalog.CatalogSource = .{ .ptr = &fixture, .io = catalog.io, .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .linearizable_table_routing_snapshot = Fixture.snapshot, .free_routing_snapshot = Fixture.free } };
+            _ = try capturePrivacyPolicyVersion(std.testing.allocator, compatibility, "docs", deadline);
+            try std.testing.expect(fixture.last.? > fixture.now);
+        }
+
+        test "certified graph point cohorts admit only selected owners before read index" {
+            const a = std.testing.allocator;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const owned = arena.allocator();
+            const Fixture = struct {
+                tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs" }},
+                ranges: []metadata_table_manager.RangeRecord,
+                admitted: std.ArrayList(u64) = .empty,
+                fn snapshot(raw: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return .{ .tables = &self.tables, .ranges = self.ranges };
+                }
+                fn free(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+                fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedAdminRead;
+                }
+                fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn wait(raw: *anyopaque, group: u64, _: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.admitted.append(std.testing.allocator, group);
+                }
+            };
+            const ranges = try owned.alloc(metadata_table_manager.RangeRecord, 64);
+            for (ranges, 0..) |*range, i| range.* = .{
+                .table_id = 7,
+                .group_id = i + 1,
+                .range_id = i + 1,
+                .start_key = if (i == 0) "" else try std.fmt.allocPrint(owned, "{d:0>2}", .{i}),
+                .end_key = if (i == 63) null else try std.fmt.allocPrint(owned, "{d:0>2}", .{i + 1}),
+            };
+            var fixture: Fixture = .{ .ranges = ranges };
+            defer fixture.admitted.deinit(a);
+            const base: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{
+                .admin_snapshot = Fixture.admin,
+                .free_admin_snapshot = Fixture.freeAdmin,
+                .routing_snapshot = Fixture.snapshot,
+                .linearizable_routing_snapshot = Fixture.snapshot,
+                .free_routing_snapshot = Fixture.free,
+            } };
+            // Exercise both the legacy resolver and the request-pinned indexed generation.
+            inline for (.{ false, true }) |pinned| {
+                const generation = try table_catalog.RoutingGeneration.create(a, try Fixture.snapshot(&fixture, null), .{});
+                var session = generation.session(a, base, true);
+                defer session.deinit();
+                var provider = ProvisionedTableReadSource.init("unused", if (pinned) session.catalog() else base, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait } });
+                const cases = [_]struct { keys: ?[]const []const u8, expected: usize }{
+                    .{ .keys = &.{"31-key"}, .expected = 1 },
+                    .{ .keys = &.{ "31-a", "31-b", "31-a" }, .expected = 1 },
+                    .{ .keys = &.{ "31-a", "63-z" }, .expected = 2 },
+                    .{ .keys = null, .expected = 64 },
+                    .{ .keys = &.{}, .expected = 64 },
+                };
+                for (cases) |case| {
+                    fixture.admitted.clearRetainingCapacity();
+                    var prepared = try provider.prepareRoutedDomainRead(a, "docs", "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = .{} } }, .read_index, .general, case.keys);
+                    defer prepared.deinit();
+                    try std.testing.expectEqual(case.expected, prepared.group_ids.len);
+                    try std.testing.expectEqualSlices(u64, prepared.group_ids, fixture.admitted.items);
+                    if (case.expected == 1) try std.testing.expectEqual(@as(u64, 32), prepared.group_ids[0]);
+                    if (case.expected == 2) try std.testing.expectEqualSlices(u64, &.{ 32, 64 }, prepared.group_ids);
+                }
+            }
+        }
+        test "certified graph point cohorts pin production generations and cancel key routing before admission" {
+            const a = std.testing.allocator;
+            const Fixture = struct {
+                generation: *table_catalog.RoutingGeneration,
+                acquisitions: usize = 0,
+                admissions: usize = 0,
+                resolutions: usize = 0,
+                fn acquire(raw: *anyopaque, _: table_catalog.RoutingBudget, _: bool) !*table_catalog.RoutingGeneration {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.acquisitions += 1;
+                    self.generation.retain();
+                    return self.generation;
+                }
+                fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedAdminRead;
+                }
+                fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn resolve(raw: *anyopaque, allocator: std.mem.Allocator, _: []const u8, query: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expect(query == .key);
+                    self.resolutions += 1;
+                    const groups = try allocator.alloc(table_catalog.CatalogGroupRoute, 1);
+                    groups[0] = .{ .group_id = 32, .range_id = 32, .identity_namespace = .{ .table_id = 7, .shard_id = 32, .range_id = 32 } };
+                    return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 7, .table_id = 7, .topology_epoch = 1, .groups = groups } };
+                }
+                fn wait(raw: *anyopaque, _: u64, _: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.admissions += 1;
+                    // Stop before physical capture: route selection must have
+                    // completed using one generation, with no fixture pinning.
+                    return error.ReadUnavailable;
+                }
+            };
+            var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+            var ranges = [_]metadata_table_manager.RangeRecord{.{ .table_id = 7, .group_id = 32, .range_id = 32, .start_key = "" }};
+            const generation = try table_catalog.RoutingGeneration.create(a, .{
+                .catalog_revision = 7,
+                .tables = &tables,
+                .ranges = &ranges,
+            }, .{});
+            defer generation.release();
+            var fixture: Fixture = .{ .generation = generation };
+            const source: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin, .acquire_routing_generation = Fixture.acquire, .resolve_route = Fixture.resolve } };
+            var provider = ProvisionedTableReadSource.init("unused", source, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.wait } });
+            const keys = try a.alloc([]const u8, 4096);
+            defer a.free(keys);
+            @memset(keys, "a");
+            var input: @import("antfly_local_sources").storage_statement_read_fence.GraphStatement = .{
+                .catalog_json = "",
+                .tables = &.{.{ .name = "docs", .table_id = 7, .schema_version = 1, .keys = keys }},
+                .cut_id = @splat('a'),
+                .expires_ms = std.math.maxInt(u64),
+                .ttl_now_ns = 1,
+            };
+            try std.testing.expectError(error.ReadUnavailable, ProvisionedTableReadSource.openCypherStatement(&provider, a, input));
+            try std.testing.expectEqual(@as(usize, 1), fixture.acquisitions);
+            try std.testing.expectEqual(@as(usize, 1), fixture.admissions);
+            const Cancel = struct {
+                calls: usize = 0,
+                fn canceled(raw: *const anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                    self.calls += 1;
+                    return self.calls > 32;
+                }
+                fn token(self: *@This()) db_mod.types.CancellationToken {
+                    return .{ .ptr = self, .is_cancelled_fn = canceled };
+                }
+            };
+            var cancellation: Cancel = .{};
+            fixture.acquisitions = 0;
+            fixture.admissions = 0;
+            input.cancellation = cancellation.token();
+            try std.testing.expectError(error.Canceled, ProvisionedTableReadSource.openCypherStatement(&provider, a, input));
+            try std.testing.expectEqual(@as(usize, 1), fixture.acquisitions);
+            try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
+            try std.testing.expectEqual(@as(usize, 33), cancellation.calls);
+            // The compatibility resolver also honors cancellation when a
+            // caller has not yet acquired a routing session.
+            cancellation.calls = 0;
+            fixture.acquisitions = 0;
+            var budget = source.budget(null);
+            budget.cancellation = cancellation.token();
+            try std.testing.expectError(error.Canceled, table_catalog.routedDocumentKeysSnapshotWithBudget(a, source, "docs", keys, budget));
+            try std.testing.expect(fixture.resolutions > 0 and fixture.resolutions < keys.len);
+            try std.testing.expectEqual(@as(usize, 0), fixture.acquisitions);
+        }
         test "privacy source vtables retain static lifetime across capability selection" {
             const Fake = struct {
                 fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -28200,16 +28772,16 @@ fn consumerTests() type {
                     .params = .{ .deduplicate = false },
                 },
             }};
-            try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(2, .{
+            try rejectUnsupportedGraphQueryMode(2, .{
                 .graph_queries = &nondeduplicated_queries,
-            }));
-            try std.testing.expectError(error.GraphQueryModeUnsupported, rejectUnsupportedGraphQueryMode(1, .{
+            });
+            try rejectUnsupportedGraphQueryMode(1, .{
                 .graph_queries = &nondeduplicated_queries,
                 .graph_table_read_authorizer = .{
                     .ctx = null,
                     .authorize_table = Authorizer.authorize,
                 },
-            }));
+            });
 
             const legacy_pattern = [_]graph_pattern_mod.PatternStep{
                 .{ .alias = "entity" },
@@ -32610,10 +33182,18 @@ fn implementationTests() type {
                 test_alloc,
                 7,
                 "docs",
-                "{\"fields\":[{\"field\":\"body\",\"terms\":[\"alpha\"]}]}",
+                "{\"_privacy_policy_version\":\"none\",\"fields\":[{\"field\":\"body\",\"terms\":[\"alpha\"]}]}",
             )) orelse unreachable;
             defer response.deinit(test_alloc);
 
+            // A coordinator expecting a protected version cannot read stats
+            // from this unprotected owner, even though the wire parses.
+            try std.testing.expectError(error.IndexRebuilding, hosted.source().textStatsGroupLocal(
+                test_alloc,
+                7,
+                "docs",
+                "{\"_privacy_policy_version\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"fields\":[{\"field\":\"body\",\"terms\":[\"alpha\"]}]}",
+            ));
             try std.testing.expectEqual(@as(usize, 0), executor_state.call_count);
             try std.testing.expect(std.mem.indexOf(u8, response.json, "\"global_doc_count\":3") != null);
             try std.testing.expect(std.mem.indexOf(u8, response.json, "\"field\":\"body\"") != null);
@@ -33289,6 +33869,264 @@ fn implementationTests() type {
             try std.testing.expect(std.mem.indexOf(u8, incoming_response.json, "\"zdoc:a\"") != null);
         }
 
+        test "hosted cross-range graph start set follows final reranking" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-api-hosted-cross-range-graph-rerank");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path();
+
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+            const left_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+            defer alloc.free(left_path);
+            const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
+            defer alloc.free(right_path);
+
+            const graph_indexes_json =
+                \\{"full_text_index_v0":{"type":"full_text"},"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
+            ;
+            const graph_config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}";
+            const graph_coverage_generation = internal_keys.derivedCoverageGeneration(graph_config_json);
+
+            {
+                var left_db = try db_mod.DB.open(alloc, left_path, .{
+                    .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+                });
+                defer left_db.close();
+                try left_db.addIndex(.{
+                    .name = "relations_graph",
+                    .kind = .graph,
+                    .config_json = graph_config_json,
+                    .coverage_generation = graph_coverage_generation,
+                });
+                try left_db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+                try left_db.batch(.{
+                    .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
+                    .graph_writes = &.{.{
+                        .index_name = "relations_graph",
+                        .source = "doc:a",
+                        .target = "evidence:left",
+                        .edge_type = "mentions",
+                    }},
+                    .sync_level = .full_index,
+                });
+            }
+
+            {
+                var right_db = try db_mod.DB.open(alloc, right_path, .{
+                    .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+                });
+                defer right_db.close();
+                try right_db.addIndex(.{
+                    .name = "relations_graph",
+                    .kind = .graph,
+                    .config_json = graph_config_json,
+                    .coverage_generation = graph_coverage_generation,
+                });
+                try right_db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+                try right_db.batch(.{
+                    .writes = &.{.{ .key = "zdoc:a", .value = "{\"title\":\"right\"}" }},
+                    .graph_writes = &.{.{
+                        .index_name = "relations_graph",
+                        .source = "zdoc:a",
+                        .target = "evidence:right",
+                        .edge_type = "mentions",
+                    }},
+                    .sync_level = .full_index,
+                });
+            }
+
+            const FakeCatalog = struct {
+                const statuses = [_]metadata_reconciler.MergedGroupStatus{
+                    .{
+                        .group_id = 7001,
+                        .doc_identity = .{
+                            .namespace_table_id = 7,
+                            .namespace_shard_id = 7001,
+                            .namespace_range_id = 7001,
+                            .next_ordinal = 3,
+                            .allocated_ordinals = 2,
+                            .state_rows = 2,
+                            .live_ordinals = 2,
+                            .complete = true,
+                        },
+                    },
+                    .{
+                        .group_id = 7002,
+                        .doc_identity = .{
+                            .namespace_table_id = 7,
+                            .namespace_shard_id = 7002,
+                            .namespace_range_id = 7002,
+                            .next_ordinal = 2,
+                            .allocated_ordinals = 1,
+                            .state_rows = 1,
+                            .live_ordinals = 1,
+                            .complete = true,
+                        },
+                    },
+                };
+
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                            .table_id = 7,
+                            .name = "docs",
+                            .placement_role = "data",
+                            .indexes_json = graph_indexes_json,
+                        }})[0..]),
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                            .{ .group_id = 7001, .table_id = 7, .range_id = 7001, .start_key = "", .end_key = "m" },
+                            .{ .group_id = 7002, .table_id = 7, .range_id = 7002, .start_key = "m", .end_key = null },
+                        })[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                        .merged_group_statuses = @constCast(statuses[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+
+            const FakeRouter = struct {
+                fn iface() table_router.HostedGroupRouter {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .local_node_id = localNodeId,
+                            .local_status = localStatus,
+                            .group_leader_node_id = groupLeaderNodeId,
+                            .node_status = nodeStatus,
+                            .node_base_uri = nodeBaseUri,
+                        },
+                    };
+                }
+
+                fn localNodeId(_: *anyopaque) u64 {
+                    return 1;
+                }
+
+                fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+                    return .active;
+                }
+
+                fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+                    return 1;
+                }
+
+                fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+                    return .absent;
+                }
+
+                fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+                    return null;
+                }
+            };
+
+            const ExecutorState = struct {
+                fn iface(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    return error.UnexpectedHttpRequest;
+                }
+            };
+
+            var executor_state = ExecutorState{};
+            var hosted = HostedProvisionedTableReadSource.init(
+                path,
+                FakeCatalog.iface(),
+                raft_mod.read_gate.alreadyReadSafeBarrier(),
+                FakeRouter.iface(),
+                executor_state.iface(),
+            );
+            _ = hosted.withIo(&io_impl);
+
+            const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "neighbors",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "relations_graph",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
+                    .params = .{ .edge_types = &.{"mentions"}, .direction = .out, .max_results = 10 },
+                },
+            }};
+            var ts = try httpx.TestServer.start(alloc, io_impl.io(), &.{
+                .{ .method = .GET, .path = "/ai/v1/models", .respond = .{ .body = "{\"rerankers\":{\"test-model\":{}}}" } },
+                .{ .method = .POST, .path = "/rerank", .respond = .{ .body = "{\"scores\":[0.1,0.9]}" } },
+            });
+            defer ts.deinit();
+            const Serve = struct {
+                fn run(server: *httpx.TestServer) !void {
+                    for (0..2) |_| try server.handleOne();
+                }
+            };
+            var serving = try io_impl.io().concurrent(Serve.run, .{&ts});
+            defer _ = serving.cancel(io_impl.io()) catch {};
+            var response = (try hosted.source().query(alloc, "docs", .{
+                .query = .{ .doc_id = .{ .ids = &.{ "doc:a", "zdoc:a" } } },
+                .limit = 2,
+                .reranker = .{ .provider = .antfly, .model = "test-model", .field = "title", .url = ts.baseUrl() },
+                .reranker_query_text = "right",
+                .graph_queries = &graph_queries,
+                .graph_query_transport = .{
+                    .dialect = .canonical,
+                    .operations_json =
+                    \\{"neighbors":{"index":"relations_graph","traverse":{"start":{"result_ref":"$query_results","limit":1},"edge_types":["mentions"],"direction":"out","max_depth":1}}}
+                    ,
+                    .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
+                    .admitted_operations_len = graph_queries.len,
+                },
+            }, .read_index)).?;
+            defer response.deinit(alloc);
+            var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryResponses, alloc, response.json, .{});
+            defer parsed.deinit();
+            const cell = parsed.value.responses.?[0];
+            try std.testing.expectEqualStrings("zdoc:a", cell.hits.?.hits.?[0]._id);
+            const neighbors = cell.graph_results.?.map.get("neighbors").?.graph_nodes_result.nodes;
+            try std.testing.expectEqual(@as(usize, 1), neighbors.len);
+            try std.testing.expectEqualStrings("evidence:right", neighbors[0].key);
+            try serving.await(io_impl.io());
+
+            // A graph-only evaluation uses the produced cross-range bindings,
+            // rather than trying to evaluate the empty retrieval result.
+            var evaluated_req = try query_api.parseQueryRequest(alloc, null, "docs",
+                \\{"limit":2,"graph_queries":{"customers":{"index":"relations_graph","match":{"anchor":"customer","nodes":{"customer":{}},"edges":[]},"return":{"bindings":["customer"],"include_documents":true,"fields":["title"],"limit":2}}},"evaluate":{"graph_query":"customers","scope":"candidates","candidate_count":10,"compute":{"label":{"field":"customer.document.title"}},"where":{"eq":[{"ref":"label"},{"literal":"right"}]}}}
+            );
+            defer evaluated_req.deinit(alloc);
+            var evaluated_response = (try hosted.source().query(alloc, "docs", evaluated_req.req, .read_index)).?;
+            defer evaluated_response.deinit(alloc);
+            var evaluated = try ant_json.parseFromSlice(metadata_openapi.QueryResponses, alloc, evaluated_response.json, .{});
+            defer evaluated.deinit();
+            const evaluated_cell = evaluated.value.responses.?[0];
+            const bindings = evaluated_cell.graph_results.?.map.get("customers").?.graph_bindings_result;
+            try std.testing.expectEqual(@as(usize, 1), bindings.rows.len);
+            try std.testing.expectEqualStrings("zdoc:a", bindings.rows[0].map.get("customer").?.?.key);
+            try std.testing.expectEqualStrings("right", bindings.computed.?[0].map.get("label").?.string);
+        }
+
         test "provisioned read cache keys entries by lsm root generation" {
             const alloc = std.testing.allocator;
             var path_tmp = try TestDirectory.init("antfly-api-provisioned-read-cache-generation");
@@ -33817,6 +34655,189 @@ fn implementationTests() type {
                 .shard_id = 7001,
                 .range_id = 7105,
             }));
+        }
+
+        test "provisioned read-only query recovers cold transient leann stubs" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-api-provisioned-query-leann");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path();
+
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+            const indexes =
+                \\{"semantic":{"type":"embeddings","field":"body","dimension":4,"algorithm":"leann","leann":{"vector_storage":"transient"},"embedder":{"provider":"antfly","model":"local-model"}}}
+            ;
+            const CatalogState = struct {
+                tables: [1]metadata_table_manager.TableRecord = .{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = indexes,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }},
+                fn iface(self: *@This()) table_catalog.CatalogSource {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = &self.tables,
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                            .group_id = 7001,
+                            .table_id = 7,
+                            .range_id = 7105,
+                            .start_key = "",
+                            .end_key = null,
+                        }})[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+
+            const Provider = struct {
+                calls: std.atomic.Value(usize) = .init(0),
+                fn dense(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, texts: []const []const u8) anyerror![][]f32 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    _ = self.calls.fetchAdd(1, .monotonic);
+                    const vectors = try a.alloc([]f32, texts.len);
+                    var ready: usize = 0;
+                    errdefer {
+                        for (vectors[0..ready]) |vector| a.free(vector);
+                        a.free(vectors);
+                    }
+                    for (texts) |value| {
+                        const i = std.fmt.parseInt(u32, value, 10) catch 1;
+                        const f: f32 = @floatFromInt(i);
+                        vectors[ready] = try a.dupe(f32, &.{ 1, f, f * f, 0 });
+                        ready += 1;
+                    }
+                    return vectors;
+                }
+                fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]db_embedder.SparseEmbedding {
+                    return error.TestUnexpectedResult;
+                }
+            };
+            var mock = Provider{};
+            const provider: managed_embedder.AntflyProvider = .{ .ptr = &mock, .embed_dense_texts = Provider.dense, .embed_sparse_texts = Provider.sparse };
+            var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+            defer runtime.deinit();
+            const namespace: db_mod.DocIdentityNamespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7105 };
+            var catalog_arena = std.heap.ArenaAllocator.init(alloc);
+            defer catalog_arena.deinit();
+            const catalog_alloc = catalog_arena.allocator();
+            var admitted_root = try std.json.parseFromSliceLeaky(std.json.Value, catalog_alloc, indexes, .{});
+            const original_config = admitted_root.object.get("semantic").?;
+            const admitted_config = (try managed_embedder.normalizeEmbeddingsIndexDimensionJsonForCatalogWithOptions(alloc, "semantic", original_config, admitted_root, .{ .antfly_provider = provider, .io = runtime.ptr().io() })) orelse return error.TestUnexpectedResult;
+            defer alloc.free(admitted_config);
+            try admitted_root.object.put(catalog_alloc, "semantic", try std.json.parseFromSliceLeaky(std.json.Value, catalog_alloc, admitted_config, .{}));
+            const admitted_indexes = try std.json.Stringify.valueAlloc(alloc, admitted_root, .{});
+            defer alloc.free(admitted_indexes);
+            {
+                const dense = (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(alloc, admitted_indexes, .{ .antfly_provider = provider, .io = runtime.ptr().io() })) orelse return error.TestUnexpectedResult;
+                var writer = try db_mod.DB.open(alloc, path, .{ .identity_namespace = namespace, .backend_runtime = runtime.ptr(), .enrichment = .{ .dense_embedder = dense } });
+                defer writer.close();
+                _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &writer, admitted_indexes, .{ .drain_resolver_backfill = false, .embedding_options = .{ .antfly_provider = provider, .io = runtime.ptr().io() } });
+                const pinned_config = writer.core.index_manager.denseIndex("semantic").?.config.config_json;
+                var admitted = try std.json.parseFromSlice(std.json.Value, alloc, pinned_config, .{});
+                defer admitted.deinit();
+                const producer_json = admitted.value.object.get("semantic_producer").?.string;
+                var producer_identity = try std.json.parseFromSlice(std.json.Value, alloc, producer_json, .{});
+                defer producer_identity.deinit();
+                try std.testing.expectEqualStrings("antfly:embedded", producer_identity.value.object.get("endpoint").?.string);
+                var writes: [300]db_mod.types.BatchWrite = undefined;
+                var keys: [300][16]u8 = undefined;
+                var values: [300][32]u8 = undefined;
+                for (&writes, &keys, &values, 0..) |*write, *key, *value, i| {
+                    write.* = .{ .key = try std.fmt.bufPrint(key, "doc:{d}", .{i}), .value = try std.fmt.bufPrint(value, "{{\"body\":\"{d}\"}}", .{i}) };
+                }
+                try writer.batch(.{ .writes = &writes, .sync_level = .full_index });
+                try writer.syncIndexes(true);
+                const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:17", "semantic");
+                defer alloc.free(key);
+                const raw = try writer.core.store.get(alloc, key);
+                defer alloc.free(raw);
+                try std.testing.expect(try @import("antfly_local_sources").storage_db_enrichment_artifact_codec.elidedDenseEmbedding(raw) != null);
+                const stored_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:18", "semantic");
+                defer alloc.free(stored_key);
+                const full = try @import("antfly_local_sources").storage_db_enrichment_artifact_codec.encodeAuthoredDenseEmbeddingAlloc(alloc, &.{ 1, 18, 324, 0 });
+                defer alloc.free(full);
+                try writer.core.store.put(stored_key, full);
+            }
+            var catalog_state = CatalogState{};
+            catalog_state.tables[0].indexes_json = admitted_indexes;
+            const before = mock.calls.load(.monotonic);
+            var db = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog_state.iface(), "docs", null, null, backend_current_root_generation, null, .{ .backend_runtime = runtime.ptr(), .antfly_provider = provider }, namespace);
+            defer db.close();
+            try std.testing.expect(!db.async_context.query_recovery_ready.load(.acquire));
+            const entry = db.core.index_manager.denseIndex("semantic") orelse return error.TestUnexpectedResult;
+            var results = try entry.index.searchWithRequest(.{ .query = &.{ 1, 17, 289, 0 }, .k = 1, .search_effort = 1 });
+            defer results.deinit();
+            try std.testing.expectEqual(@as(usize, 1), results.items.items.len);
+            try std.testing.expect(mock.calls.load(.monotonic) > before);
+            const retained_config = try retainedRecoveryIndexesJson(alloc, &db);
+            defer alloc.free(retained_config);
+            try attachProvisionedQueryRecovery(&db, retained_config, .{ .backend_runtime = runtime.ptr(), .antfly_provider = provider });
+            // Fork from the retained catalog without initializing the live
+            // catalog. A broken live definition cannot block a historical read.
+            const live_factory = db.async_context.query_recovery_factory.?;
+            const live_recipe: *ProvisionedQueryRecovery = @ptrCast(@alignCast(live_factory.ptr));
+            live_recipe.indexes_json = "{\"unavailable-live-model\":{}}";
+            const forked = try live_factory.fork.?(live_factory.ptr, alloc, retained_config);
+            const before_fork_attach = mock.calls.load(.monotonic);
+            try db.attachLazyQueryRecovery(forked);
+            try std.testing.expectEqual(before_fork_attach, mock.calls.load(.monotonic));
+            db.core.index_manager.leann_reembed_cache.deinit(alloc);
+            const cold_calls = mock.calls.load(.monotonic);
+            var retained_result = try entry.index.searchWithRequest(.{ .query = &.{ 1, 17, 289, 0 }, .k = 1, .search_effort = 1 });
+            defer retained_result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), retained_result.items.items.len);
+            try std.testing.expect(mock.calls.load(.monotonic) > cold_calls);
+            const retained_dense = db.async_context.query_recovery_runtime.?.config.dense_embedder.?;
+            const cloned_dense = try retained_dense.clone_for_indexes_fn.?(retained_dense.ptr, alloc, retained_config, .{ .io = runtime.ptr().io().?, .deadline_ns = null });
+            defer cloned_dense.deinit(alloc);
+            const cloned_vector = try cloned_dense.embedDense(alloc, "semantic", "17", 4);
+            defer alloc.free(cloned_vector);
+            try std.testing.expectEqual(@as(usize, 4), cloned_vector.len);
+
+            // A filesystem-only runtime cannot initialize query inference.
+            var filesystem_runtime = try db_mod.background_runtime.BackendRuntimeHandle.initManualWithOwnedFilesystemIo(alloc);
+            defer filesystem_runtime.deinit();
+            var without_recovery = try openProvisionedQueryDbForTableWithCache(alloc, path, catalog_state.iface(), "docs", null, null, backend_current_root_generation, null, .{ .backend_runtime = filesystem_runtime.ptr(), .antfly_provider = provider }, namespace);
+            defer without_recovery.close();
+            var scan = try without_recovery.scan(alloc, "doc:18", "doc:19", .{ .inclusive_from = true, .include_documents = true });
+            defer scan.deinit(alloc);
+            try std.testing.expect(scan.documents.len > 0);
+            const manager = without_recovery.core.index_manager;
+            const stored_id = (try manager.lookupDenseVectorId(without_recovery.core.store, "semantic", "doc:18")) orelse return error.TestUnexpectedResult;
+            const stub_id = (try manager.lookupDenseVectorId(without_recovery.core.store, "semantic", "doc:17")) orelse return error.TestUnexpectedResult;
+            const degraded_entry = manager.denseIndex("semantic") orelse return error.TestUnexpectedResult;
+            var stored = try degraded_entry.index.searchWithRequest(.{ .query = &.{ 1, 18, 324, 0 }, .k = 1, .filter_ids = &.{stored_id} });
+            defer stored.deinit();
+            try std.testing.expectEqual(@as(usize, 1), stored.items.items.len);
+            try std.testing.expectError(error.ReembedUnavailable, degraded_entry.index.searchWithRequest(.{ .query = &.{ 1, 17, 289, 0 }, .k = 1, .filter_ids = &.{stub_id} }));
         }
 
         test "provisioned query runtime db rejects stale identity namespace" {
@@ -36887,15 +37908,18 @@ test "SQL relation lifetime restore staging reads bind owner group independently
 }
 
 fn capturePrivacyPolicyVersion(a: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, deadline: ?u64) ![64]u8 {
+    // TableReadSource controls use native MONOTONIC; catalog callbacks may use
+    // a borrowed executor's awake clock. Preserve remaining time at the edge.
+    const routing_deadline = catalog.deadlineFrom(.{ .deadline_ns = deadline });
     if (catalog.vtable.privacy_policy_binding) |capture| {
-        const binding = try capture(catalog.ptr, table_name, deadline);
+        const binding = try capture(catalog.ptr, table_name, routing_deadline);
         try binding.validate();
         return binding.policy_version;
     }
     // Foreign/test catalog adapters may only provide the older owned snapshot.
     // First-party adapters use the compact capability above, including remotely.
     const capture = catalog.vtable.linearizable_table_routing_snapshot orelse return error.PrivacyReadFenceUnavailable;
-    var snapshot = try capture(catalog.ptr, table_name, deadline);
+    var snapshot = try capture(catalog.ptr, table_name, routing_deadline);
     defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
     const table = for (snapshot.tables) |*entry| {
         if (std.mem.eql(u8, entry.name, table_name)) break entry;

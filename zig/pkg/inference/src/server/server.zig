@@ -133,6 +133,57 @@ const InferenceExecutionControl = execution_control_mod.InferenceExecutionContro
 const cancellable_rerank_batch_size: usize = 8;
 const native_call_cancellation_grace_ns: u64 = 5 * std.time.ns_per_s;
 
+const admission_failure_key = "antfly.inference_admission_failure";
+
+fn httpAdmissionFailure(ctx: *const httpx.Context) ?*runtime.tier.memory.AdmissionFailure {
+    return if (ctx.getData(admission_failure_key)) |raw| @ptrCast(@alignCast(raw)) else null;
+}
+
+/// Stack-owned for the entire handler, including joined preparation workers.
+/// A nested generation route restores its caller's diagnostic on return.
+const AdmissionFailureScope = struct {
+    failure: runtime.tier.memory.AdmissionFailure = .{},
+    previous: ?httpx.Context.DataEntry = null,
+
+    fn bind(self: *@This(), ctx: *httpx.Context) !void {
+        self.previous = if (ctx.data) |data| data.get(admission_failure_key) else null;
+        if (self.previous != null) {
+            ctx.data.?.getPtr(admission_failure_key).?.* = .{ .ptr = &self.failure };
+        } else try ctx.setData(admission_failure_key, &self.failure, null);
+    }
+
+    fn unbind(self: *@This(), ctx: *httpx.Context) void {
+        if (self.previous) |previous| {
+            ctx.data.?.getPtr(admission_failure_key).?.* = previous;
+        } else _ = ctx.data.?.remove(admission_failure_key);
+    }
+};
+
+const InferenceBudgetFailurePayload = struct {
+    @"error": []const u8 = "MODEL_RESOURCE_LIMIT",
+    message: []const u8 = "request resource plan exceeds the configured inference budget",
+    retryable: bool = false,
+    budget: ?[]const u8 = null,
+    required_bytes: ?usize = null,
+    limit_bytes: ?usize = null,
+};
+
+fn modelResourceLimitPayload(ctx: *const httpx.Context) InferenceBudgetFailurePayload {
+    if (httpAdmissionFailure(ctx)) |failure| {
+        if (failure.snapshot()) |exceeded| return .{
+            .message = "request and required model residency exceed the configured inference budget",
+            .budget = @tagName(exceeded.limit),
+            .required_bytes = exceeded.requested_bytes,
+            .limit_bytes = exceeded.limit_bytes,
+        };
+    }
+    return .{};
+}
+
+fn modelResourceLimitResponse(ctx: *httpx.Context) !httpx.Response {
+    return ctx.status(400).openApiJson(modelResourceLimitPayload(ctx));
+}
+
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
     const Check = struct {
         fn check(raw: ?*anyopaque) !void {
@@ -146,7 +197,9 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
         }
     };
     return .{
-        .http_request_admitted = true,
+        .admission_failure = httpAdmissionFailure(ctx),
+        .content_security_json = if (ctx.getData("antfly.content_security_json")) |raw| @as(*const []const u8, @ptrCast(@alignCast(raw))).* else null,
+        .request_slot_admitted = true,
         .document_store = if (ctx.getData("antfly.document_store")) |raw| @as(*const @import("antfly_runtime_abi").document_abi.View, @ptrCast(@alignCast(raw))).* else .{},
         .io = ctx.io,
         .native_call_policy = node.session_manager.native_call_policy,
@@ -1900,8 +1953,25 @@ fn inferenceDownloadContext(context: *const InferenceDownloadRequestContext) !sc
             return false;
         }
     };
+    const Blocking = struct {
+        fn check(raw: *const anyopaque) !void {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            try request.control.check();
+        }
+        fn enter(raw: *const anyopaque) !u64 {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            const guard = try request.control.enterUninterruptible(.uninterruptible);
+            return guard.token;
+        }
+        fn leave(raw: *const anyopaque, token: u64) void {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            var guard = execution_control_mod.UninterruptibleGuard{ .boundary = request.control.hard_cancellation, .token = token };
+            guard.deinit();
+        }
+    };
     return .{
         .io = context.io,
+        .blocking_io = .{ .context = context, .enter = Blocking.enter, .leave = Blocking.leave, .check = Blocking.check },
         .timeout_ms = try remainingInferenceDeadlineMs(context.control.deadline_ns, embedTimingNowNs()),
         .cancellation = .{
             .ptr = context,
@@ -2953,6 +3023,9 @@ fn addCompatibilityManifestFacts(
         @intFromBool(man.hasIncompleteClipclapGgufBundle()),
         @intFromBool(man.hasIncompleteFlorence2GgufBundle()),
         @intFromBool(man.isClipclapGgufBundle()),
+        @intFromBool(man.glide_declared),
+        @intFromBool(man.glide_unsupported),
+        @backingInt(man.glide_backbone),
     });
 }
 
@@ -3252,6 +3325,13 @@ fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
 }
 
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (@import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(err)) |message| return ctx.status(400).json(.{
+        .@"error" = "INVALID_MODEL",
+        .reason = @errorName(err),
+        .message = message,
+        .retryable = false,
+    });
+    if (err == error.ResourceLimitExceeded) return modelResourceLimitResponse(ctx);
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     return switch (err) {
@@ -3277,11 +3357,6 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .@"error" = "INVALID_MODEL",
             .message = "GLiNER specialty artifacts must match the qualified FP32 checkpoint and provenance",
         }),
-        error.ResourceLimitExceeded => ctx.status(400).json(.{
-            .@"error" = "MODEL_RESOURCE_LIMIT",
-            .message = "model resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
-            .retryable = false,
-        }),
         error.ProcessIsolationRequired => ctx.status(503).json(.{
             .@"error" = "PROCESS_ISOLATION_REQUIRED",
             .message = "this backend requires the supervised inference process; configure inference.api_url instead of embedding it in the database process",
@@ -3295,6 +3370,7 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
 }
 
 fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.ResourceLimitExceeded) return modelResourceLimitResponse(ctx);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     return switch (err) {
@@ -3311,11 +3387,6 @@ fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         error.Canceled, error.Cancelled => ctx.status(408).json(.{
             .@"error" = "INFERENCE_CANCELLED",
             .message = "the inference request was cancelled",
-            .retryable = false,
-        }),
-        error.ResourceLimitExceeded => ctx.status(400).json(.{
-            .@"error" = "MODEL_RESOURCE_LIMIT",
-            .message = "request resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
             .retryable = false,
         }),
         error.ProcessIsolationRequired => ctx.status(503).json(.{
@@ -4370,6 +4441,7 @@ const SileroWeightCache = struct {
 const HostCaches = struct {
     allocator: std.mem.Allocator,
     media_index_cache: @import("../pipelines/media_index_cache.zig").Cache = .{},
+    local_source_verifications: scraping.LocalVerificationCache = .{},
     silero_weights: SileroWeightCache = .{},
     silero_weights_lock: std.atomic.Mutex = .unlocked,
 
@@ -5361,6 +5433,17 @@ pub const Node = struct {
         texts: []const []const u8,
         supplied_control: InferenceExecutionControl,
     ) ![]DirectSparseEmbedding {
+        return self.embedSparseTextsDirectWithControlAndRevision(allocator, model_name, texts, supplied_control, null);
+    }
+
+    pub fn embedSparseTextsDirectWithControlAndRevision(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        texts: []const []const u8,
+        supplied_control: InferenceExecutionControl,
+        expected_revision: ?[32]u8,
+    ) ![]DirectSparseEmbedding {
         var control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
@@ -5389,9 +5472,11 @@ pub const Node = struct {
             control: InferenceExecutionControl,
             vectors: ?[]DirectSparseEmbedding = null,
             node: *Node,
+            expected_revision: ?[32]u8,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
                 if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 const input_tokens = try maxTokenizerTextTokens(
                     attempt.allocator,
@@ -5430,6 +5515,7 @@ pub const Node = struct {
             .executor_contract = executor_contract,
             .control = control,
             .node = self,
+            .expected_revision = expected_revision,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;
@@ -6222,6 +6308,44 @@ pub const Node = struct {
         return output.text;
     }
 
+    fn generationAdmissionManifest(self: *Node, allocator: std.mem.Allocator, path: []const u8, control: InferenceExecutionControl) !manifest_mod.ModelManifest {
+        return (try self.model_manager.copyCachedGenerationManifestWithControl(allocator, path, control)) orelse
+            try self.loadBoundManifest(allocator, path, false, control);
+    }
+
+    fn bindPreparationModelResidency(preparation: *@import("../backends/admitted_allocator.zig").AdmittedAllocator, model: *model_manager_mod.LoadedModel) !?@import("../backends/admitted_allocator.zig").AdmittedAllocator.ResidencyBinding {
+        const admission = model.session.run_admission orelse return null;
+        return try preparation.requireResidency(admission.controller, admission.requiredResidency());
+    }
+
+    /// Planning runs before the execution lease, including on independent
+    /// cohort/continuous workers. Its temporary allocations need their own owner.
+    fn countAdmittedPromptTokens(self: *Node, model_dir: []const u8, model: *model_manager_mod.LoadedModel, cfg: gpt_model_mod.Config, messages: []const generation.Message, max_tokens: i32) !NativePromptTokenCount {
+        var preparation = try self.inferencePreparation();
+        defer preparation.deinit();
+        var binding = try bindPreparationModelResidency(&preparation, model);
+        defer if (binding) |*held| held.deinit();
+        return countPromptTokens(preparation.allocator(), model_dir, model, cfg, messages, max_tokens, false, false) catch |err|
+            if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
+    }
+
+    fn inferencePreparation(self: *Node) !@import("../backends/admitted_allocator.zig").AdmittedAllocator {
+        try self.model_manager.ensureResourceOwnerReady();
+        const Preparation = struct {
+            fn acquire(owner: *const @import("../backends/admitted_allocator.zig").AdmittedAllocator, bytes: usize) !runtime.tier.memory.AdmissionLease {
+                const node: *Node = @ptrCast(@alignCast(owner.admission_context.?));
+                const controller = &node.model_manager.resource_domain.?.admission;
+                return node.model_manager.admitHostPreflightOwnedWithResidency(bytes, try owner.ownedHostBytesFor(controller), try owner.requiredResidencyFor(controller));
+            }
+        };
+        return @import("../backends/admitted_allocator.zig").AdmittedAllocator{
+            .backing = std.heap.smp_allocator,
+            .admission_context = self,
+            .admit_owned = Preparation.acquire,
+            .trim_on_free = true,
+        };
+    }
+
     fn generateMessagesDirectPrepared(
         self: *Node,
         caller_allocator: std.mem.Allocator,
@@ -6242,8 +6366,14 @@ pub const Node = struct {
         prompt_cache_key: ?[]const u8,
         supplied_control: InferenceExecutionControl,
     ) !DirectGenerateOutput {
-        var synchronized = executor_microbatch.SynchronizedAllocator{ .child = caller_allocator };
-        const allocator = synchronized.allocator();
+        var preparation = try self.inferencePreparation();
+        defer preparation.deinit();
+        const preparation_allocator = preparation.allocator();
+        // Model execution is owned by the generation resource lease below.
+        // A caller's document/source/output quota must not become a second
+        // tensor-workspace limit or retain logically freed intermediates.
+        // Only the compact returned text is allocated through caller_allocator.
+        const allocator = std.heap.smp_allocator;
         var execution_control = self.bindExecutionControl(null, supplied_control);
         try execution_control.update(.loading_model, 0, 1);
         const started_at_ns = embedTimingNowNs();
@@ -6262,7 +6392,8 @@ pub const Node = struct {
         execution_control = model_path_selection.bind(execution_control);
         defer self.allocator.free(model_path);
         const resolved_at_ns = embedTimingNowNs();
-        var admission_manifest = try self.loadBoundManifest(allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control));
+        var admission_manifest = self.generationAdmissionManifest(preparation_allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
+            return if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
         defer admission_manifest.deinit();
         const executor_contract = try resolvedGenerateExecutorContract(self, &admission_manifest);
         const decoded_pixels = try measureDirectGenerateDecodedPixels(&admission_manifest, messages);
@@ -6293,6 +6424,8 @@ pub const Node = struct {
             try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, execution_control));
         defer model_handle.release();
         const model = model_handle.get();
+        var preparation_residency = try bindPreparationModelResidency(&preparation, model);
+        defer if (preparation_residency) |*binding| binding.deinit();
         if (preflight.expected_model_revision) |expected| {
             const actual = model.resolution_revision orelse return error.CheckpointRevisionUnavailable;
             if (!std.mem.eql(u8, &expected, &actual)) return error.StaleCheckpoint;
@@ -6305,7 +6438,9 @@ pub const Node = struct {
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         // Preserve model resolution, capability checks, admission and cancellation
         // for silence, but do not ask a generative model to invent a transcript.
-        if (preflight.audio_transcription and try audioReadIsDigitalSilence(allocator, messages, execution_control)) {
+        if (preflight.audio_transcription and (audioReadIsDigitalSilence(preparation_allocator, messages, execution_control) catch |err|
+            return if (err == error.OutOfMemory) preparation.admission_error orelse err else err))
+        {
             return .{ .text = try allocator.dupe(u8, ""), .prompt_tokens = 0, .completion_tokens = 0, .truncated = false, .silent_audio = true };
         }
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
@@ -6354,7 +6489,8 @@ pub const Node = struct {
             self.defaultGenerationLimits(budget_backend_class),
         ));
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
-        const prompt_estimate = try countPromptTokens(allocator, model_path, model, gpt_config, messages, max_tokens, preflight.enable_thinking, preflight.grammar != null);
+        const prompt_estimate = countPromptTokens(preparation_allocator, model_path, model, gpt_config, messages, max_tokens, preflight.enable_thinking, preflight.grammar != null) catch |err|
+            return if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
         const prompt_tokens = prompt_estimate.token_count;
         try validateGenerateExecutorInvocation(executor_contract, .{
             .item_count = 1,
@@ -7906,7 +8042,9 @@ pub const Node = struct {
         const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check });
         var longest: usize = 0;
         for (items) |item| longest = @max(longest, item.payloadAs(DecideClassifyTicket).sample.input_ids.len);
-        var budget = gliner_microbatch.classificationBudget(first.limits, first.config, longest, items.len) catch |err| {
+        const variant = try gliner_decide_qualification.require(try session_factory.getGlinerDecisionIdentity(first.model.session));
+        const workspace_bytes: usize = if (variant == .decide_deberta or variant == .decide_deberta_q8) gliner_specialty.cuda_matmul_workspace_bytes else 0;
+        var budget = gliner_microbatch.classificationBudget(first.limits, first.config, longest, items.len, workspace_bytes) catch |err| {
             if (err == error.MemoryBudgetExceeded) return error.ClassificationMicrobatchCapacity;
             return err;
         };
@@ -9321,7 +9459,7 @@ pub const Node = struct {
             qwen3vl_projector.supportsResidentVisionBudget(cfg) and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET");
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend);
         const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = prompt } } }};
-        const estimate = try countPromptTokens(a, model_path, model, cfg, &messages, max_tokens, false, false);
+        const estimate = try self.countAdmittedPromptTokens(model_path, model, cfg, &messages, max_tokens);
         try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(max_tokens));
         const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
         var local_budget = runtime.tier.memory.RunBudget.init(limits);
@@ -9804,7 +9942,7 @@ pub const Node = struct {
         for (items, tasks) |item, *task| {
             const payload = item.payloadAs(LightOnReadPayload);
             const messages = [_]generation.Message{.{ .role = "user", .content = payload.prompt, .image_bytes = &.{payload.image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = payload.prompt } } }};
-            const estimate = try countPromptTokens(allocator, payload.model_path, model, cfg, &messages, payload.max_tokens, false, false);
+            const estimate = try self.countAdmittedPromptTokens(payload.model_path, model, cfg, &messages, payload.max_tokens);
             try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(payload.max_tokens));
             // countPromptTokens owns no retained encode; it only returns shape.
             const components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{ .backend = backend, .kv_dtype = kv_dtype, .config = cfg, .workspace_capacity = model.session.generationWorkspaceCapacity() }};
@@ -9894,23 +10032,43 @@ pub const Node = struct {
         requested_prompt: ?[]const u8,
         requested_max_tokens: ?usize,
         reserved_units: *usize,
+        supplied_control: InferenceExecutionControl,
+        allow_incomplete: bool,
+    ) ![]Qwen3VlReadResult {
+        var cancellation = ReadCancellationBridge{ .control = &supplied_control };
+        const results = self.readQwen3VlImagesRetained(allocator, model_path, image_datas, requested_prompt, requested_max_tokens, reserved_units, cancellation.retainedControl(), allow_incomplete) catch |err|
+            return cancellation.failure() orelse err;
+        errdefer {
+            for (results) |*result| result.deinit(allocator);
+            allocator.free(results);
+        }
+        try cancellation.checkRetained();
+        return results;
+    }
+
+    fn readQwen3VlImagesRetained(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        image_datas: []const []const u8,
+        requested_prompt: ?[]const u8,
+        requested_max_tokens: ?usize,
+        reserved_units: *usize,
         control: InferenceExecutionControl,
         allow_incomplete: bool,
     ) ![]Qwen3VlReadResult {
         try control.update(.loading_model, 0, 1);
-        var manifest = try manifest_mod.loadFromDir(allocator, model_path);
-        defer manifest.deinit();
-        const contract = try resolvedInferenceExecutorContract(self, "read", &manifest);
-        const max_tokens: i32 = @intCast(resolveGenerativeReadMaxTokens(&manifest, requested_max_tokens, contract.batch.max_output_tokens_per_item));
-        try validateInferenceExecutorInvocation(contract, .{ .item_count = image_datas.len, .output_tokens_per_item = @intCast(max_tokens), .has_image = true });
         // Keep one handle alive across the serial batch so another request
         // cannot evict the resident decoder/projector between page images.
         // generateMessagesDirectPrepared acquires a short-lived execution
         // handle for each item and therefore reuses this same loaded model.
         var resident_model_handle = try self.model_manager.acquireFromDirWithControl(model_path, control);
         defer resident_model_handle.release();
-        if (!isGenerativeReadModel(&resident_model_handle.get().manifest))
-            return error.InvalidModelForReading;
+        const manifest = &resident_model_handle.get().manifest;
+        if (!isGenerativeReadModel(manifest)) return error.InvalidModelForReading;
+        const contract = try resolvedInferenceExecutorContract(self, "read", manifest);
+        const max_tokens: i32 = @intCast(resolveGenerativeReadMaxTokens(manifest, requested_max_tokens, contract.batch.max_output_tokens_per_item));
+        try validateInferenceExecutorInvocation(contract, .{ .item_count = image_datas.len, .output_tokens_per_item = @intCast(max_tokens), .has_image = true });
 
         const prompt = try resolveGenerativeReadPrompt(&resident_model_handle.get().manifest, requested_prompt);
         if (resident_model_handle.get().manifest.isLightOnOcr3() and (resident_model_handle.get().session.backend() == .metal or
@@ -10050,9 +10208,11 @@ pub const Node = struct {
             inline_source_bytes = try addReadInlineSourceBytes(inline_source_bytes, url, inline_source_cap);
         }
         const admission = readRequestAdmission(self, request.images.len, inline_source_bytes, max_tokens);
-        try self.acquireAdmissionUnits(admission.units);
+        var request_slot = try ReadRequestSlot.acquire(self, &control);
+        defer request_slot.deinit();
+        try self.reserveAdmissionUnits(admission.units);
         var reserved_units = admission.units;
-        defer self.releaseAdmissionUnits(reserved_units);
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
 
@@ -10193,6 +10353,25 @@ pub const Node = struct {
         return out;
     }
 
+    /// Logical requests retain their permit while a physical batch is queued
+    /// or running. A batch reserves weighted work only, never another request.
+    const ReadRequestSlot = struct {
+        node: *Node,
+        owned: bool,
+
+        fn acquire(node: *Node, control: *InferenceExecutionControl) !ReadRequestSlot {
+            if (control.request_slot_admitted) return .{ .node = node, .owned = false };
+            if (!node.tryAcquireRequestSlot()) return error.QueueFull;
+            control.request_slot_admitted = true;
+            return .{ .node = node, .owned = true };
+        }
+
+        fn deinit(self: *ReadRequestSlot) void {
+            if (self.owned) self.node.releaseRequestSlot();
+            self.owned = false;
+        }
+    };
+
     pub fn readEncodedImagesDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -10225,6 +10404,92 @@ pub const Node = struct {
         deadline_ns: ?u64,
         cancellation: ExecutorCancellation,
     ) !readers_api.BatchResult {
+        var probe = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
+        return self.readEncodedImagesReportedDirectWithControl(allocator, model_name, request, .{ .deadline_ns = deadline_ns, .ptr = &probe, .check_fn = BorrowedReadControl.check });
+    }
+
+    /// Preserve deadline, cancellation, diagnostics and the caller's logical
+    /// request permit through document leaf and page-batcher dispatch.
+    pub fn readEncodedImagesReportedDirectWithControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.EncodedRequest,
+        supplied_control: InferenceExecutionControl,
+    ) !readers_api.BatchResult {
+        // Reader/generator execution owns process admission. Keep its tensors
+        // off document source/output quotas and copy only bounded results back.
+        var control = self.bindExecutionControl(null, supplied_control);
+        try control.check();
+        var request_slot = try ReadRequestSlot.acquire(self, &control);
+        defer request_slot.deinit();
+        var preparation = try self.inferencePreparation();
+        defer preparation.deinit();
+        const work = preparation.allocator();
+        var cancellation = ReadCancellationBridge{ .control = &control };
+        var result = self.readEncodedImagesReportedInWorkspace(work, model_name, request, cancellation.retainedControl(), cancellation.token()) catch |err| {
+            // Preserve even a one-shot checkpoint failure observed by a broker
+            // thread; a later callback invocation need not reproduce that error.
+            if (cancellation.failure()) |failure| return failure;
+            try control.check();
+            return if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
+        };
+        defer result.deinit(work);
+        if (cancellation.failure()) |failure| return failure;
+        try control.check();
+        return cloneReaderBatchResult(allocator, result);
+    }
+
+    /// Boolean broker probes retain their first typed failure atomically.
+    /// The synchronous join keeps this bridge and control alive for all probes.
+    const ReadCancellationBridge = struct {
+        control: *const InferenceExecutionControl,
+        failure_code: std.atomic.Value(u32) = .init(0),
+
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checkRetained() catch return true;
+            return false;
+        }
+
+        fn checkRetained(self: *@This()) !void {
+            if (self.failure()) |err| return err;
+            self.control.check() catch |err| {
+                _ = self.failure_code.cmpxchgStrong(0, @intFromError(err), .acq_rel, .acquire);
+                return self.failure().?;
+            };
+        }
+
+        fn checkpoint(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.checkRetained();
+        }
+
+        fn retainedControl(self: *@This()) InferenceExecutionControl {
+            return self.control.withCheckpoint(self, checkpoint);
+        }
+
+        fn token(self: *@This()) ExecutorCancellation {
+            return .{ .ptr = self, .is_cancelled_fn = cancelled };
+        }
+
+        fn failure(self: *const @This()) ?anyerror {
+            const code = self.failure_code.load(.acquire);
+            return if (code == 0) null else @errorFromInt(@as(u16, @intCast(code)));
+        }
+    };
+
+    fn readEncodedImagesReportedInWorkspace(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.EncodedRequest,
+        supplied_control: InferenceExecutionControl,
+        cancellation: ExecutorCancellation,
+    ) !readers_api.BatchResult {
+        var execution_control = self.bindExecutionControl(null, supplied_control);
+        try execution_control.check();
+        const deadline_ns = execution_control.deadline_ns;
         if (cancellation.isCancelled()) return error.Canceled;
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (request.images.len == 0) return error.ReadBatchTooLarge;
@@ -10235,9 +10500,7 @@ pub const Node = struct {
             const definition = try self.documentDefinition(allocator, model_name, .read);
             defer if (definition) |bytes| allocator.free(bytes);
             if (definition != null or std.mem.eql(u8, model_name, "antfly/native-document")) {
-                var probe = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
-                const control = self.bindExecutionControl(null, .{ .deadline_ns = deadline_ns, .ptr = &probe, .check_fn = BorrowedReadControl.check });
-                const result = try self.documentOperationJson(allocator, model_name, control, .read, .{ .images = request });
+                const result = try self.documentOperationJson(allocator, model_name, execution_control, .read, .{ .images = request });
                 defer allocator.free(result);
                 if (request.max_response_bytes) |limit| if (result.len > limit) return error.ResponseTooLarge;
                 const batch = try readers_api.documentBatchResult(allocator, result);
@@ -10287,10 +10550,9 @@ pub const Node = struct {
 
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
-        const io = self.inferenceIo(allocator, null, &owned_io);
+        const io = self.inferenceIo(allocator, execution_control.io, &owned_io);
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
-        var read_control = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
-        var execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
+        execution_control = self.bindExecutionControl(io, execution_control);
         const model_path_selection = try self.resolveReadModelSelection(io, if (model_name.len > 0) model_name else null);
         const model_path = model_path_selection.path;
         execution_control = model_path_selection.bind(execution_control);
@@ -10327,8 +10589,8 @@ pub const Node = struct {
                     1,
                     @intCast(output_tokens),
                 )));
-                try self.acquireAdmissionUnits(reserved_units);
-                defer self.releaseAdmissionUnits(reserved_units);
+                try self.reserveAdmissionUnits(reserved_units);
+                defer self.releaseSlotUnits(reserved_units);
                 const results = try self.readQwen3VlImagesWithAdmission(
                     allocator,
                     model_path,
@@ -10367,8 +10629,8 @@ pub const Node = struct {
         // native-batch candidates above are admitted once by the broker leader
         // for the fused group, rather than each follower pinning a full model
         // lease while it waits for compatible work.
-        try self.acquireAdmissionUnits(required_units);
-        defer self.releaseAdmissionUnits(required_units);
+        try self.reserveAdmissionUnits(required_units);
+        defer self.releaseSlotUnits(required_units);
         const image_datas = try allocator.alloc([]const u8, request.images.len);
         defer allocator.free(image_datas);
         for (request.images, 0..) |image, i| image_datas[i] = image.bytes;
@@ -10507,6 +10769,20 @@ pub const Node = struct {
         );
     }
 
+    fn cloneReaderBatchResult(allocator: std.mem.Allocator, source: readers_api.BatchResult) !readers_api.BatchResult {
+        const items = try allocator.alloc(readers_api.Result, source.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |*item| readers_api.deinitResult(allocator, item);
+            allocator.free(items);
+        }
+        for (source.items, items) |item, *output| {
+            output.* = try cloneReaderApiResult(allocator, item);
+            initialized += 1;
+        }
+        return .{ .items = items, .usage = source.usage, .execution = source.execution };
+    }
+
     fn cloneReaderApiResult(allocator: std.mem.Allocator, source: readers_api.Result) !readers_api.Result {
         const text = try allocator.dupe(u8, source.text);
         errdefer allocator.free(text);
@@ -10609,6 +10885,8 @@ pub const Node = struct {
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
         var read_control = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
         var execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
+        var request_slot = try ReadRequestSlot.acquire(self, &execution_control);
+        defer request_slot.deinit();
         const model_path_selection = try self.resolveReadModelSelection(io, if (model_name.len > 0) model_name else null);
         const model_path = model_path_selection.path;
         execution_control = model_path_selection.bind(execution_control);
@@ -10630,8 +10908,8 @@ pub const Node = struct {
             execution_control,
         )) |broker_batch| return broker_batch;
 
-        try self.acquireAdmissionUnits(required_units);
-        defer self.releaseAdmissionUnits(required_units);
+        try self.reserveAdmissionUnits(required_units);
+        defer self.releaseSlotUnits(required_units);
         var batch = try self.runReadRasterBatchReportedDirect(
             allocator,
             model_path,
@@ -10865,11 +11143,11 @@ pub const Node = struct {
         defer if (lane) |lease| lease.release();
 
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
-        self.acquireAdmissionUnits(required_units) catch |err| {
+        self.reserveAdmissionUnits(required_units) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
-        defer self.releaseAdmissionUnits(required_units);
+        defer self.releaseSlotUnits(required_units);
 
         const batch = self.runReadImageBatchReportedDirect(
             allocator,
@@ -10992,11 +11270,11 @@ pub const Node = struct {
         defer if (lane) |lease| lease.release();
 
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
-        self.acquireAdmissionUnits(required_units) catch |err| {
+        self.reserveAdmissionUnits(required_units) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
-        defer self.releaseAdmissionUnits(required_units);
+        defer self.releaseSlotUnits(required_units);
 
         const batch = self.runReadRasterBatchReportedDirect(
             allocator,
@@ -11273,6 +11551,27 @@ pub const Node = struct {
         result_allocators: ?[]const std.mem.Allocator,
         control: InferenceExecutionControl,
     ) !readers_api.BatchResult {
+        var preparation = try self.inferencePreparation();
+        defer preparation.deinit();
+        preparation.parent = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator);
+        return self.runReadImageBatchPrepared(allocator, preparation.allocator(), model_path, image_datas, encoded_images, prompt, requested_max_tokens, source_fingerprint, execution_fence, result_allocators, control) catch |err|
+            if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
+    }
+
+    fn runReadImageBatchPrepared(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        preparation_allocator: std.mem.Allocator,
+        model_path: []const u8,
+        image_datas: []const []const u8,
+        encoded_images: ?[]const readers_api.EncodedImage,
+        prompt: ?[]const u8,
+        requested_max_tokens: ?usize,
+        source_fingerprint: ?[]const u8,
+        execution_fence: ?*const readers_mod.ExecutionFence,
+        result_allocators: ?[]const std.mem.Allocator,
+        control: InferenceExecutionControl,
+    ) !readers_api.BatchResult {
         try control.check();
         if (result_allocators) |allocators| {
             if (allocators.len != image_datas.len) return error.InvalidReadResultCount;
@@ -11282,7 +11581,7 @@ pub const Node = struct {
         const admission_manifest: *const manifest_mod.ModelManifest = if (execution_fence) |fence|
             fence.manifest()
         else blk: {
-            owned_admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+            owned_admission_manifest = try manifest_mod.loadFromDir(preparation_allocator, model_path);
             break :blk &owned_admission_manifest.?;
         };
         const executor_contract = try resolvedInferenceExecutorContract(self, "read", admission_manifest);
@@ -11307,10 +11606,10 @@ pub const Node = struct {
         });
 
         var reader = if (execution_fence) |fence|
-            try readers_mod.LoadedReader.loadFromExecutionFence(allocator, fence)
+            try readers_mod.LoadedReader.loadFromExecutionFence(preparation_allocator, fence)
         else
             try readers_mod.LoadedReader.loadFromDirWithControl(
-                allocator,
+                preparation_allocator,
                 model_path,
                 &self.session_manager,
                 &self.model_manager,
@@ -11346,20 +11645,15 @@ pub const Node = struct {
             allocator.free(out);
         }
 
-        const batch = try reader.readBatchReported(image_datas, .{
+        var owned_batch = try reader.readBatchInWorkspace(std.heap.smp_allocator, image_datas, .{
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
             .source_fingerprint = source_fingerprint,
             .execution_control = control,
-        });
+        }, @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(preparation_allocator));
+        defer owned_batch.deinit();
+        const batch = owned_batch.batch;
         const results = batch.results;
-        defer {
-            for (results) |result| {
-                var tmp = result;
-                tmp.deinit();
-            }
-            allocator.free(results);
-        }
         if (results.len != image_datas.len) return error.InvalidReadResultCount;
 
         for (results, 0..) |result, i| {
@@ -11467,7 +11761,31 @@ pub const Node = struct {
     }
 
     fn recognizePcmFromPath(self: *Node, allocator: std.mem.Allocator, model_path: []const u8, request: transcribing_api.Request, pcm: audio_mod.PcmAudio, control: InferenceExecutionControl, max_working_bytes: usize, expected_revision: ?[64]u8, diarization_options: speaker_embedding_mod.DiarizeOptions) !long_transcription.Result {
-        var whisper = WhisperRuntime{ .node = self, .allocator = allocator, .model_path = try allocator.dupe(u8, model_path) };
+        const Admission = struct {
+            fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
+                const node: *Node = @ptrCast(@alignCast(raw));
+                return node.admitDocumentHost(bytes);
+            }
+        };
+        // The document allocator bounds source/metadata/output, not Whisper's
+        // transient encoder/decoder tensors. Keep that workspace separately
+        // charged to the same process resource manager and release it before
+        // returning the compact transcript to the document owner.
+        var workspace = @import("../backends/admitted_allocator.zig").AdmittedAllocator{
+            .backing = std.heap.smp_allocator,
+            .admission_context = self,
+            .admit = Admission.acquire,
+            .trim_on_free = true,
+        };
+        defer workspace.deinit();
+        return self.recognizePcmInWorkspace(workspace.allocator(), allocator, model_path, request, pcm, control, max_working_bytes, expected_revision, diarization_options) catch |err| {
+            if (err == error.OutOfMemory) if (workspace.admission_error) |failure| return failure;
+            return err;
+        };
+    }
+
+    fn recognizePcmInWorkspace(self: *Node, work: std.mem.Allocator, output: std.mem.Allocator, model_path: []const u8, request: transcribing_api.Request, pcm: audio_mod.PcmAudio, control: InferenceExecutionControl, max_working_bytes: usize, expected_revision: ?[64]u8, diarization_options: speaker_embedding_mod.DiarizeOptions) !long_transcription.Result {
+        var whisper = WhisperRuntime{ .node = self, .allocator = work, .model_path = try work.dupe(u8, model_path) };
         defer whisper.deinit();
         var stage: WhisperRuntimeStage = .manifest;
         try self.loadWhisperRuntime(&whisper, null, 0, control, &stage);
@@ -11478,19 +11796,24 @@ pub const Node = struct {
             try validateLoadedMediaRevision(expected, handle.get().resolution_revision);
         }
         const timestamps = (request.timestamps orelse false) or (request.diarization orelse false);
+        const admitted_workspace = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(work);
+        if (whisper.encoder.backend() == .native) if (admitted_workspace) |workspace|
+            try workspace.bindSession(whisper.encoder.withAdmissionControl(control));
         var pipeline = try whisper.pipeline(request.language, max_working_bytes, control, timestamps, .full);
+        if (whisper.encoder.backend() == .native)
+            pipeline.native_workspace = admitted_workspace;
 
         // The same windowed path the HTTP handler takes: clips longer than
         // one Whisper window are cut at pauses and decoded window by window,
         // so an in-process enrichment gets the whole recording, not its first
         // 30 seconds.
-        var result = try long_transcription.transcribeLong(allocator, &pipeline, pcm.samples, pcm.sample_rate, .{ .control = control });
-        errdefer result.deinit();
+        var result = try long_transcription.transcribeLong(work, &pipeline, pcm.samples, pcm.sample_rate, .{ .control = control });
+        defer result.deinit();
         if (request.diarization orelse false) {
             try control.update(.executing, 0, 0);
-            try self.assignTranscriptSpeakers(allocator, &result, pcm.samples, pcm.sample_rate, control, diarization_options);
+            try self.assignTranscriptSpeakers(work, &result, pcm.samples, pcm.sample_rate, control, diarization_options);
         }
-        return result;
+        return result.clone(output);
     }
 
     /// Where the default speaker-embedding model lives once pulled: the
@@ -11724,7 +12047,7 @@ pub const Node = struct {
             defer allocator.free(json);
             return .{ .allocator = allocator, .json = try self.extractDocumentsJsonWithControl(allocator, json, control) };
         }
-        return self.extractWithAdmission(allocator, model_name, request, if (control.http_request_admitted) .http_route else .direct, control);
+        return self.extractWithAdmission(allocator, model_name, request, if (control.request_slot_admitted) .http_route else .direct, control);
     }
 
     const ExtractionAdmissionOwner = enum { direct, http_route };
@@ -11736,9 +12059,18 @@ pub const Node = struct {
         // listing validation. Execution still requires the live artifact identity.
         resolved_path: []const u8,
     };
+    /// GLiDE decisions reuse the extraction admission, lease and bounded
+    /// request heap; only decideJsonWithAdmission creates this after model
+    /// resolution and listing validation.
+    const DecideGlideInput = struct {
+        request: @import("antfly_decisions").Request,
+        selected: ResolvedModel,
+        max_input_tokens: ?usize,
+    };
     const ExtractionV2Input = union(enum) {
         json: []const u8,
         decide_span: DecideSpanInput,
+        decide_glide: DecideGlideInput,
         // An origin marker owned by the legacy HTTP upgrade; never a wire field.
         legacy_classification_json: []const u8,
         typed: struct {
@@ -11767,7 +12099,7 @@ pub const Node = struct {
             .json = try self.extractDocumentsJsonWithControl(allocator, request_json, control orelse .{}),
         };
         var failure = extraction_v2.FailureContext{};
-        return self.extractV2WithAdmission(allocator, .{ .json = request_json }, if (control != null and control.?.http_request_admitted) .http_route else .direct, control, &failure, null, "extract");
+        return self.extractV2WithAdmission(allocator, .{ .json = request_json }, if (control != null and control.?.request_slot_admitted) .http_route else .direct, control, &failure, null, "extract");
     }
 
     fn extractV2WithAdmission(
@@ -11814,7 +12146,7 @@ pub const Node = struct {
         const control: ?InferenceExecutionControl = self.extractionExecutionControl(supplied_control);
         if (control) |active| try active.check();
         const serialized: ?[]u8 = switch (input) {
-            .json, .legacy_classification_json, .decide_span => null,
+            .json, .legacy_classification_json, .decide_span, .decide_glide => null,
             .typed => |typed| blk: {
                 observer.emit(.{ .phase = .parsing });
                 if (typed.request.attachments.len != 0) return error.UnsupportedExtractionInput;
@@ -11826,7 +12158,7 @@ pub const Node = struct {
             .json => |bytes| bytes,
             .legacy_classification_json => |bytes| bytes,
             .typed => serialized.?,
-            .decide_span => "",
+            .decide_span, .decide_glide => "",
         };
         observer.emit(.{ .phase = .admission });
         switch (admission_owner) {
@@ -11857,16 +12189,17 @@ pub const Node = struct {
         const scratch = allocation_failure.allocator(&bounded);
         defer std.debug.assert(bounded.live == 0);
         const resolved_span_selection = switch (input) {
-            .json, .legacy_classification_json, .decide_span => null,
+            .json, .legacy_classification_json, .decide_span, .decide_glide => null,
             .typed => |typed| typed.resolved_span_selection,
         };
         const classification_compatibility: ClassificationCompatibility = switch (input) {
-            .json, .decide_span => .none,
+            .json, .decide_span, .decide_glide => .none,
             .legacy_classification_json => .legacy_extraction,
             .typed => |typed| typed.classification_compatibility,
         };
         const json = (switch (input) {
             .decide_span => |decision| self.extractDecideSpanInMemory(scratch, decision, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure),
+            .decide_glide => |decision| self.decideGlideInMemory(scratch, decision, control, failure, observer, working_bytes),
             else => self.extractV2InMemory(scratch, request_json, resolved_span_selection, classification_compatibility, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure, decision_execution),
         }) catch |err| return allocation_failure.translate(err);
         defer scratch.free(json);
@@ -11929,6 +12262,81 @@ pub const Node = struct {
         if (listing.embedding_style != .embedding_gemma2) return null;
         _ = response_limit;
         return error.UnsupportedExtractionModel;
+    }
+
+    /// GLiDE: one readout forward per (input, question) prompt, batched under
+    /// the reference padded-token budget (pipelines/glide.zig), presented with
+    /// the shared typed-decision response.
+    fn decideGlideInMemory(
+        self: *Node,
+        scratch: std.mem.Allocator,
+        decision: DecideGlideInput,
+        control: ?InferenceExecutionControl,
+        failure: *extraction_v2.FailureContext,
+        observer: metrics_mod.extraction.observation.Observer,
+        working_bytes: usize,
+    ) ![]u8 {
+        const glide_pipeline = @import("../pipelines/glide.zig");
+        const decision_api = @import("antfly_decisions");
+        glide_pipeline.trace.mark("extraction admission+lease");
+        observer.emit(.{ .phase = .parsing });
+        var arena = std.heap.ArenaAllocator.init(scratch);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const request = decision.request;
+        const questions = try glide_pipeline.prompt.questionsFromPublic(a, request);
+        const states = try a.alloc([]const u8, request.items.len);
+        var input_bytes: usize = 0;
+        for (states, request.items) |*state, item| {
+            state.* = item.input;
+            input_bytes +|= item.input.len;
+        }
+        observer.emit(.{ .parsed = .{ .items = states.len, .input_bytes = input_bytes } });
+        failure.* = .{ .stage = "model" };
+        observer.emit(.{ .phase = .model });
+        const effective = self.bindModelSelection(decision.selected, control);
+        try effective.check();
+        var handle = try self.model_manager.acquireFromDirWithControl(decision.selected.path, effective);
+        defer handle.release();
+        const loaded = handle.get();
+        const head = session_factory.getGlideHead(loaded.session) orelse return error.UnsupportedDecideModel;
+        glide_pipeline.trace.mark("acquire model");
+        const options = glide_pipeline.Options{
+            .max_input_tokens = decision.max_input_tokens,
+            // Native forwards allocate their activations on the bounded
+            // request heap. Leave half of it for prompts and results (as
+            // Laya does) and split micro-batches before allocating tensors.
+            .max_workspace_bytes = if (loaded.session.backend() == .native) working_bytes / 2 else null,
+        };
+        // Rendering and tokenization need no execution lock; only the
+        // forwards serialize on the model.
+        failure.* = .{ .stage = "tokenizing" };
+        observer.emit(.{ .phase = .tokenizing });
+        var plan = try glide_pipeline.prepare(a, scratch, loaded.session, loaded.getTokenizer(), &head.config, states, questions, effective, options);
+        defer plan.deinit();
+        failure.* = .{ .stage = "execution" };
+        observer.emit(.{ .phase = .execution });
+        const result = blk: {
+            const mutex = loaded.targetInferenceExecutionMutex();
+            if (mutex) |lock| try effective.lock(lock);
+            defer if (mutex) |lock| lock.unlock();
+            while (true) {
+                break :blk glide_pipeline.run(a, scratch, loaded.session, &plan, &head.config, questions, effective, options) catch |err| {
+                    // Run admission does not evict idle models; this model is
+                    // pinned by `handle`, so reclaim another and retry.
+                    if (err == error.ResourceTemporarilyUnavailable and self.model_manager.reclaimIdleForRun(loaded.session.backend())) continue;
+                    return err;
+                };
+            }
+        };
+        failure.* = .{ .stage = "serializing" };
+        observer.emit(.{ .phase = .serializing });
+        const json = try glide_pipeline.prompt.decisionsJson(a, questions, states.len, result.probabilities, result.prompt_tokens);
+        // GLiDE answers share Laya's complete-distribution `decisions` rows.
+        const response = try decision_api.trainedResponse(a, request, json, .laya);
+        try effective.check();
+        glide_pipeline.trace.mark("present");
+        return scratch.dupe(u8, response);
     }
 
     fn extractDecideSpanInMemory(
@@ -12539,10 +12947,14 @@ pub const Node = struct {
         // identity supplies its own measured ceiling. FP32 and Q8 evidence
         // independently cover the 1B's 1024-token budget.
         if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
-            options.classification_batch_items = gliner_decide_qualification.cuda_batch_items;
+            const policy = gliner_decide_qualification.executionBatchPolicy(qualified_identity.?, .cuda) orelse return error.UnsupportedGlinerDecisionArtifact;
+            options.classification_batch_items = policy.batch_items;
+            options.classification_batch_tokens = policy.padded_batch_tokens;
             options.max_sequences_per_item = 1;
-        } else if (backend == .metal and qualified_variant == .decide_deberta) {
-            options.classification_batch_items = gliner_decide_qualification.metal_batch_items;
+        } else if (backend == .metal and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
+            const policy = gliner_decide_qualification.metalExecutionPolicy(qualified_identity.?) orelse return error.UnsupportedGlinerDecisionArtifact;
+            options.classification_batch_items = policy.batch_items;
+            options.classification_batch_tokens = policy.padded_batch_tokens;
         }
         const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
         const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
@@ -12627,7 +13039,11 @@ pub const Node = struct {
             else if (span_geometry) |geometry|
                 try span_v2_executor.spanExtractionDeviceScratchUpperBound(config, geometry)
             else
-                try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), span_v2_executor.classificationBatchItems(request, &request_plan, options));
+                try std.math.add(
+                    usize,
+                    try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), span_v2_executor.classificationBatchItems(request, &request_plan, options)),
+                    if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) gliner_specialty.cuda_matmul_workspace_bytes else 0,
+                );
             const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                 self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(if (gpu) .gpu else .cpu)),
                 self.config.generation_budget_overrides.scratch_limit_bytes,
@@ -13991,6 +14407,9 @@ pub const Node = struct {
     }
 
     pub fn createEmbedding(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const tracing = platform.env.getenv("ANTFLY_EMBED_TRACE_DIR") != null;
         const trace_started = if (tracing) embedding_trace.now() else 0;
         var execution_control = httpInferenceExecutionControl(self, ctx);
@@ -14678,9 +15097,15 @@ pub const Node = struct {
             defer transport_admission.deinit();
             var transport_bound = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = transport_admission.allocator(), .limit = try std.math.add(usize, 32 * 1024 * 1024, request.limits.remote_cache_bytes) };
             const transport_allocator = transport_bound.allocator();
-            var security = effectiveRequestContentSecurity(self);
+            var security_snapshot = if (control.content_security_json) |json| try std.json.parseFromSlice(scraping.ContentSecurityConfig, transport_allocator, json, .{}) else null;
+            defer if (security_snapshot) |*snapshot| snapshot.deinit();
+            var security = if (security_snapshot) |snapshot| defaultedRequestContentSecurity(snapshot.value) else effectiveRequestContentSecurity(self);
             const download_context = InferenceDownloadRequestContext{ .io = io, .control = control };
-            const remote = try scraping.PinnedRange.create(transport_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, if (reference.version_kind == .strong_etag) .strong_etag else .s3_version_id, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{});
+            const remote = try scraping.PinnedRange.createWithLocalCache(transport_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, switch (reference.version_kind) {
+                .strong_etag => .strong_etag,
+                .s3_version_id => .s3_version_id,
+                .file_sha256 => .file_sha256,
+            }, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{}, &self.host_caches.local_source_verifications);
             defer remote.destroy();
             const Range = struct {
                 fn read(raw: *anyopaque, offset: u64, out: []u8, check: media.source.Control) !usize {
@@ -14709,7 +15134,9 @@ pub const Node = struct {
             resolved.native_source = &source;
             resolved.native_transport_bytes = 0; // Transport allocations already own shared admission.
             resolved.source_version = reference.version;
-            return self.chunkAndEmbedAdmitted(a, io, control, resolved, target, sink);
+            const execution = try self.chunkAndEmbedAdmitted(a, io, control, resolved, target, sink);
+            try remote.validate();
+            return execution;
         }
         if (request.transcribe_boundary) return self.chunkTranscribeBoundary(a, io, control, request, target, sink);
         if (target.model.len == 0 or (target.dimensions != null and target.dimensions.? == 0)) return error.InvalidChunkModel;
@@ -14782,6 +15209,9 @@ pub const Node = struct {
     }
 
     fn chunkModelAwareHttp(self: *Node, ctx: *httpx.Context, body: api.ChunkRequest, input: lib_chunker.Input, config: lib_chunker.FixedChunkConfig) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const wire = @import("chunk_response.zig");
         var output_config: ?std.json.Parsed(lib_chunker.outputs.Config) = null;
         defer if (output_config) |*parsed_outputs| parsed_outputs.deinit();
@@ -14960,6 +15390,9 @@ pub const Node = struct {
     }
 
     pub fn rerankDocuments(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
@@ -15304,9 +15737,9 @@ pub const Node = struct {
             if (try self.growSlotUnits(ctx, reserved_units, image_units)) |response| return response;
             reserved_units = image_units;
         }
-        var image_permit = model.session.admitHostPreprocess(image_working_bytes) catch |err| return inferenceFailureResponse(ctx, err);
+        var image_permit = model.session.withAdmissionControl(model_path_selection_control).admitHostPreprocess(image_working_bytes) catch |err| return inferenceFailureResponse(ctx, err);
         defer image_permit.deinit();
-        var image_memory = @import("../pipelines/preprocessing_memory.zig").Scope.init(ctx.allocator, model.session, .{ .process_bytes = image_working_bytes }, null);
+        var image_memory = @import("../pipelines/preprocessing_memory.zig").Scope.init(ctx.allocator, model.session.withAdmissionControl(model_path_selection_control), .{ .process_bytes = image_working_bytes }, null);
         defer image_memory.deinit();
         const image_allocator = try image_memory.allocator();
 
@@ -15511,6 +15944,9 @@ pub const Node = struct {
     }
 
     pub fn prepareChatContext(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var control = httpInferenceExecutionControl(self, ctx);
         control.check() catch |err| return contextRequestFailure(ctx, err);
         const bytes = (try ctx.body()) orelse return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -15690,6 +16126,10 @@ pub const Node = struct {
         // Keep this charge until the decoded checkpoint itself is destroyed.
         upload_admission: ?runtime.tier.memory.AdmissionLease = null,
 
+        fn requiredResidency(self: *const NativeCheckpointTransfer) runtime.tier.memory.Residency {
+            return if (self.upload_admission) |lease| .fromLease(lease) else .{};
+        }
+
         fn releaseOwnedState(self: *NativeCheckpointTransfer) void {
             if (self.prepare) |request| request.deinit();
             if (self.resume_request) |request| request.deinit();
@@ -15724,6 +16164,9 @@ pub const Node = struct {
     }
 
     pub fn resumeNativeKvCheckpoint(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var lease = NativeCheckpointLease.acquire(&self.native_checkpoint_active) orelse
             return modelResourceBusyResponse(ctx);
         defer lease.release();
@@ -15821,6 +16264,9 @@ pub const Node = struct {
     }
 
     fn completeNativeOrOrdinaryGeneration(self: *Node, ctx: *httpx.Context, native_transfer: ?*NativeCheckpointTransfer) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         // Also retire upload ownership if generation returns an error before
         // it can construct an HTTP response or a deferred terminal callback.
         defer if (native_transfer) |transfer| transfer.releaseOwnedState();
@@ -17138,6 +17584,7 @@ pub const Node = struct {
                 .backend_class = target_backend_class,
                 .limits = target_admission_limits,
                 .amounts = .fromEstimate(resource_estimate),
+                .failure = execution_control.admission_failure,
             },
         };
         const native_resume = if (native_transfer) |transfer| transfer.resume_request != null else false;
@@ -17167,6 +17614,7 @@ pub const Node = struct {
                         ),
                     ),
                     .amounts = .fromEstimate(estimate),
+                    .failure = execution_control.admission_failure,
                 },
             };
             break :blk 2;
@@ -17183,20 +17631,13 @@ pub const Node = struct {
             // A partial upload must not borrow the model's execution workspace
             // or reserve device KV/scratch. Ordinary generation can proceed
             // while the bounded checkpoint body is still arriving.
-            native_transfer.?.upload_admission = self.model_manager.acquireRunResourceAmounts(
-                target_backend_class,
-                target_admission_limits,
-                .{ .host_scratch_bytes = native_host_reservation },
-            ) catch |err| {
-                if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
-                return switch (err) {
-                    error.ResourceLimitExceeded => ctx.status(400).json(.{
-                        .@"error" = "MODEL_RESOURCE_LIMIT",
-                        .message = "request exceeds the configured inference resource budget",
-                    }),
-                    else => inferenceFailureResponse(ctx, err),
-                };
-            };
+            native_transfer.?.upload_admission = self.model_manager.acquireRunResourceEstimates(&.{.{
+                .backend_class = target_backend_class,
+                .limits = target_admission_limits,
+                .amounts = .{ .host_scratch_bytes = native_host_reservation },
+                .required_residency = if (model.session.run_admission) |admission| admission.requiredResidency() else .{},
+                .failure = execution_control.admission_failure,
+            }}) catch |err| return inferenceFailureResponse(ctx, err);
         }
         const native_identity = if (native_transfer != null or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE"))
             model.nativeKvIdentity(kv_dtype, execution_control) catch |err| return nativeCheckpointErrorResponse(ctx, err)
@@ -17220,22 +17661,14 @@ pub const Node = struct {
         // Admit execution only after a native upload has been fully decoded
         // and its framing validated. The separate host lease remains charged,
         // so admission still enforces the combined host/device envelope.
+        if (native_transfer) |transfer| {
+            // The decoded checkpoint cannot be reclaimed to make its own
+            // execution fit. Include it without charging its lease again.
+            admission_requests[0].resources.required_residency = try admission_requests[0].resources.required_residency.merge(transfer.requiredResidency());
+        }
         var admission_lease = self.model_manager.acquireGenerationResources(
             admission_requests[0..admission_request_count],
-        ) catch |err| {
-            if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
-            return switch (err) {
-                error.ResourceLimitExceeded => ctx.status(400).json(.{
-                    .@"error" = "MODEL_RESOURCE_LIMIT",
-                    .message = "request exceeds the configured inference resource budget",
-                }),
-                // Ownership configuration errors should have failed startup before
-                // request surfaces were published. Keep the HTTP boundary total so
-                // a violated invariant is reported as an internal failure instead
-                // of widening this inferred error set into a compile failure.
-                else => inferenceFailureResponse(ctx, err),
-            };
-        };
+        ) catch |err| return inferenceFailureResponse(ctx, err);
         defer admission_lease.release();
 
         const first_locked_model = if (draft_model_for_generation) |draft_model|
@@ -18603,6 +19036,9 @@ pub const Node = struct {
     }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
@@ -20421,7 +20857,7 @@ pub const Node = struct {
                 if (cuda_profile_session) |sess| session_factory.drainCudaProfile(sess);
             }
             // Try to send an error event before closing
-            writeGenerationStreamError(&writer, err);
+            writeGenerationStreamError(ctx, &writer, err);
             writer.close() catch {};
             return ctx.response.build();
         };
@@ -21225,6 +21661,9 @@ pub const Node = struct {
     }
 
     pub fn classifyDocument(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentClassificationRequest)) orelse
@@ -21332,6 +21771,9 @@ pub const Node = struct {
     }
 
     pub fn classifyDocumentTokens(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentTokenClassificationRequest)) orelse
@@ -21483,6 +21925,9 @@ pub const Node = struct {
     }
 
     pub fn rewriteText(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.RewriteRequest)) orelse
@@ -21600,6 +22045,9 @@ pub const Node = struct {
     /// Antfarm's native OCR adapter uses the existing reader contract and the
     /// same request permits, media policy, cancellation, and memory admission.
     pub fn antfarmAppleOcr(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         if (!readers_api.apple.enabled) return ctx.status(501).json(.{ .@"error" = "APPLE_OCR_UNAVAILABLE", .message = "Apple OCR is unavailable on this server" });
         const Request = struct {
             images: []const struct { url: []const u8 },
@@ -21712,7 +22160,9 @@ pub const Node = struct {
         defer admitted.deinit();
         var bounded = BoundedRequestAllocator{ .backing = admitted.allocator(), .limit = 512 * 1024 * 1024 };
         const a = bounded.allocator();
-        const control = self.bindExecutionControl(null, supplied);
+        var control = self.bindExecutionControl(null, supplied);
+        var request_slot = try ReadRequestSlot.acquire(self, &control);
+        defer request_slot.deinit();
         const result = (switch (operation) {
             .read => if (encoded) |request| switch (request) {
                 .images => |images| document_service.Service(Node).readEncodedJson(self, a, json, images, control),
@@ -22009,6 +22459,9 @@ pub const Node = struct {
         return self.executeDocumentRemote(ctx, .extract);
     }
     fn executeDocumentRemote(self: *Node, ctx: *httpx.Context, operation: enum { read, extract }) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const protocol = readers_api.document_stream;
         if (!std.mem.eql(u8, ctx.header("content-type") orelse "", protocol.content_type)) return ctx.status(415).json(.{ .@"error" = "UnsupportedDocumentTransport" });
         const model = ctx.header("X-Antfly-Document-Model") orelse return ctx.status(400).json(.{ .@"error" = "ModelRequired" });
@@ -22263,9 +22716,9 @@ pub const Node = struct {
         defer manifest.deinit();
         const whisper = manifest.model_type == .transcriber;
         const audio_admission = audioDecodeAdmission(self, bytes.len);
-        if (control.http_request_admitted) try self.reserveAdmissionUnits(audio_admission.units) else try self.acquireAdmissionUnits(audio_admission.units);
+        if (control.request_slot_admitted) try self.reserveAdmissionUnits(audio_admission.units) else try self.acquireAdmissionUnits(audio_admission.units);
         var reserved_units = audio_admission.units;
-        defer if (control.http_request_admitted) self.releaseSlotUnits(reserved_units) else self.releaseAdmissionUnits(reserved_units);
+        defer if (control.request_slot_admitted) self.releaseSlotUnits(reserved_units) else self.releaseAdmissionUnits(reserved_units);
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
         const DecodeControl = struct {
@@ -22335,11 +22788,17 @@ pub const Node = struct {
         const required_units = @max(reserved_units, estimateGenerateAdmissionUnitsFromShape((prompt orelse @as([]const u8, AudioReadInput.default_prompt)).len, 1, tokens));
         try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
-        const output = self.generateMessagesDirectPrepared(a, model_path, &messages, tokens, preflight, reserved_units, null, false, null, false, null, null, null, control) catch |err| {
+        // Model execution has its own checked KV/workspace budget and resource
+        // admission. Keep its reclaimable allocations out of the document
+        // arena: that arena bounds source/evidence/output bytes, and retains
+        // logically freed tensor scratch until the complete document finishes.
+        const output = self.generateMessagesDirectPrepared(self.allocator, model_path, &messages, tokens, preflight, reserved_units, null, false, null, false, null, null, null, control) catch |err| {
             return if (err == error.EmbeddingSequenceTooLong) error.AudioTooLong else err;
         };
-        errdefer a.free(output.text);
-        return .{ .text = output.text, .prompt_tokens = output.prompt_tokens, .completion_tokens = output.completion_tokens, .truncated = output.truncated, .audio_json = try std.json.Stringify.valueAlloc(a, metadata, .{}), .origin = if (prompt != null and !std.mem.eql(u8, prompt.?, AudioReadInput.default_prompt)) .interpretation else .transcription };
+        defer self.allocator.free(output.text);
+        const text = try a.dupe(u8, output.text);
+        errdefer a.free(text);
+        return .{ .text = text, .prompt_tokens = output.prompt_tokens, .completion_tokens = output.completion_tokens, .truncated = output.truncated, .audio_json = try std.json.Stringify.valueAlloc(a, metadata, .{}), .origin = if (prompt != null and !std.mem.eql(u8, prompt.?, AudioReadInput.default_prompt)) .interpretation else .transcription };
     }
 
     pub fn readAudioJsonWithControl(self: *Node, a: std.mem.Allocator, raw: []const u8, supplied_control: InferenceExecutionControl) ![]u8 {
@@ -22347,6 +22806,9 @@ pub const Node = struct {
     }
 
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
@@ -23193,6 +23655,9 @@ pub const Node = struct {
     }
 
     pub fn dictate(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
@@ -23474,7 +23939,7 @@ pub const Node = struct {
                 cleanup_cache_key,
                 execution_control,
             ) catch |err| {
-                writeGenerationStreamError(&writer, err);
+                writeGenerationStreamError(ctx, &writer, err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
@@ -23485,7 +23950,7 @@ pub const Node = struct {
                 return ctx.response.build();
             }
             const cleaned = normalizeDirectDictationOutput(ctx.allocator, generated) catch |err| {
-                writeGenerationStreamError(&writer, err);
+                writeGenerationStreamError(ctx, &writer, err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
@@ -23747,6 +24212,9 @@ pub const Node = struct {
     }
 
     pub fn createTranscriptionSession(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.TranscriptionSessionRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -23865,6 +24333,9 @@ pub const Node = struct {
     }
 
     pub fn appendTranscriptionAudio(self: *Node, ctx: *httpx.Context, session_id: []const u8) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const execution_control = httpInferenceExecutionControl(self, ctx);
         if (!transcription_sessions.isValidId(session_id)) return transcriptionSessionNotFound(ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
@@ -24468,6 +24939,9 @@ pub const Node = struct {
     }
 
     pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
@@ -24825,6 +25299,8 @@ pub const Node = struct {
     }
 
     fn decideJsonWithAdmission(self: *Node, allocator: std.mem.Allocator, request_json: []const u8, owner: ExtractionAdmissionOwner, control: ?InferenceExecutionControl) ![]u8 {
+        const glide_trace = @import("../pipelines/glide.zig").trace;
+        glide_trace.begin();
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -24840,14 +25316,21 @@ pub const Node = struct {
         };
         const public_request = try decision_api.parseValue(a, envelope);
         const request = public_request.inner;
+        glide_trace.mark("parse");
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(a, null, &owned_io);
         const selected = try self.resolveRequestModelSelection(a, io, request.model, "deciders");
         const path = selected.path;
         const selected_control = self.bindModelSelection(selected, control);
-        var manifest = try self.loadBoundManifest(a, path, true, selected_control);
+        glide_trace.mark("resolve model");
+        // A warm GLiDE model already holds this generation's manifest.
+        var manifest = if (try self.model_manager.copyCachedGlideManifestWithControl(a, path, selected_control)) |cached|
+            cached
+        else
+            try self.loadBoundManifest(a, path, true, selected_control);
         defer manifest.deinit();
+        glide_trace.mark("manifest");
         if (manifest.embedding_style == .embedding_gemma2) {
             if (request.long_document.mode == .window) return error.UnsupportedDecisionWindowing;
             return self.decideEmbeddingSimilarity(allocator, a, path, public_request, selected_control);
@@ -24855,6 +25338,27 @@ pub const Node = struct {
         if (request.model_identity != null) return error.UnsupportedDecideModel;
         for (public_request.policies) |policy| if (policy.embedding_configured or policy.kind == .multi_choice) return error.UnsupportedDecideModel;
         for (request.questions) |question| for (question.examples) |examples| if (examples.len != 0) return error.UnsupportedDecideModel;
+        if (manifest.glide_declared) {
+            // GLiDE truncates (encoder) or rejects (decoder) long prompts itself.
+            if (request.long_document.mode == .window) return error.UnsupportedDecisionWindowing;
+            const glide_input = try decision_api.extractionValue(a, public_request, .laya);
+            const contract = try resolvedInferenceExecutorContract(self, "decide", &manifest);
+            var max_labels: usize = 0;
+            for (request.questions) |question| max_labels = @max(max_labels, question.labels.len);
+            const texts = try a.alloc([]const u8, public_request.items.len);
+            for (public_request.items, texts) |item, *text| text.* = item.input;
+            try validateTextExecutorInvocation(contract, texts.len, texts, 0, 0, max_labels, glide_input.schema_bytes);
+            glide_trace.mark("contract");
+            var failure = extraction_v2.FailureContext{};
+            var extraction = try self.extractV2WithAdmission(a, .{ .decide_glide = .{
+                .request = public_request,
+                .selected = selected,
+                .max_input_tokens = contract.batch.max_input_tokens_per_item,
+            } }, owner, selected_control, &failure, null, "decide");
+            defer extraction.deinit();
+            glide_trace.mark("admission teardown");
+            return allocator.dupe(u8, extraction.json);
+        }
         const decision_contract = decideExecutionContract(manifest) orelse return error.UnsupportedDecideModel;
         const extraction_input = try decision_api.extractionValue(a, public_request, decision_contract);
         const contract = try resolvedInferenceExecutorContract(self, "decide", &manifest);
@@ -25276,6 +25780,9 @@ pub const Node = struct {
     }
 
     pub fn decide(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const request_json = (try ctx.body()) orelse return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
         const response_json = self.decideJsonWithAdmission(ctx.allocator, request_json, .http_route, httpInferenceExecutionControl(self, ctx)) catch |err| return decideFailureResponse(ctx, err);
         defer ctx.allocator.free(response_json);
@@ -25563,6 +26070,24 @@ pub const Node = struct {
             error.AmbiguousModelIdentifier,
             => requestModelResolutionError(ctx, err),
             error.UnsupportedDecideModel => ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) }),
+            // A GLiDE decoder prompt over the checkpoint's context (the
+            // reference's request error); encoder prompts are truncated.
+            error.GlidePromptTooLong => ctx.status(413).json(.{ .@"error" = "REQUEST_TOO_LARGE", .message = "prompt exceeds the model's maximum context length" }),
+            error.InvalidGlideQuestion, error.InvalidGlideRequest => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+            error.UnsupportedGlideBackbone,
+            error.UnsupportedGlideDecisionConfig,
+            error.UnsupportedGlidePromptFormat,
+            error.UnsupportedGlideLoopedCheckpoint,
+            error.UnsupportedGlideAttentionMode,
+            error.UnsupportedGlidePooling,
+            error.InvalidGlideDecisionConfig,
+            error.InvalidGlideReadout,
+            error.GlideReadoutNotFound,
+            error.GlideDecisionConfigNotFound,
+            error.UnsupportedGlideCheckpoint,
+            error.GlideDecoderRequiresMetal,
+            error.GlideDecoderRequiresGpu,
+            => ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) }),
             else => extractionV2FailureResponse(ctx, err, .{}),
         };
     }
@@ -25788,6 +26313,9 @@ pub const Node = struct {
     }
 
     pub fn loadModelInstance(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var parsed = (try ctx.parseJson(api.ModelInstanceLoadRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
         defer parsed.deinit();
@@ -26227,7 +26755,9 @@ pub const Node = struct {
                 try jsonEncodeString(&body, a, entry.path);
                 try body.appendSlice(a, ":{\"compatibility\":\"incompatible\",\"error\":{\"code\":");
                 try jsonEncodeString(&body, a, @errorName(rejected.err));
-                try body.appendSlice(a, ",\"message\":\"the model directory could not be read; repair or re-pull it\"}}");
+                try body.appendSlice(a, ",\"message\":");
+                try jsonEncodeString(&body, a, @import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(rejected.err) orelse "the model directory could not be read; repair or re-pull it");
+                try body.appendSlice(a, "}}");
                 model_count += 1;
             }
 
@@ -26457,6 +26987,9 @@ pub const Node = struct {
     }
 
     pub fn predict(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.PredictRequest)) orelse
@@ -27648,6 +28181,8 @@ fn extractionV2FailureResponse(ctx: *httpx.Context, err: anyerror, failure: extr
 }
 
 fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (@import("../registry/pull_diagnostics.zig").glinerSpanConfigMessage(err) != null)
+        return modelLoadFailureResponse(ctx, err);
     if (err == error.UnsupportedConstrainedProbabilities) return generationErrorResponse(ctx, err);
     if (isInferenceExecutorContractError(err))
         return inferenceExecutorContractFailureResponse(ctx, err);
@@ -27875,9 +28410,9 @@ test "document extraction reuses HTTP request admission and releases nested work
     const json = "{\"schema_version\":2,\"model\":\"missing\",\"schema\":{\"entities\":[\"person\"]},\"inputs\":[{\"content\":\"John\"}]}";
     for (0..2) |entry| {
         const result = if (entry == 0)
-            node.extractDirectWithControl(a, "missing", direct, .{ .http_request_admitted = true })
+            node.extractDirectWithControl(a, "missing", direct, .{ .request_slot_admitted = true })
         else
-            node.extractV2DirectJsonWithControl(a, json, .{ .http_request_admitted = true });
+            node.extractV2DirectJsonWithControl(a, json, .{ .request_slot_admitted = true });
         if (result) |response| {
             var owned = response;
             owned.deinit();
@@ -29187,7 +29722,7 @@ fn manifestMatchesModelListingTask(
     if (std.mem.eql(u8, task, "readers") and isGenerativeReadModel(manifest)) return true;
     if (std.mem.eql(u8, task, "extractors") and (manifest.laya_declared or manifest.embedding_style == .embedding_gemma2)) return false;
     if (std.mem.eql(u8, task, "deciders") and manifest.embedding_style != .embedding_gemma2 and
-        !manifest.laya_declared and
+        !manifest.laya_declared and !manifest.glide_declared and
         !(manifest.gliner_architecture == .span and manifest.gliner_span_declared)) return false;
     return taskMatchesModelListing(
         task,
@@ -30628,14 +31163,14 @@ fn resolvedInferenceExecutorContract(
         std.mem.eql(u8, resolved_task, "extract") and
         manifest.gliner_classification_head == .label_marker_mlp and manifest.gliner_span_encoder_family == .deberta)
     {
-        // Metal preserves the existing public request cardinality and chunks
-        // physical forwards at eight rows. CUDA's qualified request cap is
-        // independently eight. Boundary discovery stays conservative because
-        // its long-document profiles still require one input per request.
+        // Unloaded-model discovery keeps its conservative eight-row preference.
+        // Authenticated Metal sessions choose physical groups using their
+        // padded-token policy without changing public request cardinality.
+        // Both pinned CUDA artifacts compose eight-row forwards, up to 32 inputs.
         implementation = .{
             .mode = .native,
             .preferred_items = if (metal_decide_batch) gliner_decide_qualification.metal_batch_items else gliner_decide_qualification.cuda_batch_items,
-            .max_items = if (metal_decide_batch) resolvedTaskMaxItems(resolved_task) else gliner_decide_qualification.cuda_batch_items,
+            .max_items = if (metal_decide_batch) resolvedTaskMaxItems(resolved_task) else gliner_decide_qualification.cuda_request_items,
             .per_item_failures = false,
         };
     }
@@ -30977,12 +31512,43 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
 }
 
 fn inferenceExecutorContractFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    // Resolving capabilities first reads the manifest. Preserve load/config
+    // failures instead of treating every failure as a request size violation.
+    if (!isInferenceExecutorContractError(err) and err != error.UnsupportedGlinerBoundaryRuntime)
+        return modelLoadFailureResponse(ctx, err);
     const failure = generateExecutorContractError(err);
     return ctx.status(failure.status).json(.{
         .@"error" = failure.batch.code,
         .message = failure.batch.message,
         .retryable = failure.batch.retryable,
     });
+}
+
+test "executor contract failures preserve configuration load and resource identities" {
+    const a = std.testing.allocator;
+    const Case = struct { err: anyerror, status: u16, code: []const u8 };
+    for ([_]Case{
+        .{ .err = error.MissingGlinerSpanEncoderConfig, .status = 400, .code = "INVALID_MODEL" },
+        .{ .err = error.InvalidGlinerSpanEncoderConfig, .status = 400, .code = "INVALID_MODEL" },
+        .{ .err = error.InferenceBatchTooLarge, .status = 413, .code = "BATCH_TOO_LARGE" },
+        .{ .err = error.InferenceInputTokensExceeded, .status = 413, .code = "INPUT_TOKEN_LIMIT_EXCEEDED" },
+        .{ .err = error.InvalidInferenceCapabilities, .status = 500, .code = "INVALID_MODEL_CAPABILITIES" },
+        .{ .err = error.UnsupportedGlinerBoundaryRuntime, .status = 400, .code = "MODEL_NOT_QUALIFIED" },
+        .{ .err = error.ResourceLimitExceeded, .status = 400, .code = "MODEL_RESOURCE_LIMIT" },
+        .{ .err = error.ResourceTemporarilyUnavailable, .status = 503, .code = "MODEL_RESOURCE_BUSY" },
+        .{ .err = error.Timeout, .status = 504, .code = "INFERENCE_TIMEOUT" },
+    }) |case| {
+        var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try inferenceExecutorContractFailureResponse(&ctx, case.err);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.code, parsed.value.object.get("error").?.string);
+    }
 }
 
 fn isInferenceExecutorContractError(err: anyerror) bool {
@@ -36645,6 +37211,31 @@ test "model listing reports an unreadable model per entry and keeps the others" 
     try std.testing.expectEqualStrings("incompatible", broken.get("compatibility").?.string);
     try std.testing.expectEqualStrings("MissingGlinerSpanEncoderConfig", broken.get("error").?.object.get("code").?.string);
 
+    // Both the legacy request from #1678 and explicit v2 must preserve the
+    // discovery diagnosis rather than inventing a request resource limit.
+    const diagnostic = broken.get("error").?.object;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.get("message").?.string, "encoder_config/config.json") != null);
+    for ([_][]const u8{
+        "{\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
+        "{\"schema_version\":2,\"model\":\"acme/broken-gliner\",\"schema\":{\"entities\":[\"email\"]},\"inputs\":[{\"content\":\"Contact custodian0@example.invalid.\"}]}",
+    }) |json| {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        request.body = json;
+        var ctx = httpx.Context.init(allocator, io, &request);
+        defer ctx.deinit();
+        var response = try node.extractJSON(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        var payload = try std.json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+        defer payload.deinit();
+        const failure = payload.value.object;
+        try std.testing.expectEqualStrings("INVALID_MODEL", failure.get("error").?.string);
+        try std.testing.expectEqualStrings(diagnostic.get("code").?.string, failure.get("reason").?.string);
+        try std.testing.expectEqualStrings(diagnostic.get("message").?.string, failure.get("message").?.string);
+        try std.testing.expect(!failure.get("retryable").?.bool);
+    }
+
     // Readiness counts the usable model instead of collapsing to zero.
     try node.refreshReadinessInventory(io);
     try std.testing.expectEqual(@as(usize, 1), node.readiness_inventory.load().counts.generators);
@@ -37059,6 +37650,24 @@ test "decider listing requires a registered decision architecture" {
     manifest.gliner_architecture = .span;
     manifest.gliner_span_declared = true;
     try std.testing.expect(manifestMatchesModelListingTask("deciders", "extractor", &manifest));
+}
+
+test "GLiDE checkpoints list only as deciders" {
+    var tasks = [_][]const u8{"decide"};
+    var capabilities = [_][]const u8{"typed_decisions"};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .classifier,
+        .tasks = &tasks,
+        .capabilities = &capabilities,
+        .glide_declared = true,
+        .glide_backbone = .encoder,
+    };
+    try std.testing.expect(manifestMatchesModelListingTask("deciders", "classifier", &manifest));
+    try std.testing.expect(!manifestMatchesModelListingTask("extractors", "classifier", &manifest));
+    try std.testing.expect(!manifestMatchesModelListingTask("classifiers", "classifier", &manifest));
+    // GLiDE routes before the typed-span/boundary/Laya execution contracts.
+    try std.testing.expect(decideExecutionContract(manifest) == null);
 }
 
 test "classification extraction applies top-k to single-label and threshold to multi-label taxonomies" {
@@ -41535,6 +42144,13 @@ test "dense partial result cleanup owns every allocation exactly once" {
 test "audio embedding asset guard releases admission on early failure" {
     var model: model_manager_mod.LoadedModel = undefined;
     model.managed_publication = null;
+    model.admission_residency = .{};
+    model.resource_lease = null;
+    model.tokenizer_resource_lease = null;
+    model.whisper_prompt_admission = null;
+    model.vision_resource_lease = null;
+    model.text_projection_resource_lease = null;
+    model.visual_projection_resource_lease = null;
     model.embedding_session_lock = .unlocked;
     model.audio_session = null;
     model.audio_projection = null;
@@ -42275,8 +42891,12 @@ test "multimodal rerank parser rejects invalid image data uris" {
 
 /// Decode a data URI (data:mime/type;base64,...) to raw bytes.
 fn effectiveRequestContentSecurity(self: *const Node) scraping.ContentSecurityConfig {
+    return defaultedRequestContentSecurity(self.config.content_security);
+}
+
+fn defaultedRequestContentSecurity(config: ?scraping.ContentSecurityConfig) scraping.ContentSecurityConfig {
     var effective = default_request_content_security;
-    const configured = self.config.content_security orelse return effective;
+    const configured = config orelse return effective;
     if (configured.allowed_hosts != null) effective.allowed_hosts = configured.allowed_hosts;
     if (configured.block_private_ips != null) effective.block_private_ips = configured.block_private_ips;
     if (configured.max_download_size_bytes != null) effective.max_download_size_bytes = configured.max_download_size_bytes;
@@ -42974,6 +43594,12 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
             .message = "prompt exceeds the model context window after reserving output tokens",
             .retryable = false,
         },
+        error.ResourceLimitExceeded => .{
+            .status = 400,
+            .code = "MODEL_RESOURCE_LIMIT",
+            .message = "request and required model residency exceed the configured inference budget",
+            .retryable = false,
+        },
         error.MemoryBudgetExceeded => .{
             .status = 507,
             .code = "MEMORY_BUDGET_EXCEEDED",
@@ -43033,6 +43659,7 @@ test "generation deadline errors retain canonical timeout and cancellation respo
 }
 
 fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.ResourceLimitExceeded) return modelResourceLimitResponse(ctx);
     if (isTransientInferenceCapacityError(err))
         return modelResourceBusyResponse(ctx);
     if (generationRequestFailure(err)) |failure| {
@@ -43084,10 +43711,23 @@ fn writeInternalStreamError(
     writer.writeEvent("error", internalErrorMessage(stage, err)) catch {};
 }
 
-fn writeGenerationStreamError(writer: *httpx.Context.StreamWriter, err: anyerror) void {
+fn writeGenerationStreamError(ctx: *httpx.Context, writer: *httpx.Context.StreamWriter, err: anyerror) void {
+    if (err == error.MemoryBudgetExceeded and !builtin.is_test)
+        std.log.warn("generation memory admission denied during streaming", .{});
+    if (err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded) {
+        // Headers may already be committed. Preserve the HTTP error contract
+        // in the terminal event, without allocating during memory pressure.
+        var buffer: [1024]u8 = undefined;
+        var json = std.Io.Writer.fixed(&buffer);
+        const payload = if (err == error.ResourceLimitExceeded) modelResourceLimitPayload(ctx) else InferenceBudgetFailurePayload{
+            .@"error" = "MEMORY_BUDGET_EXCEEDED",
+            .message = memory_budget_exceeded_message,
+        };
+        std.json.Stringify.value(payload, .{ .emit_null_optional_fields = false }, &json) catch return;
+        writer.writeEvent("error", json.buffered()) catch {};
+        return;
+    }
     if (generationRequestFailure(err)) |failure| {
-        if (err == error.MemoryBudgetExceeded and !builtin.is_test)
-            std.log.warn("generation memory admission denied during streaming", .{});
         writer.writeEvent("error", failure.message) catch {};
         return;
     }
@@ -43557,8 +44197,7 @@ fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
 }
 
 fn isGenerativeReadModel(manifest: *const manifest_mod.ModelManifest) bool {
-    return (manifest.isLightOnOcr3() and manifest.hasTask("read")) or (manifest.model_type == .generator and
-        manifest.isQwen3VlGgufBundle() and !manifest.isQwen3VlReranker());
+    return manifest.isGenerativeReader();
 }
 
 fn resolveGenerativeReadPrompt(manifest: *const manifest_mod.ModelManifest, prompt: ?[]const u8) ![]const u8 {
@@ -46898,6 +47537,7 @@ test "audio read digital silence preserves quiet speech and rejects invalid samp
 }
 
 fn documentFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.QueueFull) return transientCapacityFailureResponse(ctx, "SERVICE_UNAVAILABLE", "server at capacity for expanded request workload, try again later", "inference_admission");
     if (err == error.AudioTooLong) return audioDurationLimitResponse(ctx);
     if (err == error.SpeakerModelUnavailable) return ctx.status(422).json(.{ .@"error" = "SpeakerModelUnavailable", .message = "The selected audio reader requires the local speaker embedding model for diarization" });
     if (remoteContentRequestFailure(err)) |_| return remoteContentErrorResponse(ctx, err);
@@ -47881,6 +48521,144 @@ test "context checkpoint HTTP errors distinguish stale revisions from corrupt pa
         try std.testing.expectEqualStrings(if (failure == error.StaleCheckpoint) "CONTEXT_CHECKPOINT_STALE_REVISION" else "CONTEXT_CHECKPOINT_MISMATCH", payload.value.@"error");
         try std.testing.expect(!payload.value.retryable);
     }
+}
+
+test "model aware media local source validates transport before model execution" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "0123456789" });
+    const path = try tmp.dir.realPathFileAlloc(io, "media", a);
+    defer a.free(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(uri);
+    const paths = [_][]u8{path};
+    var node = try Node.init(a, .{ .process_termination_available = true, .content_security = .{ .allowed_paths = &.{} } });
+    const allowed = try std.json.Stringify.valueAlloc(a, .{ .allowed_paths = paths }, .{});
+    defer a.free(allowed);
+    var control = InferenceExecutionControl{ .deadline_ns = platform.time.monotonicNs() + 60 * std.time.ns_per_s, .content_security_json = allowed };
+    defer node.deinit();
+    try node.attachIo(io);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("0123456789", &digest, .{});
+    const version = std.fmt.bytesToHex(digest, .lower);
+    const chunks = @import("../pipelines/media_chunking.zig");
+    var request = chunks.Request{ .input = .{ .source = .{ .uri = uri, .mime_type = "video/mp4", .version_kind = .file_sha256, .version = &version, .length = 10 } } };
+    const Discard = struct {
+        fn accept(_: *anyopaque, _: chunks.Item) !void {
+            return error.UnexpectedOutput;
+        }
+    };
+    const sink = chunks.Sink{ .context = &node, .accept = Discard.accept };
+    // An empty model is rejected only after the local transport is resolved.
+    try std.testing.expectError(error.InvalidChunkModel, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    try std.testing.expectError(error.InvalidChunkModel, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    try std.testing.expectEqual(@as(u64, 1), node.host_caches.local_source_verifications.hash_count.load(.monotonic));
+    request.input.source.version = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectError(error.SourceVersionChanged, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    request.input.source.version = &version;
+    control.content_security_json = "{\"allowed_paths\":[]}";
+    try std.testing.expectError(error.PathNotAllowed, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    control.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+}
+
+test "model aware media local source completes paged WAV decoding replay and final mutation checks" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const chunks = @import("../pipelines/media_chunking.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const samples: [4096]f32 = @splat(0.125);
+    const encoded = try audio_mod.wav.encodeInterleaved(a, &samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer a.free(encoded);
+    try tmp.dir.writeFile(io, .{ .sub_path = "audio.wav", .data = encoded });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const uri = try std.fmt.allocPrint(a, "file://{s}/audio.wav", .{root});
+    defer a.free(uri);
+    const paths = [_][]u8{root};
+    var node = try Node.init(a, .{ .models_dir = root, .process_termination_available = true, .content_security = .{ .allowed_paths = &.{} } });
+    defer node.deinit();
+    try node.attachIo(io);
+    const policy = try std.json.Stringify.valueAlloc(a, .{ .allowed_paths = paths, .max_download_size_bytes = @as(u64, 1024) }, .{});
+    defer a.free(policy);
+    var control = InferenceExecutionControl{ .deadline_ns = platform.time.monotonicNs() + 60 * std.time.ns_per_s, .content_security_json = policy };
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &hash, .{});
+    const version = std.fmt.bytesToHex(hash, .lower);
+    const targets = [_]lib_chunker.outputs.Target{.{ .name = "speech", .kind = .transcribe, .model = "fixture-transcriber" }};
+    const config = lib_chunker.outputs.Config{ .boundary_model = "speech", .targets = &targets };
+    // Use the production audio planner, decoder, admission, range transport,
+    // collectors and replay. Only the final model invocation is a deterministic
+    // consumer, so this qualification requires no downloaded weights.
+    const Consumer = struct {
+        consumers: MediaOutputExecution,
+        dir: std.Io.Dir,
+        mutate: bool = false,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, payload: chunks.Payload, descriptor: lib_chunker.planning.Descriptor, _: ?chunks.EmbeddingContext, _: ?chunks.Output, _: ?anyerror, _: bool) ![]const lib_chunker.outputs.Result {
+            const owner: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+            const self: *@This() = @fieldParentPtr("consumers", owner);
+            try std.testing.expect(payload == .pcm and payload.pcm.samples.len != 0);
+            for (payload.pcm.samples) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0.125), sample, 0.00001);
+            self.calls += 1;
+            const coordinates = descriptor.coordinates;
+            const spans = try alloc.alloc(lib_chunker.outputs.Span, 1);
+            spans[0] = .{ .text = "tone", .start_ns = coordinates.start_ns.?, .end_ns = coordinates.end_ns.? };
+            const results = try alloc.alloc(lib_chunker.outputs.Result, 1);
+            results[0] = .{ .name = "speech", .kind = .transcribe, .required = true, .model = "fixture-transcriber", .model_identity = &owner.resolved[0].identity, .model_revision = &owner.resolved[0].revision, .recipe_id = &owner.resolved[0].recipe_id, .start_ns = coordinates.start_ns, .end_ns = coordinates.end_ns, .status = .complete, .spans = spans };
+            if (self.mutate) try self.dir.writeFile(std.testing.io, .{ .sub_path = "audio.wav", .data = "changed" });
+            return results;
+        }
+    };
+    var consumer = Consumer{ .consumers = .{ .node = &node, .io = io, .control = control, .config = config, .initialized = 1 }, .dir = tmp.dir };
+    consumer.consumers.resolved[0] = .{ .path = "", .identity = @splat('a'), .revision = @splat('b'), .recipe_id = @splat('c') };
+    var request = chunks.Request{ .input = .{ .source = .{ .uri = uri, .mime_type = "audio/wav", .version = &version, .version_kind = .file_sha256, .length = encoded.len } }, .outputs = config, .output_executor = .{ .context = &consumer.consumers, .execute = Consumer.execute }, .transcribe_boundary = true, .audio_boundary = true, .needs_audio = true, .execute = false, .allow_partial = true, .max_chunks = 1, .include_content = true, .policy = .{ .window_ns = 50 * std.time.ns_per_ms, .step_ns = 50 * std.time.ns_per_ms } };
+    const target = chunk_response.Target{ .model = "fixture-transcriber", .task_type = "TRANSCRIBE" };
+    var first = try node.chunkModelPageDirect(a, io, control, request, target);
+    defer first.deinit(a);
+    try std.testing.expect(first.chunks.len == 1 and !first.complete);
+    try std.testing.expect(first.chunks[0].data.?.len > 1024);
+    var ordinal = first.covered_through_ordinal;
+    while (true) {
+        const cursor = try std.fmt.allocPrint(a, "{s}:{d}", .{ first.plan_id, ordinal });
+        defer a.free(cursor);
+        request.continuation = cursor;
+        var page = try node.chunkModelPageDirect(a, io, control, request, target);
+        defer page.deinit(a);
+        try std.testing.expectEqual(ordinal, page.start_ordinal);
+        try std.testing.expect(page.covered_through_ordinal > ordinal);
+        try std.testing.expectEqualStrings(first.plan_id, page.plan_id);
+        ordinal = page.covered_through_ordinal;
+        if (page.complete) break;
+    }
+    try std.testing.expect(consumer.calls > 1);
+    const replay = try node.replayModelChunkDirect(a, io, control, request, target, first.plan_id, first.source_fingerprint, 0);
+    defer lib_chunker.types.freeChunks(a, replay);
+    try std.testing.expectEqualDeep(first.chunks[0].metadata.?.descriptor.coordinates, replay[0].metadata.?.descriptor.coordinates);
+    try std.testing.expectEqual(@as(u64, 1), node.host_caches.local_source_verifications.hash_count.load(.monotonic));
+    // A raised caller ceiling must still obey a smaller node ceiling, and a
+    // deliberately smaller request budget must remain effective too. Exercise
+    // both through production decoding/collectors, without large allocations.
+    request.continuation = null;
+    const working_budget = request.max_working_bytes;
+    const node_budget = node.config.chunking_limits.max_working_bytes;
+    request.max_working_bytes = 1024 * 1024 * 1024;
+    node.config.chunking_limits.max_working_bytes = 1;
+    try std.testing.expectError(error.SharedAdmissionExceeded, node.chunkModelPageDirect(a, io, control, request, target));
+    node.config.chunking_limits.max_working_bytes = node_budget;
+    request.max_working_bytes = 1;
+    try std.testing.expectError(error.SharedAdmissionExceeded, node.chunkModelInputDirect(a, io, control, request, target));
+    try std.testing.expectError(error.SharedAdmissionExceeded, node.replayModelChunkDirect(a, io, control, request, target, first.plan_id, first.source_fingerprint, 0));
+    request.max_working_bytes = working_budget;
+    control.content_security_json = "{\"allowed_paths\":[]}";
+    try std.testing.expectError(error.PathNotAllowed, node.chunkModelPageDirect(a, io, control, request, target));
+    control.content_security_json = policy;
+    request.continuation = null;
+    consumer.mutate = true;
+    try std.testing.expectError(error.SourceVersionChanged, node.chunkModelPageDirect(a, io, control, request, target));
 }
 
 test "model aware media borrowed PCM transcription rejects empty input before model work" {
@@ -50033,7 +50811,7 @@ test "audio read HTTP leaf shares request admission and releases work on decode 
     var run = document_contract.Run{ .limits = .{} };
     defer run.deinit();
     for (0..4) |_| {
-        if (node.documentReadAudio(a, path, "not an audio container", null, null, .{}, .{ .http_request_admitted = true }, &run)) |result| {
+        if (node.documentReadAudio(a, path, "not an audio container", null, null, .{}, .{ .request_slot_admitted = true }, &run)) |result| {
             a.free(result.text);
             if (result.audio_json) |json| a.free(json);
             return error.TestUnexpectedResult;
@@ -51976,4 +52754,583 @@ test "direct dictation cleanup rejects unfinished and normalized empty text" {
     try std.testing.expectEqualStrings("Hello.", text);
     complete.text = @constCast("\"\"");
     try std.testing.expectError(error.InferenceOutputIncomplete, Node.normalizeDirectDictationOutput(a, complete));
+}
+
+test "checkpoint resume admission counts owned upload and model exactly once" {
+    const memory = runtime.tier.memory;
+    var manager = model_manager_mod.ModelManager.init(std.testing.allocator, backends_mod.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = &manager.resource_domain.?.admission;
+    const limits = memory.Limits{ .host_limit_bytes = 100 };
+    controller.configureSharedLimits(.{});
+    var weights = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = 90 }, false);
+    defer weights.release();
+    var transfer = Node.NativeCheckpointTransfer{ .metadata = "{}", .upload_admission = try controller.tryAcquire(.gpu, limits, .{ .host_scratch_bytes = 5 }, false) };
+    defer transfer.releaseOwnedState();
+    const session = backends_mod.Session{ .ptr = controller, .vtable = undefined, .run_admission = .{ .controller = controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = weights.amounts, .check_live_memory = false } };
+    var failure = memory.AdmissionFailure{};
+    var request = model_manager_mod.GenerationAdmissionRequest{ .session = session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .{ .host_scratch_bytes = 10 }, .required_residency = transfer.requiredResidency(), .failure = &failure } };
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&.{request}));
+    try std.testing.expectEqual(@as(usize, 105), failure.snapshot().?.requested_bytes);
+    try std.testing.expectEqual(@as(usize, 95), controller.snapshot().hostTotalBytes());
+    request.resources.amounts.host_scratch_bytes = 5;
+    var fitting = try manager.acquireGenerationResources(&.{request});
+    try std.testing.expectEqual(@as(usize, 100), controller.snapshot().hostTotalBytes());
+    fitting.release();
+    var peer = try controller.tryAcquire(.gpu, limits, .{ .host_scratch_bytes = 1 }, false);
+    defer peer.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&.{request}));
+}
+
+test "admission HTTP diagnostics preserve lazy load preprocessing and nested request isolation" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var outer = AdmissionFailureScope{};
+    try outer.bind(&ctx);
+    defer outer.unbind(&ctx);
+    outer.failure.record(.{ .limit = .host, .requested_bytes = 110, .limit_bytes = 100 });
+    {
+        var inner = AdmissionFailureScope{};
+        try inner.bind(&ctx);
+        defer inner.unbind(&ctx);
+        try std.testing.expect(httpAdmissionFailure(&ctx).?.snapshot() == null);
+        inner.failure.record(.{ .limit = .scratch, .requested_bytes = 240, .limit_bytes = 200 });
+        var response = try generationErrorResponse(&ctx, error.ResourceLimitExceeded);
+        defer response.deinit();
+        const parsed = try std.json.parseFromSlice(struct { budget: []const u8, required_bytes: usize, limit_bytes: usize, retryable: bool }, a, response.body.?, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expectEqualStrings("scratch", parsed.value.budget);
+        try std.testing.expectEqual(@as(usize, 240), parsed.value.required_bytes);
+        try std.testing.expectEqual(@as(usize, 200), parsed.value.limit_bytes);
+        try std.testing.expect(!parsed.value.retryable);
+    }
+    var response = try modelLoadFailureResponse(&ctx, error.ResourceLimitExceeded);
+    defer response.deinit();
+    const parsed = try std.json.parseFromSlice(struct { budget: []const u8, required_bytes: usize, limit_bytes: usize, retryable: bool }, a, response.body.?, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("host", parsed.value.budget);
+    try std.testing.expectEqual(@as(usize, 110), parsed.value.required_bytes);
+    try std.testing.expectEqual(@as(usize, 100), parsed.value.limit_bytes);
+    try std.testing.expect(!parsed.value.retryable);
+    const batch = batchGenerationError(error.ResourceLimitExceeded);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", batch.code);
+    try std.testing.expect(!batch.retryable);
+    var busy = try inferenceFailureResponse(&ctx, error.ResourceTemporarilyUnavailable);
+    defer busy.deinit();
+    try std.testing.expectEqual(@as(u16, 503), busy.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, busy.body.?, "required_bytes") == null);
+}
+
+test "streaming admission emits structured terminal budget details without allocation" {
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        fn start(_: ?*anyopaque, _: u16, _: []const u8, _: *const httpx.Headers) !void {}
+        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+        fn close(_: ?*anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var failure = AdmissionFailureScope{};
+    try failure.bind(&ctx);
+    defer failure.unbind(&ctx);
+    failure.failure.record(.{ .limit = .host, .requested_bytes = 110, .limit_bytes = 100 });
+    var capture = Capture{};
+    defer capture.bytes.deinit(a);
+    var writer = httpx.Context.StreamWriter{ .h1_sock = null, .h2_writer = null, .delegate = .{ .ptr = &capture, .start = Capture.start, .write = Capture.write, .close = Capture.close } };
+    // The error serializer must work when request allocations are exhausted.
+    ctx.allocator = std.testing.failing_allocator;
+    writeGenerationStreamError(&ctx, &writer, error.ResourceLimitExceeded);
+    ctx.allocator = a;
+    try std.testing.expect(std.mem.startsWith(u8, capture.bytes.items, "event: error\ndata: {"));
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "[DONE]") == null);
+    const data_start = std.mem.indexOf(u8, capture.bytes.items, "data: ").? + 6;
+    const data_end = std.mem.indexOfPos(u8, capture.bytes.items, data_start, "\n\n").?;
+    const parsed = try std.json.parseFromSlice(InferenceBudgetFailurePayload, a, capture.bytes.items[data_start..data_end], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", parsed.value.@"error");
+    try std.testing.expect(!parsed.value.retryable);
+    try std.testing.expectEqualStrings("host", parsed.value.budget.?);
+    try std.testing.expectEqual(@as(usize, 110), parsed.value.required_bytes.?);
+    try std.testing.expectEqual(@as(usize, 100), parsed.value.limit_bytes.?);
+    capture.bytes.clearRetainingCapacity();
+    failure.failure.record(null);
+    writeGenerationStreamError(&ctx, &writer, error.ResourceLimitExceeded);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "required_bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "\"retryable\":false") != null);
+    capture.bytes.clearRetainingCapacity();
+    writeGenerationStreamError(&ctx, &writer, error.MemoryBudgetExceeded);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "\"error\":\"MEMORY_BUDGET_EXCEEDED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "\"retryable\":false") != null);
+    capture.bytes.clearRetainingCapacity();
+    writeGenerationStreamError(&ctx, &writer, error.PromptTooLong);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "prompt exceeds") != null);
+}
+
+test "document reader borrows one logical request slot and bounds physical work" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .max_concurrent_requests = 1, .max_work_units = 64 });
+    defer node.deinit();
+    var control = InferenceExecutionControl{};
+    var owner = try Node.ReadRequestSlot.acquire(&node, &control);
+    defer owner.deinit();
+    try std.testing.expect(control.request_slot_admitted);
+    try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+    var peer_control = InferenceExecutionControl{};
+    try std.testing.expectError(error.QueueFull, Node.ReadRequestSlot.acquire(&node, &peer_control));
+    try std.testing.expect(!peer_control.request_slot_admitted);
+    var nested = try Node.ReadRequestSlot.acquire(&node, &control);
+    try node.reserveAdmissionUnits(64);
+    try std.testing.expectError(error.QueueFull, node.reserveAdmissionUnits(1));
+    node.releaseSlotUnits(64);
+    nested.deinit();
+    try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    owner.deinit();
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
+test "document work admission exhaustion preserves retryable identity" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try documentFailureResponse(&ctx, error.QueueFull);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    var body = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer body.deinit();
+    try std.testing.expect(body.value.object.get("retryable").?.bool);
+    try std.testing.expectEqualStrings("inference_admission", body.value.object.get("reason").?.string);
+}
+
+fn checkReaderWorkspaceOutputClone(a: std.mem.Allocator) !void {
+    var text = [_]u8{ 'o', 'c', 'r' };
+    var source_items = [_]readers_api.Result{ .{ .text = &text, .item_id = "page-1", .source_fingerprint = "source", .page_number = 2, .regions_json = "[]", .fields_json = "{}", .document_json = "{}" }, .{ .text = &text, .item_id = "page-2", .completion = .length } };
+    const source = readers_api.BatchResult{ .items = &source_items, .execution = .{ .requested_items = 2, .serial_items = 2 }, .usage = .{ .prompt_tokens = 4, .completion_tokens = 2, .total_tokens = 6 } };
+    var copy = try Node.cloneReaderBatchResult(a, source);
+    defer copy.deinit(a);
+    @memset(&text, 'x');
+    try std.testing.expectEqualStrings("ocr", copy.items[0].text);
+    try std.testing.expectEqualStrings("page-1", copy.items[0].item_id);
+    try std.testing.expectEqualStrings("source", copy.items[0].source_fingerprint.?);
+    try std.testing.expectEqual(readers_api.Completion.length, copy.items[1].completion);
+    try std.testing.expectEqual(@as(i64, 6), copy.usage.?.total_tokens);
+    try copy.execution.validate(2);
+}
+
+test "reader workspace output transfer preserves ownership and every OOM cleanup" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReaderWorkspaceOutputClone, .{});
+}
+
+test "native media Node dispatcher transfers serial credit and releases physical encoder peaks" {
+    const a = std.testing.allocator;
+    const Tensor = backends_mod.Tensor;
+    const Info = backends_mod.TensorInfo;
+    const Session = backends_mod.Session;
+    const Fake = struct {
+        batched: bool,
+        kv: bool = false,
+        factor: f32 = 1,
+        fn info(_: *anyopaque) []const Info {
+            return &.{.{ .name = "values", .dtype = .f32, .shape = &.{ -1, 1 } }};
+        }
+        fn independent(raw: *anyopaque, _: []const Tensor) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.batched;
+        }
+        fn outputInfo(raw: *anyopaque) []const Info {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.kv) &.{.{ .name = "present.0.decoder.key", .dtype = .f32, .shape = &.{ -1, 1 } }} else info(raw);
+        }
+        fn geometry(raw: *anyopaque, _: @import("../backends/session.zig").ShapeInputs, _: usize) !?@import("../backends/session.zig").RunGeometry {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.kv) .{ .sequence = 1, .output_bytes = 20, .output_kv_bytes = 20 } else null;
+        }
+        fn backend(_: *anyopaque) backends_mod.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(raw: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const scratch = try alloc.alloc(u8, 128 * 1024);
+            defer alloc.free(scratch);
+            @memset(scratch, 42);
+            const out = try alloc.alloc(Tensor, 1);
+            errdefer alloc.free(out);
+            out[0] = try Tensor.initFloat32(alloc, if (self.kv) "present.0.decoder.key" else "values", &.{ 1, 1 }, &.{inputs[0].asFloat32()[0] * self.factor});
+            return out;
+        }
+        fn controlled(raw: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]Tensor {
+            try control.check();
+            return run(raw, inputs, alloc);
+        }
+    };
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    for (0..3) |mode| {
+        var encoder = Fake{ .batched = false };
+        var fake = Fake{ .batched = mode == 1, .kv = mode == 2, .factor = 2 };
+        var controller = runtime.tier.memory.AdmissionController{};
+        var gate: std.atomic.Mutex = .unlocked;
+        const session = Session{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .runWithControl = Fake.controlled, .inputInfo = Fake.info, .outputInfo = Fake.outputInfo, .runGeometry = Fake.geometry, .backend = Fake.backend, .close = Fake.close, .independentBatchRows = Fake.independent }, .execution_gate = &gate, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 192 * 1024 }, .static_workspace_bytes = 128 * 1024, .check_live_memory = false } };
+        var encoder_session = session;
+        encoder_session.ptr = &encoder;
+        var workspace = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = a, .session = encoder_session, .trim_on_free = true };
+        defer workspace.deinit();
+        var input = try Tensor.initFloat32(a, "values", &.{ 1, 1 }, &.{7});
+        defer input.deinit();
+        const dispatch = node.tensorBatchDispatch(.transcribe);
+        const outputs = try dispatch.run(workspace.allocator(), session, null, &gate, &.{input}, .{ .io = std.testing.io });
+        try std.testing.expectEqualSlices(f32, &.{14}, outputs[0].asFloat32());
+        try std.testing.expect(workspace.session.?.ptr == @as(*anyopaque, @ptrCast(&encoder)));
+        try std.testing.expectEqual(mode == 2, controller.snapshot().host_kv_bytes > 0);
+        // The output remains alive, but not the encoder's 128 KiB peak.
+        try std.testing.expect(controller.snapshot().host_scratch_bytes < 4096);
+        for (outputs) |*tensor| tensor.deinit();
+        workspace.allocator().free(outputs);
+        try workspace.trim();
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    }
+}
+
+test "document direct entry owns one request through native text and releases failures" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .max_concurrent_requests = 1, .max_work_units = 64 });
+    defer node.deinit();
+    const Probe = struct {
+        node: *Node,
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(usize, 1), self.node.inference_admission.inFlightRequests());
+            self.calls += 1;
+        }
+    };
+    var probe = Probe{ .node = &node };
+    const fixture = @import("antfly_documents").fixtures.get("two-pages.pdf");
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
+    defer a.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, fixture);
+    const json = try std.fmt.allocPrint(a, "{{\"model\":\"antfly/native-document\",\"documents\":[{{\"id\":\"pdf\",\"url\":\"data:application/pdf;base64,{s}\",\"media_type\":\"application/pdf\"}}]}}", .{encoded});
+    defer a.free(json);
+    const result = try node.readDocumentsJsonWithControl(a, json, .{ .ptr = &probe, .check_fn = Probe.check });
+    defer a.free(result);
+    try std.testing.expect(probe.calls > 0);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+    try std.testing.expect(node.tryAcquireRequestSlot());
+    defer node.releaseRequestSlot();
+    try std.testing.expectError(error.QueueFull, node.readDocumentsJsonWithControl(a, json, .{}));
+    try std.testing.expectError(error.QueueFull, node.extractDocumentsJsonWithControl(a, "{}", .{}));
+    const borrowed = try node.readDocumentsJsonWithControl(a, json, .{ .request_slot_admitted = true, .ptr = &probe, .check_fn = Probe.check });
+    a.free(borrowed);
+    try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+}
+
+test "generation preparation admits prompt formatting before execution and refunds on denial" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    var initial = try node.model_manager.admitHostPreflight(1);
+    initial.release();
+    node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 };
+    var preparation = try node.inferencePreparation();
+    defer preparation.deinit();
+    const content = try a.alloc(u8, 8192);
+    defer a.free(content);
+    @memset(content, 'x');
+    const formatted = generation.formatMessages(preparation.allocator(), &.{.{ .role = "user", .content = content }});
+    try std.testing.expectError(error.OutOfMemory, formatted);
+    try std.testing.expectEqual(error.ResourceLimitExceeded, preparation.admission_error.?);
+    try preparation.trim();
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().hostTotalBytes());
+}
+
+test "encoded reader restores typed checkpoint errors from boolean cancellation" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        failure: anyerror,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 3) return self.failure;
+        }
+    };
+    for ([_]anyerror{ error.Timeout, error.CheckpointRevisionUnavailable }) |failure| {
+        var probe = Probe{ .failure = failure };
+        try std.testing.expectError(failure, node.readEncodedImagesReportedDirectWithControl(a, "unused", .{ .images = &.{} }, .{ .ptr = &probe, .check_fn = Probe.check }));
+        try std.testing.expect(probe.calls >= 3);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+    }
+}
+
+test "encoded reader admits preparatory manifest allocations before loading models" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const padding = try a.alloc(u8, 32 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const config = try std.fmt.allocPrint(a, "{{\"model_type\":\"qwen2_vl\",\"ignored\":\"{s}\"}}", .{padding});
+    defer a.free(config);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = config });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var node = try Node.init(a, .{ .max_concurrent_requests = 1, .max_work_units = 64 });
+    defer node.deinit();
+    var initial = try node.model_manager.admitHostPreflight(1);
+    initial.release();
+    node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 16 * 1024, .scratch_limit_bytes = 16 * 1024 };
+    try std.testing.expectError(error.ResourceLimitExceeded, node.readEncodedImagesReportedDirectWithControl(a, path, .{ .images = &.{.{ .bytes = @import("antfly_documents").fixtures.get("one-pixel.png"), .mime_type = "image/png" }} }, .{ .io = std.testing.io }));
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
+test "reader retained control preserves one-shot failures through nested broker adapters" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.CheckpointRevisionUnavailable;
+        }
+        fn cancelled(raw: *const anyopaque) bool {
+            const control: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+            control.check() catch return true;
+            return false;
+        }
+        fn execute(_: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+            for (items) |item| {
+                item.control.check() catch |err| {
+                    item.slot.fail(err);
+                    continue;
+                };
+                item.slot.setValue(usize, 1, .serial);
+            }
+        }
+    };
+    var probe = Probe{};
+    const original = InferenceExecutionControl{ .ptr = &probe, .check_fn = Probe.check };
+    var retained = Node.ReadCancellationBridge{ .control = &original };
+    const control = retained.retainedControl();
+    var broker = executor_microbatch.Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    const result = try broker.submitControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "nested-reader", .task = .read, .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 1, .max_items = 1 }, .{}, .{}, null, .{ .ptr = &control, .is_cancelled_fn = Probe.cancelled }, &@as(usize, 1), &probe, Probe.execute);
+    try std.testing.expect(result.result == .item_error);
+    try std.testing.expectEqual(error.CheckpointRevisionUnavailable, retained.failure().?);
+    try std.testing.expectError(error.CheckpointRevisionUnavailable, control.check());
+}
+
+test "reader worker prompt planning admits before execution and refunds denials" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    var initial = try node.model_manager.admitHostPreflight(1);
+    initial.release();
+    node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 };
+    const content = try a.alloc(u8, 8192);
+    defer a.free(content);
+    @memset(content, 'x');
+    // Formatting must fail before the helper can access a tokenizer or model
+    // execution state. Both cohort and continuous paths use this same owner.
+    var model: model_manager_mod.LoadedModel = undefined;
+    model.chat_tmpl = null;
+    model.session = .{ .ptr = undefined, .vtable = undefined };
+    try std.testing.expectError(error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1));
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().hostTotalBytes());
+}
+
+test "reader preparation cumulative owned allocations distinguish policy from peers" {
+    for ([_]bool{ false, true }) |contended| {
+        var node = try Node.init(std.testing.allocator, .{});
+        defer node.deinit();
+        var initial = try node.model_manager.admitHostPreflight(1);
+        initial.release();
+        node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = if (contended) 96 * 1024 else 48 * 1024, .scratch_limit_bytes = if (contended) 96 * 1024 else 48 * 1024 };
+        var peer = try node.model_manager.admitHostPreflight(if (contended) 48 * 1024 else 0);
+        defer peer.release();
+        var preparation = try node.inferencePreparation();
+        defer preparation.deinit();
+        const a = preparation.allocator();
+        _ = try a.alloc(u8, 32 * 1024);
+        try preparation.trim();
+        // Each delta fits the policy alone. Together, this owner cannot fit in
+        // the first case; only unrelated peer occupancy prevents the second.
+        try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 24 * 1024));
+        try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.admission_error.?);
+    }
+}
+
+test "reader metadata ancestry remains intrinsic during execution admission" {
+    const Scope = @import("../pipelines/preprocessing_memory.zig").Scope;
+    for ([_]bool{ false, true }) |contended| {
+        var node = try Node.init(std.testing.allocator, .{});
+        defer node.deinit();
+        var metadata = try node.inferencePreparation();
+        defer metadata.deinit();
+        node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = if (contended) 160 * 1024 else 80 * 1024, .scratch_limit_bytes = if (contended) 160 * 1024 else 80 * 1024 };
+        _ = try metadata.allocator().alloc(u8, 32 * 1024);
+        try metadata.trim();
+        var peer = try node.model_manager.admitHostPreflight(if (contended) 80 * 1024 else 0);
+        defer peer.release();
+        const Fake = struct {
+            fn info(_: *anyopaque) []const backends_mod.TensorInfo {
+                return &.{};
+            }
+        };
+        const session = backends_mod.Session{ .ptr = undefined, .vtable = &.{ .run = undefined, .inputInfo = Fake.info, .outputInfo = Fake.info, .backend = undefined, .close = undefined }, .run_admission = .{ .controller = &node.model_manager.resource_domain.?.admission, .backend_class = .cpu, .limits = node.model_manager.resource_domain.?.admission_limits, .static_workspace_bytes = 1, .check_live_memory = false } };
+        var preparation = Scope.child(std.testing.allocator, session, null);
+        preparation.owner.parent = &metadata;
+        defer preparation.deinit();
+        const a = try preparation.allocator();
+        _ = try a.alloc(u8, 8 * 1024);
+        try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.admitRun(session, .{ .output_bytes = 0, .workspace_bytes = 48 * 1024, .workspace_planned = true }));
+        try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 64 * 1024));
+        try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.failure(error.OutOfMemory));
+        try std.testing.expect(node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes > 0);
+    }
+}
+
+test "reader prompt planning includes pinned model residency before formatting" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |contended| {
+        var node = try Node.init(a, .{});
+        defer node.deinit();
+        var preparation = try node.inferencePreparation();
+        defer preparation.deinit();
+        const domain = node.model_manager.resource_domain.?;
+        domain.admission_limits = .{ .host_limit_bytes = if (contended) 48 * 1024 else 24 * 1024, .scratch_limit_bytes = 48 * 1024 };
+        var weights = try domain.admission.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = 16 * 1024 }, false);
+        defer weights.release();
+        var peer = try domain.admission.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = if (contended) 24 * 1024 else 0 }, false);
+        defer peer.release();
+        var model: model_manager_mod.LoadedModel = undefined;
+        model.chat_tmpl = null;
+        model.session = .{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &domain.admission, .backend_class = .cpu, .limits = domain.admission_limits, .required_residency = weights.amounts, .static_workspace_bytes = 1, .check_live_memory = false } };
+        const content = try a.alloc(u8, 16 * 1024);
+        defer a.free(content);
+        @memset(content, 'x');
+        try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1));
+    }
+}
+
+test "reader direct prompt preparation includes metadata and pinned model in rejection classification" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |contended| {
+        var node = try Node.init(a, .{});
+        defer node.deinit();
+        var preparation = try node.inferencePreparation();
+        defer preparation.deinit();
+        const domain = node.model_manager.resource_domain.?;
+        domain.admission_limits = .{ .host_limit_bytes = if (contended) 64 * 1024 else 32 * 1024, .scratch_limit_bytes = 64 * 1024 };
+        _ = try preparation.allocator().alloc(u8, 4 * 1024);
+        try preparation.trim();
+        var weights = try domain.admission.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = 16 * 1024 }, false);
+        defer weights.release();
+        var peer = try domain.admission.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = if (contended) 32 * 1024 else 0 }, false);
+        defer peer.release();
+        var model: model_manager_mod.LoadedModel = undefined;
+        model.chat_tmpl = null;
+        model.session = .{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &domain.admission, .backend_class = .cpu, .limits = domain.admission_limits, .required_residency = weights.amounts, .static_workspace_bytes = 1, .check_live_memory = false } };
+        // The direct path reuses an owner already holding manifest metadata.
+        var binding = try Node.bindPreparationModelResidency(&preparation, &model);
+        defer if (binding) |*held| held.deinit();
+        const content = try a.alloc(u8, 16 * 1024);
+        defer a.free(content);
+        @memset(content, 'x');
+        try std.testing.expectError(error.OutOfMemory, Node.countPromptTokens(preparation.allocator(), "unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1, false, false));
+        try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.admission_error.?);
+    }
+}
+
+test "reader direct generation entry point preserves pinned residency and cleans up planning rejection" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"llama","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"intermediate_size":8,"vocab_size":8192,"max_position_embeddings":1048576}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data =
+        \\{"model":{"type":"WordPiece","vocab":{"[UNK]":0,"x":1},"unk_token":"[UNK]","continuing_subword_prefix":"##"},"pre_tokenizer":{"type":"Whitespace"}}
+    });
+    // Only prompt planning runs: a real native session imports this embedding
+    // table, but no forward requiring the other decoder weights may execute.
+    const header = "{\"model.embed_tokens.weight\":{\"dtype\":\"F32\",\"shape\":[8192,4],\"data_offsets\":[0,131072]}}";
+    const header_len = std.mem.alignForward(usize, header.len, 8);
+    const checkpoint = try a.alloc(u8, 8 + header_len + 131072);
+    defer a.free(checkpoint);
+    @memset(checkpoint, 0);
+    std.mem.writeInt(u64, checkpoint[0..8], header_len, .little);
+    @memset(checkpoint[8..][0..header_len], ' ');
+    @memcpy(checkpoint[8..][0..header.len], header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = checkpoint });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    node.session_manager.preferred_backends = &.{.native};
+    node.session_manager.native_call_policy = .in_process;
+    node.model_manager.session_manager.preferred_backends = &.{.native};
+    node.model_manager.session_manager.native_call_policy = .in_process;
+    var handle = try node.model_manager.acquireFromDirWithControl(path, .{ .io = io });
+    defer handle.release();
+    const model = handle.get();
+    try std.testing.expect(model.manifest.model_type == .generator);
+    const domain = node.model_manager.resource_domain.?;
+    const resident = (try model.session.run_admission.?.requiredResidency().total()).hostTotalBytes();
+    try std.testing.expect(resident >= 128 * 1024);
+    const content = try a.alloc(u8, 16 * 1024);
+    defer a.free(content);
+    @memset(content, 'x');
+    const messages = [_]generation.Message{.{ .role = "user", .content = content }};
+    for ([_]bool{ false, true }) |contended| {
+        const cap = resident + if (contended) @as(usize, 256 * 1024) else @as(usize, 32 * 1024);
+        domain.admission_limits = .{ .host_limit_bytes = cap, .scratch_limit_bytes = cap };
+        model.session.run_admission.?.limits = domain.admission_limits;
+        const baseline = domain.admission.snapshot().hostTotalBytes();
+        var peer = try domain.admission.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = if (contended) cap - baseline - 32 * 1024 else 0 }, false);
+        defer peer.release();
+        const before = domain.admission.snapshot();
+        const slots_before = model.generation_admission.snapshot();
+        try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, node.generateMessagesDirectPrepared(
+            a,
+            path,
+            &messages,
+            1,
+            try Node.directGeneratePreflightForMessages(&messages),
+            1,
+            null,
+            true,
+            null,
+            false,
+            null,
+            null,
+            null,
+            .{ .io = io },
+        ));
+        try std.testing.expectEqualDeep(before, domain.admission.snapshot());
+        const slots_after = model.generation_admission.snapshot();
+        // Prove rejection occurred after model acquisition and execution-slot
+        // admission, rather than during preliminary manifest inspection.
+        try std.testing.expectEqual(slots_before.started + 1, slots_after.started);
+        try std.testing.expectEqual(@as(usize, 0), slots_after.active);
+        try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    }
 }

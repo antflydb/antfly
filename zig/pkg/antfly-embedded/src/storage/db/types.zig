@@ -57,6 +57,8 @@ pub const GeoShapeRelation = enum {
 };
 
 pub const SyncLevel = @import("mutation_values.zig").SyncLevel;
+pub const CommitRequires = @import("mutation_values.zig").CommitRequires;
+pub const parseCommitRequires = @import("mutation_values.zig").parseCommitRequires;
 pub const parsePublicSyncLevelText = @import("mutation_values.zig").parsePublicSyncLevelText;
 pub const parsePublicSyncLevelJson = @import("mutation_values.zig").parsePublicSyncLevelJson;
 pub const publicSyncLevelText = @import("mutation_values.zig").publicSyncLevelText;
@@ -347,6 +349,9 @@ pub const BatchRequest = struct {
     /// select revision_v1; an absent wire field always decodes as legacy.
     document_version_scheme: DocumentVersionScheme = .admit_current,
     sync_level: SyncLevel = .write,
+    commit_requires: ?CommitRequires = null,
+    /// Private immutable producer effects. Never accepted by public codecs.
+    prepared_enrichments_json: ?[]const u8 = null,
     /// Internal single-participant transaction contract. Transform expansion
     /// still runs under the DB apply lock, but the batch is rejected before
     /// mutation if it would emit graph projection deltas that the distributed
@@ -497,7 +502,7 @@ pub const BatchRequest = struct {
 /// Promote a borrowed public view without copying or granting private authority.
 /// The caller retains every buffer through the synchronous mutation call.
 pub fn fromPublicMutation(req: @import("mutation_values.zig").PublicBatchRequest) BatchRequest {
-    return .{ .writes = req.writes, .deletes = req.deletes, .transforms = req.transforms, .graph_writes = req.graph_writes, .graph_deletes = req.graph_deletes, .sync_level = req.sync_level };
+    return .{ .writes = req.writes, .deletes = req.deletes, .transforms = req.transforms, .graph_writes = req.graph_writes, .graph_deletes = req.graph_deletes, .sync_level = req.sync_level, .commit_requires = req.commit_requires };
 }
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
@@ -1901,6 +1906,8 @@ pub const TransactionIntentRequest = struct {
     timestamp_ns: u64 = 0,
     external_decision_owner: ?@import("../transactions.zig").ExternalDecisionOwner = null,
     external_activation: bool = false,
+    commit_requires: ?CommitRequires = null,
+    prepared_enrichments_json: ?[]const u8 = null,
     document_version_scheme: DocumentVersionScheme = .admit_current,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
@@ -2136,6 +2143,7 @@ pub const GraphQueryDiagnosticSink = struct {
     record_fn: *const fn (*anyopaque, []const u8, []const u8, []const u8) void,
 };
 
+pub const IndexAliasFence = struct { name: []const u8, incarnation: u64 };
 pub const SearchRequest = struct {
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
@@ -2143,6 +2151,7 @@ pub const SearchRequest = struct {
 
     /// Private authoritative metadata assertion. Zero means no active masking;
     /// a nonzero value must match the installed policy before reading data.
+    index_alias_fences: []const IndexAliasFence = &.{},
     privacy_policy_version: ?[64]u8 = null,
     /// Trusted graph admission workspace; never part of the public wire DSL.
     graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
@@ -2366,6 +2375,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "index_alias_fences",
     "privacy_policy_version",
     "graph_work_budget",
     // Conditional delivery runs after child authorization and retrieval.
@@ -3844,6 +3854,7 @@ pub const ResolverReplayObservation = struct {
 };
 
 pub const ResolverReplayDiagnostic = struct {
+    candidate_key_prefix: []const u8 = "",
     name: []const u8 = "",
     config_generation: u64 = 0,
     effective_generation: u64 = 0,
@@ -3854,6 +3865,26 @@ pub const ResolverReplayDiagnostic = struct {
     table: []const u8 = "",
     source_artifact: []const u8 = "",
     resolution_artifact: []const u8 = "",
+
+    // Diagnostics cross cache/snapshot ownership boundaries. Keep all textual
+    // fields in one cloning contract so adding a fence cannot introduce a
+    // borrowed pointer into an otherwise owned snapshot.
+    pub fn clone(self: @This(), alloc: Allocator) !@This() {
+        var owned = self;
+        inline for (@typeInfo(@This()).@"struct".field_names, @typeInfo(@This()).@"struct".field_types) |name, T| {
+            if (T == []const u8) @field(owned, name) = "";
+        }
+        errdefer owned.deinit(alloc);
+        inline for (@typeInfo(@This()).@"struct".field_names, @typeInfo(@This()).@"struct".field_types) |name, T| {
+            if (T == []const u8) @field(owned, name) = try alloc.dupe(u8, @field(self, name));
+        }
+        return owned;
+    }
+    pub fn deinit(self: @This(), alloc: Allocator) void {
+        inline for (@typeInfo(@This()).@"struct".field_names, @typeInfo(@This()).@"struct".field_types) |name, T| {
+            if (T == []const u8) alloc.free(@field(self, name));
+        }
+    }
 };
 
 pub const ResolverReplayDiagnostics = struct {
@@ -5398,6 +5429,7 @@ pub const DerivedWorkerStats = struct {
     workers: u64 = 0,
     failed_workers: u64 = 0,
     workers_with_replay_debt: u64 = 0,
+    workers_waiting_for_replay_input: u64 = 0,
     max_replay_lag_sequences: u64 = 0,
     recoverable_retries: u64 = 0,
     writer_locked_retries: u64 = 0,
@@ -5565,12 +5597,7 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
 }
 
 pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
-    for (stats.resolvers) |resolver| {
-        alloc.free(resolver.name);
-        alloc.free(resolver.table);
-        alloc.free(resolver.source_artifact);
-        alloc.free(resolver.resolution_artifact);
-    }
+    for (stats.resolvers) |resolver| resolver.deinit(alloc);
     if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
 }
 
@@ -5677,6 +5704,60 @@ pub const IndexTargetVisibility = struct {
     serving_set_effect: ServingSetEffect = .may_reduce,
 };
 
+/// New dense envelopes use formerly reserved bits. Gate the complete transport
+/// before proposal, including fragmented uploads whose header is not visible.
+/// Legacy commands retain their original minimum and remain replayable.
+pub fn requiresDenseArtifactFlagsProtocol(req: BatchRequest) bool {
+    const floor = @import("artifact_inventory.zig").dense_artifact_flags_protocol;
+    if (req.artifact_catalog) |catalog| if (catalog.binding.effect_protocol >= floor) return true;
+    if (req.group_source) |group| if (group.action == .activate_catalog) return true;
+    if (req.online_source) |source| if (source == .admit) {
+        if (source.admit.artifact_catalog) |catalog| if (catalog.effect_protocol >= floor) return true;
+    };
+    if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |catalog| if (catalog.effect_protocol >= floor) return true;
+    if (req.leann_record != null) return true; // apply may emit an int8 stub
+    if (req.artifact_publication_transport) |transport| switch (transport.action) {
+        .begin, .chunk, .finalize => return true,
+        .prune, .abandon => {},
+    };
+    for (req.writes) |write| if (hasDenseArtifactFlags(write.value)) return true;
+    for (req.merge_artifacts) |write| if (hasDenseArtifactFlags(write.value)) return true;
+    if (req.artifact_publication) |command| for (command.mutations) |mutation| {
+        if (mutation.value) |value| if (hasDenseArtifactFlags(value)) return true;
+    };
+    if (req.merge_page) |page| {
+        if (page.source.artifact_catalog) |catalog| if (catalog.effect_protocol >= floor) return true;
+        for (page.artifact_effects) |effect| if (effect.value) |value| if (hasDenseArtifactFlags(value)) return true;
+        if (page.chunk) |chunk| if (chunk.payload == .artifact and @import("../internal_keys.zig").isEmbeddingArtifactKey(chunk.row_key)) return true;
+    }
+    return false;
+}
+
+fn hasDenseArtifactFlags(value: []const u8) bool {
+    const codec = @import("enrichment/artifact_codec.zig");
+    const header = codec.decodeHeaderPrefix(value) catch return false;
+    return header.kind == .dense_embedding and (header.flags.text_input or header.flags.int8_payload);
+}
+
+test "leann dense artifact flags require a distinct all-replica protocol floor" {
+    const a = std.testing.allocator;
+    const codec = @import("enrichment/artifact_codec.zig");
+    const old = try codec.encodeDenseEmbeddingAlloc(a, 7, &.{ 1, 2 });
+    defer a.free(old);
+    const text = try codec.encodeProducedDenseEmbeddingAlloc(a, 7, true, &.{ 1, 2 });
+    defer a.free(text);
+    const media = try codec.encodeInt8ElidedDenseEmbeddingAlloc(a, try codec.decodeHeader(old), &.{ 1, 2 }, 9);
+    defer a.free(media);
+    try std.testing.expect(!requiresDenseArtifactFlagsProtocol(.{ .writes = &.{.{ .key = "vector", .value = old }} }));
+    for ([_][]const u8{ text, media }) |value| try std.testing.expect(requiresDenseArtifactFlagsProtocol(.{ .writes = &.{.{ .key = "vector", .value = value }} }));
+    // Partial/base64 upload bytes cannot be reliably identified as an envelope.
+    try std.testing.expect(requiresDenseArtifactFlagsProtocol(.{ .artifact_publication_transport = .{ .action = .chunk } }));
+    try std.testing.expect(requiresDenseArtifactFlagsProtocol(.{ .leann_record = .{ .index_name = "idx", .record = "r" } }));
+    // Model a legacy validator: new bits were all reserved on old replicas.
+    try std.testing.expect((text[11] & 0xe0) != 0);
+    try std.testing.expect((old[11] & 0xe0) == 0);
+}
+
 /// New relationship keys and durable endpoint retirements require peers that
 /// understand their complete identities before any primary rows are applied.
 pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
@@ -5750,6 +5831,7 @@ pub fn validateLeannRecordCommand(req: BatchRequest) !void {
     if (command.record.len == 0 or command.record.len > leann_record_max_bytes) return error.InvalidBatchRequest;
     const defaults = BatchRequest{};
     inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, field_name, "leann_record") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
             const value = @field(req, field_name);
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
@@ -5761,6 +5843,9 @@ pub fn validateLeannRecordCommand(req: BatchRequest) !void {
 
 test "leann record command must stand alone" {
     try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .sync_level = .write });
+    try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .document_version_scheme = .legacy });
+    // Version tags have no document effect on this standalone control.
+    try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .document_version_scheme = .revision_v1 });
     try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "", .record = "r" } }));
     try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "" } }));
     try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .deletes = &.{"doc"} }));
@@ -5779,6 +5864,7 @@ pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
     if (req.graph_endpoint_cleanup_planned) try validatePlannedGraphEndpointCleanup(req);
     const defaults = BatchRequest{};
     inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, field_name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field_name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
             if (comptime std.mem.eql(u8, field_name, "deletes") or std.mem.eql(u8, field_name, "graph_deletes") or std.mem.eql(u8, field_name, "graph_endpoint_cleanup_guards") or std.mem.eql(u8, field_name, "merge_artifacts")) {
                 if (!req.graph_endpoint_cleanup_planned and @field(req, field_name).len != 0) return error.InvalidBatchRequest;
@@ -5876,4 +5962,17 @@ test "document revision admission preserves explicit schemes and excludes isolat
         frozen.document_version_scheme = .revision_v1;
         try std.testing.expectEqual(DocumentVersionScheme.revision_v1, frozen.admittedDocumentVersionScheme(supported));
     }
+}
+
+fn testResolverDiagnosticOwnership(a: Allocator) !void {
+    const original = ResolverReplayDiagnostic{ .name = "facts", .table = "entities", .source_artifact = "input", .resolution_artifact = "output", .candidate_key_prefix = "source/ours/", .config_generation = 42 };
+    const copy = try original.clone(a);
+    defer copy.deinit(a);
+    try std.testing.expectEqualStrings(original.candidate_key_prefix, copy.candidate_key_prefix);
+    try std.testing.expect(copy.candidate_key_prefix.ptr != original.candidate_key_prefix.ptr);
+    try std.testing.expectEqual(original.config_generation, copy.config_generation);
+}
+
+test "resolver diagnostics cloning owns every textual fence under allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testResolverDiagnosticOwnership, .{});
 }

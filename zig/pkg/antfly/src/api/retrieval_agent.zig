@@ -12951,7 +12951,7 @@ test "retrieval agent context compacts pipeline evidence through independent gen
             }
             self.generations += 1;
             if (chain[0].generator.provider == .apple) {
-                const request_json = try generating.appleGenerationRequestAlloc(a, chain[0].generator, messages, false);
+                const request_json = try generating.appleGenerationRequestAlloc(a, chain[0].generator, messages);
                 defer a.free(request_json);
             } else try std.testing.expectEqualStrings("main", chain[0].generator.model);
             const encoded = try std.json.Stringify.valueAlloc(a, messages, .{});

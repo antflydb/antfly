@@ -76,6 +76,8 @@ class DependencyTests(unittest.TestCase):
             ("diagnose-zig-arm64-bad-alloc.yml", "archives"),
             ("pr-ci.yml", "linux-release"),
             ("pr-ci.yml", "darwin"),
+            ("pr-ci.yml", "sdks"),
+            ("sdks-ci.yml", "sdks"),
         ):
             with self.subTest(workflow=workflow, job=name):
                 self.assertIn("      id-token: write", job(workflow, name))

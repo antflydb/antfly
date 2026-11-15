@@ -18,12 +18,15 @@ class ChunkSourceReference:
     """
     Attributes:
         type_ (ChunkSourceReferenceType):
-        uri (str): HTTP(S) or S3 object URI resolved through configured content security and credentials.
+        uri (str): HTTP(S), S3, or absolute file:// URI resolved through configured content security and credentials.
+            Local files require an explicit remote_content.security.allowed_paths allowlist.
         mime_type (str):
-        version (str): Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read.
-        length (int): Exact immutable object length, verified against Content-Range.
-        version_kind (ChunkSourceReferenceVersionKind | Unset): Defaults to strong_etag. S3 version IDs are supported
-            only for S3 sources.
+        version (str): Quoted strong HTTP/S3 ETag, immutable S3 version ID, or lowercase SHA-256 hex digest for
+            file_sha256. Local files are verified in a bounded streaming scan; unchanged files reuse a bounded process-local
+            verification cache across continuation pages. Size, inode, mtime and ctime are checked around every range read.
+        length (int): Exact immutable object length, verified against Content-Range or local file metadata.
+        version_kind (ChunkSourceReferenceVersionKind | Unset): Defaults to strong_etag. S3 version IDs require S3
+            sources; file_sha256 requires a local file URI.
     """
 
     type_: ChunkSourceReferenceType

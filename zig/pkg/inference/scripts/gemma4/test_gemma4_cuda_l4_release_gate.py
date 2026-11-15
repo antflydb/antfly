@@ -361,7 +361,10 @@ class L4ReleaseGateTest(unittest.TestCase):
         self.assertIn("x86_64-linux-musl", platforms)
         self.assertIn("aarch64-linux-musl", platforms)
         self.assertIn("ledger_sha256:", container)
-        self.assertIn("antfly-release-runtime-archives", release)
+        # Promotion consumes sealed scopes; compilation belongs to the artifact
+        # builder rather than a mutable artifact name in the promotion workflow.
+        self.assertIn("build-zig-runtime-archives:", artifact_build)
+        self.assertIn("scripts/packaging/build_zig_release_archive.sh", artifact_build)
         self.assertIn("debian:bookworm-slim", runtime)
         self.assertNotIn("alpine:", runtime)
         self.assertIn('arm64) wasmtime_arch="aarch64"', runtime)

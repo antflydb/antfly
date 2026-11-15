@@ -35,12 +35,12 @@ class ConformanceFixturesTest(unittest.TestCase):
         cls.openjpeg = root / "openjpeg-fixtures"
         cls.cache_args = [
             "--cache-dir",
-            os.environ.get("ZIG_LOCAL_CACHE_DIR", "/tmp/zig-local-cache"),
+            os.environ.get("ZIG_LOCAL_CACHE_DIR", str(ZIG_ROOT / ".zig-cache")),
         ]
         cls.cache_env = {
             **os.environ,
             "ZIG_GLOBAL_CACHE_DIR": os.environ.get(
-                "ZIG_GLOBAL_CACHE_DIR", "/tmp/zig-global-cache"
+                "ZIG_GLOBAL_CACHE_DIR", str(ZIG_ROOT / ".zig-cache/global")
             ),
         }
         subprocess.run(
@@ -158,7 +158,23 @@ class ConformanceFixturesTest(unittest.TestCase):
             [
                 "zig",
                 "test",
-                "lib/image/src/mod.zig",
+                "--dep",
+                "image_processing",
+                "--dep",
+                "image_values",
+                "--dep",
+                "image_work_control",
+                "--dep",
+                "antfly_hash",
+                "-Mroot=lib/image/src/mod.zig",
+                "--dep",
+                "image_values",
+                "--dep",
+                "image_work_control",
+                "-Mimage_processing=lib/image/src/processing.zig",
+                "-Mimage_values=lib/image/src/values.zig",
+                "-Mimage_work_control=lib/image/src/work_control.zig",
+                "-Mantfly_hash=lib/hash/src/mod.zig",
                 "--test-filter",
                 "external jpeg2000 iso conformance corpus",
                 *self.cache_args,

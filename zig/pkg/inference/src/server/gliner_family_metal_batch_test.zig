@@ -24,7 +24,6 @@ const Loopback = @import("gliner_boundary_socket_test.zig").Loopback;
 const batch = @import("gliner_family_cuda_socket_test.zig");
 const factory = @import("../architectures/session_factory.zig");
 const metal = @import("../backends/metal_tensor.zig");
-const decide_qualification = @import("../models/gliner_decide_qualification.zig");
 const memory = @import("../runtime/tier/memory.zig");
 const manager = @import("model_manager.zig");
 const httpx = @import("httpx");
@@ -60,6 +59,8 @@ fn batchPool(node: *Node, transport: *Loopback, directory: []const u8, comptime 
     defer a.free(baselines);
     const allocations = try a.alloc(u64, cases.len);
     defer a.free(allocations);
+    const prepared_lengths = try a.alloc(usize, cases.len);
+    defer a.free(prepared_lengths);
     var built: usize = 0;
     defer for (baselines[0..built]) |body| a.free(body);
     for (cases, baselines, allocations) |case, *baseline, *work| {
@@ -70,6 +71,9 @@ fn batchPool(node: *Node, transport: *Loopback, directory: []const u8, comptime 
         try transport.idle();
         const before = metal.memoryStatsSnapshot();
         baseline.* = try response(transport, body);
+        var decoded = try std.json.parseFromSlice(std.json.Value, a, baseline.*, .{});
+        defer decoded.deinit();
+        prepared_lengths[built] = @intCast(decoded.value.object.get("usage").?.object.get("prompt_tokens").?.integer);
         try transport.idle();
         work.* = metal.memoryStatsSnapshot().device_owned_buffers_created - before.device_owned_buffers_created;
         built += 1;
@@ -95,9 +99,13 @@ fn batchPool(node: *Node, transport: *Loopback, directory: []const u8, comptime 
         for (0..n) |i| serial_work += allocations[(if (reverse) n - 1 - i else i) % cases.len];
         try std.testing.expect(work < serial_work);
         if (role == .decide) {
-            // Large public requests still use <=8 rows and one readback per
-            // physical forward, including their final partial group.
-            const forwards: u64 = @intCast((n - 1) / decide_qualification.metal_batch_items + 1);
+            // Physical grouping obeys the authenticated padded-token policy.
+            // Independent serial usage reports supply the expected row lengths.
+            var longest: usize = 0;
+            for (0..n) |i| longest = @max(longest, prepared_lengths[(if (reverse) n - 1 - i else i) % cases.len]);
+            const policy = factory.getGlinerDecideMetalExecutionPolicy(handle.get().session) orelse return error.MissingGlinerDecisionIdentity;
+            const physical = @min(policy.batch_items, @max(1, policy.padded_batch_tokens / longest));
+            const forwards: u64 = @intCast((n - 1) / physical + 1);
             try std.testing.expectEqual(before.to_host_device_calls + forwards, after.to_host_device_calls);
         }
         var parsed = try std.json.parseFromSlice(std.json.Value, a, actual, .{});
@@ -216,9 +224,12 @@ const ExecutionBarrier = struct {
             {
                 try control.lock(&node.model_manager.load_lock);
                 defer node.model_manager.load_lock.unlock();
-                try std.testing.expectEqual(count + 1, self.handle.get().active_handles);
-                try std.testing.expect(self.held);
-                return;
+                // Aggregate phase counts do not prove that every request owns
+                // a model handle. Wait for both leases under this deadline.
+                if (self.handle.get().active_handles == count + 1) {
+                    try std.testing.expect(self.held);
+                    return;
+                }
             }
             try std.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
@@ -256,12 +267,17 @@ fn lifecycle(node: *Node, transport: *Loopback, directory: []const u8, comptime 
     defer a.free(large);
     const requests = [_][]const u8{ small, large };
     var expected: [2][]u8 = undefined;
+    var expected_readbacks: u64 = 0;
     var built: usize = 0;
     defer for (expected[0..built]) |bytes| a.free(bytes);
     for (requests, &expected) |body, *out| {
+        const readbacks_before = metal.memoryStatsSnapshot().to_host_device_calls;
         out.* = try response(transport, body);
         built += 1;
         try transport.idle();
+        // Concurrent work must perform exactly the same readbacks as these
+        // independent serial calls under the model's current physical policy.
+        expected_readbacks += metal.memoryStatsSnapshot().to_host_device_calls - readbacks_before;
     }
     const domain = node.model_manager.resource_domain.?;
     const retained = domain.admission.snapshot();
@@ -295,7 +311,7 @@ fn lifecycle(node: *Node, transport: *Loopback, directory: []const u8, comptime 
         }
         const after = metal.memoryStatsSnapshot();
         try std.testing.expect(after.device_owned_buffers_created > before.device_owned_buffers_created);
-        if (role == .decide) try std.testing.expectEqual(before.to_host_device_calls + 4, after.to_host_device_calls);
+        if (role == .decide) try std.testing.expectEqual(before.to_host_device_calls + expected_readbacks, after.to_host_device_calls);
         try restored(node, transport, retained);
         std.debug.print("production_metal_batch_lifecycle role={s} concurrent_items=2,{d} pass={d} simultaneous_admissions=2 parity=true leases_restored=true\n", .{ @tagName(role), large_count, pass });
     }
@@ -391,7 +407,7 @@ fn parity(comptime role: Role, environment: [:0]const u8, comptime lifecycle_onl
     node.model_manager.session_manager.preferred_backends = &.{.metal};
     node.model_manager.session_manager.required_backend = .metal;
     try node.attachIo(std.testing.io);
-    const transport = try Loopback.initWithCapacity(a, &node, 2);
+    const transport = try Loopback.initWithLimits(a, &node, 2, .{ .max_h1_inflight_bodies = 2 });
     defer transport.deinit();
     try transport.start();
     const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, switch (role) {
@@ -476,4 +492,12 @@ test "GLiNER production Metal batch lifecycle multilingual FP32" {
 
 test "GLiNER production Metal batch lifecycle Decide FP32" {
     try parity(.decide, "ANTFLY_GLINER_DECIDE_MODEL", true);
+}
+
+test "GLiNER production Metal distinct input batches Decide Q8" {
+    try parity(.decide, "ANTFLY_GLINER_DECIDE_Q8_MODEL", false);
+}
+
+test "GLiNER production Metal batch lifecycle Decide Q8" {
+    try parity(.decide, "ANTFLY_GLINER_DECIDE_Q8_MODEL", true);
 }

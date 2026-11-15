@@ -44,6 +44,11 @@ pub const Provider = struct {
 
     /// Total work belongs to a configuration, across private file checkpoints.
     resume_work: ?*ResumeWork = null,
+    bulk_stage: ?*@import("lake_bulk_stage.zig").Stage = null,
+    bulk_checkpoints: bool = true,
+    bulk_compact_partitions: bool = false,
+    bulk_prebind_parents: bool = true,
+    construction: []const local.metadata_lake_index_catalog.ConstructionWork = &.{},
     source: *serving.ServingSource,
     /// Borrowed authenticated prior inventory, shared by all native builders.
     previous_inventory: ?local.serverless_external_source_types.Inventory = null,
@@ -144,7 +149,21 @@ pub const Provider = struct {
         ptr: *anyopaque,
         save: *const fn (*anyopaque, local.serverless_segment_sidecar_manifest.DeclaredArtifact) anyerror!void,
         save_batch: ?*const fn (*anyopaque, []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) anyerror!void = null,
+        save_work: ?*const fn (*anyopaque, local.metadata_lake_index_catalog.ConstructionWork) anyerror!void = null,
     };
+    pub fn checkpointWork(self: *Provider, work: local.metadata_lake_index_catalog.ConstructionWork) !void {
+        try self.context.ensureActive();
+        const progress = self.progress orelse return;
+        const save = progress.save_work orelse return;
+        var phase: stores.IoGuard = .{};
+        if (self.io_phase) |io| {
+            try io.begin(io.ptr, 1);
+            phase.phase = io;
+        }
+        defer phase.abort();
+        save(progress.ptr, work) catch |err| return phase.failed(err);
+        try phase.finish();
+    }
     pub fn checkpoint(self: *Provider, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
         try self.context.ensureActive();
         if (self.progress) |progress| {

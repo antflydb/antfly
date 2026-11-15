@@ -118,23 +118,12 @@ restarting owners, so recovery must use the repository rather than colocated pin
 Query capture briefly closes write admission while derivations converge and
 manifests are sealed; deadlines, cancellation and WAL/capacity admission bound
 this work. The retained files never hold an apply lock across cursor pages.
-Speculative native snapshot warming defaults off for standalone, embedded and
-distributed deployments, and on for serverless. Set
-`lake_indexes.query_cursors.background_warming` to explicitly enable or disable
-it. On-demand durable cursor capture and retained-generation recovery remain
-available regardless of this setting; disabling warming does not shorten an
-issued cursor's retention or remove already-retained generations.
-When enabled, the shared maintenance scheduler warms coherent private generations in bounded
-8 MiB upload turns with a ten-second I/O deadline. Capture has a two-second
-admission deadline. Chunk progress survives restart; foreground captures reuse
-immutable extent proofs. Failed turns back off, and close cancels and joins the
-worker. One private local generation is retained while uploading, then released;
-warming is disabled when configured capacity allows only one cut. The repository
-commits no readable manifest until every file is uploaded and revalidated.
-First capture can still require a complete generation when hints are cold.
-An already immutable remote-native view can publish a new checkpoint manifest
-by reference, without reconstructing a host tree or transferring its chunks. Cold
-mutable generations still need their first upload; portability is not latency-neutral.
+Speculative native snapshot warming is explicit opt-in in every deployment.
+It owns one size-bounded, unpublished local checkpoint rather than durable
+cursor history. Foreground requests promote matching immutable extents under
+their own retention and store-wide durable admission budget. Private expiry
+maintenance runs independently of warming and new requests, and preserves
+active reader leases. See the runtime/resource contract in architecture.mdx.
 
 Overlay keys are flat scalar fields, with explicit numeric/timestamp normalization
 when declared through `key_types`. The changes input must retain one unique latest

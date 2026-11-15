@@ -60,8 +60,25 @@ pub const Result = struct {
     regions: []Region = &.{},
     structured: ?StructuredValue = null,
     allocator: std.mem.Allocator,
+    lifetime: ?struct { context: *anyopaque, release: *const fn (*anyopaque) void, detach_preparation: ?*const fn (*anyopaque) void = null } = null,
+
+    pub fn detachPreparation(self: *Result) void {
+        if (self.lifetime) |*owner| if (owner.detach_preparation) |detach| {
+            detach(owner.context);
+            owner.detach_preparation = null;
+        };
+    }
 
     pub fn deinit(self: *Result) void {
+        if (self.lifetime) |owner| {
+            self.lifetime = null;
+            owner.release(owner.context);
+            self.text = &.{};
+            self.fields = &.{};
+            self.regions = &.{};
+            self.structured = null;
+            return;
+        }
         self.allocator.free(self.text);
         for (self.fields) |*field| field.deinit(self.allocator);
         if (self.fields.len > 0) self.allocator.free(self.fields);

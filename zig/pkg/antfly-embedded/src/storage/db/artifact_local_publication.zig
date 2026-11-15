@@ -18,8 +18,13 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 const prefix = "\x00\x00__artifact_local_publication:";
-pub fn key(a: A, artifact: []const u8) ![]u8 {
+const keys = @import("../internal_keys.zig");
+const compact_prefix = prefix ++ "v2:";
+pub fn legacyKey(a: A, artifact: []const u8) ![]u8 {
     return std.mem.concat(a, u8, &.{ prefix, artifact });
+}
+pub fn key(a: A, artifact: []const u8) ![]u8 {
+    return keys.documentMetadataKeyAlloc(a, prefix, compact_prefix, artifact);
 }
 pub fn recipe(entry: anytype) [32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
@@ -43,8 +48,6 @@ pub fn encode(definition: [32]u8, parent: []const u8, output: []const u8) [96]u8
     return result;
 }
 pub fn require(a: A, txn: anytype, artifact: []const u8, definition: [32]u8, parent: []const u8, output: []const u8) !void {
-    const selected = try key(a, artifact);
-    defer a.free(selected);
-    const actual = txn.get(selected) catch |err| if (err == error.NotFound) return error.ArtifactPublicationPending else return err;
+    const actual = keys.readDocumentMetadata(a, txn, prefix, compact_prefix, artifact) catch |err| if (err == error.NotFound) return error.ArtifactPublicationPending else return err;
     if (!std.mem.eql(u8, actual, &encode(definition, parent, output))) return error.EnrichmentSourceChanged;
 }

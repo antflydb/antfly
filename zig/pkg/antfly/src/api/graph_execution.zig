@@ -23,6 +23,20 @@ const operation = local.api_operation;
 const port = local.storage_statement_read_fence;
 
 pub const WriteOutcome = enum { not_started, aborted, committed, unknown };
+pub fn readDomains(a: std.mem.Allocator, graph: cypher.catalog.Graph, query: cypher.ast.Query, parameters: []const cypher.value.Entry, context: operation.RequestContext) !cypher.read_domains.Plan {
+    return readDomainsWithBudget(a, graph, query, parameters, context, null);
+}
+pub fn readDomainsWithBudget(a: std.mem.Allocator, graph: cypher.catalog.Graph, query: cypher.ast.Query, parameters: []const cypher.value.Entry, context: operation.RequestContext, budget: ?*cypher.read_domains.Budget) !cypher.read_domains.Plan {
+    return readDomainsForTables(a, graph, query, parameters, context, budget, null);
+}
+pub fn readDomainsForTables(a: std.mem.Allocator, graph: cypher.catalog.Graph, query: cypher.ast.Query, parameters: []const cypher.value.Entry, context: operation.RequestContext, budget: ?*cypher.read_domains.Budget, prunable_tables: ?*const cypher.read_domains.TableSet) !cypher.read_domains.Plan {
+    return cypher.read_domains.plan(a, graph, query, parameters, .{ .budget = budget, .prunable_tables = prunable_tables, .checkpoint = .{ .ptr = &context, .call = struct {
+        fn check(ptr: *const anyopaque) !void {
+            const current: *const operation.RequestContext = @ptrCast(@alignCast(ptr));
+            try current.ensureActive();
+        }
+    }.check } });
+}
 
 /// Shared operator ceilings for text queries and SQL GRAPH_TABLE execution.
 pub fn limits(server: *const server_mod.ApiHttpServer) cypher.runtime.Limits {
@@ -49,7 +63,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     const bytes = try server.source.systemCatalog(scratch, context, .{ .read = .{ .kind = .graph, .name = name } });
     const state = try std.json.parseFromSliceLeaky(domain.State, scratch, bytes, .{ .allocate = .alloc_always });
     const record = state.find(.graph, 0, name) orelse return error.CatalogNotFound;
-    const graph = try domain.graphForExecution(scratch, record);
+    var graph = try domain.graphForExecution(scratch, record);
     var sql: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = identity, .context = context };
     var tables: std.ArrayList(port.GraphTable) = .empty;
     var targets: std.ArrayList(domain.Target) = .empty;
@@ -67,6 +81,8 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
         };
     }
     const resolved = try sql.resolveMany(scratch, targets.items, if (writes and !compiled.query.explain) .read_write else .read);
+    const resolved_record = try @import("../system_catalog/graph_bindings.zig").resolveAliases(scratch, record, resolved);
+    graph = try domain.graphForExecution(scratch, resolved_record);
     for (@constCast(graph.labels), positions) |*physical, position| {
         const target = targets.items[position];
         const table = resolved[position];
@@ -89,12 +105,17 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     var read: ?port.GraphRead = null;
     defer if (read) |value| value.deinit();
     var client: cypher.rpc.Client = undefined;
-    var channel: AuthorityChannel = .{ .read_owner = &read, .server = server, .identity = identity, .context = context, .name = name, .record_id = record.id, .tables = tables.items, .writes = writes and !compiled.query.explain, .role_revision = role_revision };
+    var channel: AuthorityChannel = .{ .read_owner = &read, .server = server, .identity = identity, .context = context, .name = name, .record_id = record.id, .index_catalogs = resolved, .tables = tables.items, .writes = writes and !compiled.query.explain, .role_revision = role_revision };
+    channel.attribution_allocator = scratch;
     const needed = try cypher.dependencies.required(scratch, compiled.query, graph);
+    const domains = try readDomains(scratch, graph, compiled.query, request.parameters, context);
     var read_tables: std.ArrayList(port.GraphTable) = .empty;
     for (tables.items) |table| if (cypher.dependencies.contains(needed, table.name)) {
         var selected = table;
         selected.indexes = if (writes) null else try cypher.dependencies.indexesForTable(scratch, compiled.query, graph, table.name);
+        if (!writes) if (domains.table(table.name)) |key_domain| {
+            selected.keys = key_domain.keys;
+        };
         try read_tables.append(scratch, selected);
     };
     if (!compiled.query.explain and read_tables.items.len != 0) {
@@ -107,11 +128,12 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
             const write_source = server.table_writes orelse return error.CypherMutationsUnavailable;
             for (read_tables.items) |table| try write_source.activateRangeTracking(scratch, table.name, context);
         }
-        read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, record, .{}), .tables = read_tables.items, .partial_graph = needed != null, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
+        read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, resolved_record, .{}), .tables = read_tables.items, .partial_graph = needed != null, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
         channel.read = &read.?;
         client = .{ .channel = channel.rpcChannel(), .incarnation = graph.incarnation, .revision = graph.revision };
         provider = client.backend();
     }
+    provider.index_attribution = .{ .ptr = &channel, .snapshot = AuthorityChannel.indexSnapshot };
     var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = read_tables.items, .release_read = AuthorityChannel.releaseRead, .channel = channel.rpcChannel() };
     errdefer if (writer.receipt) |receipt| {
         write_outcome.* = switch (receipt.status) {
@@ -152,6 +174,10 @@ pub const AuthorityChannel = struct {
     name: []const u8,
     record_id: u64,
     tables: []const port.GraphTable,
+    index_catalogs: []const local.sql_catalog.Table = &.{},
+    resolved_search_indexes: std.StringHashMapUnmanaged(void) = .empty,
+    attribution_allocator: ?std.mem.Allocator = null,
+    attribution_sink: ?cypher.backend.IndexObserver = null,
     writes: bool,
     read: ?*port.GraphRead = null,
     read_owner: ?*?port.GraphRead = null,
@@ -161,6 +187,21 @@ pub const AuthorityChannel = struct {
     /// Internal RPCs share that boundary; long operations still refresh guards.
     guarded_operation: bool = false,
     role_revision: ?u64 = null,
+    fn indexSnapshot(ptr: *anyopaque, a: std.mem.Allocator) ![]const []const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const result = try a.alloc([]const u8, self.resolved_search_indexes.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |name| a.free(name);
+            a.free(result);
+        }
+        var names = self.resolved_search_indexes.keyIterator();
+        for (result) |*name| {
+            name.* = try a.dupe(u8, names.next().?.*);
+            initialized += 1;
+        }
+        return result;
+    }
     fn releaseRead(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.read = null;
@@ -260,12 +301,21 @@ pub const AuthorityChannel = struct {
         }
         const scope = server_mod.ApiHttpServer.queryEmbeddingSecurityScope(self.identity.*);
         var resolver = self.server.semanticStatusResolver(scope.domain, scope.value);
+        resolver.statement_indexes_json = for (self.index_catalogs) |table| {
+            if (std.mem.eql(u8, table.physical_name, request.table)) break table.index_catalog_json;
+        } else return error.CatalogGenerationChanged;
         const normalized = try self.context.platformDeadline();
         resolver.query_embedding_deadline_ns = normalized.deadline_ns;
         resolver.query_cancellation = normalized.cancellation;
         var parsed = try local.api_query.parsePublicQueryRequestWithDeadline(owned, resolver.iface(), request.table, try std.json.Stringify.valueAlloc(owned, json, .{}), normalized.deadline_ns);
         defer parsed.deinit(owned);
         request.prepared_search_json = try local.api_local_query_contract.encodeQueryRequest(owned, parsed.req);
+        for (try local.api_query.resolvedIndexNames(owned, parsed.req) orelse &.{}) |name| {
+            if (self.attribution_sink) |sink| try sink.record(sink.ptr, name) else {
+                const attribution = self.attribution_allocator orelse return error.CypherSearchPreparationRequired;
+                if (!self.resolved_search_indexes.contains(name)) try self.resolved_search_indexes.put(attribution, try attribution.dupe(u8, name), {});
+            }
+        }
     }
 };
 const Metadata = struct {
@@ -295,7 +345,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.Forbidden, error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => 403,
         error.CatalogNotFound, error.TableNotFound, error.IndexNotFound => 404,
         error.CatalogGenerationChanged, error.SchemaVersionChanged, error.RowPolicyCatalogChanged, error.CypherTransactionConflict, error.CypherWriteRequestAlreadyUsed => 409,
-        error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable, error.EnrichmentRetryInProgress, error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => 503,
+        error.StorageOwnerAdmissionPending, error.CatalogRoutingSnapshotTimeout, error.DocIdentityNamespaceMismatch, error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable, error.EnrichmentRetryInProgress, error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => 503,
         error.OutOfMemory, error.CypherResponseTooLarge, error.CypherMemoryBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherStateBudgetExceeded, error.SqlWriteCapacityUnavailable => 429,
         error.DeadlineExceeded => 408,
         error.Canceled => 499,
@@ -317,7 +367,7 @@ pub fn errorMessage(err: anyerror, outcome: WriteOutcome) []const u8 {
         error.TableNotFound, error.IndexNotFound => "A mapped table or graph index is unavailable. Refresh the graph definition and check its mappings.",
         error.CatalogGenerationChanged, error.SchemaVersionChanged, error.RowPolicyCatalogChanged => "The graph catalog, table schema, or row policy changed during execution. Refresh the graph and run a new query.",
         error.CypherTransactionConflict => "The write was aborted because its read set changed. Run a new statement with a new write request ID.",
-        error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable, error.EnrichmentRetryInProgress, error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => "A coherent graph read is temporarily unavailable. Check graph readiness and try again after the owners become available.",
+        error.StorageOwnerAdmissionPending, error.CatalogRoutingSnapshotTimeout, error.DocIdentityNamespaceMismatch, error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable, error.EnrichmentRetryInProgress, error.CypherSnapshotRequired, error.CypherSnapshotNotReady, error.ReadUnavailable, error.NotLeader, error.LeaderUnavailable, error.ReadIndexTimeout, error.TopologyChanged, error.StorageReadTemporarilyUnavailable, error.RetainedReadRestartRequired, error.GroupLeaderUnavailable, error.Backpressured, error.ConnectionResetByPeer, error.ConnectionRefused, error.ConnectionTimedOut, error.Timeout => "A coherent graph read is temporarily unavailable. Check graph readiness and try again after the owners become available.",
         error.CypherValueDepthExceeded => "A computed or input value exceeds 64 nesting levels. Reduce nested list or map construction.",
         error.CypherResponseTooLarge => "The result exceeds the response limit. Reduce RETURN data or add a smaller LIMIT.",
         error.OutOfMemory, error.CypherMemoryBudgetExceeded, error.CypherAnchorBudgetExceeded, error.CypherEdgeBudgetExceeded, error.CypherStateBudgetExceeded => "The query exceeded its execution budget. Narrow the starting nodes, bound path lengths, or reduce intermediate results.",
@@ -431,8 +481,16 @@ test "graph admission batches SQL operation guards from completed authority chec
 }
 
 test "graph privacy availability retains retryable HTTP outcomes" {
-    for ([_]anyerror{ error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable }) |err| {
+    for ([_]anyerror{ error.StorageOwnerAdmissionPending, error.CatalogRoutingSnapshotTimeout, error.DocIdentityNamespaceMismatch, error.IndexRebuilding, error.PrivacyPending, error.PrivacyStale, error.PrivacyPublicationPending, error.PrivacyInspectionFailed, error.PrivacyReadFenceUnavailable }) |err| {
         try std.testing.expectEqual(@as(u16, 503), httpStatus(err));
         try std.testing.expect(std.mem.indexOf(u8, errorMessage(err, .not_started), "temporarily unavailable") != null);
     }
+}
+
+test "graph readiness failures remain retryable after topology refresh is exhausted" {
+    try std.testing.expectEqual(@as(u16, 503), httpStatus(error.StorageOwnerAdmissionPending));
+    try std.testing.expect(std.mem.indexOf(u8, errorMessage(error.StorageOwnerAdmissionPending, .not_started), "temporarily unavailable") != null);
+    try std.testing.expectEqual(@as(u16, 503), httpStatus(error.CatalogRoutingSnapshotTimeout));
+    try std.testing.expectEqual(@as(u16, 503), httpStatus(error.TopologyChanged));
+    try std.testing.expectEqual(@as(u16, 503), httpStatus(error.DocIdentityNamespaceMismatch));
 }

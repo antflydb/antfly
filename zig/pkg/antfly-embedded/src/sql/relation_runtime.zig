@@ -97,6 +97,15 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
                 const request = if (expression.request == .parameter) parameters[expression.request.parameter - 1] else try describe.bindLiteral(a, expression.request, .string);
                 if (request != .string) return error.InvalidSqlParameters;
                 search.request_text = request.string;
+                if (std.mem.indexOf(u8, scan.table.index_catalog_json, "_index_aliases") != null and
+                    std.mem.startsWith(u8, std.mem.trimStart(u8, request.string, " \t\r\n"), "{"))
+                {
+                    const aliases = @import("../api/index_aliases.zig");
+                    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, scan.table.index_catalog_json, .{});
+                    var body = try std.json.parseFromSliceLeaky(std.json.Value, a, request.string, .{});
+                    try aliases.bindQuery(a, root, &body);
+                    search.request_text = try std.json.Stringify.valueAlloc(a, body, .{});
+                }
                 if (expression.limit) |input| {
                     const limit = if (input == .parameter) parameters[input.parameter - 1] else try describe.bindLiteral(a, input, .integer);
                     const number = if (limit == .integer) limit.integer else if (limit == .string) std.fmt.parseInt(i64, limit.string, 10) catch return error.InvalidSqlParameters else return error.InvalidSqlParameters;
@@ -232,6 +241,10 @@ const SetTestBackend = struct {
 };
 
 test "SQL weighted relational operators retain bags and unwind failed negotiation" {
+    // Retain leak/safety checks and every fault position without collecting
+    // allocation/free stack traces on the successful allocation path.
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
     const Fixture = struct {
         const This = @This();
         fn checkpoint(_: *anyopaque) !void {}
@@ -396,13 +409,13 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
             try std.testing.expectEqual(self.opened, self.closed);
         }
     };
-    try Fixture.run(std.testing.allocator, null);
-    try Fixture.spillRun(std.testing.allocator, false);
-    try Fixture.spillRun(std.testing.allocator, true);
+    try Fixture.run(checked.allocator(), null);
+    try Fixture.spillRun(checked.allocator(), false);
+    try Fixture.spillRun(checked.allocator(), true);
     // Each query owns a separate statement and cursor cohort. Enumerate every
     // allocation failure per query, avoiding quadratic replay of earlier cases.
     for (0..Fixture.cases.len + 3) |index|
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{@as(?usize, index)});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(checked.allocator(), Fixture.run, .{@as(?usize, index)});
 }
 
 test "SQL row membership executes captured typed relations with NULL-aware truth and query boundaries" {

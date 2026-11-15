@@ -64,6 +64,8 @@ pub const Executor = struct {
         remove_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         applied_sequence: *const fn (ptr: *anyopaque, name: []const u8) ?u64,
         snapshot_stats: *const fn (ptr: *anyopaque) types.DerivedWorkerStats,
+        request_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
+        request_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
         notify_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
         notify_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
         notify_except_kind: *const fn (ptr: *anyopaque, sequence: u64, excluded_kind: types.IndexKind) void,
@@ -132,6 +134,13 @@ pub const Executor = struct {
 
     pub fn snapshotStats(self: *Executor) types.DerivedWorkerStats {
         return self.vtable.snapshot_stats(self.ptr);
+    }
+
+    pub fn requestSequence(self: *Executor, sequence: u64) void {
+        self.vtable.request_sequence(self.ptr, sequence);
+    }
+    pub fn requestIndexes(self: *Executor, sequence: u64, names: []const []const u8) void {
+        self.vtable.request_indexes(self.ptr, sequence, names);
     }
 
     pub fn notifySequence(self: *Executor, sequence: u64) void {
@@ -347,9 +356,9 @@ const ManualRuntime = struct {
         self.backlog.releaseThrough(sequence);
     }
 
-    fn canAdvanceToTarget(self: *ManualRuntime, worker: *ManualWorker, from_sequence: u64, target_sequence: u64) !bool {
+    fn canAdvanceToTarget(self: *ManualRuntime, worker: *ManualWorker, from_sequence: u64, target_sequence: u64, replayed_through_sequence: u64) !bool {
         if (self.can_advance_to_target_fn) |callback| {
-            return try callback(self.ctx, worker.kind, from_sequence, target_sequence);
+            return try callback(self.ctx, worker.kind, from_sequence, target_sequence, replayed_through_sequence);
         }
         return true;
     }
@@ -415,7 +424,7 @@ const ManualRuntime = struct {
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
             else if (stats.shouldTryTargetAdvance(worker.applied_sequence, worker.target_sequence) and
-                try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence))
+                try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence, stats.targetAdvanceFromSequence(worker.applied_sequence, worker.target_sequence)))
                 worker.target_sequence
             else
                 worker.applied_sequence;
@@ -465,7 +474,7 @@ const ManualRuntime = struct {
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
             else if (stats.shouldTryTargetAdvance(worker.applied_sequence, worker.target_sequence) and
-                try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence))
+                try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence, stats.targetAdvanceFromSequence(worker.applied_sequence, worker.target_sequence)))
                 worker.target_sequence
             else
                 worker.applied_sequence;
@@ -555,6 +564,8 @@ const manual_vtable = Executor.VTable{
     .remove_worker = manualRemoveWorker,
     .applied_sequence = manualAppliedSequence,
     .snapshot_stats = manualSnapshotStats,
+    .request_sequence = manualNotifySequence,
+    .request_indexes = manualNotifyIndexes,
     .notify_sequence = manualNotifySequence,
     .notify_indexes = manualNotifyIndexes,
     .notify_except_kind = manualNotifyExceptKind,
@@ -713,6 +724,8 @@ const io_threaded_vtable = Executor.VTable{
     .remove_worker = ioThreadedRemoveWorker,
     .applied_sequence = ioThreadedAppliedSequence,
     .snapshot_stats = ioThreadedSnapshotStats,
+    .request_sequence = ioThreadedRequestSequence,
+    .request_indexes = ioThreadedRequestIndexes,
     .notify_sequence = ioThreadedNotifySequence,
     .notify_indexes = ioThreadedNotifyIndexes,
     .notify_except_kind = ioThreadedNotifyExceptKind,
@@ -775,6 +788,15 @@ fn ioThreadedAppliedSequence(ptr: *anyopaque, name: []const u8) ?u64 {
 fn ioThreadedSnapshotStats(ptr: *anyopaque) types.DerivedWorkerStats {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return runtime.snapshotStats();
+}
+
+fn ioThreadedRequestSequence(ptr: *anyopaque, sequence: u64) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.requestSequence(sequence);
+}
+fn ioThreadedRequestIndexes(ptr: *anyopaque, sequence: u64, names: []const []const u8) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.requestIndexes(sequence, names);
 }
 
 fn ioThreadedNotifySequence(ptr: *anyopaque, sequence: u64) void {

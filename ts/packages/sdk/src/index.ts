@@ -183,6 +183,9 @@ export {
 export { Client, type SDKConfig } from "./sdk.js";
 // Type exports
 export type {
+  AgentContextDiagnostics,
+  AgentContextEvent,
+  AgentContextManagement,
   // Chat Agent types
   AgentDecision,
   AgentQuestion,
@@ -474,9 +477,6 @@ export type {
   RetrievalAgentRequest,
   RetrievalAgentResult,
   RetrievalAgentSteps,
-  AgentContextManagement,
-  AgentContextEvent,
-  AgentContextDiagnostics,
   RetrievalAgentStreamCallbacks,
   RetrievalNavigationConfig,
   RouteType,
@@ -578,6 +578,7 @@ export type {
   SeriesPoint,
   SeriesQueryOptions,
   SeriesRange,
+  SeriesSQLOptions,
   TimeSeries,
 } from "./time-series.js";
 export {

@@ -40,7 +40,9 @@ pub const privacy_schema_policy_abi_version: u32 = 120;
 pub const cypher_schema_policy_abi_version: u32 = 121;
 /// Checked isolated read handles and borrowed batch contracts.
 pub const isolated_read_owner_abi_version: u32 = 122;
-pub const abi_version: u32 = isolated_read_owner_abi_version;
+/// Combined main direct effects/commit prerequisites and SQL read/owner layouts.
+pub const merged_main_owner_abi_version: u32 = 123;
+pub const abi_version: u32 = merged_main_owner_abi_version;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1673,6 +1675,10 @@ pub const WriteAdmissionRequest = extern struct {
     /// Empty probes return the compiled owner's grouping capability without
     /// serializing or parsing ordinary writes on tables that have no groups.
     request_json: BorrowedBytes = .{},
+    execution_deadline_ns: u64 = 0,
+    has_execution_deadline: u8 = 0,
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
 };
 
 pub const TableRequest = extern struct {
@@ -2310,6 +2316,12 @@ pub extern fn antfly_storage_owner_preflight_write_admission(
     owner: ?*anyopaque,
     request: *const WriteAdmissionRequest,
     out_has_groups: *u8,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_prepare_enrichments(
+    owner: ?*anyopaque,
+    request: *const WriteAdmissionRequest,
+    out_command: *OwnedBytes,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_find_median_key(

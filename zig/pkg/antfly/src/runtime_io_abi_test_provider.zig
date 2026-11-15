@@ -137,7 +137,7 @@ const RemoteConfig = @import("antfly_scraping").RemoteContentConfig;
 var remote_failure: RemoteConfig.RemoteContentRuntime.AcquireStatus = .ok;
 var remote_config: RemoteConfig = .{};
 fn remoteSnapshot(_: *anyopaque, output: *RemoteConfig.Snapshot) callconv(.c) RemoteConfig.RemoteContentRuntime.AcquireStatus {
-    if (remote_failure == .ok) output.* = .{ .config = &remote_config };
+    if (remote_failure == .ok) output.* = .{ .config = &remote_config, .revision = @splat(42) };
     return remote_failure;
 }
 export fn runtime_io_abi_test_remote_snapshot(output: *RemoteConfig.RemoteContentRuntime, failure: u8) callconv(.c) void {

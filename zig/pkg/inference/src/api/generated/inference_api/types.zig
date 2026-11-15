@@ -2194,6 +2194,12 @@ pub const Error = struct {
     input_index: ?i64 = null,
     /// Extraction failure stage, when known
     stage: ?[]const u8 = null,
+    /// Blocking inference budget (host, backend, combined, scratch, or kv), when known
+    budget: ?[]const u8 = null,
+    /// Required working-set bytes, including resident resources, for the blocking budget
+    required_bytes: ?u64 = null,
+    /// Configured bytes allowed by the blocking budget
+    limit_bytes: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2204,6 +2210,9 @@ pub const Error = struct {
         .{ "retry_after_ms", "retry_after_ms", true },
         .{ "input_index", "input_index", true },
         .{ "stage", "stage", true },
+        .{ "budget", "budget", true },
+        .{ "required_bytes", "required_bytes", true },
+        .{ "limit_bytes", "limit_bytes", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2240,6 +2249,18 @@ pub const Error = struct {
         }
         if (self.stage) |value| {
             try jw.objectField("stage");
+            try jw.write(value);
+        }
+        if (self.budget) |value| {
+            try jw.objectField("budget");
+            try jw.write(value);
+        }
+        if (self.required_bytes) |value| {
+            try jw.objectField("required_bytes");
+            try jw.write(value);
+        }
+        if (self.limit_bytes) |value| {
+            try jw.objectField("limit_bytes");
             try jw.write(value);
         }
         try jw.endObject();

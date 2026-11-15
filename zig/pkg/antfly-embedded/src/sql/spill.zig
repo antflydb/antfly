@@ -3872,7 +3872,7 @@ pub const Sequential = struct {
                 .bool => 1,
                 .i64 => 2,
                 .f64 => 3,
-                .bytes, .json => 5,
+                .bytes, .json, .vector_f32 => 5,
                 else => return error.InvalidSqlSpill,
             };
             const encoded = if (self.encoded) |block| block.values[column] else null;
@@ -3895,6 +3895,23 @@ pub const Sequential = struct {
                     }
                 }
                 flag.* = @intFromBool((try self.cell(row_index, column)).sql_null);
+            }
+            if (kind == .vector_f32) {
+                const vectors = try a.alloc([]const f32, count_rows);
+                errdefer a.free(vectors);
+                var initialized: usize = 0;
+                errdefer for (vectors[0..initialized]) |vector| a.free(vector);
+                for (vectors, nulls, 0..) |*vector, flag, row_index| {
+                    if (flag != 0) {
+                        vector.* = &.{};
+                    } else {
+                        const value = (try self.cell(row_index, column)).value;
+                        if (value != .string) return error.InvalidSqlSpill;
+                        vector.* = try @import("antfly_vector").codec.decodePackedF32BytesAlloc(a, value.string);
+                    }
+                    initialized += 1;
+                }
+                return .{ .name = "", .values = .{ .vector_f32 = vectors }, .nulls = .{ .bytes = nulls } };
             }
             if (encoded) |stored| {
                 if (stored.values == .dictionary and kind != .json and kind != .bool) {
@@ -6544,6 +6561,17 @@ pub const Sort = struct {
         var bytes: usize = 0;
         const logical_rows = @max(1, byte_limit / @max(1, self.max_payload_bytes));
         while (count < @min(@min(maximum, logical_rows), keys.len)) {
+            // Prefetched keys may outlive a shortened payload window. Reserve
+            // their unread-reference backlog before consuming more input,
+            // rather than spending the first row's decode headroom on keys.
+            // Always allow the first reference: an already resident payload
+            // can still make progress below a conservative cold-page estimate.
+            if (count != 0) if (@import("memory_budget.zig").headroom(self.manager.alloc)) |available| {
+                const pending = count + 1 + self.deferred_count - self.deferred_index;
+                const backlog = if (pending > self.deferred_references.len) pending * @sizeOf(?RowLease) else 0;
+                const delivery = (count + 1) * @sizeOf(RowLease) + @sizeOf(PageView);
+                if (bytes +| backlog +| delivery > available) break;
+            };
             // Crossing a physical key boundary must leave room to hydrate the
             // already collected payload prefix. Within a resident key block,
             // only descriptor growth needs admission.
@@ -10528,7 +10556,11 @@ test "external lake leased sort payloads retain physical columns across spill an
 }
 
 test "SQL shared spill runs retain balanced tiers independently of descriptor caps" {
-    const a = std.testing.allocator;
+    // Retain leak/safety checks and every fault position without collecting
+    // allocation/free stack traces on the successful allocation path.
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     var state: u8 = 0;
     var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &state, .checkpoint = struct {
         fn check(_: *anyopaque) !void {}

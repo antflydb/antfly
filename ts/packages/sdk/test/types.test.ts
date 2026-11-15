@@ -254,6 +254,7 @@ describe("Antfly Query Type Integration", () => {
   describe("Batch transform types", () => {
     it("accepts the numeric $min transform operator", () => {
       const request: BatchRequest = {
+        commit_requires: "direct_enrichments",
         transforms: [
           {
             key: "doc-1",

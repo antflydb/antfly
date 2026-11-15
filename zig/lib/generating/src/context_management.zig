@@ -377,13 +377,13 @@ test "Apple destination text rendering is counted and passes production request 
     for ([_]preparation.Mode{ .inspect, .reject, .window, .compact }) |mode| {
         var runner = FakeRunner{ .expected_provider = .antfly };
         const result = try prepare(a, &runner, .{ .mode = mode, .context_window_tokens = 16000 }, &chain, &source, .{}, .{});
-        _ = try g.appleGenerationRequestAlloc(a, apple, result.messages, false);
+        _ = try g.appleGenerationRequestAlloc(a, apple, result.messages);
         try std.testing.expectEqual(@as(usize, 0), runner.calls);
     }
     var runner = FakeRunner{ .expected_provider = .antfly };
     const config = Config{ .context_window_tokens = 7000, .reserved_output_tokens = 1000, .target_input_tokens = 2500, .summarizer_context_window_tokens = 16000, .summarizer = .{ .provider = .antfly, .model = "summary", .url = "" } };
     const result = try prepare(a, &runner, config, &chain, &source, .{}, .{});
-    _ = try g.appleGenerationRequestAlloc(a, apple, result.messages, false);
+    _ = try g.appleGenerationRequestAlloc(a, apple, result.messages);
     try std.testing.expectEqual(@as(usize, 1), runner.calls);
     const views = try viewMessages(a, result.messages);
     const keep = try a.alloc(bool, views.len);

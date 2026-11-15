@@ -52,6 +52,7 @@ pub fn modelSourceFromValue(field: std.json.Value) !ModelSource {
         _ = try @import("antfly_source_reference").validateReference(reference.uri, reference.version, switch (reference.version_kind) {
             .strong_etag => .strong_etag,
             .s3_version_id => .s3_version_id,
+            .file_sha256 => .file_sha256,
         }, reference.length);
         return .{ .source = reference };
     }

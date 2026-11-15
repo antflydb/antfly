@@ -372,6 +372,49 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    pub fn ownerReadiness(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/api.zig").OwnerReadinessRequest, budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget) !@import("../metadata/api.zig").OwnerReadiness {
+        try budget.checkpoint();
+        const deadline = (@import("antfly_local_sources").api_routing_budget.RoutingBudget{}).deadlineFrom(budget);
+        const Callback = struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
+        const bytes = try std.json.Stringify.valueAlloc(alloc, contract.CatalogProjectionRequest{ .owner_readiness = request }, .{});
+        defer alloc.free(bytes);
+        const result = try self.projectionWithAllocator(@import("../metadata/api.zig").OwnerReadiness, alloc, .{
+            .kind = .system_catalog,
+            .group_id = group_id,
+            .key = .fromSlice(bytes),
+            .control = .{ .execution_deadline_ns = deadline orelse 0, .has_execution_deadline = @intFromBool(deadline != null), .cancellation_ctx = @ptrCast(@constCast(&budget.cancellation)), .cancellation_fn = Callback.cancelled },
+        });
+        try budget.checkpoint();
+        return result;
+    }
+
+    pub fn ownerReadinessTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/api.zig").OwnerReadinessRequest, budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget) ![]@import("../metadata/api.zig").OwnerTransitionCheck {
+        try budget.checkpoint();
+        const deadline = (@import("antfly_local_sources").api_routing_budget.RoutingBudget{}).deadlineFrom(budget);
+        const Callback = struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
+        const bytes = try std.json.Stringify.valueAlloc(alloc, contract.CatalogProjectionRequest{ .owner_readiness_transitions = request }, .{});
+        defer alloc.free(bytes);
+        const result = try self.projectionWithAllocator([]@import("../metadata/api.zig").OwnerTransitionCheck, alloc, .{
+            .kind = .system_catalog,
+            .group_id = group_id,
+            .key = .fromSlice(bytes),
+            .control = .{ .execution_deadline_ns = deadline orelse 0, .has_execution_deadline = @intFromBool(deadline != null), .cancellation_ctx = @ptrCast(@constCast(&budget.cancellation)), .cancellation_fn = Callback.cancelled },
+        });
+        errdefer alloc.free(result);
+        try budget.checkpoint();
+        return result;
+    }
+
     pub fn readControlStores(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, groups: []const u64) ![]metadata.StoreRecord {
         return self.catalogProjection([]metadata.StoreRecord, alloc, group_id, .{ .read_control_stores = groups });
     }
@@ -924,6 +967,17 @@ pub const RaftApplyStore = struct {
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
         try @import("antfly_local_sources").storage_db_relational_integrity_json.write(contract.CatalogProjectionRequest{ .sql_policy_definition_command = command }, &stream);
         return self.projectionWithAllocator([]u8, alloc, .{ .kind = .system_catalog, .group_id = group_id, .key = .fromSlice(output.written()) });
+    }
+
+    pub fn hasIndexAliases(self: *RaftApplyStore, group_id: u64) !bool {
+        return self.catalogProjection(bool, self.alloc, group_id, .has_index_aliases);
+    }
+    pub fn hasIndexAliasLifecycleState(self: *RaftApplyStore, group_id: u64) !bool {
+        return self.catalogProjection(bool, self.alloc, group_id, .has_index_alias_lifecycle_state);
+    }
+    pub fn validateTableIndexMutation(self: *RaftApplyStore, group_id: u64, before: metadata.TableRecord, after: metadata.TableRecord) !void {
+        const result = try self.catalogProjection(contract.TableIndexMutationValidation, self.alloc, group_id, .{ .validate_table_index_mutation = .{ .before = before, .after = after } });
+        try result.requireValid();
     }
     pub fn requirePolicyIndexMutationAllowed(self: *RaftApplyStore, group_id: u64, table_id: u64) !void {
         const value = try self.catalogProjection(bool, self.alloc, group_id, .{ .require_policy_index_mutation_allowed = table_id });

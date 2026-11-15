@@ -3172,6 +3172,7 @@ pub const BatchRequest = struct {
     deletes: ?[]const []const u8 = null,
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add or remove array values ($addToSet, $pull) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
+    commit_requires: ?CommitRequires = null,
     sync_level: ?SyncLevel = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -3179,6 +3180,7 @@ pub const BatchRequest = struct {
         .{ "inserts", "inserts", true },
         .{ "deletes", "deletes", true },
         .{ "transforms", "transforms", true },
+        .{ "commit_requires", "commit_requires", true },
         .{ "sync_level", "sync_level", true },
     };
 
@@ -3202,6 +3204,10 @@ pub const BatchRequest = struct {
         }
         if (self.transforms) |value| {
             try jw.objectField("transforms");
+            try jw.write(value);
+        }
+        if (self.commit_requires) |value| {
+            try jw.objectField("commit_requires");
             try jw.write(value);
         }
         if (self.sync_level) |value| {
@@ -5392,14 +5398,14 @@ pub const ChunkOutputs = struct {
 
 pub const ChunkSourceReference = struct {
     type: []const u8,
-    /// HTTP(S) or S3 object URI resolved through configured content security and credentials.
+    /// HTTP(S), S3, or absolute file:// URI resolved through configured content security and credentials. Local files require an explicit remote_content.security.allowed_paths allowlist.
     uri: []const u8,
     mime_type: []const u8,
-    /// Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read.
+    /// Quoted strong HTTP/S3 ETag, immutable S3 version ID, or lowercase SHA-256 hex digest for file_sha256. Local files are verified in a bounded streaming scan; unchanged files reuse a bounded process-local verification cache across continuation pages. Size, inode, mtime and ctime are checked around every range read.
     version: []const u8,
-    /// Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+    /// Defaults to strong_etag. S3 version IDs require S3 sources; file_sha256 requires a local file URI.
     version_kind: ?[]const u8 = null,
-    /// Exact immutable object length, verified against Content-Range.
+    /// Exact immutable object length, verified against Content-Range or local file metadata.
     length: i64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -6869,6 +6875,32 @@ pub const CohereRerankerConfig = struct {
     }
 };
 
+/// Admission prerequisite independent of sync_level. Explicit none commits the source without precomputing enrichments. direct_enrichments requires eligible document-local producers to succeed, committing their outputs and coverage atomically with the source; producer failure rejects the whole batch. Artifact-source stages, committed graph/neighbor context, grouped producers, protected producers and PDF page-image embeddings remain asynchronous. Configured producers with no eligible request reject the requirement. Direct admission has an 8 MiB and 16384-row budget for the complete mutation, including source keys/values, artifact effects, deletions, coverage, revisions, counters and replay payload. Both the submitted source envelope and final physical effect set must fit; this is not an artifact-only allowance. Supported by embedded batches, server/Raft writes and distributed transactions. Raft prepares on the leader and replays immutable effects without inference. Transactions reserve the complete envelope before voting prepared; their conservative reservation can reject a batch below the final physical limit. Serverless supports source-local pipeline stages through conditional atomic WAL batches (at most 1024 mutations and 8 MiB including WAL framing). Backends without that capability reject before source admission. Omission retains legacy embedded precomputation for enrichments/full_index during the compatibility window; other surfaces retain their existing waits.
+pub const CommitRequires = enum {
+    none,
+    direct_enrichments,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .none => "none",
+            .direct_enrichments => "direct_enrichments",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "none", .none },
+            .{ "direct_enrichments", .direct_enrichments },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// The metadata mutation committed, but requested visibility or local materialization is not yet fully healthy. Clients must observe status instead of automatically replaying the mutation. `committed_superseded` is terminal: a newer schema version became visible first.
 pub const CommittedMutationOutcome = struct {
     status: []const u8,
@@ -7868,6 +7900,10 @@ pub const CreateEmbeddingsIndexRequest = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -7913,6 +7949,8 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -7974,6 +8012,14 @@ pub const CreateEmbeddingsIndexRequest = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -8697,6 +8743,8 @@ pub const CreatedEmbeddingsIndex = struct {
     external: ?bool = null,
     external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
@@ -8729,6 +8777,8 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -8790,6 +8840,14 @@ pub const CreatedEmbeddingsIndex = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -8869,6 +8927,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     external: ?bool = null,
     external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
@@ -8896,6 +8956,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -8942,6 +9004,14 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -14676,6 +14746,10 @@ pub const EmbeddingsIndexConfig = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -14717,6 +14791,8 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -14765,6 +14841,14 @@ pub const EmbeddingsIndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -21919,7 +22003,7 @@ pub const GlobalStatefulQueryRequest = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
     /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = exact dense top-k over the eligible indexed vectors Full effort on dense HBC indexes establishes exactness using certified bounds and authoritative scoring. It may examine every eligible vector; latency scales with corpus size and can be substantially higher than approximate search at values below `1.0`. When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
     /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
     select: ?std.json.Value = null,
@@ -26102,6 +26186,8 @@ pub const GraphQueryRequest = struct {
 };
 
 pub const GraphQueryResult = struct {
+    /// Concrete graph index names selected from the statement catalog cut.
+    resolved_indexes: ?[]const []const u8 = null,
     wire_version: i64,
     columns: []const []const u8,
     rows: []const []const GraphWireValue,
@@ -26116,6 +26202,7 @@ pub const GraphQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "wire_version", "wire_version", false },
         .{ "columns", "columns", false },
         .{ "rows", "rows", false },
@@ -26138,6 +26225,10 @@ pub const GraphQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         try jw.objectField("wire_version");
         try jw.write(self.wire_version);
         try jw.objectField("columns");
@@ -26591,6 +26682,8 @@ pub const GraphResolverConfig = struct {
     suppress: ?GraphResolverSuppressionConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
+    /// Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching.
+    candidate_key_prefix: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
     candidate_limit: ?i64 = null,
     name_embedding: ?[]const u8 = null,
@@ -26620,6 +26713,7 @@ pub const GraphResolverConfig = struct {
         .{ "suppress", "suppress", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
+        .{ "candidate_key_prefix", "candidate_key_prefix", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
         .{ "candidate_limit", "candidate_limit", true },
         .{ "name_embedding", "name_embedding", true },
@@ -26690,6 +26784,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.candidate_search) |value| {
             try jw.objectField("candidate_search");
+            try jw.write(value);
+        }
+        if (self.candidate_key_prefix) |value| {
+            try jw.objectField("candidate_key_prefix");
             try jw.write(value);
         }
         if (self.candidate_ann_index) |value| {
@@ -28296,6 +28394,81 @@ pub const IncompleteDetails = struct {
     reason: []const u8,
 };
 
+pub const IndexAlias = struct {
+    index: []const u8,
+    previous_index: OpenApiOptionalNullable([]const u8) = .absent,
+    swapped_at_ms: i64,
+    require: []const u8,
+    idempotency_key: []const u8,
+    readiness: IndexReadinessStatus,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        switch (self.previous_index) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("previous_index");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("previous_index");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("swapped_at_ms");
+        try jw.write(self.swapped_at_ms);
+        try jw.objectField("require");
+        try jw.write(self.require);
+        try jw.objectField("idempotency_key");
+        try jw.write(self.idempotency_key);
+        try jw.objectField("readiness");
+        try jw.write(self.readiness);
+        try jw.endObject();
+    }
+};
+
+pub const IndexAliasRequest = struct {
+    index: []const u8,
+    expected_index: ?[]const u8 = null,
+    require: ?[]const u8 = null,
+    idempotency_key: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "expected_index", "expected_index", true },
+        .{ "require", "require", true },
+        .{ "idempotency_key", "idempotency_key", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        if (self.expected_index) |value| {
+            try jw.objectField("expected_index");
+            try jw.write(value);
+        }
+        if (self.require) |value| {
+            try jw.objectField("require");
+            try jw.write(value);
+        }
+        try jw.objectField("idempotency_key");
+        try jw.write(self.idempotency_key);
+        try jw.endObject();
+    }
+};
+
 /// Configuration for an index
 pub const IndexConfig = struct {
     /// Name of the index
@@ -28327,6 +28500,10 @@ pub const IndexConfig = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
@@ -28400,6 +28577,8 @@ pub const IndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "embedding_name", "embedding_name", true },
         .{ "source_artifact_name", "source_artifact_name", true },
@@ -28500,6 +28679,14 @@ pub const IndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -32298,6 +32485,12 @@ pub const InferenceError = struct {
     input_index: ?i64 = null,
     /// Extraction failure stage, when known
     stage: ?[]const u8 = null,
+    /// Blocking inference budget (host, backend, combined, scratch, or kv), when known
+    budget: ?[]const u8 = null,
+    /// Required working-set bytes, including resident resources, for the blocking budget
+    required_bytes: ?u64 = null,
+    /// Configured bytes allowed by the blocking budget
+    limit_bytes: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -32308,6 +32501,9 @@ pub const InferenceError = struct {
         .{ "retry_after_ms", "retry_after_ms", true },
         .{ "input_index", "input_index", true },
         .{ "stage", "stage", true },
+        .{ "budget", "budget", true },
+        .{ "required_bytes", "required_bytes", true },
+        .{ "limit_bytes", "limit_bytes", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -32344,6 +32540,18 @@ pub const InferenceError = struct {
         }
         if (self.stage) |value| {
             try jw.objectField("stage");
+            try jw.write(value);
+        }
+        if (self.budget) |value| {
+            try jw.objectField("budget");
+            try jw.write(value);
+        }
+        if (self.required_bytes) |value| {
+            try jw.objectField("required_bytes");
+            try jw.write(value);
+        }
+        if (self.limit_bytes) |value| {
+            try jw.objectField("limit_bytes");
             try jw.write(value);
         }
         try jw.endObject();
@@ -36122,6 +36330,32 @@ pub const KeyRange = struct {
     }
 };
 
+/// Offline clustering algorithm for fresh native Parquet lake HBC indexes.
+pub const LakeBulkBuildAlgorithm = enum {
+    lloyd,
+    emeans,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .lloyd => "lloyd",
+            .emeans => "emeans",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "lloyd", .lloyd },
+            .{ "emeans", .emeans },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const LakeCatalogCommitRequest = struct {
     commit_id: []const u8,
     expected_metadata_location: []const u8,
@@ -36308,14 +36542,18 @@ pub const LeannIndexConfig = struct {
     max_degree: ?i64 = null,
     /// Compact code used to steer the graph walk. "rabitq" (default) carries error bounds, so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's fixed rerank ratio; prefer it only for very low dimensions (below about 64).
     quantizer: ?[]const u8 = null,
-    /// Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+    /// Whether document embeddings stay stored after the graph covers them. "auto" (the default when the index has its own embedder) keeps only a small stub for each embedding computed from text (a field, a text-only template, or a text chunk) and re-embeds a few such candidates per query, while embeddings computed from media (images, audio windows, model outputs) stay stored. "transient" stubs every covered embedding, so it requires inputs that re-embed from text: no media chunkers. "persistent" keeps every embedding, and is the only choice for external vectors, indexes fed by other enrichments, and the pq quantizer.
     vector_storage: ?[]const u8 = null,
     /// Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
     search_ef: ?i64 = null,
     /// Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates and loses fewer true neighbors.
     bound_scale: ?f32 = null,
-    /// Candidates recomputed per batch. 0 uses k.
+    /// Candidates recomputed per batch. 0 uses k for bounded search and 128 for full-effort search.
     batch_size: ?i64 = null,
+    /// Time a query may spend re-embedding candidates whose stored vectors were dropped. If the budget is spent before scoring finishes, the search returns an incomplete-coverage error; retry with a larger budget. 0 means no limit.
+    reembed_budget_ms: ?i64 = null,
+    /// How vectors that cannot be re-embedded from text (images, audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector. "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-embedding. Requires "auto" or "transient" storage.
+    media_vectors: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -36325,6 +36563,8 @@ pub const LeannIndexConfig = struct {
         .{ "search_ef", "search_ef", true },
         .{ "bound_scale", "bound_scale", true },
         .{ "batch_size", "batch_size", true },
+        .{ "reembed_budget_ms", "reembed_budget_ms", true },
+        .{ "media_vectors", "media_vectors", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -36359,6 +36599,14 @@ pub const LeannIndexConfig = struct {
         }
         if (self.batch_size) |value| {
             try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.reembed_budget_ms) |value| {
+            try jw.objectField("reembed_budget_ms");
+            try jw.write(value);
+        }
+        if (self.media_vectors) |value| {
+            try jw.objectField("media_vectors");
             try jw.write(value);
         }
         try jw.endObject();
@@ -43947,12 +44195,15 @@ pub const ModelRef = struct {
 
 /// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
 pub const MultiBatchRequest = struct {
+    /// Default admission prerequisite for tables without an explicit commit_requires. A table-level value overrides this default. Staged transaction statements retain the strongest prerequisite selected for each table.
+    commit_requires: ?std.json.Value = null,
     /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
     tables: std.json.ArrayHashMap(BatchRequest),
     sync_level: ?SyncLevel = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "commit_requires", "commit_requires", true },
         .{ "tables", "tables", false },
         .{ "sync_level", "sync_level", true },
     };
@@ -43967,6 +44218,10 @@ pub const MultiBatchRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.commit_requires) |value| {
+            try jw.objectField("commit_requires");
+            try jw.write(value);
+        }
         try jw.objectField("tables");
         try jw.write(self.tables);
         if (self.sync_level) |value| {
@@ -47969,7 +48224,7 @@ pub const QueryRequest = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
     /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = exact dense top-k over the eligible indexed vectors Full effort on dense HBC indexes establishes exactness using certified bounds and authoritative scoring. It may examine every eligible vector; latency scales with corpus size and can be substantially higher than approximate search at values below `1.0`. When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
     /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
     select: ?std.json.Value = null,
@@ -48281,6 +48536,8 @@ pub const QueryResponses = struct {
 
 /// Result of a canonical query operation.
 pub const QueryResult = struct {
+    /// Concrete index names selected for this query before embedding and execution.
+    resolved_indexes: ?[]const []const u8 = null,
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
@@ -48312,6 +48569,7 @@ pub const QueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -48339,6 +48597,10 @@ pub const QueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         if (self.source_ranking) |value| {
             try jw.objectField("source_ranking");
             try jw.write(value);
@@ -48401,6 +48663,8 @@ pub const QueryResult = struct {
 
 /// Fields shared by canonical and stateful query result envelopes.
 pub const QueryResultBase = struct {
+    /// Concrete index names selected for this query before embedding and execution.
+    resolved_indexes: ?[]const []const u8 = null,
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
@@ -48431,6 +48695,7 @@ pub const QueryResultBase = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -48457,6 +48722,10 @@ pub const QueryResultBase = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         if (self.source_ranking) |value| {
             try jw.objectField("source_ranking");
             try jw.write(value);
@@ -57308,6 +57577,8 @@ pub const SQLRequest = struct {
 /// Ordinal result rows with corresponding logical column metadata. SQL NULL is JSON null; sql_nulls distinguishes it from a JSON column containing the JSON literal null. Integer-typed values are exact decimal strings; datetime values are strings. Objects and arrays in JSON columns remain JSON. Array-typed columns contain SQLArrayValue envelopes, with their element descriptor in the corresponding SQLColumn. They are not JSON columns.
 pub const SQLResponse = struct {
     notices: ?[]const SQLNotice = null,
+    /// Concrete graph index names selected from the statement catalog cut.
+    resolved_indexes: ?[]const []const u8 = null,
     columns: []const SQLColumn,
     rows: []const []const std.json.Value,
     /// Number of rows affected by a mutation, or zero for a read-only statement.
@@ -57328,6 +57599,7 @@ pub const SQLResponse = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "notices", "notices", true },
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "columns", "columns", false },
         .{ "rows", "rows", false },
         .{ "rows_affected", "rows_affected", false },
@@ -57353,6 +57625,10 @@ pub const SQLResponse = struct {
         try jw.beginObject();
         if (self.notices) |value| {
             try jw.objectField("notices");
+            try jw.write(value);
+        }
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
             try jw.write(value);
         }
         try jw.objectField("columns");
@@ -59112,7 +59388,7 @@ pub const StatefulQueryRequest = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
     /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = exact dense top-k over the eligible indexed vectors Full effort on dense HBC indexes establishes exactness using certified bounds and authoritative scoring. It may examine every eligible vector; latency scales with corpus size and can be substantially higher than approximate search at values below `1.0`. When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
     /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
     select: ?std.json.Value = null,
@@ -59438,6 +59714,8 @@ pub const StatefulQueryResponses = struct {
 
 /// Result emitted by the stateful compatibility transport.
 pub const StatefulQueryResult = struct {
+    /// Concrete index names selected for this query before embedding and execution.
+    resolved_indexes: ?[]const []const u8 = null,
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
@@ -59469,6 +59747,7 @@ pub const StatefulQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -59496,6 +59775,10 @@ pub const StatefulQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         if (self.source_ranking) |value| {
             try jw.objectField("source_ranking");
             try jw.write(value);
@@ -59733,7 +60016,7 @@ pub const SuccessMessage = struct {
     }
 };
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for the write to be durably applied to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Precompute enrichments before committing the document. A synchronous producer failure rejects the write; post-commit worker failures retain the document and may return `committed_repair_required`. - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+/// Response acknowledgment/publication barrier, independent of commit_requires: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for durable application to the local key-value store - "full_text": Wait for full-text index WAL write - "enrichments": Wait for this write's enrichment publication - "full_index": Wait for full-text, enrichment and vector-index publication A post-commit wait failure never rolls back the source. Terminal background failures may return committed_repair_required. During the embedded migration window, omitting commit_requires retains legacy precomputation for enrichments and full_index; explicit none disables that implicit admission prerequisite.
 pub const SyncLevel = enum {
     propose,
     write,
@@ -60247,7 +60530,7 @@ pub const TableRepairIssueList = struct {
     }
 };
 
-/// Durable table repair job state.
+/// Durable table repair job state. In result, work counters accumulate across passes, while unresolved and in_progress describe only the latest bounded pass. Earlier failures remain represented by cumulative failure counters, debt_remaining, and the current remaining_failures summary.
 pub const TableRepairJob = struct {
     /// Server-assigned durable repair job identifier.
     job_id: u64,
@@ -60546,7 +60829,7 @@ pub const TableRepairRunResult = struct {
     unsupported: u64,
     /// Number of attempted repair records that remained queued after this pass.
     unresolved: u64,
-    /// Number of selected repair records or indexes skipped because another repair pass already owns them.
+    /// Number of selected repair records or indexes still in progress after this pass, including queued native producer work and work owned by another repair pass.
     in_progress: u64,
     /// Number of indexes rebuilt by this pass when target is index.
     indexes_rebuilt: u64,
@@ -61909,6 +62192,8 @@ pub const TransactionBeginResponse = struct {
 
 /// Stateless OCC (Optimistic Concurrency Control) transaction commit request. The client reads documents (capturing version tokens from the X-Antfly-Version response header on lookups), computes writes locally, then submits everything in this single commit request. The server validates that all read versions still match before executing writes atomically via 2PC. **No server-side state**: There is no "begin" endpoint. The client manages its own read set and submits the full transaction in one request.
 pub const TransactionCommitRequest = struct {
+    /// Default admission prerequisite for tables without an explicit commit_requires. A table-level value overrides this default. Staged transaction statements retain the strongest prerequisite selected for each table.
+    commit_requires: ?std.json.Value = null,
     /// Set of keys that were read during the transaction, with their observed versions. The server verifies these versions still match before committing writes.
     read_set: []const TransactionReadItem,
     /// Write set: map of table names to batch operations, same format as MultiBatchRequest.tables.
@@ -61917,6 +62202,7 @@ pub const TransactionCommitRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "commit_requires", "commit_requires", true },
         .{ "read_set", "read_set", false },
         .{ "tables", "tables", false },
         .{ "sync_level", "sync_level", true },
@@ -61932,6 +62218,10 @@ pub const TransactionCommitRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.commit_requires) |value| {
+            try jw.objectField("commit_requires");
+            try jw.write(value);
+        }
         try jw.objectField("read_set");
         try jw.write(self.read_set);
         try jw.objectField("tables");

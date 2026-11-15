@@ -113,7 +113,23 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "view",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "full",
+                "declaration"
+              ],
+              "default": "full"
+            },
+            "description": "declaration requests configuration, revision and reconciliation state without native readiness observations. Older runtimes may return full observations."
+          }
+        ]
       },
       "put": {
         "operationId": "putSource",
@@ -148,7 +164,33 @@
               }
             }
           }
-        }
+        },
+        "description": "Replaces the source declaration. Runtimes that advertise revision_preconditions honor two standard HTTP preconditions, evaluated atomically with the write: If-Match (update only when the current declaration revision matches; never creates) and If-None-Match: * (create only when no source with this ID exists). A failed precondition returns 412.",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "description": "Quoted declaration revision from a prior GET (strong tag only).",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "description": "Use * to create the source only if it does not already exist.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "*"
+              ]
+            }
+          }
+        ]
       },
       "delete": {
         "operationId": "removeSource",
@@ -475,6 +517,50 @@
           }
         }
       }
+    },
+    "/sources/{source_id}/knowledge-query": {
+      "post": {
+        "operationId": "QuerySourceKnowledge",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KnowledgeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bounded native graph response with source_knowledge consistency/provenance. Current runtime authorization remains required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid binding/query"
+          },
+          "403": {
+            "description": "Unsupported or unauthorized deployment boundary"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -533,6 +619,21 @@
           },
           "processing_jobs": {
             "type": "boolean"
+          },
+          "knowledge_versions": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "knowledge_audience": {
+            "type": "string",
+            "description": "Runtime deployment boundary, absent when knowledge is disabled."
+          },
+          "revision_preconditions": {
+            "type": "boolean",
+            "description": "PUT /sources/{source_id} honors If-Match declaration revisions and If-None-Match: * create-only writes."
           }
         }
       },
@@ -636,6 +737,27 @@
           "processing": {
             "$ref": "#/components/schemas/ProcessingDeclaration",
             "description": "Native processing desired state. Hosted reads expose this only to table administrators. On update, omission or null preserves existing processing; an explicit empty indexes list clears the declaration and requires table administration. Native indexes are retired separately through native administration.",
+            "x-go-type-skip-optional-pointer": false
+          },
+          "knowledge": {
+            "$ref": "#/components/schemas/KnowledgeDeclaration",
+            "x-go-type-skip-optional-pointer": false,
+            "description": "Versioned references to native resolvers/graphs. Omission or null preserves existing knowledge on update. An explicit versioned declaration with empty entities/graphs clears discovery without retiring shared native resources."
+          },
+          "knowledge_status": {
+            "$ref": "#/components/schemas/KnowledgeStatus",
+            "readOnly": true,
+            "x-go-type-skip-optional-pointer": false
+          },
+          "revision": {
+            "type": "string",
+            "readOnly": true,
+            "x-go-type-skip-optional-pointer": true,
+            "description": "Opaque declaration revision returned by GET and PUT. Covers declared fields only; run state and search status do not change it. Ignored when submitted."
+          },
+          "reconciliation_status": {
+            "$ref": "#/components/schemas/ReconciliationStatus",
+            "readOnly": true,
             "x-go-type-skip-optional-pointer": false
           }
         },
@@ -1319,6 +1441,264 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 256
+          }
+        }
+      },
+      "KnowledgeDeclaration": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "instance_one_audience"
+            ],
+            "description": "Requires an independently configured runtime deployment boundary; never grants authorization. Mixed-audience matching/promotion is unsupported."
+          },
+          "audience": {
+            "type": "string",
+            "description": "Opaque runtime-controlled audience identity; all participating inputs, entities, curation and graph outputs must share this audience."
+          },
+          "entities": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/EntityBinding"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "graphs": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/GraphBinding"
+            },
+            "x-go-type-skip-optional-pointer": true
+          }
+        },
+        "required": [
+          "version",
+          "mode",
+          "audience"
+        ]
+      },
+      "EntityBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "index": {
+            "type": "string",
+            "description": "Native graph index owning the resolver."
+          },
+          "resolver": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Stable key prefix ending in /. Candidate enumeration/order is never part of identity."
+          },
+          "source_artifact": {
+            "type": "string"
+          },
+          "resolution_artifact": {
+            "type": "string"
+          },
+          "schema_uri": {
+            "type": "string"
+          },
+          "location_field": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "index",
+          "resolver",
+          "table",
+          "namespace",
+          "source_artifact",
+          "resolution_artifact"
+        ]
+      },
+      "GraphBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "index": {
+            "type": "string"
+          },
+          "artifacts": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "items": {
+              "type": "string"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "entities": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "string"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "temporal": {
+            "$ref": "#/components/schemas/GraphTemporalBinding"
+          },
+          "location_field": {
+            "type": "string"
+          },
+          "schema_uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "index",
+          "artifacts",
+          "temporal"
+        ]
+      },
+      "GraphTemporalBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mapping": {
+            "type": "string",
+            "enum": [
+              "native_intervals_v1"
+            ]
+          },
+          "history": {
+            "type": "string",
+            "enum": [
+              "current_state"
+            ],
+            "description": "Filters retained current relationship metadata; no complete historical replay promise. Missing valid bounds are open; known_at requires created_at."
+          }
+        },
+        "required": [
+          "mapping",
+          "history"
+        ]
+      },
+      "KnowledgeStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer"
+          },
+          "entities": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/RepresentationStatus"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "graphs": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/RepresentationStatus"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "observed_at": {
+            "type": "integer"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "audience": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "entities",
+          "graphs",
+          "observed_at",
+          "mode"
+        ]
+      },
+      "KnowledgeRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "graph": {
+            "type": "string"
+          },
+          "start": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "items": {
+              "type": "string"
+            },
+            "x-go-type-skip-optional-pointer": true
+          },
+          "depth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "valid_at": {
+            "type": "string"
+          },
+          "known_at": {
+            "type": "string"
+          },
+          "require_snapshot": {
+            "type": "boolean"
+          },
+          "entity": {
+            "type": "string",
+            "description": "Optional entity binding from the selected graph. Derives the native start table; arbitrary table qualifiers are not accepted."
+          }
+        },
+        "required": [
+          "graph",
+          "start"
+        ]
+      },
+      "ReconciliationStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "failed",
+              "ready"
+            ]
           }
         }
       }

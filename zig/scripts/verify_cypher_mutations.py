@@ -5,12 +5,13 @@ import argparse
 import base64
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
 import uuid
 
-from cypher_qualification_retry import retry_allowed
+from cypher_qualification_retry import retry_allowed, rolled_back_sql_fixture
 
 
 def main():
@@ -18,6 +19,13 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:18591")
     parser.add_argument("--shards", type=int, choices=[1, 2], default=2)
     parser.add_argument("--preexisting-producers", action="store_true")
+    parser.add_argument(
+        "--contract",
+        choices=("all", "mutations", "producers"),
+        default="all",
+        help="Run independent mutation or producer contracts; all remains the CLI default",
+    )
+    parser.add_argument("--progress", action="store_true")
     args = parser.parse_args()
     headers = {
         "Content-Type": "application/json",
@@ -28,16 +36,29 @@ def main():
     graph = table + "_graph"
     created_table = created_graph = False
 
-    def call(path, body=None, method="POST", status=None):
+    def call(path, body=None, method="POST", status=None, *, timeout_s=40):
+        began = time.monotonic()
+        if args.progress:
+            statement = (
+                body.get("query", body.get("statement", ""))
+                if isinstance(body, dict)
+                else ""
+            )
+            print(
+                f"START {method} {path} {statement[:200]}", file=sys.stderr, flush=True
+            )
         request = urllib.request.Request(
             args.url.rstrip("/") + "/db/v1" + path,
             data=None if body is None else json.dumps(body).encode(),
             headers=headers,
             method=method,
         )
+        deadline = time.monotonic() + timeout_s
         for attempt in range(40):
             try:
-                with urllib.request.urlopen(request, timeout=40) as response:
+                with urllib.request.urlopen(
+                    request, timeout=max(0.001, deadline - time.monotonic())
+                ) as response:
                     code, content = response.status, response.read()
             except urllib.error.HTTPError as error:
                 code, content = error.code, error.read()
@@ -52,14 +73,21 @@ def main():
             )
             if (
                 attempt < 39
+                and time.monotonic() < deadline
                 and status != code
                 and retry_allowed(
                     code, content, path=path, body=body, read_only=read_only
                 )
             ):
-                time.sleep(0.25)
+                time.sleep(min(0.25, max(0, deadline - time.monotonic())))
                 continue
             break
+        if args.progress:
+            print(
+                f"DONE {code} {time.monotonic() - began:.3f}s {path}",
+                file=sys.stderr,
+                flush=True,
+            )
         assert (200 <= code < 300) if status is None else code == status, (
             path,
             code,
@@ -75,7 +103,8 @@ def main():
         assert result["complete"] is True, result
         return result["rows"]
 
-    try:
+    def verify_mutations():
+        nonlocal created_table, created_graph
         call(
             f"/tables/{table}",
             {
@@ -262,6 +291,8 @@ def main():
                 assert query(f"MATCH {patterns} RETURN length(p)") == [
                     [{"type": "integer", "value": "2"}]
                 ]
+
+    def verify_producers():
         # Use a relational fixture for SQL writes; the earlier graph exercises
         # dynamic document properties. Distributed transactions support READ
         # COMMITTED, while bare BEGIN requests serializable range guards.
@@ -374,41 +405,25 @@ def main():
                     assert call("/sql", {"statement": nonvertex_count})["rows"] == [
                         ["2"]
                     ]
-                    session = call(
-                        "/sql", {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"}
-                    )["session_id"]
-                    try:
-                        call(
-                            "/sql",
-                            {
-                                "statement": f"UPDATE {owned_table} SET kind='producer' WHERE _id='owned-claim'",
-                                "session_id": session,
-                            },
-                        )
-                        assert call(
-                            "/sql",
-                            {"statement": nonvertex_count, "session_id": session},
-                        )["rows"] == [["2"]]
-                    finally:
-                        call("/sql", {"statement": "ROLLBACK", "session_id": session})
+                    rolled_back_sql_fixture(
+                        call,
+                        [
+                            (
+                                f"UPDATE {owned_table} SET kind='producer' WHERE _id='owned-claim'",
+                                None,
+                            ),
+                            (nonvertex_count, [["2"]]),
+                        ],
+                    )
                 finally:
                     call(f"/graphs/{nonvertex_graph}", method="DELETE")
-                session = call(
-                    "/sql", {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"}
-                )["session_id"]
-                try:
-                    call(
-                        "/sql",
-                        {
-                            "statement": f"DELETE FROM {owned_table} WHERE _id='owned-claim'",
-                            "session_id": session,
-                        },
-                    )
-                    assert call("/sql", {"statement": count, "session_id": session})[
-                        "rows"
-                    ] == [["1"]]
-                finally:
-                    call("/sql", {"statement": "ROLLBACK", "session_id": session})
+                rolled_back_sql_fixture(
+                    call,
+                    [
+                        (f"DELETE FROM {owned_table} WHERE _id='owned-claim'", None),
+                        (count, [["1"]]),
+                    ],
+                )
                 assert call("/sql", {"statement": count})["rows"] == [["2"]]
                 result = call(
                     f"/graphs/{owned_graph}/query",
@@ -527,43 +542,16 @@ def main():
                             {"query": "MATCH ()-[r:LINK]->() RETURN r"},
                         ),
                     )
-                    # This fixture never commits. A transient coherent-cut
-                    # failure can restart the complete transaction after its
-                    # staged changes have been explicitly rolled back.
-                    for attempt in range(40):
-                        session = call(
-                            "/sql",
-                            {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"},
-                        )["session_id"]
-                        try:
-                            call(
-                                "/sql",
-                                {
-                                    "statement": f"UPDATE {owned_table} SET ref=NULL WHERE _id='mixed/a'",
-                                    "session_id": session,
-                                },
-                            )
-                            assert call(
-                                "/sql",
-                                {"statement": mixed_count, "session_id": session},
-                            )["rows"] == [["1"]]
-                            break
-                        except AssertionError as error:
-                            detail = error.args[0]
-                            if not isinstance(detail, tuple) or len(detail) != 3:
-                                raise
-                            failure = json.loads(detail[2])
-                            if (
-                                attempt == 39
-                                or failure.get("code") not in ("53300", "40001")
-                                or failure.get("retryable") is not True
-                            ):
-                                raise
-                        finally:
-                            call(
-                                "/sql", {"statement": "ROLLBACK", "session_id": session}
-                            )
-                        time.sleep(0.1)
+                    rolled_back_sql_fixture(
+                        call,
+                        [
+                            (
+                                f"UPDATE {owned_table} SET ref=NULL WHERE _id='mixed/a'",
+                                None,
+                            ),
+                            (mixed_count, [["1"]]),
+                        ],
+                    )
                     mixed = call(
                         f"/graphs/{mixed_graph}/query",
                         {
@@ -581,9 +569,18 @@ def main():
                 call(f"/graphs/{owned_graph}", method="DELETE")
         finally:
             call(f"/tables/{owned_table}", method="DELETE")
-        print(
-            "32 authenticated Cypher mutation semantics checks passed; producer postimages and deferred shortest paths passed"
-        )
+
+    try:
+        if args.contract in ("all", "mutations"):
+            verify_mutations()
+        if args.contract in ("all", "producers"):
+            verify_producers()
+        if args.contract == "all":
+            print(
+                "32 authenticated Cypher mutation semantics checks passed; producer postimages and deferred shortest paths passed"
+            )
+        else:
+            print(f"Authenticated Cypher {args.contract} contract passed")
     finally:
         if created_graph:
             call(f"/graphs/{graph}", method="DELETE")

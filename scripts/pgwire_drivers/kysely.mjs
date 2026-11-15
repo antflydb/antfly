@@ -15,6 +15,7 @@
 
 // Run through test_pgwire_drivers.py after building @antfly/sdk.
 import { fork } from "node:child_process";
+import { waitForWorkerResult } from "./worker-progress.mjs";
 import { once } from "node:events";
 import assert from "node:assert/strict";
 import { Kysely, PostgresDialect, sql } from "kysely";
@@ -230,6 +231,9 @@ try {
     .executeTakeFirstOrThrow();
   assert.equal(defaultDecimals.amount, expectedDecimal.amount);
   assert.equal(typeof defaultDecimals.amounts[0][0], "number");
+  // This control is complete. Do not retain an idle session until pg's timer
+  // happens to expire; later phases have their own bounded live clients.
+  await standard.destroy();
   await db
     .insertInto("kysely_shapes")
     .values([
@@ -299,19 +303,27 @@ try {
         { stdio: ["ignore", "inherit", "inherit", "ipc"] },
       );
       workers.add(child);
-      const message = once(child, "message", {
-        signal: AbortSignal.timeout(60_000),
-      }).then(([value]) => value);
+      // A worker can exit before reporting (including an unsettled top-level
+      // await). Surface that outcome immediately instead of masking it as an
+      // unrelated 60-second AbortError. Keep the deadline for a live stall.
+      const message = waitForWorkerResult(child, mode);
       const exited = once(child, "exit").then((value) => {
         workers.delete(child);
         return value;
       });
       return { child, message, exited };
     };
+    const stoppedEarly = spawnWorker("exit-before-report");
+    await assert.rejects(stoppedEarly.message, /exited before reporting: code=17/);
+    assert.deepEqual(await stoppedEarly.exited, [17, null]);
     const runners = [spawnWorker("migrate"), spawnWorker("migrate")];
     const outcomes = await Promise.all(runners.map((runner) => runner.message));
     await Promise.all(runners.map((runner) => runner.exited));
-    for (const outcome of outcomes) assert.equal(outcome.error, null);
+    if (process.env.ANTFLY_PGWIRE_TRACE_MIGRATIONS === "1") {
+      console.log("Concurrent migration timings:", JSON.stringify(outcomes.map((outcome) => outcome.timings)));
+    }
+    assert.deepEqual(outcomes.map((outcome) => outcome.error), [null, null],
+      `Concurrent migration outcomes: ${JSON.stringify(outcomes)}`);
     assert.equal(
       outcomes.reduce((total, outcome) => total + outcome.applied, 0),
       1,
@@ -356,6 +368,9 @@ try {
       }),
       false,
     );
+    // The competing-client assertions are complete; release their connection
+    // before running the independent namespace/direction migration matrix.
+    await second.destroy();
     await owner.release(runtime.db);
     assert.equal(await runtime.inspectMigrationLock(), null);
     const result = await runtime.migrateToLatest({
@@ -456,9 +471,19 @@ try {
     assert.match(source, /"public.shadow": \{\s+"value": number;/);
     assert.match(source, /"shadow": \{\s+"value": string;/);
     assert.ok(!source.includes('"kysely_people"'));
+    let checkedMigrationIntrospection = false;
     const provider = { async getMigrations() { return {
       "001": {
-        async up(tx) { await tx.schema.withSchema("app").createTable("scoped_migration").addColumn("value", "text").execute(); },
+        async up(tx) {
+          if (!checkedMigrationIntrospection) {
+            const tables = await tx.introspection.getTables();
+            const shadow = tables.find((table) => table.schema === "app" && table.name === "shadow");
+            assert.ok(shadow?.columns.some((column) => column.name === "value"),
+              "application migration must receive full introspection, not the private bootstrap view");
+            checkedMigrationIntrospection = true;
+          }
+          await tx.schema.withSchema("app").createTable("scoped_migration").addColumn("value", "text").execute();
+        },
         async down(tx) { await tx.schema.withSchema("app").dropTable("scoped_migration").execute(); },
       },
     }; } };

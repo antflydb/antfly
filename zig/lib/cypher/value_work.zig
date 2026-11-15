@@ -121,11 +121,26 @@ pub const Work = struct {
     fn mix(left: u64, right: u64) u64 {
         return std.hash.Wyhash.hash(left, std.mem.asBytes(&right));
     }
-    fn text(seed: u64, input: []const u8) u64 {
-        return std.hash.Wyhash.hash(mix(seed, input.len), input);
+    /// Preserve the hash format while admitting byte work before each bounded
+    /// scan. Checkpoints are per 4 KiB, not per byte or per entire wide value.
+    fn text(self: *Work, seed: u64, input: []const u8) !u64 {
+        const initial = mix(seed, input.len);
+        if (input.len <= 4096) {
+            try self.charge(self.ptr, std.math.divCeil(usize, input.len, 64) catch unreachable);
+            return std.hash.Wyhash.hash(initial, input);
+        }
+        var hash = std.hash.Wyhash.init(initial);
+        var offset: usize = 0;
+        while (offset < input.len) {
+            const end = offset + @min(4096, input.len - offset);
+            try self.charge(self.ptr, std.math.divCeil(usize, end - offset, 64) catch unreachable);
+            hash.update(input[offset..end]);
+            offset = end;
+        }
+        return hash.final();
     }
-    fn identity(seed: u64, id: v.Identity) u64 {
-        return text(text(seed, id.table), id.key);
+    fn identity(self: *Work, seed: u64, id: v.Identity) !u64 {
+        return self.text(try self.text(seed, id.table), id.key);
     }
     pub fn cachedShape(self: *const Work, value: v.Value) ?Shape {
         const k = key(value) orelse return null;
@@ -215,22 +230,27 @@ pub const Work = struct {
                 } else result.hash = mix(mix(result.hash, 1), @bitCast(number));
             },
             .string => |item| {
-                try self.charge(self.ptr, item.len / 64);
-                result.hash = text(result.hash, item);
+                result.hash = try self.text(result.hash, item);
                 result.work +|= item.len / 64;
             },
             .node => |node| {
-                result.hash = identity(result.hash, node.identity);
+                result.hash = try self.identity(result.hash, node.identity);
                 result.entities = true;
             },
             .relationship => |edge| {
-                result.hash = text(identity(result.hash, edge.identity), edge.index);
+                result.hash = try self.text(try self.identity(result.hash, edge.identity), edge.index);
                 result.entities = true;
             },
             .path => |path| {
                 result.entities = true;
-                for (path.nodes) |node| result.hash = identity(result.hash, node.identity);
-                for (path.relationships) |edge| result.hash = text(identity(result.hash, edge.identity), edge.index);
+                for (path.nodes) |node| {
+                    try self.charge(self.ptr, 1);
+                    result.hash = try self.identity(result.hash, node.identity);
+                }
+                for (path.relationships) |edge| {
+                    try self.charge(self.ptr, 1);
+                    result.hash = try self.text(try self.identity(result.hash, edge.identity), edge.index);
+                }
                 result.work +|= path.nodes.len +| path.relationships.len;
 
                 result.entity_work = result.work;
@@ -253,8 +273,7 @@ pub const Work = struct {
                 var entries: u64 = 0;
                 for (items) |item| {
                     const child = try self.infoDepth(item.value, depth + 1);
-                    try self.charge(self.ptr, item.name.len / 64);
-                    entries +%= text(child.hash, item.name);
+                    entries +%= try self.text(child.hash, item.name);
                     result.depth = @max(result.depth, child.depth + 1);
                     result.work +|= child.work +| (item.name.len / 64);
                     result.entity_work +|= if (child.entities) child.entity_work else 1;
@@ -959,4 +978,80 @@ test "comparisons meter visited structure and skip certified shared DAGs while p
     var too_deep: v.Value = .{ .integer = 0 };
     for (0..66) |_| too_deep = .{ .list = try a.dupe(v.Value, &.{too_deep}) };
     try std.testing.expectError(error.CypherValueDepthExceeded, owner.equal(.{ .list = &.{ .{ .integer = 0 }, too_deep } }, .{ .list = &.{ .{ .integer = 1 }, too_deep } }));
+}
+
+test "identity and path hashes admit visited identities and bytes before traversal" {
+    const Meter = struct {
+        left: usize,
+        calls: usize = 0,
+        cancel_after: usize = std.math.maxInt(usize),
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls > self.cancel_after) return error.Canceled;
+            if (amount > self.left) return error.CypherStateBudgetExceeded;
+            self.left -= amount;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nodes = try a.alloc(*const v.Node, 2048);
+    for (nodes, 0..) |*out, index| {
+        const key_bytes = try a.alloc(u8, 512);
+        @memset(key_bytes, 'x');
+        _ = try std.fmt.bufPrint(key_bytes[0..8], "{d:0>8}", .{index});
+        const node = try a.create(v.Node);
+        node.* = .{ .identity = .{ .table = "docs", .key = key_bytes } };
+        out.* = node;
+    }
+    const edges = try a.alloc(*const v.Relationship, nodes.len - 1);
+    for (edges, 0..) |*out, index| {
+        const edge = try a.create(v.Relationship);
+        edge.* = .{ .identity = .{ .table = "docs", .key = try std.fmt.allocPrint(a, "r{d}", .{index}) }, .index = "links", .type = "R", .source = nodes[index].identity, .target = nodes[index + 1].identity };
+        out.* = edge;
+    }
+    const path: v.Value = .{ .path = .{ .nodes = nodes, .relationships = edges } };
+    var meter: Meter = .{ .left = 1 };
+    var work: Work = .{ .a = a, .ptr = &meter, .charge = Meter.charge };
+    try std.testing.expectError(error.CypherStateBudgetExceeded, work.info(path));
+    meter = .{ .left = 100000, .cancel_after = 20 };
+    try std.testing.expectError(error.Canceled, work.info(path));
+    meter = .{ .left = 100000 };
+    _ = try work.info(path);
+    try std.testing.expect(100000 - meter.left >= 16384);
+    try std.testing.expect(meter.calls >= nodes.len + edges.len);
+    meter = .{ .left = 2 };
+    try std.testing.expectError(error.CypherStateBudgetExceeded, work.info(.{ .node = nodes[0] }));
+    meter = .{ .left = 2 };
+    try std.testing.expectError(error.CypherStateBudgetExceeded, work.info(.{ .relationship = edges[0] }));
+}
+
+test "chunked hash admission preserves hashes and checkpoints wide byte scans" {
+    const Meter = struct {
+        calls: usize = 0,
+        cancel_after: usize = std.math.maxInt(usize),
+        fn charge(ptr: *anyopaque, _: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls > self.cancel_after) return error.Canceled;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meter: Meter = .{};
+    var work: Work = .{ .a = a, .ptr = &meter, .charge = Meter.charge };
+    for ([_]usize{ 0, 1, 63, 64, 4095, 4096, 4097, 65536 }) |length| {
+        const bytes = try a.alloc(u8, length);
+        for (bytes, 0..) |*byte, index| byte.* = @truncate(index *% 17 +% 3);
+        const value: v.Value = .{ .string = bytes };
+        const expected = std.hash.Wyhash.hash(Work.mix(v.Value.rank(value), length), bytes);
+        try std.testing.expectEqual(expected, (try work.info(value)).hash);
+    }
+    const wide = try a.alloc(u8, 2 << 20);
+    @memset(wide, 'x');
+    meter = .{ .cancel_after = 3 };
+    try std.testing.expectError(error.Canceled, work.info(.{ .string = wide }));
+    try std.testing.expectEqual(@as(usize, 4), meter.calls);
 }

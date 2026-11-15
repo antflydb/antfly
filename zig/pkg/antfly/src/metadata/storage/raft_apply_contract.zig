@@ -377,6 +377,9 @@ pub const TriggerPolicySchemaPreparation = struct {
         try writer.write(.{ .after = self.after });
     }
 };
+/// Expected alias-validation rejections retain their identity across the
+/// independently compiled owner boundary without transporting Zig errors.
+pub const TableIndexMutationValidation = @import("index_mutation_validation.zig").Result;
 
 pub const CatalogProjectionRequest = union(enum) {
     // Closed extension-family projections use the existing owned JSON CABI.
@@ -451,6 +454,8 @@ pub const CatalogProjectionRequest = union(enum) {
     topology_activation: void,
     report_cursor: u64,
     read_control_stores: []const u64,
+    owner_readiness: @import("../api.zig").OwnerReadinessRequest,
+    owner_readiness_transitions: @import("../api.zig").OwnerReadinessRequest,
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
     catalog_snapshot: void,
@@ -462,6 +467,8 @@ pub const CatalogProjectionRequest = union(enum) {
     sql_policy_publication_work: u64,
     sql_policy_begin_command: @import("antfly_local_sources").system_catalog_policies.BeginRequest,
     sql_policy_definition_command: @import("antfly_local_sources").system_catalog_policies.Command,
+    has_index_aliases: void,
+    validate_table_index_mutation: struct { before: metadata.TableRecord, after: metadata.TableRecord },
     require_policy_index_mutation_allowed: u64,
     require_policy_topology_mutation_allowed: u64,
     sql_completion_reference: [16]u8,
@@ -533,6 +540,7 @@ pub const CatalogProjectionRequest = union(enum) {
     sql_graph_preparation_read: @import("../../system_catalog/graph_preparation.zig").Source,
     sql_graph_preparation_outcome: @import("../../system_catalog/graph_preparation.zig").Observation,
     sql_trigger_snapshot: @import("../../system_catalog/trigger_snapshot.zig").Request,
+    has_index_alias_lifecycle_state: void,
 };
 
 test "system catalog creation sources have a distinct strict command version" {

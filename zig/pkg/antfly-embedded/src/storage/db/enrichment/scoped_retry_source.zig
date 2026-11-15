@@ -19,6 +19,25 @@ const identities = @import("../doc_identity.zig");
 const keys = @import("../../internal_keys.zig");
 pub const Stamp = @import("scoped_retries.zig").SourceStamp;
 pub const Observation = struct { stamp: ?Stamp = null, logical_digest: ?[32]u8 = null, primary_read: bool = false };
+pub const DocumentLocation = @import("scoped_retries.zig").DocumentLocation;
+
+pub fn captureLocation(a: std.mem.Allocator, txn: anytype, physical: []const u8, document: []const u8) !?DocumentLocation {
+    const revision = revisions.keyForPhysical(physical) orelse return null;
+    const ordinal = (try identities.lookupOrdinalTxn(a, txn, document)) orelse return null;
+    return .{ .revision_hash = revision[revision.len - 32 ..].*, .ordinal = ordinal, .kind = physical[physical.len - 1] };
+}
+/// Null requests the legacy primary fallback; a present observation with no
+/// stamp proves deletion. Ordinals are immutable within the owning namespace.
+pub fn observeLocation(txn: anytype, location: DocumentLocation, previous: ?Stamp) !?Observation {
+    const state = (try identities.lookupStateTxn(txn, location.ordinal)) orelse return Observation{};
+    if (!state.isLive()) return Observation{};
+    const key = revisions.keyFromHash(location.revision_hash);
+    const revision = try revisions.load(txn, key);
+    if (previous) |old| if (revision != 0 and revision == old.mutation_revision and state.created_generation == old.incarnation)
+        return .{ .stamp = old };
+    const content = (try revisions.loadContentByKey(txn, key, location.kind)) orelse return null;
+    return .{ .stamp = .{ .mutation_revision = revision, .incarnation = state.created_generation, .digest = content.digest } };
+}
 
 /// All observations share one read snapshot. Primary bytes are needed only
 /// for old/unsupported metadata or to qualify a relational input on failure.
@@ -55,6 +74,77 @@ pub fn observe(a: std.mem.Allocator, txn: anytype, physical: []const u8, documen
     var logical_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(value, &logical_digest, .{});
     return .{ .stamp = stamp, .logical_digest = logical_digest, .primary_read = true };
+}
+
+test "durable enrichment scoped retry locators validate source changes without loading opaque keys" {
+    const a = std.testing.allocator;
+    const memory = @import("../../mem_backend.zig");
+    var backend = memory.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "retry-source-locator" });
+    defer store.deinit();
+    const physical = try keys.documentKeyAlloc(a, "doc");
+    defer a.free(physical);
+    const revision_key = revisions.keyForPhysical(physical).?;
+    var revision: [8]u8 = undefined;
+    std.mem.writeInt(u64, &revision, 1, .little);
+    var content: [49]u8 = undefined;
+    @memcpy(content[0..8], &revision);
+    std.mem.writeInt(u64, content[8..16], 2, .little);
+    content[16] = physical[physical.len - 1];
+    @memset(content[17..49], 17);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        _ = try identities.ensureOrdinalTxn(a, &write, 1, 2, 5, "doc");
+        try write.put(physical, "{}");
+        try write.put(&revision_key, &revision);
+        try write.put(&revisions.contentKey(revision_key), &content);
+        try write.commit();
+    }
+    var location: DocumentLocation = undefined;
+    var first: Stamp = undefined;
+    {
+        var read = try store.beginProbe();
+        defer read.abort();
+        location = (try captureLocation(a, &read, physical, "doc")).?;
+        const Spy = struct {
+            read: *@TypeOf(read),
+            physical: []const u8,
+            pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+                if (std.mem.eql(u8, key, self.physical)) return error.TestUnexpectedResult;
+                return self.read.get(key);
+            }
+        };
+        var spy = Spy{ .read = &read, .physical = physical };
+        first = (try observeLocation(&spy, location, null)).?.stamp.?;
+        try std.testing.expectEqual(@as(u64, 5), first.incarnation);
+        try std.testing.expectEqual(@as(u64, 1), first.mutation_revision);
+        for (0..128) |_| try std.testing.expectEqualDeep(first, (try observeLocation(&spy, location, first)).?.stamp.?);
+    }
+    // An older writer can advance the compatibility revision without the
+    // content cache. The locator must request the primary fallback then.
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        std.mem.writeInt(u64, &revision, 2, .little);
+        try write.put(&revision_key, &revision);
+        try write.commit();
+    }
+    {
+        var read = try store.beginProbe();
+        defer read.abort();
+        try std.testing.expect(try observeLocation(&read, location, first) == null);
+    }
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try identities.markDeletedTxn(a, &write, 6, "doc");
+        try write.commit();
+    }
+    var read = try store.beginProbe();
+    defer read.abort();
+    try std.testing.expect((try observeLocation(&read, location, first)).?.stamp == null);
 }
 
 test "durable enrichment scoped retry validates metadata without reading unchanged primary bodies" {

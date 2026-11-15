@@ -20,6 +20,9 @@ pub const Implementation = struct {
     primary: Admission.CaptureLease,
     replay: Admission.CaptureLease,
     pub fn release(self: *@This()) void {
+        // Revoke the borrowed owner capability before releasing its leases.
+        // A retained pointer must not authorize capture after exclusion ends.
+        self.owner = null;
         self.replay.release();
         self.primary.release();
     }

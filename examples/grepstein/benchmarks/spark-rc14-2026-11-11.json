@@ -1,0 +1,273 @@
+{
+  "date_utc": "2026-11-11",
+  "hardware": "DGX Spark NVIDIA GB10, CUDA compute 12.1, driver 580.178.04",
+  "runtime": "antfly 0.3.0-rc.14 (zig runtime)",
+  "runtime_sha256": "8e743bdab075dc6ef9696bb86e7fecdeafe51ec833fbca0d9c2458ddcfdf3468",
+  "contention": "Another user GPU training job remained active throughout; no clean-device or A100 result.",
+  "models": {
+    "ocr": "lightonai/LightOnOCR-3-4B:safetensors@b71010f095dc3735de7ee6b9969bff8f8f50b39a",
+    "embed": "google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b",
+    "extract": "fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d"
+  },
+  "corpus": {
+    "doj-01": {
+      "records": 3142,
+      "pages": 3142
+    },
+    "doj-02": {
+      "records": 574,
+      "pages": 699
+    },
+    "doj-03": {
+      "records": 120,
+      "pages": 1847
+    },
+    "doj-04": {
+      "records": 213,
+      "pages": 2704
+    },
+    "doj-05": {
+      "records": 120,
+      "pages": 120
+    },
+    "doj-06": {
+      "records": 28,
+      "pages": 487
+    },
+    "doj-07": {
+      "records": 34,
+      "pages": 660
+    },
+    "doj-12": {
+      "records": 191,
+      "pages": 1525
+    }
+  },
+  "total_records": 4422,
+  "total_pages": 11184,
+  "native_prepass": {
+    "input_bytes": 6176876,
+    "native_seconds": 0.6532239530060906,
+    "pages": 53,
+    "incomplete_without_ocr": 6,
+    "samples": [
+      {
+        "dataset": "doj-01",
+        "sample_pages": 1,
+        "incomplete_without_ocr": 1
+      },
+      {
+        "dataset": "doj-02",
+        "sample_pages": 1,
+        "incomplete_without_ocr": 1
+      },
+      {
+        "dataset": "doj-03",
+        "sample_pages": 3,
+        "incomplete_without_ocr": 2
+      },
+      {
+        "dataset": "doj-04",
+        "sample_pages": 1,
+        "incomplete_without_ocr": 1
+      },
+      {
+        "dataset": "doj-05",
+        "sample_pages": 1,
+        "incomplete_without_ocr": 1
+      },
+      {
+        "dataset": "doj-06",
+        "sample_pages": 8,
+        "incomplete_without_ocr": 0
+      },
+      {
+        "dataset": "doj-07",
+        "sample_pages": 25,
+        "incomplete_without_ocr": 0
+      },
+      {
+        "dataset": "doj-12",
+        "sample_pages": 13,
+        "incomplete_without_ocr": 0
+      }
+    ]
+  },
+  "inference_requests": [
+    {
+      "kind": "ocr",
+      "label": "synthetic-receipt-cold",
+      "items": 1,
+      "request_sha256": "610aa697a4026edae02a7be53687ca34d8f75634d7b8744f6b5cbaa1b181c27b",
+      "complete": true,
+      "usage": {
+        "prompt_tokens": 554,
+        "completion_tokens": 201,
+        "total_tokens": 755
+      },
+      "execution": {
+        "requested_items": 1,
+        "native_batches": 0,
+        "native_items": 0,
+        "max_native_step_items": 1,
+        "serial_items": 1,
+        "rejected_items": 0,
+        "fallback_items": 0
+      },
+      "text_characters": 354,
+      "seconds": 46.9857381269976,
+      "items_per_second": 0.02128305396197253
+    },
+    {
+      "kind": "ocr",
+      "label": "synthetic-receipt-warm",
+      "items": 1,
+      "request_sha256": "610aa697a4026edae02a7be53687ca34d8f75634d7b8744f6b5cbaa1b181c27b",
+      "complete": true,
+      "usage": {
+        "prompt_tokens": 554,
+        "completion_tokens": 201,
+        "total_tokens": 755
+      },
+      "execution": {
+        "requested_items": 1,
+        "native_batches": 0,
+        "native_items": 0,
+        "max_native_step_items": 1,
+        "serial_items": 1,
+        "rejected_items": 0,
+        "fallback_items": 0
+      },
+      "text_characters": 354,
+      "seconds": 11.02076680600294,
+      "items_per_second": 0.09073778781484666
+    },
+    {
+      "kind": "ocr",
+      "label": "synthetic-receipt-concurrent-1",
+      "items": 1,
+      "request_sha256": "610aa697a4026edae02a7be53687ca34d8f75634d7b8744f6b5cbaa1b181c27b",
+      "complete": true,
+      "usage": {
+        "prompt_tokens": 554,
+        "completion_tokens": 201,
+        "total_tokens": 755
+      },
+      "execution": {
+        "requested_items": 1,
+        "native_batches": 1,
+        "native_items": 1,
+        "max_native_step_items": 2,
+        "serial_items": 0,
+        "rejected_items": 0,
+        "fallback_items": 0
+      },
+      "text_characters": 354,
+      "seconds": 11.506245394004509,
+      "items_per_second": 0.0869093232203325
+    },
+    {
+      "kind": "ocr",
+      "label": "synthetic-receipt-concurrent-0",
+      "items": 1,
+      "request_sha256": "610aa697a4026edae02a7be53687ca34d8f75634d7b8744f6b5cbaa1b181c27b",
+      "complete": true,
+      "usage": {
+        "prompt_tokens": 554,
+        "completion_tokens": 201,
+        "total_tokens": 755
+      },
+      "execution": {
+        "requested_items": 1,
+        "native_batches": 1,
+        "native_items": 1,
+        "max_native_step_items": 2,
+        "serial_items": 0,
+        "rejected_items": 0,
+        "fallback_items": 0
+      },
+      "text_characters": 354,
+      "seconds": 11.79914890701184,
+      "items_per_second": 0.08475187557008738
+    },
+    {
+      "kind": "embed",
+      "label": "text-chunks-cold",
+      "items": 4,
+      "request_sha256": "870f827d77463cfb7356910b04409a0768d72a23fe4ad090ba873ba7e8e7f46b",
+      "complete": true,
+      "usage": {
+        "prompt_tokens": 448,
+        "total_tokens": 448
+      },
+      "execution": null,
+      "seconds": 11.490049511980033,
+      "items_per_second": 0.3481273075306963
+    },
+    {
+      "kind": "embed",
+      "label": "text-chunks-warm",
+      "items": 4,
+      "request_sha256": "3382f062440c261b06ffb2528508306ec83729b8a903f229ee911416735d9530",
+      "complete": true,
+      "usage": {
+        "prompt_tokens": 448,
+        "total_tokens": 448
+      },
+      "execution": null,
+      "seconds": 0.031216037983540446,
+      "items_per_second": 128.1392597647759
+    },
+    {
+      "kind": "extract",
+      "label": "relation-window-cold",
+      "items": 1,
+      "request_sha256": "49b5225a16ae0572a0f657e17d2fbfd309cb837e0ac5ed378aebd81f94b7b604",
+      "complete": true,
+      "usage": {
+        "prompt_tokens": 412,
+        "completion_tokens": 0,
+        "total_tokens": 412
+      },
+      "execution": null,
+      "seconds": 4.953571841004305,
+      "items_per_second": 0.20187453257915333
+    },
+    {
+      "kind": "extract",
+      "label": "relation-window-warm",
+      "items": 1,
+      "request_sha256": "2558a9c15986393b94d1038bfb5842eb18ba3bbc64656252ee31740d6719692e",
+      "complete": true,
+      "usage": {
+        "prompt_tokens": 412,
+        "completion_tokens": 0,
+        "total_tokens": 412
+      },
+      "execution": null,
+      "seconds": 0.11242519799270667,
+      "items_per_second": 8.89480310334764
+    }
+  ],
+  "concurrent_ocr": {
+    "completed": 2,
+    "seconds": 11.80037301100674,
+    "pages_per_second": 0.16948616777914643
+  },
+  "dense_page": {
+    "kind": "ocr",
+    "label": "real-dense-page-warm-model",
+    "items": 1,
+    "request_sha256": "7d1f1ecbf1fc90adc111f55dc86218eaf9e5fcc38780e726f12928944556cfb4",
+    "complete": false,
+    "error": "HTTP Error 504: Gateway Timeout",
+    "response": "{\"error\":\"INFERENCE_TIMEOUT\",\"message\":\"the inference deadline expired\",\"retryable\":true}",
+    "seconds": 55.1999809719855
+  },
+  "conditional_scenarios": {
+    "assumptions": "Every OCR-required page costs the same as the tiny synthetic receipt; not an ETA. Does not include GCS acquisition, publication, graph resolution, repair, or failed work.",
+    "all_pages_ocr_hours": 18.329912743763803,
+    "single_pdf_per_release_weighted_ocr_pages": 7896.333333333333,
+    "weighted_receipt_like_ocr_hours": 12.941622048969384
+  }
+}

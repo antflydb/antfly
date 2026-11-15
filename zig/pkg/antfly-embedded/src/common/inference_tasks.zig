@@ -361,7 +361,10 @@ pub const Executor = struct {
         const uses_default = cfg.provider == .antfly and cfg.resolvedUrl() == null;
         if (uses_default) if (self.antfly_provider) |provider| {
             const callback = provider.transcribe_audio_with_context orelse return error.UnsupportedInferenceFeature;
-            const effective = transcribing.withRequestDefaults(cfg, request);
+            var effective = transcribing.withRequestDefaults(cfg, request);
+            const source = if (audio) |bytes| try transcribing.inlineAudioSourceAlloc(a, bytes, null, cfg.max_download_bytes) else null;
+            defer if (source) |uri| a.free(uri);
+            if (source) |uri| effective.url = uri;
             return callback(provider.ptr, a, cfg.model orelse return error.ModelRequired, effective, self.context);
         };
         if (cfg.provider == .antfly and cfg.resolvedUrl() == null) if (self.inference_api_url) |url| {

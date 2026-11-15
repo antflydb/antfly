@@ -449,6 +449,7 @@ pub const ServingSource = struct {
     alloc: std.mem.Allocator,
     snapshot_pin: ?host_store.SnapshotPin = null,
     store: object_store_support.OpenedObjectStore,
+    provider_allocator: ?*@import("../../sql/parallel_scheduler.zig").LockedAllocator = null,
     inventory: external_source_api.Inventory,
     scanner: PinnedExternalObjectStorageLakeRowsScanner,
     iceberg_schema: ?@import("lake_schema.zig").Detected = null,
@@ -607,7 +608,13 @@ pub const ServingSource = struct {
         if (comptime @import("builtin").os.tag == .freestanding) if (cache != null) return error.UnsupportedHostedLakeCache;
         const binding = (schema.external_base_source orelse return error.InvalidExternalTableBinding).binding;
         const identity_version = options.row_identity_version orelse binding.row_identity_version;
-        var store = try options.open(alloc, binding);
+        // HTTP pools/authentication may allocate while admitted column workers
+        // overlap. Never let those clients retain a bare request arena. Keep
+        // the synchronizing allocator at its final address until client drain.
+        const provider_allocator = try alloc.create(@import("../../sql/parallel_scheduler.zig").LockedAllocator);
+        errdefer alloc.destroy(provider_allocator);
+        provider_allocator.* = .{ .backing = @import("../../sql/memory_budget.zig").reclaimingAllocator(alloc) };
+        var store = try options.open(provider_allocator.allocator(), binding);
         errdefer store.deinit();
         const context_store = try alloc.create(@import("lake_read_context.zig").Store);
         errdefer alloc.destroy(context_store);
@@ -650,7 +657,11 @@ pub const ServingSource = struct {
                 const manifest_api = @import("lake_parquet_manifest.zig");
                 const manifest_uri = base orelse binding.source_uri;
                 const bytes = if (options.retained_manifest) |manifest| try alloc.dupe(u8, manifest) else try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, manifest_uri, .iceberg_metadata, null, 1024 * 1024);
-                defer alloc.free(bytes);
+                // Transfer this allocation into the serving source after the
+                // plan is admitted. Failure and plan construction still own it
+                // here; parallel views borrow it from the parent source.
+                var bytes_transferred = false;
+                defer if (!bytes_transferred) alloc.free(bytes);
                 var snapshot: @import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan = undefined;
                 if (cache) |shared| {
                     const scope = try cacheScope(alloc, store, binding);
@@ -664,12 +675,11 @@ pub const ServingSource = struct {
                         defer if (!adopted) header.deinit(alloc);
                         file_navigation = try navigation.?.resolve(navigation.?.ptr, alloc, .{ .requested = key, .current = key, .selected = key }, header, context);
                         if (file_navigation != null) {
-                            const metadata_copy = try alloc.dupe(u8, bytes);
-                            errdefer alloc.free(metadata_copy);
                             const uri_copy = try alloc.dupe(u8, manifest_uri);
                             errdefer alloc.free(uri_copy);
                             const snapshot_copy = if (binding.snapshot_mode.pinnedSnapshotId()) |value| try alloc.dupe(u8, value) else null;
-                            deferred_snapshot = .{ .metadata = metadata_copy, .uri = uri_copy, .snapshot = snapshot_copy, .cache = shared, .key = key, .scope = scope };
+                            deferred_snapshot = .{ .metadata = bytes, .uri = uri_copy, .snapshot = snapshot_copy, .cache = shared, .key = key, .scope = scope };
+                            bytes_transferred = true;
                             snapshot = .{ .inventory = header };
                             adopted = true;
                         }
@@ -685,7 +695,10 @@ pub const ServingSource = struct {
                         snapshot = lease.item.payload.snapshot;
                     }
                 } else snapshot = try manifest_api.plan(alloc, .{ .client = client, .source = binding.table_id, .uri = binding.source_uri, .schema = binding.schema_fingerprint, .context = context }, bytes);
-                if (deferred_snapshot == null) sealed_manifest = try alloc.dupe(u8, bytes);
+                if (deferred_snapshot == null) {
+                    sealed_manifest = bytes;
+                    bytes_transferred = true;
+                }
                 break :blk snapshot.inventory;
             },
             .iceberg => blk: {
@@ -811,7 +824,7 @@ pub const ServingSource = struct {
         errdefer if (snapshot_pin) |pin| pin.deinit(pin.ptr);
         if (snapshot_pin) |pin| context_store.extra_checkpoint = .{ .ptr = pin.ptr, .check = pin.check };
         const local_plan = if (plan_lease == null and file_navigation == null) try PreparedPlan.init(alloc, inventory) else null;
-        var result: ServingSource = .{ .file_navigation = file_navigation, .deferred_snapshot = deferred_snapshot, .sealed_manifest = sealed_manifest, .alloc = alloc, .snapshot_pin = snapshot_pin, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .local_plan = local_plan, .inventory_owned = plan_lease == null, .attachment_uri = attachment_uri, .catalog_metadata = retained_metadata, .lazy_versions = lazy_versions, .immutable_objects = binding.object_mutability == .immutable, .pinned_files = pinned_files };
+        var result: ServingSource = .{ .file_navigation = file_navigation, .deferred_snapshot = deferred_snapshot, .sealed_manifest = sealed_manifest, .alloc = alloc, .snapshot_pin = snapshot_pin, .store = store, .provider_allocator = provider_allocator, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .local_plan = local_plan, .inventory_owned = plan_lease == null, .attachment_uri = attachment_uri, .catalog_metadata = retained_metadata, .lazy_versions = lazy_versions, .immutable_objects = binding.object_mutability == .immutable, .pinned_files = pinned_files };
         errdefer result.freeCatalogFiles();
         try result.ensureDeleteQualification();
         errdefer if (result.delete_qualification_owned) if (result.delete_qualification) |qualification| qualification.destroy();
@@ -1269,7 +1282,12 @@ pub const ServingSource = struct {
         const reader = try self.alloc.create(@import("lake_serving_cache.zig").Reader);
         errdefer self.alloc.destroy(reader);
         const scope = try cacheScope(self.alloc, self.store, binding);
-        reader.* = .{ .base = self.scanner.object_reader, .cache = cache, .scope = scope, .context = self.protectContext(context) };
+        var read_context = self.protectContext(context);
+        // Borrowed resolver clients may ignore our construction allocator.
+        // Only known owned provider instances establish that synchronization.
+        const owned_provider = self.store.gcs_client != null or self.store.s3_client != null;
+        read_context.parallel_object_io = self.provider_allocator != null and owned_provider and self.store.client.vtable.supports_concurrent_requests;
+        reader.* = .{ .base = self.scanner.object_reader, .cache = cache, .scope = scope, .context = read_context };
         self.scanner.shared_reader = reader;
     }
 
@@ -1304,6 +1322,7 @@ pub const ServingSource = struct {
             self.alloc.destroy(snapshot);
         };
         self.store.deinit();
+        if (self.provider_allocator) |owned| self.alloc.destroy(owned);
         if (self.context_store) |store| self.alloc.destroy(store);
         self.* = undefined;
     }

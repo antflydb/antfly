@@ -19,7 +19,7 @@ relationships that Progenitor can't express. The generated code lands in
 
 ```toml
 [dependencies]
-antfly-sdk = { path = "../sdk" }  # or a git/registry dependency once published
+antfly-sdk = "0.3.0"
 ```
 
 ## Usage

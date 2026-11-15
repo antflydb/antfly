@@ -579,7 +579,11 @@ pub const Page = struct {
                     }
                     break :blk @unionInit(rows.ColumnValues, @tagName(tag), .{ .values = values.items, .indices = indices });
                 },
-                .vector_f32 => return error.UnsupportedSqlExecution,
+                .vector_f32 => |values| blk: {
+                    const gathered = try pa.alloc([]const f32, selection.len);
+                    for (selection, gathered, nulls) |index, *value, flag| value.* = if (flag != 0) &.{} else try pa.dupe(f32, values[index]);
+                    break :blk .{ .vector_f32 = gathered };
+                },
             };
         }
         self.columns = columns;

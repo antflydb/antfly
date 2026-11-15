@@ -116,6 +116,25 @@ pub fn reconcileDbIndexesWithOptions(
     };
 }
 
+fn collectArtifactReferences(value: std.json.Value, required: *std.StringHashMap(void)) !void {
+    switch (value) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const name = entry.key_ptr.*;
+                if (entry.value_ptr.* == .string and
+                    (std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_name") or std.mem.eql(u8, name, "embedding_name") or std.mem.eql(u8, name, "source_artifact_name")))
+                    try required.put(entry.value_ptr.string, {});
+                try collectArtifactReferences(entry.value_ptr.*, required);
+            }
+        },
+        .array => |array| for (array.items) |item| {
+            try collectArtifactReferences(item, required);
+        },
+        else => {},
+    }
+}
+
 /// Reconcile one catalog index without applying sibling index, resolver, or
 /// table-schema changes carried by the same metadata snapshot.
 /// This is the storage boundary used by online index DDL after its foreground
@@ -180,6 +199,29 @@ pub fn reconcileDbIndexTargetWithOptions(
 
     if (target_value) |value| {
         try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(alloc, value, options.embedding_options, &target_enrichments);
+        // Root producers are shared declarations, but activation owns only the
+        // transitive dependency closure of its target. The desired list is
+        // already in topological order, so append selected nodes in that order.
+        var required = std.StringHashMap(void).init(alloc);
+        defer required.deinit();
+        try collectArtifactReferences(value, &required);
+        for (target_enrichments.items) |cfg| {
+            try required.put(cfg.name, {});
+            if (cfg.source_artifact_name.len != 0) try required.put(cfg.source_artifact_name, {});
+        }
+        var cursor = desired_enrichments.items.len;
+        while (cursor > 0) {
+            cursor -= 1;
+            const cfg = desired_enrichments.items[cursor];
+            if (required.contains(cfg.name) and cfg.source_artifact_name.len != 0)
+                try required.put(cfg.source_artifact_name, {});
+        }
+        for (desired_enrichments.items) |cfg| {
+            if (!required.contains(cfg.name)) continue;
+            var owned = try db_mod.types.EnrichmentConfig.clone(alloc, cfg);
+            errdefer owned.deinit(alloc);
+            try target_enrichments.append(alloc, owned);
+        }
         dedupeDesiredEnrichments(alloc, &target_enrichments);
         try indexes_api.sortArtifactEnrichmentsByDependency(alloc, target_enrichments.items);
     }

@@ -415,6 +415,10 @@ pub const ProvisionedKernelOwnerSource = struct {
     quiescing: bool = false,
     shutdown_abandoned: bool = false,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    // Retain per-group admission watermarks across owner close/reopen gaps. Otherwise
+    // a delayed pre-DDL descriptor can remove a newer index and its artifacts
+    // without changing the schema version or physical root generation.
+    catalog_observations: std.AutoHashMapUnmanaged(u64, metadata_api.CatalogRoutingChangeToken) = .empty,
     publications: std.ArrayListUnmanaged(*PendingPublication) = .empty,
     owner_cache_hits: std.atomic.Value(u64) = .init(0),
     native_owner_diagnostics: std.atomic.Value(u32) = .init(0),
@@ -528,6 +532,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     };
 
     pub const LoadedDescriptor = struct {
+        catalog_observation: ?metadata_api.CatalogRoutingChangeToken = null,
         path: []u8,
         schema_json: []u8,
         indexes_json: []u8,
@@ -551,6 +556,12 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .restore = self.restore,
                 .initial_child_bootstrap_json = self.initial_child_bootstrap_json orelse "",
             };
+        }
+
+        fn readControls(self: *const LoadedDescriptor, base: ReadControls) ReadControls {
+            var controls = base;
+            controls.catalog_observation = self.catalog_observation;
+            return controls;
         }
 
         pub fn deinit(self: *LoadedDescriptor, alloc: std.mem.Allocator) void {
@@ -988,6 +999,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.native_initializers.deinit(self.alloc);
         self.entries.deinit(self.alloc);
         self.entries = .empty;
+        self.catalog_observations.deinit(self.alloc);
+        self.catalog_observations = .empty;
         self.mutex.unlock();
         if (self.owns_context) self.context.deinit();
     }
@@ -1477,7 +1490,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !?restore_state_contract.State {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .transient, .{});
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .transient, descriptor.readControls(.{}));
         defer lease.deinit();
         defer lease.requestTransientRetirement();
         var response = (try lease.owner().restoreStateJson(table_name)) orelse return null;
@@ -2743,7 +2756,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !void {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .transient, .{});
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .transient, descriptor.readControls(.{}));
         defer lease.deinit();
         // Warmup can overlap startup catch-up or foreground admission. Retire
         // only a transient owner, while the lease still pins it. Borrowing
@@ -2761,7 +2774,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn prepareOnlineMergeOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !void {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, .{});
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, descriptor.readControls(.{}));
         defer lease.deinit();
     }
 
@@ -2842,6 +2855,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             descriptor,
             retain_cold_owner or advance_index_repair,
             if (retain_cold_owner) .resident else .transient,
+            descriptor.readControls(.{}),
         )) orelse return .{ .state = .busy };
         defer lease.deinit();
         errdefer lease.requestTransientRetirement();
@@ -2999,6 +3013,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             // A scheduled repair returns busy immediately behind live leases.
             retain_cold_owner,
             if (retain_cold_owner) .resident else .transient,
+            descriptor.readControls(.{}),
         )) orelse return .{ .result = .{ .state = .busy } };
         defer lease.deinit();
         errdefer lease.requestTransientRetirement();
@@ -3673,6 +3688,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer projection.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         return .{
+            .catalog_observation = projection.catalog_observation,
             .path = path,
             .schema_json = projection.schema_json,
             .indexes_json = projection.indexes_json,
@@ -3721,6 +3737,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             host: @import("antfly_local_sources").common_topology_records.RelationPersistence.Context,
         } = null,
         native_boot_observed: bool = false,
+        catalog_observation: ?metadata_api.CatalogRoutingChangeToken = null,
         execution_deadline_ns: ?u64 = null,
         execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
@@ -3832,7 +3849,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             view.table_storage = null;
             view.initial_range = null;
         }
-        return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, view, false, .resident, controls);
+        return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, view, false, .resident, descriptor.readControls(controls));
     }
 
     /// Private metadata-job controls carry their own independently validated
@@ -3852,7 +3869,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             view.table_storage = null;
             view.initial_range = null;
         }
-        return self.acquireDescriptorWithMode(group, table, descriptor.path, view, false, .resident, controls);
+        return self.acquireDescriptorWithMode(group, table, descriptor.path, view, false, .resident, descriptor.readControls(controls));
     }
 
     /// Only an immutable phase-two owner may finish debt on this exact live
@@ -6938,15 +6955,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
         wait_for_readers: bool,
         residency: Residency,
+        controls: ReadControls,
     ) !?Lease {
-        if (wait_for_readers) return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, true, residency, .{ .allow_deferred_catalog = true });
+        var reconcile_controls = controls;
+        reconcile_controls.allow_deferred_catalog = true;
+        if (wait_for_readers) return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, true, residency, reconcile_controls);
         // Periodic inspection must yield to admitted foreground/maintenance
         // leases. Queueing a writer here closes foreground admission while an
         // existing lease may itself be waiting for a long derived-index apply.
         // Return busy without installing that gate; the startup scheduler
         // retains the inspection debt and retries. Explicit structural changes
         // and admitted repair work keep their writer-preference contract.
-        return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .exclusive_if_idle, residency, .{ .allow_deferred_catalog = true }) catch |err| switch (err) {
+        return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .exclusive_if_idle, residency, reconcile_controls) catch |err| switch (err) {
             error.StorageKernelOwnerTransitionRequired, error.StorageKernelOwnerStaleDescriptor => null,
             else => return err,
         };
@@ -7258,7 +7278,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn exactApplyDescriptor(entry: *const Entry, descriptor: descriptor_contract.Descriptor) bool {
-        const restore_matches = restoreBindingMatches(entry.restore, descriptor.restore, false);
+        return descriptorMatches(entry, descriptor, false);
+    }
+
+    fn descriptorMatches(entry: *const Entry, descriptor: descriptor_contract.Descriptor, inherit_admitted_restore: bool) bool {
+        const restore_matches = restoreBindingMatches(entry.restore, descriptor.restore, inherit_admitted_restore);
         return entry.generation == descriptor.lsm_root_generation and
             entry.identity.eql(descriptor.identity) and
             restore_matches and
@@ -7401,6 +7425,29 @@ pub const ProvisionedKernelOwnerSource = struct {
             actual.data_generation = native.data_generation;
             try native.requireHost(actual);
             return error.SqlRelationRecoveryIncomplete;
+        };
+        if (!controls.historical_raft_apply) if (controls.catalog_observation) |incoming| {
+            const observation = try self.catalog_observations.getOrPut(self.alloc, group_id);
+            var stale = false;
+            if (observation.found_existing) {
+                const current = observation.value_ptr.*;
+                if (incoming.authorityEql(current) and incoming.revision < current.revision)
+                    stale = true;
+            }
+            if (stale) {
+                // Unrelated catalog changes need not invalidate a warm read.
+                // Only reuse an exact live contract; a missing/changed owner
+                // would let the delayed capture mutate durable definitions.
+                const unchanged = for (self.entries.items) |entry| {
+                    if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name) and
+                        !entry.retired and !entry.closing and !entry.opened_for_historical_apply and
+                        (!controls.prepare_graph_indexes or entry.graph_replay_indexes_prepared) and
+                        descriptorMatches(entry, descriptor, true)) break true;
+                } else false;
+                if (!unchanged) return error.StorageKernelOwnerStaleDescriptor;
+            } else {
+                observation.value_ptr.* = incoming;
+            }
         };
         // Return to the caller rather than waiting with a descriptor captured
         // before publication; a retry must acquire the new catalog descriptor.
@@ -9093,20 +9140,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         return summary;
     }
 
+    /// Prepared-owner admission is shared by native and replicated callers.
+    /// Contention and publication fencing yield without prescribing a Raft retry.
     fn acquirePreparedOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !Lease {
         const generation = self.visibleRootGeneration(group_id);
-        if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
+        if (!self.mutex.tryLock()) return error.StorageOwnerAdmissionPending;
         defer self.mutex.unlock();
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.sql_persistence != null) return error.SqlRelationOwnerChanged;
             if (entry.retired or entry.closing or entry.generation != generation or
-                !tryReserveEntryLeaseLocked(entry, .shared)) return error.RaftApplyWriterUnavailable;
+                !tryReserveEntryLeaseLocked(entry, .shared)) return error.StorageOwnerAdmissionPending;
             entry.resident = true;
             entry.transient_retirement_pending = false;
             return .{ .source = self, .entry = entry, .exclusive = false };
         }
-        return error.RaftApplyWriterUnavailable;
+        return error.StorageOwnerAdmissionPending;
     }
 
     fn replicatedBatchGroupLocal(
@@ -9251,6 +9300,17 @@ pub const ProvisionedKernelOwnerSource = struct {
             return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, descriptor.view());
         }
         return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, null);
+    }
+
+    pub fn prepareEnrichments(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, deadline: ?u64, cancellation: db_types.CancellationToken) ![]u8 {
+        try cancellation.check();
+        const json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(json);
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = deadline, .cancellation = cancellation });
+        defer lease.deinit();
+        var response = try lease.owner().prepareEnrichments(table_name, json, deadline, cancellation);
+        defer response.deinit();
+        return alloc.dupe(u8, response.bytes());
     }
 
     fn batchGroupLocalWithDescriptor(
@@ -9896,7 +9956,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer self.mutex.unlock();
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or entry.restore_bootstrap_json.len == 0) continue;
-            if (entry.retired or entry.closing or entry.generation != generation or !tryReserveEntryLeaseLocked(entry, .shared)) return error.RaftApplyWriterUnavailable;
+            if (entry.retired or entry.closing or entry.generation != generation or !tryReserveEntryLeaseLocked(entry, .shared)) return error.StorageOwnerAdmissionPending;
             return .{ .source = self, .entry = entry };
         }
         return null;
@@ -11254,16 +11314,16 @@ test "storage owner quiesce drains leases and promotion callbacks before context
     try std.testing.expectError(error.Canceled, source.acquireDescriptor(7001, "docs", path, descriptor));
 }
 
-// Direct compiled-owner fixtures have no retained-Ready Raft driver. A
-// physical writer yield retries only the identical committed entry; semantic
-// errors and the tests' explicit registry-admission negatives remain unchanged.
-fn applyCommittedSourceFixtureEntry(source: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group: u64, table: []const u8, descriptor: descriptor_contract.Descriptor, req: db_types.BatchRequest, term: u64, index: u64) !void {
-    const deadline = platform_time.monotonicNs() +| 2 * std.time.ns_per_s;
+// Direct owner fixtures stand in for the Raft progress driver. Retry only an
+// exact committed term/index after definitive admission refusal; uncertain
+// mutation outcomes are never replayed here.
+fn applyCommittedForTest(source: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor, req: db_types.BatchRequest, term: u64, index: u64) !void {
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
     while (true) {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, group, table, descriptor, req, term, index) catch |err| switch (err) {
-            error.RaftApplyWriterUnavailable => {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, group_id, table_name, descriptor, req, term, index) catch |err| switch (err) {
+            error.StorageBusy, error.RaftApplyWriterUnavailable => {
                 if (platform_time.monotonicNs() >= deadline) return err;
-                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
                 continue;
             },
             else => return err,
@@ -11288,7 +11348,7 @@ test "committed owner apply yields admission conflicts and retries the exact ent
             .lsm_root_generation = table_reads.backend_current_root_generation,
             .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
         };
-        try applyCommittedSourceFixtureEntry(&source, alloc, 1, "docs", descriptor, .{
+        try applyCommittedForTest(&source, alloc, 1, "docs", descriptor, .{
             .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }},
         }, 1, 1);
         const increment: db_types.BatchRequest = .{ .transforms = &.{.{
@@ -11320,13 +11380,13 @@ test "committed owner apply yields admission conflicts and retries the exact ent
         // Publication may first retire the old owner. Bounded progress retries
         // reopen it without abandoning the original term/index identity.
         for (0..4) |_| {
-            applyCommittedSourceFixtureEntry(&source, alloc, 1, "docs", descriptor, increment, 1, 2) catch |err| switch (err) {
+            applyCommittedForTest(&source, alloc, 1, "docs", descriptor, increment, 1, 2) catch |err| switch (err) {
                 error.StorageBusy => continue,
                 else => return err,
             };
             break;
         } else return error.TestOwnerAdmissionDidNotRecover;
-        try applyCommittedSourceFixtureEntry(&source, alloc, 1, "docs", descriptor, increment, 1, 2);
+        try applyCommittedForTest(&source, alloc, 1, "docs", descriptor, increment, 1, 2);
         var reader = try source.acquireDescriptor(1, "docs", path, descriptor);
         defer reader.deinit();
         var value = try reader.owner().lookupJson("docs", "{\"key\":\"doc:counter\",\"include_all_fields\":true}");
@@ -11711,14 +11771,14 @@ test "committed relational catch-up applies an older pinned schema version" {
     };
     var current = old;
     current.schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"relational_indexes\":[{\"name\":\"id_idx\",\"keys\":[{\"column\":\"id\"}]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"extra\":{\"type\":\"string\"}},\"additionalProperties\":false}}}}";
-    try applyCommittedSourceFixtureEntry(&source, alloc, 1, "docs", old, .{
+    try applyCommittedForTest(&source, alloc, 1, "docs", old, .{
         .writes = &.{.{ .key = "doc:first", .value = "{\"id\":1}" }},
         .relational_schema_version = 1,
     }, 1, 1);
     var lease = try source.acquireDescriptor(1, "docs", path, current);
     lease.deinit();
     for (0..4) |_| {
-        applyCommittedSourceFixtureEntry(&source, alloc, 1, "docs", old, .{
+        applyCommittedForTest(&source, alloc, 1, "docs", old, .{
             .writes = &.{.{ .key = "doc:second", .value = "{\"id\":2}" }},
             .relational_schema_version = 1,
         }, 1, 2) catch |err| switch (err) {
@@ -11792,7 +11852,7 @@ test "committed catch-up does not reconcile an older index-only descriptor" {
         .schema_json = old.schema_json,
         .indexes_json = "{\"new_idx\":{\"type\":\"full_text\"}}",
     };
-    try applyCommittedSourceFixtureEntry(&source, alloc, 1, "docs", old, .{
+    try applyCommittedForTest(&source, alloc, 1, "docs", old, .{
         .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
     }, 1, 1);
     {
@@ -11800,7 +11860,7 @@ test "committed catch-up does not reconcile an older index-only descriptor" {
         lease.deinit();
     }
     for (0..4) |_| {
-        applyCommittedSourceFixtureEntry(&source, alloc, 1, "docs", old, .{
+        applyCommittedForTest(&source, alloc, 1, "docs", old, .{
             .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
         }, 1, 2) catch |err| switch (err) {
             error.StorageBusy => continue,
@@ -11835,7 +11895,7 @@ test "source owner graph replay prepares its pinned index catalog" {
     {
         var initial = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
         defer initial.deinit();
-        try initial.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        try applyCommittedForTest(&initial, alloc, 1, "docs", old, .{
             .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" } },
         }, 1, 1);
     }
@@ -11845,7 +11905,7 @@ test "source owner graph replay prepares its pinned index catalog" {
     graph.schema_json = "{\"version\":1}";
     graph.indexes_json = "{\"links\":{\"type\":\"graph\",\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}}";
     for (0..8) |_| {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", graph, .{
+        applyCommittedForTest(&source, alloc, 1, "docs", graph, .{
             .writes = &.{.{ .key = "a", .value = "{\"ref\":\"b\"}" }},
         }, 1, 2) catch |err| switch (err) {
             error.StorageBusy => continue,
@@ -11854,7 +11914,7 @@ test "source owner graph replay prepares its pinned index catalog" {
         break;
     } else return error.TestOwnerAdmissionDidNotRecover;
     // An exact redelivery must remain safe after the required catalog is ready.
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", graph, .{
+    try applyCommittedForTest(&source, alloc, 1, "docs", graph, .{
         .graph_writes = &.{.{ .index_name = "links", .source = "a", .target = "b", .edge_type = "link" }},
     }, 1, 2);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
@@ -11886,13 +11946,13 @@ test "current catalog acquisition replaces a replay-only owner with the same des
     {
         var initial = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
         defer initial.deinit();
-        try applyCommittedSourceFixtureEntry(&initial, alloc, 1, "docs", descriptor, .{
+        try applyCommittedForTest(&initial, alloc, 1, "docs", descriptor, .{
             .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
         }, 1, 1);
     }
     var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
     defer source.deinit();
-    try applyCommittedSourceFixtureEntry(&source, alloc, 1, "docs", descriptor, .{
+    try applyCommittedForTest(&source, alloc, 1, "docs", descriptor, .{
         .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
     }, 1, 2);
     try std.testing.expectEqual(@as(u64, 1), source.cacheStats().miss_count);
@@ -12265,6 +12325,76 @@ test "storage owner rejects prior ABI before reading deferred-output field" {
     try std.testing.expect(owner == null);
 }
 
+test "owner descriptor catalog watermark fences index-only regressions across owner close" {
+    const Source = ProvisionedKernelOwnerSource;
+    var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    defer source.catalog_observations.deinit(std.testing.allocator);
+    var entry: Source.Entry = .{
+        .group_id = 1,
+        .table_name = @constCast("docs"),
+        .generation = 7,
+        .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .schema_json = @constCast("{}"),
+        .indexes_json = @constCast("{\"model_a\":{},\"model_b\":{}}"),
+        .restore_bootstrap_json = @constCast(""),
+        .initial_child_bootstrap_json = @constCast(""),
+        .owner = undefined,
+        .resident = true,
+    };
+    try source.entries.append(std.testing.allocator, &entry);
+    var descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = entry.generation,
+        .identity = entry.identity,
+        .schema_json = entry.schema_json,
+        .indexes_json = entry.indexes_json,
+    };
+    var controls: Source.ReadControls = .{ .catalog_observation = .{ .metadata_group_id = 11, .revision = 42 } };
+    {
+        var lease = try source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .shared, .resident, controls);
+        defer lease.deinit();
+        try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
+    }
+    // Only the index catalog changed. Both schema and physical root remain
+    // equal, so the schema-version safeguard cannot detect this delayed DDL.
+    controls.catalog_observation.?.revision = 41;
+    for ([_]bool{ false, true }) |restored| {
+        entry.restore = if (restored) .{ .backup_id = "backup", .location = "file:///backup", .snapshot_path = "snapshot", .artifact_sha256 = "digest" } else null;
+        var lease = try source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .shared, .resident, controls);
+        defer lease.deinit();
+        try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
+    }
+    entry.restore = null;
+    descriptor.indexes_json = "{\"model_a\":{}}";
+    for ([_]u64{ 41, 0 }) |revision| {
+        controls.catalog_observation.?.revision = revision;
+        for ([_]Source.LeaseAdmission{ .shared, .exclusive, .exclusive_if_idle }) |admission| {
+            try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, controls));
+            try std.testing.expect(!entry.retired);
+        }
+        // Legacy snapshots cannot reset an ordered watermark or replace a
+        // changed definition; the adapter must find a revisioned peer.
+        try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
+    }
+    // Committed Raft entries still use their exact historical descriptor;
+    // they must not acquire current-catalog authority or lower this watermark.
+    controls.historical_raft_apply = true;
+    entry.active_users = 1;
+    try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .exclusive, .resident, controls));
+    try std.testing.expect(entry.retired);
+    try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
+    controls.historical_raft_apply = false;
+    // Owner retirement releases the registry mutex while draining the runtime.
+    // The observation must survive that gap rather than live on the entry.
+    source.entries.clearRetainingCapacity();
+    try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .shared, .resident, controls));
+    try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
+    // Catalog observations must never alter the existing replicated wire.
+    const wire = try std.json.Stringify.valueAlloc(std.testing.allocator, descriptor, .{});
+    defer std.testing.allocator.free(wire);
+    try std.testing.expect(std.mem.indexOf(u8, wire, "catalog_observation") == null);
+}
+
 test "owner descriptor changes do not retire a live owner for an older schema version" {
     const Source = ProvisionedKernelOwnerSource;
     try std.testing.expectEqual(@as(?u32, 7), Source.schemaVersionFromJson("{\"default_type\":\"_default\",\"types\":{\"a\":{\"version\":1}},\"version\":7}"));
@@ -12362,7 +12492,7 @@ test "scheduled repair admission yields to readers and reuses exact configured g
         .schema_json = entry.schema_json,
         .indexes_json = entry.indexes_json,
     };
-    try std.testing.expect((try source.acquireDescriptorForReconcile(1, "docs", "/unused", descriptor, false, .transient)) == null);
+    try std.testing.expect((try source.acquireDescriptorForReconcile(1, "docs", "/unused", descriptor, false, .transient, .{})) == null);
     try std.testing.expect(!entry.exclusive_pending);
     try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, .shared));
     entry.active_users -= 1;
@@ -12417,6 +12547,20 @@ const PublicationWaitTest = struct {
     }
 };
 
+test "prepared owner lease admission reports storage contention without Raft" {
+    const Source = ProvisionedKernelOwnerSource;
+    var source = Source.init(std.testing.allocator, ".zig-cache/tmp/unopened-owner-admission", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    {
+        Source.lock(&source.mutex);
+        defer source.mutex.unlock();
+        try std.testing.expectError(error.StorageOwnerAdmissionPending, source.acquirePreparedOwner(1, "docs"));
+    }
+    // A not-yet-prepared owner yields the same admission contract without
+    // opening a database or requiring a Raft runtime on the calling thread.
+    try std.testing.expectError(error.StorageOwnerAdmissionPending, source.acquirePreparedOwner(1, "docs"));
+}
+
 test "publication drains existing readers status and maintenance before reopening admission" {
     const alloc = std.testing.allocator;
     const Source = ProvisionedKernelOwnerSource;
@@ -12469,7 +12613,7 @@ test "publication drains existing readers status and maintenance before reopenin
         // With no Entry remaining, the independent gate still excludes open
         // and prepared apply until the publisher completes commit/rollback.
         try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.acquireDescriptor(1, "docs", path, descriptor));
-        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.acquirePreparedOwner(1, "docs"));
+        try std.testing.expectError(error.StorageOwnerAdmissionPending, source.acquirePreparedOwner(1, "docs"));
         try std.testing.expectError(error.StorageBusy, source.snapshotSource().beginPublication(.{
             .io = wait.io(&vtable),
             .group_id = 1,

@@ -424,7 +424,7 @@ test "secret backend GCS uses observed generation for conditional upload" {
         generation: u64 = 10,
         body: ?[]u8 = null,
         writes: usize = 0,
-        fn request(ptr: ?*anyopaque, a: std.mem.Allocator, method: Gcs.HttpMethod, url: []const u8, _: []const Gcs.HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?objects.CancellationToken) !Gcs.TransportResponse {
+        fn request(ptr: ?*anyopaque, a: std.mem.Allocator, method: Gcs.HttpMethod, url: []const u8, _: []const Gcs.HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?objects.CancellationToken, _: Gcs.TransportOptions) !Gcs.TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             if (method == .GET) {
                 if (std.mem.indexOf(u8, url, "alt=media") == null) return .{ .status = 200, .body = try a.dupe(u8, "{}") };

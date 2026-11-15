@@ -66,3 +66,46 @@ test "filesystem capacity reports the test volume" {
     try std.testing.expect(observation.total_bytes > 0);
     try std.testing.expect(observation.available_bytes <= observation.total_bytes);
 }
+
+/// Open without waiting for a FIFO writer, then validate the descriptor that
+/// will actually be read. Path metadata checks alone have a replacement race.
+/// Callers must supervise blocking filesystem syscalls when imposing deadlines.
+pub fn openRegularFile(io: std.Io, path: []const u8) !std.Io.File {
+    if (!std.fs.path.isAbsolute(path)) return error.BadPathName;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.BadPathName;
+    try io.checkCancel();
+    const file: std.Io.File = if (comptime switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
+        else => false,
+    }) opened: {
+        var flags: std.posix.O = .{ .ACCMODE = .RDONLY, .NONBLOCK = true };
+        if (@hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+        if (@hasField(std.posix.O, "LARGEFILE")) flags.LARGEFILE = true;
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, flags, 0);
+        break :opened .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    } else try std.Io.Dir.openFileAbsolute(io, path, .{ .allow_directory = false });
+    errdefer file.close(io);
+    if ((try file.stat(io)).kind != .file) return error.NotRegularFile;
+    return file;
+}
+
+test "regular file opens reject FIFOs without waiting for a writer" {
+    if (comptime !builtin.link_libc or (builtin.os.tag != .linux and builtin.os.tag != .macos)) return error.SkipZigTest;
+    const Posix = struct {
+        extern "c" fn mkfifo([*:0]const u8, std.c.mode_t) c_int;
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/pipe", .{root}, 0);
+    defer a.free(path);
+    try std.testing.expectEqual(@as(c_int, 0), Posix.mkfifo(path, 0o600));
+    try std.testing.expectError(error.NotRegularFile, openRegularFile(io, path));
+    try tmp.dir.symLink(io, "pipe", "link", .{});
+    const link = try std.fmt.allocPrint(a, "{s}/link", .{root});
+    defer a.free(link);
+    try std.testing.expectError(error.NotRegularFile, openRegularFile(io, link));
+}

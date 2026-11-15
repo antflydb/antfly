@@ -32,7 +32,11 @@ pub const Artifact = struct {
 pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var object_options = options;
     object_options.use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(options.root_module.resolved_target.?.result);
-    object_options.max_rss = @import("runtime_memory.zig").testCompileMaxRss(options.name, b.graph.host.result, options.root_module.resolved_target.?.result, options.root_module.optimize, options.max_rss);
+    // Only default closures match the measured stripped profile. A caller's
+    // compile filter can expand the selected surface (not merely narrow it).
+    const stripped_default_selection = (options.root_module.strip orelse false) and
+        @import("../../../build_support/antfly/test_support.zig").selectTestFilters(b, &.{}).len == 0;
+    object_options.max_rss = @import("runtime_memory.zig").linkedTestCompileMaxRss(options.name, b.graph.host.result, options.root_module.resolved_target.?.result, options.root_module.optimize, stripped_default_selection, options.max_rss);
     object_options.emit_object = true;
     object_options.test_runner = options.test_runner orelse .{
         .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),

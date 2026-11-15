@@ -115,6 +115,7 @@ fn encodeWithStorageOwnerDescriptorOwned(
     if (internal_batch_forwarding.graphTransactionProtocol(req)) |required| {
         if (protocol_version < required) return error.UnsupportedRaftBatchProtocolVersion;
     }
+    if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) return error.InvalidBatchRequest;
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
 

@@ -3872,8 +3872,11 @@ fn shouldUseQ8_KQ8KActivationQuant(rows: usize, out_dim: usize, row_blocks: usiz
 }
 
 fn convertTensorToOwnedF32(allocator: std.mem.Allocator, tensor: *const tensor_mod.Tensor) ![]f32 {
-    const count = tensor.elementCount();
+    const count = try tensor.denseElementCount();
     const out = try allocator.alloc(f32, count);
+    errdefer allocator.free(out);
+    var scan = @import("../util/c_file.zig").MmapRegion.SequentialRead.begin(tensor.mmap_source_bytes, tensor.data);
+    defer scan.deinit();
     switch (tensor.dtype) {
         .f32 => {
             if (tensor.asFloat32IfAligned()) |src| {
@@ -4001,14 +4004,25 @@ fn convertTensorRowsToF32(
 }
 
 fn shouldBorrowEmbeddingTensor(name: []const u8) bool {
-    return std.mem.eql(u8, name, "model.embed_tokens.weight") or
+    return std.mem.eql(u8, name, "embed_tokens.weight") or
+        std.mem.eql(u8, name, "model.embed_tokens.weight") or
         std.mem.eql(u8, name, "language_model.embed_tokens.weight") or
         std.mem.eql(u8, name, "vision_tower.patch_embedder.position_embedding_table") or
         std.mem.eql(u8, name, "wte.weight");
 }
 
+fn decoderLocalWeightName(self: *const NativeCompute, name: []const u8) []const u8 {
+    const prefix = self.decoder_weight_prefix;
+    var local = name;
+    if (prefix.len != 0 and local.len > prefix.len and std.mem.startsWith(u8, local, prefix) and local[prefix.len] == '.')
+        local = local[prefix.len + 1 ..];
+    if (std.mem.startsWith(u8, local, "model.")) local = local["model.".len..];
+    return local;
+}
+
 fn shouldBorrowTypedWeightTensor(self: *const NativeCompute, name: []const u8, tensor: *const tensor_mod.Tensor) bool {
-    if (shouldBorrowEmbeddingTensor(name)) return true;
+    const local = decoderLocalWeightName(self, name);
+    if (shouldBorrowEmbeddingTensor(local)) return true;
     if (self.cache_embeddinggemma2_bf16_weights and !native.useBlas() and
         embeddinggemma2_weight_cache.nativeClass(name) != null and tensor.shape.len == 2 and
         tensor.shape[0] >= 64 and tensor.shape[1] >= 64 and
@@ -4017,15 +4031,23 @@ fn shouldBorrowTypedWeightTensor(self: *const NativeCompute, name: []const u8, t
         (tensor.dtype == .f16 or tensor.dtype == .bf16)) return true;
     if (!self.borrow_bf16_linear_weights) return false;
     if (tensor.dtype != .bf16 or tensor.shape.len != 2) return false;
-    if (std.mem.eql(u8, name, "lm_head.weight") or std.mem.eql(u8, name, "cls.output.weight")) return true;
-    if (!std.mem.startsWith(u8, name, "model.layers.")) return false;
-    return std.mem.endsWith(u8, name, ".self_attn.q_proj.weight") or
-        std.mem.endsWith(u8, name, ".self_attn.k_proj.weight") or
-        std.mem.endsWith(u8, name, ".self_attn.v_proj.weight") or
-        std.mem.endsWith(u8, name, ".self_attn.o_proj.weight") or
-        std.mem.endsWith(u8, name, ".mlp.gate_proj.weight") or
-        std.mem.endsWith(u8, name, ".mlp.up_proj.weight") or
-        std.mem.endsWith(u8, name, ".mlp.down_proj.weight");
+    if (std.mem.eql(u8, local, "lm_head.weight") or std.mem.eql(u8, local, "cls.output.weight")) return true;
+    if (!std.mem.startsWith(u8, local, "layers.")) return false;
+    // Projection matrices share the typed, bounded conversion kernel across
+    // full-attention and recurrent decoders. Conv/norm/state tensors retain
+    // their dense representation; borrowing every rank-two tensor is unsafe.
+    return std.mem.endsWith(u8, local, ".linear_attn.in_proj_qkv.weight") or
+        std.mem.endsWith(u8, local, ".linear_attn.in_proj_z.weight") or
+        std.mem.endsWith(u8, local, ".linear_attn.in_proj_b.weight") or
+        std.mem.endsWith(u8, local, ".linear_attn.in_proj_a.weight") or
+        std.mem.endsWith(u8, local, ".linear_attn.out_proj.weight") or
+        std.mem.endsWith(u8, local, ".self_attn.q_proj.weight") or
+        std.mem.endsWith(u8, local, ".self_attn.k_proj.weight") or
+        std.mem.endsWith(u8, local, ".self_attn.v_proj.weight") or
+        std.mem.endsWith(u8, local, ".self_attn.o_proj.weight") or
+        std.mem.endsWith(u8, local, ".mlp.gate_proj.weight") or
+        std.mem.endsWith(u8, local, ".mlp.up_proj.weight") or
+        std.mem.endsWith(u8, local, ".mlp.down_proj.weight");
 }
 
 const WeightF32View = struct {
@@ -4091,6 +4113,11 @@ fn linearNoBiasSourceTensorChunked(
     const output_elements = std.math.mul(usize, rows, out_dim) catch return error.ShapeMismatch;
     if (tensor.data.len != weight_bytes or input.len != input_elements or output.len != output_elements) return error.ShapeMismatch;
 
+    // The operation scans this matrix only. No checkpoint-wide warmup and no
+    // change to embedding-row or sparse-expert access patterns.
+    var scan = self.firstMappedWeightScan(tensor.mmap_source_bytes, tensor.data);
+    defer scan.deinit();
+
     // Fast path: f16 weights, naturally aligned, can be consumed directly by
     // sgemmTransBF16Weights without materializing an f32 copy.  This halves
     // the weight bandwidth -- the dominant cost for transformer linear ops.
@@ -4117,20 +4144,11 @@ fn linearNoBiasSourceTensorChunked(
     const scratch_row_bytes = std.math.mul(usize, scratch_row_elements, @sizeOf(f32)) catch return error.ShapeMismatch;
     const block_rows = @max(@as(usize, 1), @min(out_dim, target_weight_bytes / @max(@as(usize, 1), scratch_row_bytes)));
     const scratch_bytes = std.math.mul(usize, block_rows, scratch_row_bytes) catch return error.ShapeMismatch;
-    const scratch_estimate = run_memory.Estimate{
-        .prompt_tokens = 0,
-        .retained_tokens = 0,
-        .kv_bytes = 0,
-        .kv_tier = .host,
-        .scratch_bytes = scratch_bytes,
-        .scratch_tier = .host,
-    };
-    if (self.run_budget) |budget| try budget.reserveEstimate(scratch_estimate);
-    defer if (self.run_budget) |budget| budget.releaseEstimate(scratch_estimate);
-    const weight_block = try self.allocator.alloc(f32, block_rows * in_dim);
-    defer self.allocator.free(weight_block);
-    const output_block = try self.allocator.alloc(f32, if (native.useBlas()) 0 else rows * block_rows);
-    defer self.allocator.free(output_block);
+    var scratch = try self.acquireLinearScratch(scratch_bytes / @sizeOf(f32));
+    defer scratch.deinit();
+    errdefer scratch.discard = true;
+    const weight_block = scratch.values[0 .. block_rows * in_dim];
+    const output_block = scratch.values[weight_block.len..];
 
     var row_start: usize = 0;
     while (row_start < out_dim) : (row_start += block_rows) {
@@ -4283,6 +4301,9 @@ pub const NativeCompute = struct {
     /// Opt in only for qualified model families whose projection consumers
     /// accept typed weights. Other native/PJRT callers keep their load policy.
     borrow_bf16_linear_weights: bool = false,
+    /// Borrowed from the model configuration. Safetensors multimodal decoders
+    /// can retain this namespace while ordinary/stripped backbones do not.
+    decoder_weight_prefix: []const u8 = "",
     /// Borrow every resident 2-D f16/bf16 weight for typed GEMM. Only for
     /// sessions whose 2-D weights are consumed exclusively by linear ops
     /// (native Moondream reads its embedding table on the host).
@@ -4298,6 +4319,80 @@ pub const NativeCompute = struct {
     /// process-wide futex pool inside lib/linalg directly.  Tests typically
     /// pass null; production session creation supplies the application's Io.
     io: ?std.Io = null,
+
+    // Like weight handles, these belong to one invocation's compute context.
+    // Retained bytes remain charged until context teardown, including idle reuse.
+    linear_scratch: []f32 = &.{},
+    linear_scratch_busy: bool = false,
+    mapped_scans: std.AutoHashMapUnmanaged(struct { address: usize, bytes: usize }, void) = .empty,
+
+    fn scratchEstimate(bytes: usize) run_memory.Estimate {
+        return .{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = bytes, .scratch_tier = .host };
+    }
+
+    const LinearScratch = struct {
+        owner: *NativeCompute,
+        values: []f32,
+        temporary: bool = false,
+        discard: bool = false,
+        fn deinit(self: *@This()) void {
+            if (self.temporary) {
+                self.owner.allocator.free(self.values);
+                if (self.owner.run_budget) |budget| budget.releaseEstimate(scratchEstimate(self.values.len * @sizeOf(f32)));
+            } else {
+                self.owner.linear_scratch_busy = false;
+                if (self.discard) self.owner.releaseLinearScratch();
+            }
+        }
+    };
+
+    fn acquireLinearScratch(self: *NativeCompute, elements: usize) !LinearScratch {
+        const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+        if (!self.linear_scratch_busy) if (self.run_budget) |budget| {
+            // A narrowed policy or a later phase's residency may make an idle
+            // larger buffer inappropriate. Reclaim it before sizing this call.
+            const exceeded = budget.currentAmounts().firstLimitExceeded(budget.limits) catch {
+                self.releaseLinearScratch();
+                return error.MemoryBudgetExceeded;
+            };
+            if (exceeded != null) self.releaseLinearScratch();
+        };
+        // An unusual matrix with a row larger than the target must not grow a
+        // retained cache without bound. Nested use retains independent ownership.
+        if (bytes > 8 * 1024 * 1024 or self.linear_scratch_busy) {
+            if (!self.linear_scratch_busy) self.releaseLinearScratch();
+            if (self.run_budget) |budget| try budget.reserveEstimate(scratchEstimate(bytes));
+            errdefer if (self.run_budget) |budget| budget.releaseEstimate(scratchEstimate(bytes));
+            return .{ .owner = self, .values = try self.allocator.alloc(f32, elements), .temporary = true };
+        }
+        if (self.linear_scratch.len < elements) {
+            self.releaseLinearScratch();
+            if (self.run_budget) |budget| try budget.reserveEstimate(scratchEstimate(bytes));
+            errdefer if (self.run_budget) |budget| budget.releaseEstimate(scratchEstimate(bytes));
+            self.linear_scratch = try self.allocator.alloc(f32, elements);
+        }
+        self.linear_scratch_busy = true;
+        return .{ .owner = self, .values = self.linear_scratch[0..elements] };
+    }
+
+    fn releaseLinearScratch(self: *NativeCompute) void {
+        std.debug.assert(!self.linear_scratch_busy);
+        const bytes = self.linear_scratch.len * @sizeOf(f32);
+        self.allocator.free(self.linear_scratch);
+        self.linear_scratch = &.{};
+        if (self.run_budget) |budget| budget.releaseEstimate(scratchEstimate(bytes));
+    }
+
+    fn firstMappedWeightScan(self: *NativeCompute, mapping: ?[]const u8, bytes: []const u8) @import("../util/c_file.zig").MmapRegion.SequentialRead {
+        const source = mapping orelse return .{};
+        const address = @intFromPtr(bytes.ptr);
+        const base = @intFromPtr(source.ptr);
+        if (bytes.len == 0 or address < base or address - base > source.len or bytes.len > source.len - (address - base)) return .{};
+        // Advice is best effort. Allocation failure cannot make inference fail.
+        const entry = self.mapped_scans.getOrPut(self.allocator, .{ .address = address, .bytes = bytes.len }) catch return .{};
+        if (entry.found_existing) return .{};
+        return @import("../util/c_file.zig").MmapRegion.SequentialRead.begin(mapping, bytes);
+    }
 
     pub fn init(allocator: std.mem.Allocator, data: *WeightStore, run_budget: ?*run_memory.RunBudget) NativeCompute {
         initPrefetchQueue(data, allocator);
@@ -4319,6 +4414,9 @@ pub const NativeCompute = struct {
     /// and before tearing down the borrowed weight store or run budget.
     pub fn deinit(self: *NativeCompute) void {
         deinitWeightHandles(self);
+        self.releaseLinearScratch();
+        self.mapped_scans.deinit(self.allocator);
+        self.mapped_scans = .empty;
         if (self.embeddinggemma2_cache_reader) {
             platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
             self.data.embeddinggemma2_f32_readers -= 1;
@@ -6667,8 +6765,20 @@ fn dispatchQuantizedLinearStrictF32(request: QuantLinearRequest) !bool {
     return true;
 }
 
+/// Borrowed F32 matrices need readahead too: unlike conversions they have no
+/// materialization boundary. Match the actual operand to its pinned mapping,
+/// never advise a converted/cache/activation buffer using only a weight name.
+fn sequentialDenseWeightRead(self: *NativeCompute, weight: CT) @import("../util/c_file.zig").MmapRegion.SequentialRead {
+    const buf = toBuf(weight);
+    if (buf.source_tensor != null or buf.quantized_storage != null or buf.data.len == 0) return .{};
+    const source = if (buf.lazy_entry) |entry| if (entry.loaded) |*loaded| &loaded.tensor else return .{} else if (self.data.resident_weights.getPtr(buf.name)) |loaded| &loaded.tensor else return .{};
+    return self.firstMappedWeightScan(source.mmap_source_bytes, std.mem.sliceAsBytes(buf.data));
+}
+
 fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var scan = sequentialDenseWeightRead(self, weight);
+    defer scan.deinit();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
@@ -8445,6 +8555,8 @@ fn preparedEmbeddingGemma2Linear(self: *NativeCompute, input: []const f32, sourc
 
 fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var scan = sequentialDenseWeightRead(self, weight);
+    defer scan.deinit();
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
@@ -8572,6 +8684,10 @@ fn linearNoBiasPairOp(
     out_dim: usize,
 ) anyerror!ops.LinearNoBiasPairResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var scan_weight_a = sequentialDenseWeightRead(self, weight_a);
+    defer scan_weight_a.deinit();
+    var scan_weight_b = sequentialDenseWeightRead(self, weight_b);
+    defer scan_weight_b.deinit();
     const weight_buf_a = toBuf(weight_a);
     const weight_buf_b = toBuf(weight_b);
     if (weight_buf_a.quantized_storage) |storage_a| {
@@ -8832,6 +8948,10 @@ fn linearPairOp(
     out_dim: usize,
 ) anyerror!ops.LinearPairResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var scan_weight_a = sequentialDenseWeightRead(self, weight_a);
+    defer scan_weight_a.deinit();
+    var scan_weight_b = sequentialDenseWeightRead(self, weight_b);
+    defer scan_weight_b.deinit();
     const weight_buf_a = toBuf(weight_a);
     const weight_buf_b = toBuf(weight_b);
 
@@ -9048,6 +9168,12 @@ fn packedMediaLinears(self: *NativeCompute, weights: []const CT, in_dim: usize, 
 }
 fn linearTripleNoBiasOp(ctx: *anyopaque, input: CT, a: CT, b: CT, c: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!ops.LinearTripleResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var scan_a = sequentialDenseWeightRead(self, a);
+    defer scan_a.deinit();
+    var scan_b = sequentialDenseWeightRead(self, b);
+    defer scan_b.deinit();
+    var scan_c = sequentialDenseWeightRead(self, c);
+    defer scan_c.deinit();
     if (!native.useBlas() and in_dim >= 64) {
         if (try linearPackedNamedOp(ctx, input, &.{ toBuf(a).name, toBuf(b).name, toBuf(c).name }, &.{ out_dim, out_dim, out_dim }, rows, in_dim)) |combined| {
             defer freeTensor(ctx, combined);
@@ -9085,6 +9211,12 @@ fn linearTripleOp(
     out_dim: usize,
 ) anyerror!ops.LinearTripleResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var scan_weight_a = sequentialDenseWeightRead(self, weight_a);
+    defer scan_weight_a.deinit();
+    var scan_weight_b = sequentialDenseWeightRead(self, weight_b);
+    defer scan_weight_b.deinit();
+    var scan_weight_c = sequentialDenseWeightRead(self, weight_c);
+    defer scan_weight_c.deinit();
     const weight_buf_a = toBuf(weight_a);
     const weight_buf_b = toBuf(weight_b);
     const weight_buf_c = toBuf(weight_c);
@@ -49472,7 +49604,7 @@ test "native typed BF16 weights borrow source reserve bytes and preserve linear 
             try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), getData(result)[row * 2 + column], 1e-6);
         }
     }
-    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    try std.testing.expectEqual(compute.linear_scratch.len * @sizeOf(f32), budget.host_scratch_bytes);
     const CanceledIo = struct {
         fn check(_: ?*anyopaque) std.Io.Cancelable!void {
             return error.Canceled;
@@ -49900,6 +50032,8 @@ test "native typed BF16 linear panels preserve output tails" {
             try std.testing.expectApproxEqAbs(expected, output[1 + row * out_dim + column], 1e-6);
         }
     }
+    try std.testing.expectEqual(compute.linear_scratch.len * @sizeOf(f32), budget.host_scratch_bytes);
+    compute.releaseLinearScratch();
     try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
     try std.testing.expect(budget.peak_host_total_bytes <= 8 * 1024 * 1024);
 }
@@ -54457,4 +54591,137 @@ test "embeddinggemma2 video host borrows avoid copies and writable views reject 
     cb.free(output); // The retained row still owns the parent allocation.
     try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, (try cb.hostFloat32Read(view)).?);
     cb.free(view);
+}
+
+test "native recurrent decoder projections use bounded BF16 workspace without dense weight copies" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "model", "model.language_model", "language_model.model" }) |prefix| {
+        const shape = [_]i64{ 2, 3 };
+        var bytes: [12]u8 = undefined;
+        for (0..6) |i| std.mem.writeInt(u16, bytes[i * 2 ..][0..2], 0x3f80, .little);
+        const roles = [_][]const u8{
+            "layers.0.linear_attn.in_proj_qkv.weight",
+            "layers.0.linear_attn.in_proj_z.weight",
+            "layers.0.linear_attn.in_proj_b.weight",
+            "layers.0.linear_attn.in_proj_a.weight",
+            "layers.0.linear_attn.out_proj.weight",
+            "lm_head.weight",
+            "embed_tokens.weight",
+        };
+        var names: [roles.len][]const u8 = undefined;
+        var initialized: usize = 0;
+        defer for (names[0..initialized]) |name| a.free(name);
+        for (roles, &names) |role, *name| {
+            name.* = if (prefix.len == 0) try a.dupe(u8, role) else try std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, role });
+            initialized += 1;
+        }
+        var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        defer store.resident_weights.deinit(a);
+        for (names) |name| try store.resident_weights.put(a, name, .{ .tensor = .{ .data = &bytes, .shape = &shape, .dtype = .bf16, .name = name, .allocator = a, .owns_data = false, .owns_shape = false } });
+        var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 1024, .scratch_limit_bytes = 128 });
+        var compute = NativeCompute.init(a, &store, &budget);
+        compute.borrow_bf16_linear_weights = true;
+        compute.decoder_weight_prefix = prefix;
+        defer compute.deinit();
+        var values = [_]f32{ 1, 2, 3 };
+        const input = try compute.makeBuf(&values, false);
+        defer freeTensor(&compute, input);
+        for (names) |name| {
+            const weight = try getWeight(&compute, name);
+            defer freeTensor(&compute, weight);
+            try std.testing.expectEqual(@as(usize, 0), toBuf(weight).data.len);
+            const output = try linearNoBiasOp(&compute, input, weight, 1, 3, 2);
+            defer freeTensor(&compute, output);
+            try std.testing.expectEqualSlices(f32, &.{ 6, 6 }, getData(output));
+            try std.testing.expectEqual(compute.linear_scratch.len * @sizeOf(f32), budget.host_scratch_bytes);
+        }
+        const source = &store.resident_weights.getPtr(names[0]).?.tensor;
+        try std.testing.expect(!shouldBorrowTypedWeightTensor(&compute, "layers.0.linear_attn.conv1d.weight", source));
+        try std.testing.expect(!shouldBorrowTypedWeightTensor(&compute, "layers.0.linear_attn.norm.weight", source));
+    }
+}
+
+test "native mapped F32 matrix consumers advise only their borrowed operand" {
+    const a = std.testing.allocator;
+    var values = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    var mapped = try @import("../util/c_file.zig").mmapTempCopy(a, "cpu-f32-matrix", std.mem.sliceAsBytes(&values));
+    defer mapped.deinit();
+    const name = "matrix.weight";
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.resident_weights.deinit(a);
+    try store.resident_weights.put(a, name, .{ .tensor = .{ .data = mapped.data, .mmap_source_bytes = mapped.data, .shape = &.{ 2, 3 }, .dtype = .f32, .name = name, .allocator = a, .owns_data = false, .owns_shape = false } });
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const weight = try getWeight(&compute, name);
+    defer freeTensor(&compute, weight);
+    var scan = sequentialDenseWeightRead(&compute, weight);
+    try std.testing.expectEqual(@as(usize, 24), scan.bytes.len);
+    scan.deinit();
+    try std.testing.expectEqual(@as(usize, 0), sequentialDenseWeightRead(&compute, weight).bytes.len);
+    const owned = try compute.makeBuf(&values, false);
+    defer freeTensor(&compute, owned);
+    toBuf(owned).name = name;
+    try std.testing.expectEqual(@as(usize, 0), sequentialDenseWeightRead(&compute, owned).bytes.len);
+    var inputs = [_]f32{ 1, 2, 3 };
+    const input = try compute.makeBuf(&inputs, false);
+    defer freeTensor(&compute, input);
+    const output = try linearNoBiasOp(&compute, input, weight, 1, 3, 2);
+    defer freeTensor(&compute, output);
+    try std.testing.expectEqualSlices(f32, &.{ 14, 32 }, getData(output));
+}
+
+test "native linear conversion scratch reuses charged capacity and releases on teardown" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var budget = run_memory.RunBudget.init(.{ .scratch_limit_bytes = 256 });
+    var compute = NativeCompute.init(a, &store, &budget);
+    defer compute.deinit();
+    var first = try compute.acquireLinearScratch(32);
+    const address = first.values.ptr;
+    @memset(first.values, 42);
+    first.deinit();
+    try std.testing.expectEqual(@as(usize, 128), budget.host_scratch_bytes);
+    var next = try compute.acquireLinearScratch(16);
+    try std.testing.expect(next.values.ptr == address);
+    try std.testing.expectEqual(@as(f32, 42), next.values[0]);
+    next.deinit();
+    try std.testing.expectError(error.MemoryBudgetExceeded, compute.acquireLinearScratch(128));
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    var recovered = try compute.acquireLinearScratch(64);
+    recovered.deinit();
+    compute.releaseLinearScratch();
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+}
+
+test "native linear conversion scratch does not pin idle capacity for oversized rows" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var budget = run_memory.RunBudget.init(.{ .scratch_limit_bytes = 8 * 1024 * 1024 + 64 });
+    var compute = NativeCompute.init(a, &store, &budget);
+    defer compute.deinit();
+    var cached = try compute.acquireLinearScratch(32);
+    cached.deinit();
+    var outlier = try compute.acquireLinearScratch(2 * 1024 * 1024 + 1);
+    try std.testing.expect(outlier.temporary);
+    try std.testing.expectEqual(@as(usize, 0), compute.linear_scratch.len);
+    outlier.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+}
+
+fn checkLinearScratchAllocationFailures(a: std.mem.Allocator) !void {
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var budget = run_memory.RunBudget.init(.{ .scratch_limit_bytes = 1024 });
+    {
+        var compute = NativeCompute.init(a, &store, &budget);
+        defer compute.deinit();
+        var small = try compute.acquireLinearScratch(16);
+        small.deinit();
+        var larger = try compute.acquireLinearScratch(32);
+        larger.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+}
+
+test "native linear conversion scratch rolls back every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkLinearScratchAllocationFailures, .{});
 }

@@ -44,13 +44,39 @@ pub extern fn antfly_storage_context_create_with_runtime(
 /// Borrowed publisher; callbacks and context outlive the storage context.
 /// JSON crosses the compilation boundary, and its producer releases it.
 /// Version 1 carries ContentSecurityConfig; version 2 carries
-/// scraping.RemoteContentSnapshotData, including scoped GCS connections.
+/// scraping.RemoteContentSnapshotData, including scoped S3, HTTP and GCS
+/// credentials. Version 3 requires the prefix of a CachedRemoteContentSource.
 pub const RemoteContentSource = extern struct {
     version: u32 = 1,
     _reserved: u32 = 0,
     context: *anyopaque,
     acquire: *const fn (*anyopaque, *abi.OwnedBytes) callconv(.c) abi.Status,
     release: *const fn (*anyopaque, abi.OwnedBytes) callconv(.c) void,
+};
+
+/// Version 3 extends the unchanged v1/v2 prefix. The configure call copies
+/// this callback as well as the prefix; the table itself need not stay alive.
+/// A successful update with null bytes means `previous` is still current.
+/// Otherwise bytes contain a complete v2 JSON payload, owned until release.
+/// Errors must propagate even when the consumer holds an older cached value.
+pub const CachedRemoteContentSource = extern struct {
+    source: RemoteContentSource,
+    /// Always consult the publisher, outside consumer locks. It must report
+    /// acquisition errors, and bind a known revision to the acquired immutable
+    /// publication. Mutable publishers report known=0 and use the full path.
+    probe: Probe,
+    acquire_if_changed: AcquireIfChanged,
+
+    pub const Revision = extern struct {
+        value: [32]u8 = @splat(0),
+        known: u8 = 0,
+    };
+    pub const Update = extern struct {
+        revision: [32]u8 = @splat(0),
+        bytes: abi.OwnedBytes = .{},
+    };
+    pub const Probe = *const fn (*anyopaque, *Revision) callconv(.c) abi.Status;
+    pub const AcquireIfChanged = *const fn (*anyopaque, ?*const [32]u8, *Update) callconv(.c) abi.Status;
 };
 
 pub extern fn antfly_storage_context_configure_remote_content_source(

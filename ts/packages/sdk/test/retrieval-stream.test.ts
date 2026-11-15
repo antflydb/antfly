@@ -293,19 +293,33 @@ describe("retrieval request cancellation", () => {
   });
 });
 
-
 it("delivers context management diagnostics separately from generation", async () => {
-  const event = { counting_method: "utf8_bytes_plus_framing", latency_ms: 10,
-    summary_provider: "openai", summary_model: "summary", diagnostics: {
-      contract_version: 1, batches: 1, summary_input_tokens: 900, summary_output_tokens: 70,
-      original_input_tokens: 8000, effective_input_tokens: 2000,
-    } };
+  const event = {
+    counting_method: "utf8_bytes_plus_framing",
+    latency_ms: 10,
+    summary_provider: "openai",
+    summary_model: "summary",
+    diagnostics: {
+      contract_version: 1,
+      batches: 1,
+      summary_input_tokens: 900,
+      summary_output_tokens: 70,
+      original_input_tokens: 8000,
+      effective_input_tokens: 2000,
+    },
+  };
   const body = `event: context_management\ndata: ${JSON.stringify(event)}\n\nevent: done\ndata: {}\n\n`;
-  vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(responseFromBytes(encoder.encode(body), true));
+  vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+    responseFromBytes(encoder.encode(body), true)
+  );
   const onContextManagement = vi.fn();
   const onDone = vi.fn();
   const onError = vi.fn();
-  await new AntflyClient({ baseUrl: "http://localhost:8080" }).streamRetrievalAgent(request, { onContextManagement, onDone, onError });
+  await new AntflyClient({ baseUrl: "http://localhost:8080" }).streamRetrievalAgent(request, {
+    onContextManagement,
+    onDone,
+    onError,
+  });
   await vi.waitFor(() => expect(onDone).toHaveBeenCalledOnce());
   expect(onContextManagement).toHaveBeenCalledWith(event);
   expect(onError).not.toHaveBeenCalled();

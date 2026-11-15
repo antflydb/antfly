@@ -1,0 +1,280 @@
+# 1M GCS failure investigation (2026-11-12)
+
+The final optimized 1M case failed; it is not a qualified performance result.
+Evidence remains in the original `test-gcs-bulk-qualification` worktree under
+`zig/.benchmark-results/gcs-bulk/local-1m-final-optimized/`. Do not overwrite it.
+
+## Observed native failure
+
+`case/build.log` records `WriteFailed` after 3,017.935988 seconds. The worker
+recorded exit 1, 69.076069 user seconds, 32.464969 system seconds and
+174,718,976 bytes peak RSS. Identity verification had not completed; 377
+`bulk_tee` calls consumed 200.131517 seconds. No source construction receipt,
+completed tree receipt, or published index was recorded. Batch count is not a
+verified row count. The queued incremental and bulk-control cases did not run.
+
+The error is ambiguous. `std.Io.Writer` local file adapters and HTTP socket
+writers can both return `WriteFailed`. The failure log has no operation/path
+attribution and its nested cause is null. Available free space after the event
+does not establish available space when the write failed.
+
+There **are remote writes during identity ingestion**. `Stage.add` calls
+`Tracker.append`, which flushes row-key chunks at roughly 192 KiB through
+`ArtifactStore.putWithCancellation`. Native `ObjectStore.putInScope` creates
+immutable objects with `if_none_match=true`; GCS implements this with media
+`POST` and `ifGenerationMatch=0`. HTTPx's default retry policy retries connection
+errors for idempotent HTTP methods. `POST` is excluded; `WriteFailed` is not a
+safe-unsent retry error. A connection failure on this path therefore can abort
+ingestion without retry. This is a concrete resilience gap, **not proof that
+this was the failing operation in the historical run**. Source GET retries,
+local spool/SST writes, and credential refresh remain other possible origins.
+
+Any retry fix must retain conditional-create semantics and authenticate an
+existing object after an ambiguous successful upload. Do not globally enable
+retries for all POST requests or treat a precondition failure as success without
+verification. Cancellation, request deadlines and retry limits must remain
+bounded.
+
+## Controller lifecycle
+
+`local.json` contains only the initial report, and `final-scale.json` originally
+still said running. Neither the wrapper nor its controller survived. The worker
+was deliberately in a separate session and did survive long enough to record
+the native failure. The controller's worker-wait `finally` would have recorded
+an exit status on an ordinary exception or handled SIGTERM.
+
+A local reproduction using the actual termination handler showed:
+
+| Signal | Controller exit | Finally executed | Worker survived |
+| --- | ---: | --- | --- |
+| SIGHUP before fix | -1 | no | yes |
+| SIGTERM | 143 | yes | no |
+
+The real snapshotted-controller regression also failed before the fix with
+exit -1 instead of 129. The controller now handles SIGHUP through the existing
+cancellation/cleanup path. This closes a reproducible orphan/stale-status bug.
+It does not establish which signal killed the original controller; SIGKILL and
+external process termination cannot be reconstructed from the retained files.
+A targeted macOS unified-log query found no matching Python ReportCrash or
+kernel memory-termination event in the run interval; absence of a log entry is
+not proof that memory pressure was impossible.
+
+The original stale suite status was preserved separately before reconciliation.
+The reconciled status records the failed case and unstarted queued cases.
+
+## Follow-up fixes and verification
+
+Create-only GCS media POSTs now explicitly admit replay under the existing
+bounded HTTP retry policy. Unconditional POSTs and resumable-session creation
+retain ordinary method safety. A precondition conflict still reaches the
+artifact layer for verification; it is never blindly converted to success.
+Authentication and HTTP execution share the captured request deadline. Replay
+admission does not follow redirects or override a zero retry ceiling.
+
+Offline transport fixtures exercise disconnects and truncated responses,
+successful retry, ambiguous commit followed by a 412 conflict, transient 503,
+terminal 403, an exhausted retry budget, and an ordinary POST that must not
+replay. Cancellation and deadline fixtures interrupt retry backoff; buffered and
+writer redirect fixtures require replay admission to be cleared. An artifact-layer
+fixture additionally checks that a lost success plus 412 accepts matching bytes
+under generation 42 and rejects corrupt bytes.
+
+Probe-only operation records distinguish identity source reads, spill append
+and reduction, identity chunk upload/finish, exact-vector flush, and spool
+append/finish. The latter retain the file writer's underlying error when
+available. Diagnostics use fixed names and error tags, never paths or payloads.
+SIGHUP and SIGTERM tests exercise the real snapshotted controller and native
+descendants; terminal reports retain cancellation status, controller exit code,
+worker exit code and elapsed time.
+
+GCS synchronous uploads also borrow their immutable body instead of copying
+it. A paired 8 MiB request-setup allocation fixture measured:
+
+| Body representation | Bytes allocated during setup |
+| --- | ---: |
+| Previous owned body | 8,388,855 |
+| Borrowed body | 247 |
+
+Both cases stop at the same pre-transport interceptor. The fixture checks body
+ownership and identity, and all attempts finish before the owner releases the
+body. This demonstrates removal of one payload-sized allocation/copy, not a
+full-build speedup. The planned source range path already skips metadata probes;
+an assumed extra metadata request is not a measured performance opportunity.
+
+The live GCS round-trip passed against the existing development bucket with
+local ADC: conditional create, conflict preservation, pinned range reads,
+generation CAS and conditional deletion of the created test object. No cloud
+worker or infrastructure was created.
+
+## Fresh review follow-up
+
+The first hangup fix still allowed a signal between worker creation and entry
+to its cleanup `try`. An isolated real-controller reproduction started the native
+child, injected SIGHUP before `Popen` returned, and observed a surviving worker
+with status still running and no worker exit/elapsed fields. A separate injected
+post-worker metadata failure left status `worker_finished` and exit zero without
+a controller error. The historical failed 1M result also confirmed that failure
+paths omitted the disk sampler's in-memory minimum-free-space observations.
+
+The controller/worker now use signal-recording cancellation scopes and process
+owners established before child creation. Re-exec preserves pending signals;
+cleanup ignores repeated cancellation until children are drained and reaped.
+Native children remain in the worker group for controller escalation. One outer
+reporting boundary handles admission, worker and post-validation failures.
+Disk samples are periodically checkpointed and finalized on failure/cancellation,
+with explicit sampling errors and unavailable resource measurements.
+
+ADC qualification rejects inherited static bearer tokens and alternate GCS
+endpoints before execution, reports names rather than values, and records its
+admitted provider mode/endpoints. Explicit ADC files remain supported. Tests cover
+signals during launch and exec, repeated signals during cleanup, process creation
+failure, post-worker source validation, cancellation while hashing, disk sampling
+failure and cancellation after successful native completion.
+
+The measured publication optimization retains the 256 KiB reader cap: a fresh
+bulk owner selects a 262,037-byte target and admits the tracker in its existing
+private quota. Full one-million-key write/readback fixtures reduced chunk puts
+489→367 (96-byte keys) and 550→413 (108-byte keys). A 1 MiB candidate failed
+reader validation and was rejected. See the raw
+[publication observations](bulk_identity_publication_results.json); these are
+artifact API counts, not full-build throughput measurements.
+
+The ongoing GCS 1M run is frozen to the earlier executable/harness snapshot.
+Edits in this follow-up do not change that running build's inputs. Any subsequent
+reopen has its own executable and harness hashes and must be identified by those
+hashes rather than assumed to use the same workspace revision.
+
+## Remaining scale evidence
+
+The frozen 1M follow-up completed unsuccessfully on 2026-11-13 at 00:37 UTC.
+Its earlier executable (`ac42c5b1dec42aec2d16346f3e2fd3a596cafe29ef3b433495d7554174cb4352`)
+reported native `Timeout` after 4,172.744 seconds. Failure-phase evidence includes
+1,459.085 seconds in identity, 134.718 seconds across 377 bulk-tee calls, and
+2,712.105 seconds in bulk receipt. No successful publication or reopen followed.
+These phase times are not necessarily additive. The retained output is
+`followup-1m-20261112T232725Z/optimized` under the local GCS benchmark results.
+This run predates the latest quota/sampling fixes and does not qualify them or
+establish a throughput improvement. The specific timed-out operation still needs
+isolation; the failure record alone does not establish its cause.
+
+The second review closed two remaining gaps: paged-reference publication now
+uses an operation-local artifact-store copy with the tracker allocator, and
+sampler shutdown saves observations before a bounded background final scan.
+Cancellation/failure skips final collection. Success requires a completed final
+sample; stalled filesystem operations produce terminal failure with explicit
+incomplete/still-running sampler fields. Regressions cover cancellation without
+rescanning, a blocked final scan, sampling deadlines, and successful final
+collection. Every publication fixture upload now asserts the quota allocator,
+including reference pages; all borrowed store fields remain unchanged.
+
+The repeated one-million-key fixtures retain the same publication counts and
+full readback equality. Including the missing upload allocations raises the
+observed tracker peaks by 239 bytes in these filesystem cases. The raw results
+preserve the preceding observations for comparison; timings remain shared-host
+filesystem observations, not full-build or WAN speedups.
+
+Second-review validation passed 49 Python regressions, all four million-key
+publication/readback cases, and native integration (28 passed, one guarded S3
+skip, no leaks). The restricted-sandbox invocation could not run the local HTTP
+ambiguous-upload fixture; both that isolated fixture and the full integration
+executable passed when rerun with loopback socket access.
+The final combined build invocation with that access passed all 99 native build
+steps, including the non-test runtime probe and publication fixture.
+
+Follow-up validation passed all 99 native build steps (including ABI integration,
+the runtime probe, and the publication/readback fixture) and 45 Python regression
+tests. A fresh frozen 1,024-row live GCS case using ADC also qualified: build,
+reopen/recall, unchanged source generation and frozen input hashes, and finalized
+scratch sampling all passed. Its executable SHA-256 was
+`7d367deb1eb7f30c7eabe3a700ecd08a27b58e20f2d2197ce97c813d7e932594`.
+The 28.73-second worker wall time is a small correctness check, not a scale or
+performance qualification.
+
+The historical failure's exact root cause remains unknown. A new qualification
+must retain the operation diagnostics rather than treating the retry fix as
+proof of that cause. The original 1M result remains failed and the successful
+100K result remains unchanged.
+
+Launch any long suite under an explicit durable supervisor with retained exit
+records, and keep cancellation ownership over its worker sessions. Only after a
+successful 1M publication and reopen/recall should a paired control or 10M case
+be interpreted as a performance comparison.
+
+
+## Timeout investigation and third-review implementation
+
+A read-only census of the failed follow-up prefix found 24,430 immutable objects
+containing 3,519,057,288 bytes. Its last 256 KiB object was created at
+2026-11-13T00:37:12.102 UTC, after the supervisor's failure record at
+00:37:04.482 UTC. A subsequent GCS Date comparison differed from local time by
+about 0.03 seconds. This strongly suggests an ambiguous in-flight upload, but
+cannot identify the exact timed-out request or the original socket stall.
+Clustering had not begun; the 2,712-second bulk-receipt phase was publication work.
+
+The socket/TLS layer returns plain `Timeout` on idle expiry, but the HTTP retry
+classifier previously excluded that tag. A local reproduction with replay-safe
+POST, a 25 ms idle timer and three admitted retries stopped after about 26 ms
+with one attempt and zero retries. The implementation now treats that idle
+failure as transient while retaining the existing total-deadline, cancellation,
+method/precondition and retry-count checks. Delayed accepted uploads exercise
+412 recovery and pinned content authentication, including corruption rejection.
+
+Sampled 3,376-, 5,828- and 5,831-byte objects were generation-map JSON nodes.
+The receipt window included approximately 11,009 objects below 32 KiB alongside
+11,892 full 256 KiB chunks. Not every small object was sampled or classified.
+The mutation writer flushed every 128 records and repeatedly copied radix paths.
+The fresh fused owner now uses a bounded hash-indexed journal with larger
+mutation waves; durable leaves and all generation/retention semantics stay the
+same. Its benchmark reads every captured version back through a new map reader.
+
+The final static review additionally restricted batching to actual stage
+admission, classified local map-budget denials before parent exhaustion, and
+added HTTP-status attribution for exhausted 429/503 responses. Expected 412s
+remain recoverable status observations. Source-operation evidence and separate
+owner limits are validated by the qualification harness. See the bulk-builder
+design for lifetimes, limits and failure behavior. The historical 1M result
+remains failed; these changes do not retroactively qualify it.
+
+The subsequent review closed the remaining operation-local allocation escape:
+cold map reads, traversal references and writer root snapshots now consume
+the admitted map/build budget. Regression coverage rejects both cold and warm
+lookups when their owner has no remaining capacity. Expected 404/412 responses
+have an independent 64-record diagnostic allowance, so large conflict replays
+cannot hide the later exhausted 429/503 response.
+
+The final allocation pass also charges provider-selector record/copy scratch
+to the caller and verifies exhausted-quota rejection before object I/O. Private
+OOM attribution now preserves backing allocation failures despite earlier
+recovered quota denials. Mixed histories stay conservatively `OutOfMemory`
+rather than claiming an unproven limit cause. The native owner records backing
+allocation failure across private owners; successful allocation and normal
+resize refusal cannot erase or fabricate that evidence.
+
+## Final live correctness validation
+
+The frozen 1,024-row local-to-GCS ADC check at 2026-11-13T02:32:25Z qualified
+with executable SHA-256
+`67df940572971836fcb3aa5ad8842850a2c7f13f05ae99fdac5bbfb2abeed8c9`.
+Native construction took 15.976 seconds; the child including reopen/recall took
+23.060 seconds and the full supervisor took 25.070 seconds. The source object
+generation and frozen input hashes were unchanged. All seven required source
+operations, owner limits, generation-journal evidence, and completed/stopped
+scratch-sampler checks passed. Observed owner peaks were 35,280,326 build bytes,
+2,814,588 transport bytes and 95,486 generation-map bytes; process peak RSS was
+53,280,768 bytes. Full retained local evidence is under
+`zig/.benchmark-results/gcs-bulk/journal-final-live-1024-20261113T023225Z/`; a
+portable summary is in `bulk_generation_publication_results.json`.
+
+This small case proves current build/reopen correctness and evidence wiring.
+It does not replace the failed historical 1M result or establish a paired large
+GCS performance improvement.
+
+Final local regression validation: the corrected native integration suite
+passed all 77 build steps with 32 tests passed, one guarded S3 skip and zero
+failures/leaks. The combined native/library invocation built the runtime probe
+and passed its publication/library targets, but initially failed compilation
+of the new selector fixture because string literals were used for owned mutable
+store fields. The fixture now uses the normal borrowing initializer; the
+complete integration rerun above includes it. All 51 Python lifecycle and
+qualification regressions passed, as did Ruff, Zig formatting and diff checks.
+Standard repository CI remains subject to exact-head maintainer approval.

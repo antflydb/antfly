@@ -22,6 +22,16 @@ pub fn resolveDocumentTransform(
     existing_json: ?[]const u8,
     transform: types.DocumentTransform,
 ) !?[]u8 {
+    return resolveDocumentTransformWithCancellation(alloc, existing_json, transform, .none);
+}
+
+pub fn resolveDocumentTransformWithCancellation(
+    alloc: Allocator,
+    existing_json: ?[]const u8,
+    transform: types.DocumentTransform,
+    cancellation: @import("antfly_cancellation").CancellationToken,
+) !?[]u8 {
+    try cancellation.check();
     // The mutable tree and operands share one request-budgeted scratch region.
     // Parse the base directly into it instead of cloning a second full DOM.
     // Only the final encoded document escapes this scope.
@@ -39,7 +49,11 @@ pub fn resolveDocumentTransform(
         break :blk parsed;
     } else std.json.Value{ .object = std.json.ObjectMap.empty };
 
-    for (prepared.operations) |*op| try applyPreparedTransformOp(scratch_alloc, &root, op, is_insert);
+    for (prepared.operations) |*op| {
+        try cancellation.check();
+        try applyPreparedTransformOp(scratch_alloc, &root, op, is_insert);
+    }
+    try cancellation.check();
 
     return try std.json.Stringify.valueAlloc(alloc, root, .{});
 }
@@ -1019,4 +1033,11 @@ test "shared transform typing preserves SQL NULL and JSON null through nested up
     }
     try std.testing.expectEqual(@as(usize, 1), fields.len);
     try std.testing.expectEqualStrings("untouched", fields[0]);
+}
+
+test "commit requirements transform cancellation precedes allocation" {
+    var failed = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, resolveDocumentTransformWithCancellation(failed.allocator(), "{}", .{ .key = "doc", .operations = &.{.{ .op = .unset, .path = "x" }} }, @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled)));
+    try std.testing.expect(!failed.has_induced_failure);
 }

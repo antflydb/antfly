@@ -1,0 +1,511 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sources
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/antflydb/antfly/go/pkg/sources/internal/declarations"
+	"github.com/antflydb/antfly/go/pkg/sources/management"
+)
+
+type KnowledgeDeclaration = management.KnowledgeDeclaration
+type EntityBinding = management.EntityBinding
+type GraphBinding = management.GraphBinding
+type KnowledgeRequest = management.KnowledgeRequest
+
+// ValidateKnowledge checks discovery against the runtime's trusted audience.
+func ValidateKnowledge(k *KnowledgeDeclaration, audience string) error {
+	return declarations.ValidateKnowledge(k, audience)
+}
+
+func containsString(values []string, want string) bool { return slices.Contains(values, want) }
+
+func checkEntityBinding(e EntityBinding, cfg map[string]any) error {
+	return declarations.CheckEntityBinding(e, cfg)
+}
+func checkKnowledgeGraph(k *KnowledgeDeclaration, g GraphBinding, cfg map[string]any) error {
+	return declarations.CheckKnowledgeGraph(k, g, cfg)
+}
+
+// Runtime diagnostics include independently administered table-scoped
+// consumers which need not appear in an index's inline declaration.
+type nativeKnowledgeResolver struct {
+	Name               string `json:"name"`
+	Table              string `json:"table"`
+	SourceArtifact     string `json:"source_artifact"`
+	ResolutionArtifact string `json:"resolution_artifact"`
+	CandidateKeyPrefix string `json:"candidate_key_prefix"`
+}
+
+func nativeGraphResolvers(g GraphBinding, idx nativeSearchIndex) []nativeKnowledgeResolver {
+	values := []nativeKnowledgeResolver{}
+	if idx.Status.ResolverReplay == nil {
+		return values
+	}
+	seen := map[nativeKnowledgeResolver]bool{}
+	for _, r := range idx.Status.ResolverReplay.Resolvers {
+		if containsString(g.Artifacts, r.SourceArtifact) && !seen[r] {
+			seen[r] = true
+			values = append(values, r)
+		}
+	}
+	sort.Slice(values, func(i, j int) bool {
+		a, b := values[i], values[j]
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		if a.Table != b.Table {
+			return a.Table < b.Table
+		}
+		if a.SourceArtifact != b.SourceArtifact {
+			return a.SourceArtifact < b.SourceArtifact
+		}
+		if a.ResolutionArtifact != b.ResolutionArtifact {
+			return a.ResolutionArtifact < b.ResolutionArtifact
+		}
+		return a.CandidateKeyPrefix < b.CandidateKeyPrefix
+	})
+	return values
+}
+func nativeEntityMatches(e EntityBinding, r nativeKnowledgeResolver) bool {
+	return r.Name == e.Resolver && r.Table == e.Table && r.SourceArtifact == e.SourceArtifact && r.ResolutionArtifact == e.ResolutionArtifact && r.CandidateKeyPrefix == e.Namespace
+}
+
+// Entity-only discovery has no graph-query admission step to perform this
+// check later. Its advertised readiness must prove the active namespace too.
+func checkNativeEntityBinding(e EntityBinding, idx nativeSearchIndex) error {
+	if err := checkEntityBinding(e, idx.Config); err != nil {
+		return err
+	}
+	if !idx.Status.Readiness.Complete || !idx.Status.Readiness.Queryable {
+		return nil
+	}
+	if idx.Status.ResolverReplay == nil {
+		return fmt.Errorf("native entity resolver observation unavailable")
+	}
+	matched := false
+	for _, r := range idx.Status.ResolverReplay.Resolvers {
+		if r.Name != e.Resolver {
+			continue
+		}
+		if !nativeEntityMatches(e, r) {
+			return fmt.Errorf("active native entity resolver identity mismatch")
+		}
+		matched = true
+	}
+	if !matched {
+		return fmt.Errorf("active native entity resolver missing")
+	}
+	return nil
+}
+
+func checkNativeKnowledgeGraph(k *KnowledgeDeclaration, g GraphBinding, idx nativeSearchIndex) error {
+	if err := checkKnowledgeGraph(k, g, idx.Config); err != nil {
+		return err
+	}
+	if !idx.Status.Readiness.Complete || !idx.Status.Readiness.Queryable {
+		return nil
+	}
+	if idx.Status.ResolverReplay == nil {
+		return fmt.Errorf("native graph resolver observation unavailable")
+	}
+	declared := map[string]EntityBinding{}
+	for _, e := range k.Entities {
+		if containsString(g.Entities, e.Name) {
+			declared[e.Resolver] = e
+		}
+	}
+	matched := map[string]bool{}
+	for _, r := range nativeGraphResolvers(g, idx) {
+		e, ok := declared[r.Name]
+		if !ok || !nativeEntityMatches(e, r) {
+			return fmt.Errorf("undeclared active native graph resolver target")
+		}
+		matched[r.Name] = true
+	}
+	if len(matched) != len(declared) {
+		return fmt.Errorf("native graph resolver observation incomplete")
+	}
+	return nil
+}
+
+// ValidateKnowledgeProcessing checks discovery and native graph recipes before DDL.
+func ValidateKnowledgeProcessing(k *KnowledgeDeclaration, plan *ProcessingDeclaration, audience string) error {
+	return declarations.ValidateKnowledgeProcessing(k, plan, audience)
+}
+
+// ValidateInstalledKnowledge checks independently managed resources and newly
+// reconciled declarations without treating their backfill as complete. Metadata
+// fanout, time and memory use share the discovery observer's fixed budgets.
+func ValidateInstalledKnowledge(ctx context.Context, client SearchIndexClient, b Binding, audience string) error {
+	if err := ValidateKnowledge(b.Knowledge, audience); err != nil {
+		return err
+	}
+	if b.Knowledge == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	b.Streams = nil
+	b.Artifacts = nil
+	cache, failures := observeSearchIndexes(ctx, client, b)
+	for _, g := range b.Knowledge.Graphs {
+		idx, ok := cache[g.Index]
+		if !ok {
+			return fmt.Errorf("graph %s observation unavailable: %v", g.Name, failures[g.Index])
+		}
+		if err := checkNativeKnowledgeGraph(b.Knowledge, g, idx); err != nil {
+			return fmt.Errorf("graph %s: %w", g.Name, err)
+		}
+	}
+	for _, e := range b.Knowledge.Entities {
+		idx, ok := cache[e.Index]
+		if !ok {
+			return fmt.Errorf("entity %s observation unavailable: %v", e.Name, failures[e.Index])
+		}
+		if err := checkNativeEntityBinding(e, idx); err != nil {
+			return fmt.Errorf("entity %s: %w", e.Name, err)
+		}
+	}
+	return nil
+}
+
+// ObserveKnowledge uses the same bounded, cached index observations as search.
+// Catalog presence is never treated as extraction or resolution completion.
+func ObserveKnowledge(ctx context.Context, client SearchIndexClient, b Binding, audience string) management.KnowledgeStatus {
+	_, status := ObserveSource(ctx, client, b, audience)
+	return status
+}
+
+// ObserveSource shares one bounded metadata snapshot across both discovery
+// families. Native index readback is fetched once per distinct index.
+func ObserveSource(ctx context.Context, client SearchIndexClient, b Binding, audience string) (management.SearchStatus, management.KnowledgeStatus) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	metadata := b
+	if ValidateKnowledge(b.Knowledge, audience) != nil {
+		metadata.Knowledge = nil
+	}
+	cache, failures := observeSearchIndexes(ctx, client, metadata)
+	return searchStatusFromIndexes(b, cache, failures), knowledgeStatusFromIndexes(b, audience, cache, failures)
+}
+func knowledgeStatusFromIndexes(b Binding, audience string, cache map[string]nativeSearchIndex, failures map[string]error) management.KnowledgeStatus {
+	out := management.KnowledgeStatus{Version: 1, ObservedAt: int(time.Now().Unix()), Mode: "unsupported", Entities: []management.RepresentationStatus{}, Graphs: []management.RepresentationStatus{}}
+	if b.Knowledge == nil {
+		return out
+	}
+	err := ValidateKnowledge(b.Knowledge, audience)
+	if err == nil {
+		out.Mode = string(b.Knowledge.Mode)
+		out.Audience = audience
+	}
+	if len(b.Knowledge.Entities)+len(b.Knowledge.Graphs) == 0 {
+		out.Mode = "disabled"
+		return out
+	}
+	state := func(name, index string, check func(map[string]any) error) management.RepresentationStatus {
+		s := management.RepresentationStatus{Name: name, State: "unsupported", Reason: "knowledge_deployment_boundary_unavailable"}
+		if err != nil {
+			return s
+		}
+		idx, ok := cache[index]
+		if !ok {
+			s.Reason = "native_observation_unavailable"
+			failure, found := failures[index]
+			if !found || errors.Is(failure, errSearchMetadataBudget) {
+				s.Reason = "native_metadata_budget_exceeded"
+			}
+			if errors.Is(failure, context.DeadlineExceeded) || errors.Is(failure, context.Canceled) {
+				s.Reason = "native_observation_timeout"
+			}
+			return s
+		}
+		if check(idx.Config) != nil {
+			s.Reason = "native_binding_mismatch"
+			return s
+		}
+		s.State = "building"
+		s.Reason = "native_index_incomplete"
+		r := idx.Status.Readiness
+		if r.State == "failed" {
+			s.State = "failed"
+			s.Reason = "native_index_failed"
+		} else if r.Complete && r.Queryable {
+			s.State = "ready"
+			s.Reason = ""
+		} else if r.State == "queryable_partial" {
+			s.State = "partial"
+			s.Reason = "native_index_partial"
+		}
+		return s
+	}
+	for _, e := range b.Knowledge.Entities {
+		out.Entities = append(out.Entities, state(e.Name, e.Index, func(c map[string]any) error { return checkNativeEntityBinding(e, cache[e.Index]) }))
+	}
+	for _, g := range b.Knowledge.Graphs {
+		out.Graphs = append(out.Graphs, state(g.Name, g.Index, func(c map[string]any) error { return checkNativeKnowledgeGraph(b.Knowledge, g, cache[g.Index]) }))
+	}
+	return out
+}
+
+// BuildKnowledgeQuery composes ordinary native traversal. It never hydrates
+// arbitrary entity documents or executes curation. Hosts authorize every call.
+func BuildKnowledgeQuery(b Binding, request KnowledgeRequest, audience string) ([]byte, error) {
+	if b.Knowledge == nil {
+		return nil, fmt.Errorf("knowledge is not declared")
+	}
+	if err := ValidateKnowledge(b.Knowledge, audience); err != nil {
+		return nil, err
+	}
+	var graph *GraphBinding
+	for i := range b.Knowledge.Graphs {
+		if b.Knowledge.Graphs[i].Name == request.Graph {
+			graph = &b.Knowledge.Graphs[i]
+			break
+		}
+	}
+	if graph == nil {
+		return nil, fmt.Errorf("unknown graph")
+	}
+	if request.Depth == 0 {
+		request.Depth = 1
+	}
+	if request.Limit == 0 {
+		request.Limit = 20
+	}
+	if request.Depth < 1 || request.Depth > 8 || request.Limit < 1 || request.Limit > 100 || len(request.Start) < 1 || len(request.Start) > 16 {
+		return nil, fmt.Errorf("graph request exceeds work bounds")
+	}
+	seen := map[string]bool{}
+	for _, key := range request.Start {
+		if !validBindingName(key) || seen[key] {
+			return nil, fmt.Errorf("invalid start keys")
+		}
+		seen[key] = true
+	}
+	if !canonicalID(b.ID) {
+		return nil, fmt.Errorf("knowledge traversal requires a source identity")
+	}
+	start := map[string]any{"keys": request.Start}
+	if request.Entity != "" {
+		if !containsString(graph.Entities, request.Entity) {
+			return nil, fmt.Errorf("entity is not declared by graph")
+		}
+		for _, e := range b.Knowledge.Entities {
+			if e.Name == request.Entity {
+				identities := []any{}
+				for _, key := range request.Start {
+					if !strings.HasPrefix(key, e.Namespace) || key == e.Namespace {
+						return nil, fmt.Errorf("start key is outside entity namespace")
+					}
+					identities = append(identities, map[string]any{"table": e.Table, "key": key})
+				}
+				start = map[string]any{"identities": identities}
+			}
+		}
+	}
+	filter := map[string]any{"properties": []any{map[string]any{"field": "/metadata/source_id", "op": "eq", "value": b.ID}}}
+	for field, v := range map[string]string{"valid_at": request.ValidAt, "known_at": request.KnownAt} {
+		if v != "" {
+			if len(v) > 64 {
+				return nil, fmt.Errorf("invalid graph timestamp")
+			}
+			if _, err := time.Parse(time.RFC3339Nano, v); err != nil {
+				return nil, fmt.Errorf("invalid graph timestamp")
+			}
+			filter[field] = v
+		}
+	}
+	return json.Marshal(map[string]any{"limit": 0, "graph_queries": map[string]any{"source_knowledge": map[string]any{"index": graph.Index, "traverse": map[string]any{"start": start, "max_depth": request.Depth, "limit": request.Limit, "include_paths": true, "deduplicate_nodes": false, "include_documents": false, "edge_filter": filter}}}})
+}
+
+// QueryKnowledge requires an operator-provided audience. That is a deployment
+// assertion, not a claim that row ACLs can secure a mixed-audience graph. The
+// native/gateway policy still authorizes current access, including historical queries.
+type KnowledgeQueryClient interface {
+	SearchIndexClient
+	Query(context.Context, string, []byte) ([]byte, error)
+}
+
+func (p *Publisher) QueryKnowledge(ctx context.Context, b Binding, request KnowledgeRequest, audience string) ([]byte, error) {
+	return QueryKnowledge(ctx, p, b, request, audience)
+}
+
+func QueryKnowledge(ctx context.Context, p KnowledgeQueryClient, b Binding, request KnowledgeRequest, audience string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if b.Status != "searchable" || b.ValidUntil == nil || time.Now().Unix() >= *b.ValidUntil {
+		return nil, fmt.Errorf("source access is not searchable")
+	}
+	query, err := BuildKnowledgeQuery(b, request, audience)
+	if err != nil {
+		return nil, err
+	}
+	ctx = scopedSearchContext(ctx, b)
+	var selected GraphBinding
+	for _, g := range b.Knowledge.Graphs {
+		if g.Name == request.Graph {
+			selected = g
+		}
+	}
+	observe := func() ([32]byte, error) {
+		raw, err := p.InspectSearchIndex(ctx, b.Table, selected.Index)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		if len(raw) > 8<<20 {
+			return [32]byte{}, fmt.Errorf("native graph metadata exceeds budget")
+		}
+		idx, err := decodeSearchIndex(raw)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		if err = checkNativeKnowledgeGraph(b.Knowledge, selected, idx); err != nil {
+			return [32]byte{}, err
+		}
+		if !idx.Status.Readiness.Complete || !idx.Status.Readiness.Queryable {
+			return [32]byte{}, fmt.Errorf("native graph is incomplete")
+		}
+		// Preserve native incarnation and exact u64 generation/revision values.
+		// The compatibility decoder intentionally ignores some status fields;
+		// hashing its reduced view would miss a same-config index replacement.
+		var wire struct {
+			Config json.RawMessage `json:"config"`
+			Status struct {
+				Readiness      json.RawMessage `json:"readiness"`
+				ResolverReplay struct {
+					Resolvers json.RawMessage `json:"resolvers"`
+				} `json:"resolver_replay"`
+			} `json:"status"`
+		}
+		if err = json.Unmarshal(raw, &wire); err != nil {
+			return [32]byte{}, err
+		}
+		// Fence only consumers of this graph's artifact set. Table-wide
+		// diagnostics also contain unrelated resolvers; their creation or
+		// observation order must not invalidate an otherwise stable query.
+		wire.Status.ResolverReplay.Resolvers, err = json.Marshal(nativeGraphResolvers(selected, idx))
+		if err != nil {
+			return [32]byte{}, err
+		}
+		encoded, err := json.Marshal(wire)
+
+		return sha256.Sum256(encoded), err
+	}
+	before, err := observe()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := p.Query(context.WithValue(ctx, responseLimitKey{}, management.MaxResponseBytes), b.Table, query)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > management.MaxResponseBytes {
+		return nil, fmt.Errorf("knowledge response exceeds budget")
+	}
+	after, err := observe()
+	if err != nil {
+		return nil, err
+	}
+	if before != after || time.Now().Unix() >= *b.ValidUntil {
+		return nil, fmt.Errorf("knowledge generation or access changed during query")
+	}
+	consistency, err := SearchConsistency(raw)
+	if err != nil {
+		return nil, err
+	}
+	if request.RequireSnapshot && consistency != "retained_snapshot" {
+		return nil, fmt.Errorf("knowledge query requires a retained snapshot")
+	}
+	var required struct {
+		Responses []struct {
+			GraphResults map[string]json.RawMessage `json:"graph_results"`
+		} `json:"responses"`
+	}
+	if err = json.Unmarshal(raw, &required); err != nil {
+		return nil, err
+	}
+	if len(required.Responses) != 1 || len(required.Responses[0].GraphResults["source_knowledge"]) == 0 || string(required.Responses[0].GraphResults["source_knowledge"]) == "null" {
+		return nil, fmt.Errorf("native graph result unavailable")
+	}
+	var response map[string]json.RawMessage
+	if err = json.Unmarshal(raw, &response); err != nil {
+		return nil, err
+	}
+	response["source_knowledge"], err = json.Marshal(map[string]any{"source": b.ID, "graph": request.Graph, "audience": audience, "consistency": consistency, "history": "current_state", "generated": true})
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(response)
+	if len(encoded) > management.MaxResponseBytes {
+		return nil, fmt.Errorf("knowledge response exceeds budget")
+	}
+	return encoded, err
+}
+
+func knowledgeVersions(audience string) []int {
+	if audience != "" {
+		return []int{1}
+	}
+	return nil
+}
+
+// EntityResources references the existing native authority. These relative
+// paths carry no credentials or access grants; clients authorize native reads
+// and curation independently. Redirect revisions/suppression remain native.
+func EntityResources(b Binding, name string) (map[string]string, error) {
+	if b.Knowledge == nil || !validBindingName(b.Table) {
+		return nil, fmt.Errorf("unknown entity binding")
+	}
+	for _, e := range b.Knowledge.Entities {
+		if e.Name == name {
+			base := tablePath(b.Table) + "/resolvers/" + url.PathEscape(e.Resolver)
+			return map[string]string{"resolver": base, "render": base + ":render", "resolve": base + ":resolve", "redirects": base + "/redirects", "suppressions": base + "/suppressions", "reviews": base + "/reviews", "entity_table": tablePath(e.Table)}, nil
+		}
+	}
+	return nil, fmt.Errorf("unknown entity binding")
+}
+
+// EntityCurationResources addresses the native entity namespace authority. Unlike
+// resolver-local configured aliases, these revisions apply to every consumer of
+// the namespace, including coexisting recipe generations. Native authorization
+// and revision-fenced mutation semantics remain authoritative.
+func EntityCurationResources(b Binding, name, key string) (map[string]string, error) {
+	if b.Knowledge == nil {
+		return nil, fmt.Errorf("unknown entity binding")
+	}
+	for _, e := range b.Knowledge.Entities {
+		if e.Name != name {
+			continue
+		}
+		if _, err := EntityJoinKey("native", e, key); err != nil {
+			return nil, err
+		}
+		base := tablePath(e.Table) + "/entities/" + url.PathEscape(key)
+		return map[string]string{"redirects": base + "/redirects", "progress": base + "/progress", "merge": base + ":merge", "unmerge": base + ":unmerge", "suppress": base + ":suppress", "unsuppress": base + ":unsuppress", "distinct": base + ":distinct"}, nil
+	}
+	return nil, fmt.Errorf("unknown entity binding")
+}

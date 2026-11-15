@@ -750,6 +750,10 @@ pub const CreateEmbeddingsIndexRequest = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -795,6 +799,8 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -856,6 +862,14 @@ pub const CreateEmbeddingsIndexRequest = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -1426,6 +1440,8 @@ pub const CreatedEmbeddingsIndex = struct {
     external: ?bool = null,
     external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
@@ -1458,6 +1474,8 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -1519,6 +1537,14 @@ pub const CreatedEmbeddingsIndex = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -1601,6 +1627,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     external: ?bool = null,
     external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
@@ -1628,6 +1656,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -1674,6 +1704,14 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -3961,6 +3999,10 @@ pub const EmbeddingsIndexConfig = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -4002,6 +4044,8 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -4050,6 +4094,14 @@ pub const EmbeddingsIndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -9195,6 +9247,8 @@ pub const GraphResolverConfig = struct {
     suppress: ?GraphResolverSuppressionConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
+    /// Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching.
+    candidate_key_prefix: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
     candidate_limit: ?i64 = null,
     name_embedding: ?[]const u8 = null,
@@ -9224,6 +9278,7 @@ pub const GraphResolverConfig = struct {
         .{ "suppress", "suppress", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
+        .{ "candidate_key_prefix", "candidate_key_prefix", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
         .{ "candidate_limit", "candidate_limit", true },
         .{ "name_embedding", "name_embedding", true },
@@ -9294,6 +9349,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.candidate_search) |value| {
             try jw.objectField("candidate_search");
+            try jw.write(value);
+        }
+        if (self.candidate_key_prefix) |value| {
+            try jw.objectField("candidate_key_prefix");
             try jw.write(value);
         }
         if (self.candidate_ann_index) |value| {
@@ -10131,6 +10190,81 @@ pub const GroupedArtifactSource = struct {
     }
 };
 
+pub const IndexAlias = struct {
+    index: []const u8,
+    previous_index: OpenApiOptionalNullable([]const u8) = .absent,
+    swapped_at_ms: i64,
+    require: []const u8,
+    idempotency_key: []const u8,
+    readiness: IndexReadinessStatus,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        switch (self.previous_index) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("previous_index");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("previous_index");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("swapped_at_ms");
+        try jw.write(self.swapped_at_ms);
+        try jw.objectField("require");
+        try jw.write(self.require);
+        try jw.objectField("idempotency_key");
+        try jw.write(self.idempotency_key);
+        try jw.objectField("readiness");
+        try jw.write(self.readiness);
+        try jw.endObject();
+    }
+};
+
+pub const IndexAliasRequest = struct {
+    index: []const u8,
+    expected_index: ?[]const u8 = null,
+    require: ?[]const u8 = null,
+    idempotency_key: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", false },
+        .{ "expected_index", "expected_index", true },
+        .{ "require", "require", true },
+        .{ "idempotency_key", "idempotency_key", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        if (self.expected_index) |value| {
+            try jw.objectField("expected_index");
+            try jw.write(value);
+        }
+        if (self.require) |value| {
+            try jw.objectField("require");
+            try jw.write(value);
+        }
+        try jw.objectField("idempotency_key");
+        try jw.write(self.idempotency_key);
+        try jw.endObject();
+    }
+};
+
 /// Configuration for an index
 pub const IndexConfig = struct {
     /// Name of the index
@@ -10162,6 +10296,10 @@ pub const IndexConfig = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
@@ -10235,6 +10373,8 @@ pub const IndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "embedding_name", "embedding_name", true },
         .{ "source_artifact_name", "source_artifact_name", true },
@@ -10335,6 +10475,14 @@ pub const IndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -11171,20 +11319,50 @@ pub const IndexType = enum {
     }
 };
 
+/// Offline clustering algorithm for fresh native Parquet lake HBC indexes.
+pub const LakeBulkBuildAlgorithm = enum {
+    lloyd,
+    emeans,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .lloyd => "lloyd",
+            .emeans => "emeans",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "lloyd", .lloyd },
+            .{ "emeans", .emeans },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Tuning for algorithm=leann dense indexes. All fields are optional.
 pub const LeannIndexConfig = struct {
     /// Graph degree cap M. Most nodes keep M/5 neighbors after pruning; hubs keep up to M.
     max_degree: ?i64 = null,
     /// Compact code used to steer the graph walk. "rabitq" (default) carries error bounds, so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's fixed rerank ratio; prefer it only for very low dimensions (below about 64).
     quantizer: ?[]const u8 = null,
-    /// Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+    /// Whether document embeddings stay stored after the graph covers them. "auto" (the default when the index has its own embedder) keeps only a small stub for each embedding computed from text (a field, a text-only template, or a text chunk) and re-embeds a few such candidates per query, while embeddings computed from media (images, audio windows, model outputs) stay stored. "transient" stubs every covered embedding, so it requires inputs that re-embed from text: no media chunkers. "persistent" keeps every embedding, and is the only choice for external vectors, indexes fed by other enrichments, and the pq quantizer.
     vector_storage: ?[]const u8 = null,
     /// Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
     search_ef: ?i64 = null,
     /// Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates and loses fewer true neighbors.
     bound_scale: ?f32 = null,
-    /// Candidates recomputed per batch. 0 uses k.
+    /// Candidates recomputed per batch. 0 uses k for bounded search and 128 for full-effort search.
     batch_size: ?i64 = null,
+    /// Time a query may spend re-embedding candidates whose stored vectors were dropped. If the budget is spent before scoring finishes, the search returns an incomplete-coverage error; retry with a larger budget. 0 means no limit.
+    reembed_budget_ms: ?i64 = null,
+    /// How vectors that cannot be re-embedded from text (images, audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector. "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-embedding. Requires "auto" or "transient" storage.
+    media_vectors: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -11194,6 +11372,8 @@ pub const LeannIndexConfig = struct {
         .{ "search_ef", "search_ef", true },
         .{ "bound_scale", "bound_scale", true },
         .{ "batch_size", "batch_size", true },
+        .{ "reembed_budget_ms", "reembed_budget_ms", true },
+        .{ "media_vectors", "media_vectors", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11228,6 +11408,14 @@ pub const LeannIndexConfig = struct {
         }
         if (self.batch_size) |value| {
             try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.reembed_budget_ms) |value| {
+            try jw.objectField("reembed_budget_ms");
+            try jw.write(value);
+        }
+        if (self.media_vectors) |value| {
+            try jw.objectField("media_vectors");
             try jw.write(value);
         }
         try jw.endObject();

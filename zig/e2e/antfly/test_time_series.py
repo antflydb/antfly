@@ -22,6 +22,7 @@ import time
 
 import pytest
 from conftest import finish_create_table
+from helpers import PhaseTimings
 
 
 def _schema():
@@ -516,6 +517,7 @@ def test_sdk_preset_grouped_materializations(stateful_api, shards):
 
 def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     """A maintained query must not hydrate the fallback's first 100,000 hits."""
+    timings = PhaseTimings("grouped-materializations-scale")
     fixture = json.loads(
         (Path(__file__).parent / "fixtures/time-series-sdk.json").read_text()
     )
@@ -524,10 +526,13 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     finish_create_table(
         api, name, api._request("POST", f"/tables/{name}", fixture["table"])
     )
+    timings.mark("table-admission")
     count = 100_001
     for first in range(0, count, 1000):
-        # Bulk full-index visibility can include checkpoint warming. Allow a
-        # longer setup transport timeout without relaxing the query's budget.
+        # Coalesce setup writes, but bound replay debt so a visibility fence
+        # fits the ordinary request budget even in a Debug build. Each fence
+        # covers all earlier sequences; the scale and final query are unchanged.
+        fence = (first + 1000) % 5000 == 0 or first + 1000 >= count
         api.batch_write_with_timeout(
             name,
             timeout_s=120,
@@ -540,8 +545,11 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
                 }
                 for i in range(first, min(first + 1000, count))
             },
-            sync_level="full_index",
+            sync_level="full_index" if fence else "write",
         )
+        if fence:
+            timings.observe("population-fence", rows=min(first + 1000, count))
+    timings.mark("population-and-indexing")
     payload = api.post("/query", dict(fixture["query"], table=name))
     result = payload.get("responses", [payload])[0]
     assert not result.get("error"), payload
@@ -554,6 +562,7 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     metrics = bucket["sub_aggregations"]["points"]["buckets"][0]["sub_aggregations"]
     assert metrics["total"]["value"] == count
     assert metrics["average"]["avg"] == 1
+    timings.mark("bounded-materialized-query")
     populated = copy.deepcopy(fixture["query"])
     histogram = populated["aggregations"]["series"]["sub_aggregations"]["points"]
     histogram.pop("date_bounds")
@@ -573,6 +582,7 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
         ]
         == count
     )
+    timings.mark("populated-bucket-query")
 
 
 def test_signed_origin_and_bounded_nesting_rejection(stateful_api):
@@ -1373,3 +1383,27 @@ def test_numeric_histogram_extremes_return_error_and_preserve_server(
         assert response.status_code == 400, response.text
     payload = api.query_table(name, {"limit": 1})
     assert payload.get("responses", [payload])[0].get("status", 200) == 200, payload
+
+
+def test_sdk_sql_output_aliases_are_unique_and_preserve_results(stateful_api):
+    api = stateful_api
+    fixture = json.loads(
+        (
+            Path(__file__).parent / "fixtures/time-series-sdk-sql-aliases.json"
+        ).read_text()
+    )
+    name = f"series_sql_alias_{time.time_ns()}"
+    finish_create_table(
+        api, name, api._request("POST", f"/tables/{name}", fixture["table"])
+    )
+    api.batch_write(name, inserts=fixture["readings"], sync_level="full_index")
+    for case in fixture["cases"]:
+        request = dict(case["sql"])
+        request["statement"] = request["statement"].replace('"fixture"', f'"{name}"')
+        response = api._request("POST", "/sql", request)
+        assert response.status_code == 200, (case["name"], response.text)
+        result = response.json()
+        names = [column["name"] for column in result["columns"]]
+        assert names == case["columns"], (case["name"], result)
+        assert len(set(names)) == len(names), (case["name"], result)
+        assert result["rows"] == case["rows"], (case["name"], result)

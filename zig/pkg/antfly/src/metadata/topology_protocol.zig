@@ -175,7 +175,7 @@ pub const sql_extension_version: u16 = 178;
 /// Require the unified v179 profile before admitting either ownership cut.
 /// The combined SQL and published graph cohort preserves main transition tag82,
 /// moves the unreleased index-completion tag, and admits both catalog families.
-pub const current_version: u16 = 180;
+pub const current_version: u16 = 193;
 /// Immutable, pre-executed statement trigger receipts/results on SQL TRUNCATE.
 pub const sql_truncate_preparation_version: u16 = 177;
 /// Atomically acknowledged trigger-schema and active row-policy pairs.
@@ -303,6 +303,16 @@ pub const checks_catalog_identity_version: u16 = 80;
 pub const constraint_occupancy_version: u16 = 79;
 pub const resolver_namespaces_version: u16 = 128;
 /// Published SQL completion ownership from main; do not renumber these floors.
+pub const index_aliases_version: u16 = 192;
+pub const index_alias_lifecycle_version: u16 = 193;
+pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelope: bool) std.mem.Allocator.Error!u16 {
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const required = if (envelope) try aliases.requiredEnvelopeStoreProtocol(a, bytes) else try aliases.requiredStoreProtocol(a, bytes);
+    return if (required >= 4) index_alias_lifecycle_version else if (required >= 3) index_aliases_version else 0;
+}
+pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
+    return @import("antfly_local_sources").api_index_metadata.aliases.uses(a, indexes_json);
+}
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;

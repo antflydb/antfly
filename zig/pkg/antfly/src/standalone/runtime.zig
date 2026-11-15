@@ -236,6 +236,7 @@ const InferenceRuntimeConfigWire = struct {
 
     audio_readers: []const antfly.transcribing.NamedConfig = &.{},
     embedded_enabled: bool = true,
+    worker_executable: ?[]const u8 = null,
     worker_environment: []const struct { name: []const u8, value: []const u8 } = &.{},
     resources: platform.resource_policy.Resources = .{},
     generation_batching: platform.inference_settings.GenerationBatching = .{},
@@ -767,6 +768,12 @@ const LocalStandaloneMetadata = struct {
     sql_command_store: ?*antfly.public_api.transactions.DurableSessionStore = null,
     data_server: ?*antfly.data.runtime.DataServer = null,
     initial_fk_round_mutex: std.atomic.Mutex = .unlocked,
+    /// An empty coherent cut can be reused until durable metadata changes.
+    /// Never suppress progress or retirement for a resident private owner.
+    empty_provisioning_cut: ?struct {
+        store: *antfly.metadata.RaftApplyStore,
+        revision: u64,
+    } = null,
     relation_reconciliation: @import("../metadata/standalone_relation_reconciliation.zig").Coordinator = .{},
     index_reconciliation: @import("../metadata/relational_index_worker.zig").Coordinator = .{},
     schema_reconciliation: @import("../metadata/schema_validation_coordinator.zig").Coordinator = .{},
@@ -858,6 +865,13 @@ const LocalStandaloneMetadata = struct {
         fn upsertTable(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, table: antfly.metadata.TableRecord) !void {
             if (metadata.lifecycle_store) |store| {
                 if (!try store.resolverProjectionValid(metadata.alloc, group_ids.main_metadata_group_id, table)) return error.ResolverCurationConflict;
+            }
+            if (metadata.manager.tables.get(table.table_id)) |prior| {
+                if (!std.mem.eql(u8, prior.indexes_json, table.indexes_json)) {
+                    var arena = std.heap.ArenaAllocator.init(metadata.alloc);
+                    defer arena.deinit();
+                    if (metadata.system_catalog_state) |*catalog| try @import("../system_catalog/graph_bindings.zig").validateTableMutations(arena.allocator(), catalog.index.graphsForTable(table.table_id), table.table_id, table.indexes_json);
+                }
             }
             try self.captureTable(metadata, table.table_id);
             try metadata.manager.upsertTable(table);
@@ -1146,6 +1160,7 @@ const LocalStandaloneMetadata = struct {
                 .linearizable_routing_snapshot = catalogRoutingSnapshot,
                 .table_routing_snapshot = catalogTableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = catalogTableRoutingSnapshot,
+                .owner_readiness = catalogOwnerReadiness,
                 .privacy_policy_binding = catalogPrivacyPolicyBinding,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .wait_for_routing_change = catalogWaitForRoutingChange,
@@ -1290,6 +1305,7 @@ const LocalStandaloneMetadata = struct {
         self.hot_standby_gate = gate;
         self.hot_standby_mirror = mirror;
         self.hot_standby_binding_generation +%= 1;
+        self.empty_provisioning_cut = null;
         self.coordinated_lifecycle_allowed = true;
     }
     fn applyHotStandbyMetadata(ptr: *anyopaque, record: antfly.hot_standby.replication_record.RecordView) !void {
@@ -1304,7 +1320,7 @@ const LocalStandaloneMetadata = struct {
             if (err == error.CatalogPublicationProofPending) return err;
             // Sync can fail after the native transaction commits. No error
             // path may retain an apparently current but stale projection.
-            self.durable_revision = 0;
+            self.invalidateDurableProjection();
             return err;
         };
         // Local initialization/migration and the source's replicated catalog
@@ -1325,7 +1341,7 @@ const LocalStandaloneMetadata = struct {
         }
         // A failed allocation/parse must leave normal snapshot and mutation
         // readers unable to mistake the previous projection for this effect.
-        self.durable_revision = 0;
+        self.invalidateDurableProjection();
         if (try store.loadStandaloneCatalog(self.alloc)) |raw| {
             defer self.alloc.free(raw);
             try self.loadCatalogBytes(raw);
@@ -2078,9 +2094,19 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
-    fn acquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, _: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
+    fn lockRoutingBudget(mutex: *std.atomic.Mutex, budget: antfly.public_api.table_catalog.RoutingBudget) !void {
+        while (true) {
+            try budget.checkpoint();
+            if (mutex.tryLock()) return;
+            try budget.sleepNs(std.time.ns_per_ms);
+        }
+    }
+
+    fn acquireRoutingGeneration(ptr: *anyopaque, input_budget: antfly.public_api.table_catalog.RoutingBudget, _: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        var budget: antfly.public_api.table_catalog.RoutingBudget = .{ .cancellation = input_budget.cancellation };
+        budget.deadline_ns = budget.deadlineFrom(input_budget);
+        try lockRoutingBudget(&self.mutex, budget);
         if (self.catalog_durability_failed) {
             self.mutex.unlock();
             return error.MetadataMutationOutcomeUnknown;
@@ -2100,7 +2126,7 @@ const LocalStandaloneMetadata = struct {
             }
         }
         const projection_incarnation = self.projection_incarnation;
-        var snapshot = self.routingSnapshotLocked(deadline_ns) catch |err| {
+        var snapshot = self.routingSnapshotLocked(budget.deadline_ns) catch |err| {
             self.mutex.unlock();
             return err;
         };
@@ -2109,9 +2135,9 @@ const LocalStandaloneMetadata = struct {
         // Build indexes outside the publication lock. The captured generation
         // is still a valid linearizable observation if a writer races it, but
         // it must not replace a newer cached generation.
-        const next = try antfly.public_api.table_catalog.RoutingGeneration.create(self.alloc, snapshot, .{ .deadline_ns = deadline_ns });
+        const next = try antfly.public_api.table_catalog.RoutingGeneration.create(self.alloc, snapshot, budget);
         errdefer next.release();
-        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        try lockRoutingBudget(&self.mutex, budget);
         if (self.catalog_durability_failed) {
             self.mutex.unlock();
             return error.MetadataMutationOutcomeUnknown;
@@ -2154,7 +2180,7 @@ const LocalStandaloneMetadata = struct {
         self.mutex.unlock();
         // Reuse the compact, coherently captured tables and ranges. Building
         // planning indexes never requires an administrative snapshot.
-        const routing = try acquireRoutingGeneration(ptr, deadline_ns, false);
+        const routing = try acquireRoutingGeneration(ptr, .{ .deadline_ns = deadline_ns }, false);
         defer routing.release();
         const snapshot = routing.indexed.snapshot.value;
         const next = try antfly.public_api.join_planning.Generation.create(self.alloc, .{
@@ -2188,6 +2214,18 @@ const LocalStandaloneMetadata = struct {
         return self.routingSnapshotLocked(deadline_ns);
     }
 
+    fn catalogOwnerReadiness(ptr: *anyopaque, request: antfly.metadata_api.OwnerReadinessRequest, budget: antfly.public_api.table_catalog.RoutingBudget) !antfly.metadata_api.OwnerReadiness {
+        try budget.checkpoint();
+        const generation = try acquireRoutingGeneration(ptr, budget, true);
+        defer generation.release();
+        for (request.owners) |owner| {
+            const range = try generation.indexed.rangeForGroup(request.table_id, owner.group_id, budget);
+            if (antfly.metadata.table_manager.rangeDocIdentityShardId(range.*) != owner.shard_id or antfly.metadata.table_manager.rangeDocIdentityRangeId(range.*) != owner.range_id) return .{ .status = .topology_changed };
+        }
+        try budget.checkpoint();
+        return .{ .status = .ready, .metadata_group_id = group_ids.main_metadata_group_id, .metadata_incarnation = generation.indexed.snapshot.value.metadata_incarnation };
+    }
+
     fn catalogPrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
@@ -2213,7 +2251,7 @@ const LocalStandaloneMetadata = struct {
         const budget = antfly.public_api.table_catalog.RoutingBudget{ .deadline_ns = deadline_ns };
         while (true) {
             try budget.checkpoint();
-            const generation = try acquireRoutingGeneration(ptr, deadline_ns, true);
+            const generation = try acquireRoutingGeneration(ptr, .{ .deadline_ns = deadline_ns }, true);
             defer generation.release();
             if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
             defer self.mutex.unlock();
@@ -2236,7 +2274,7 @@ const LocalStandaloneMetadata = struct {
                     tables[0].indexes_json = indexes;
                 }
             }
-            const refs = if (table) |value| generation.indexed.table_range_refs.get(value.table_id) orelse &.{} else &.{};
+            const refs = if (table) |value| if (generation.indexed.table_range_refs.get(value.table_id)) |entry| entry.ranges else &.{} else &.{};
             const ranges = try self.alloc.alloc(antfly.metadata.RangeRecord, refs.len);
             var copied_ranges: usize = 0;
             errdefer {
@@ -2717,6 +2755,10 @@ const LocalStandaloneMetadata = struct {
         pub fn physicalById(self: @This(), id: u64) !?system_catalog.PhysicalTable {
             const table = self.owner.manager.tables.get(id) orelse return null;
             return .{ .id = table.table_id, .name = try self.alloc.dupe(u8, table.name) };
+        }
+        pub fn graphIndexName(self: @This(), id: u64, name: []const u8) ![]const u8 {
+            const table = self.owner.manager.tables.get(id) orelse return error.TableNotFound;
+            return @import("../system_catalog/graph_bindings.zig").indexName(self.alloc, table.indexes_json, name);
         }
         pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
             const table = self.owner.manager.tables.get(id) orelse return null;
@@ -3556,6 +3598,7 @@ const LocalStandaloneMetadata = struct {
                 defer alloc.free(body);
                 try context.ensureActive();
                 const previous = self.durable_revision;
+                const authority_revision = try self.lifecycle_store.?.standaloneRevision();
                 try self.lifecycle_store.?.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_resolver_authority = body });
                 const receipt_id = try write.receipt(alloc);
                 defer alloc.free(receipt_id);
@@ -3572,7 +3615,13 @@ const LocalStandaloneMetadata = struct {
                     }
                     self.certifyProjectionRevisionLocked(revision) catch return error.MetadataMutationOutcomeUnknown;
                 } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
-                if (!view.value.receipt) return error.ResolverCurationConflict;
+                if (!view.value.receipt) {
+                    // A missing receipt certifies non-publication. Catalog
+                    // churn is distinct from a caller's namespace revision
+                    // conflict and may safely acquire a fresh adoption cut.
+                    if (write.catalog_revision.? != authority_revision) return error.CatalogGenerationChanged;
+                    return error.ResolverCurationConflict;
+                }
                 return result;
             },
             .resolver_catalog_read => |input| {
@@ -5152,6 +5201,10 @@ const LocalStandaloneMetadata = struct {
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try mutation.upsertTable(self, updated);
+        // Authored DDL may change privacy's logical catalog. Reconciliation
+        // upserts intentionally cannot change that owned state; commit the
+        // exact definition through the same CAS used by replicated DDL.
+        mutation.compare_and_replace_table = updated.table_id;
         self.epoch +|= 1;
         try mutation.commit(self);
     }
@@ -5170,6 +5223,10 @@ const LocalStandaloneMetadata = struct {
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try mutation.upsertTable(self, updated);
+        // Authored DDL may change privacy's logical catalog. Reconciliation
+        // upserts intentionally cannot change that owned state; commit the
+        // exact definition through the same CAS used by replicated DDL.
+        mutation.compare_and_replace_table = updated.table_id;
         self.epoch +|= 1;
         try mutation.commit(self);
     }
@@ -5594,11 +5651,11 @@ const LocalStandaloneMetadata = struct {
             return;
         };
         const before = self.durable_revision;
-        self.durable_revision = 0;
+        self.invalidateDurableProjection();
         try store.applyStandaloneCommand(group, .{ .advance_resolver_namespace = work.advance });
         // Scoped publication changes execution bindings, never source DDL.
         // Only lifecycle/bootstrap passes need to refresh the table manager.
-        self.durable_revision = 0;
+        self.invalidateDurableProjection();
         for (work.refresh_sources) |source_id| {
             const actual = (try store.getTable(a, group, source_id)) orelse continue;
             try self.manager.upsertTable(actual);
@@ -5676,8 +5733,20 @@ const LocalStandaloneMetadata = struct {
         var projection = blk: {
             lockAtomic(&self.mutex);
             defer self.mutex.unlock();
+            const before = try store.standaloneRevision();
+            if (self.initial_fk_primed.count() == 0) {
+                if (self.empty_provisioning_cut) |empty| {
+                    if (empty.store == store and empty.revision == before) return;
+                }
+            }
+            self.empty_provisioning_cut = null;
             var cut = try store.captureProvisioningCatalog(self.alloc, group_ids.main_metadata_group_id);
             errdefer cut.deinit(self.alloc);
+            // The revision brackets capture: a concurrent publication must
+            // force another capture even when this particular cut was empty.
+            if (cut.initial_fk_owners.len == 0 and cut.jobs_json.len == 0 and
+                self.initial_fk_primed.count() == 0 and before == try store.standaloneRevision())
+                self.empty_provisioning_cut = .{ .store = store, .revision = before };
             // Verify the private/public separation against this same local
             // catalog cut with indexed lookups. Never clone and scan every
             // public table on the 100 ms provisioning round.
@@ -6415,13 +6484,20 @@ const LocalStandaloneMetadata = struct {
         self.catalog_privileges_refresh_required = false;
     }
 
+    fn invalidateDurableProjection(self: *LocalStandaloneMetadata) void {
+        self.durable_revision = 0;
+        // HA imports can replace contents without changing the numeric cut.
+        // Private provisioning must follow the same invalidation as routing.
+        self.empty_provisioning_cut = null;
+    }
+
     fn reloadLifecycleProjectionLocked(self: *LocalStandaloneMetadata) !void {
         if (builtin.is_test) self.lifecycle_projection_reloads += 1;
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
         // A single read transaction prevents tagging mixed physical/logical
         // generations with a later revision during concurrent restore cutover.
-        self.durable_revision = 0;
-        errdefer self.durable_revision = 0;
+        self.invalidateDurableProjection();
+        errdefer self.invalidateDurableProjection();
         const bytes = (try store.loadStandaloneCatalogSnapshot(self.alloc)) orelse return error.InvalidStandaloneCatalog;
         defer self.alloc.free(bytes);
         try self.loadCatalogBytes(bytes);
@@ -6696,7 +6772,7 @@ const LocalStandaloneMetadata = struct {
             }
             if (err == error.MetadataMutationOutcomeUnknown) {
                 mutation.committed = true;
-                self.durable_revision = 0;
+                self.invalidateDurableProjection();
                 // The native commit may be visible while its durable sync is
                 // unresolved. Apply the same fail-closed fence as the legacy
                 // journal; a visible revision alone is not a durability proof.
@@ -6715,7 +6791,7 @@ const LocalStandaloneMetadata = struct {
             if (!self.manager.tables.contains(id.*)) continue;
             const actual = (try self.lifecycle_store.?.getTable(a, group_ids.main_metadata_group_id, id.*)) orelse return error.TableLifecycleConflict;
             self.manager.upsertTable(actual) catch {
-                self.durable_revision = 0;
+                self.invalidateDurableProjection();
                 return error.MetadataMutationOutcomeUnknown;
             };
         }
@@ -6902,6 +6978,8 @@ pub fn runFromIterator(
         printUsage();
         return;
     }
+
+    try preflightOpenFileLimit();
 
     var termination_signals = antfly.common.runtime_lifecycle.ProcessSignalScope.install();
     defer termination_signals.deinit();
@@ -7216,9 +7294,15 @@ pub fn runFromIterator(
     if (cli.inference_scratch_budget_mb) |value| inference_resource_policy.inference.memory.max_scratch_bytes = try mibToBytes(value);
     const audio_readers = if (loaded_cfg) |cfg| try cfg.transcribers.hostedReaders(alloc) else try alloc.alloc(antfly.transcribing.NamedConfig, 0);
     defer alloc.free(audio_readers);
+    // The CLI knows it implements `inference _worker`. Supply its OS path
+    // explicitly: the inference owner is a static archive and cannot infer
+    // whether its final linker host is this CLI or an embedding application.
+    const worker_executable = std.process.executablePathAlloc(init.io, alloc) catch null;
+    defer if (worker_executable) |path| alloc.free(path);
     const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
         .audio_readers = audio_readers,
         .embedded_enabled = embedded_inference_enabled,
+        .worker_executable = worker_executable,
         .worker_environment = worker_environment.items,
         .resources = inference_resource_policy,
         .generation_batching = configured_inference.generation_batching,
@@ -7239,6 +7323,30 @@ pub fn runFromIterator(
     }, .{});
     defer alloc.free(inference_runtime_config_json);
 
+    // Inherited policy stays live even when inference runs in a replaceable
+    // worker. Explicit inference policy retains its configured precedence.
+    const SecuritySource = struct {
+        remote: ?*const antfly.common.config.Config.RemoteContentConfig,
+        explicit: ?*const antfly.common.config.Config.ContentSecurityConfig,
+        fn acquire(raw: ?*anyopaque, out: *inference_bridge.String) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const bytes = self.snapshot() catch |err| return inference_bridge.statusFromError(err);
+            out.* = .init(bytes);
+            return .ok;
+        }
+        fn snapshot(self: *@This()) ![]u8 {
+            var lease = if (self.remote) |remote| try remote.acquire() else null;
+            defer if (lease) |*value| value.deinit();
+            const fallback = if (lease) |value| if (value.config.security) |*security| security else null else null;
+            const effective = @import("antfly_scraping").effectiveContentSecurity(self.explicit, fallback);
+            const security: antfly.common.config.Config.ContentSecurityConfig = if (effective) |value| value.* else .{};
+            return std.json.Stringify.valueAlloc(std.heap.smp_allocator, security, .{});
+        }
+        fn release(_: ?*anyopaque, bytes: inference_bridge.String) callconv(.c) void {
+            std.heap.smp_allocator.free(bytes.slice());
+        }
+    };
+    var security_source = SecuritySource{ .remote = remote_content, .explicit = if (loaded_cfg) |cfg| if (cfg.inference.content_security) |*security| security else null else null };
     var handle: ?*anyopaque = null;
     const inference_create_context = inference_bridge.CreateContext{
         .abi_version = inference_bridge.abi_version,
@@ -7261,6 +7369,7 @@ pub fn runFromIterator(
         .max_loaded_models = if (loaded_cfg) |cfg| cfg.inference.max_loaded_models orelse 0 else 0,
         .has_max_loaded_models = if (loaded_cfg) |cfg| @intFromBool(cfg.inference.max_loaded_models != null) else 0,
         .content_security_json = inference_bridge.OptionalString.init(content_security_json),
+        .content_security_source = .{ .context = &security_source, .acquire = SecuritySource.acquire, .release = SecuritySource.release },
         .s3_credentials_json = inference_bridge.OptionalString.init(s3_credentials_json),
         .runtime_config_json = inference_bridge.String.init(inference_runtime_config_json),
         .executor = .init(&inference_io),
@@ -8483,6 +8592,29 @@ fn publicHttpConnectionLimitForFdSoftLimit(fd_soft_limit: u64) u32 {
     return @intCast(@min(proportional_limit, public_http_connection_ceiling));
 }
 
+fn validateOpenFileSoftLimit(soft_limit: u64) !void {
+    if (soft_limit < 256) return error.OpenFileLimitTooLow;
+}
+
+fn preflightOpenFileLimit() !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return;
+    const limit = try std.posix.getrlimit(.NOFILE);
+    const soft: u64 = @intCast(limit.cur);
+    validateOpenFileSoftLimit(soft) catch |err| {
+        std.log.err("RLIMIT_NOFILE soft limit {d} is below the supported minimum 256; configure at least 65536 for production", .{soft});
+        return err;
+    };
+    if (soft < 65536) std.log.warn("RLIMIT_NOFILE soft limit is {d}; production deployments should configure at least 65536 (minimum supported: 256)", .{soft});
+}
+
+test "standalone open file preflight supports constrained deployments and rejects unsafe limits" {
+    try std.testing.expectError(error.OpenFileLimitTooLow, validateOpenFileSoftLimit(255));
+    try validateOpenFileSoftLimit(256);
+    try validateOpenFileSoftLimit(1024);
+    try validateOpenFileSoftLimit(65536);
+    try validateOpenFileSoftLimit(std.math.maxInt(u64));
+}
+
 fn configuredPublicHttpConnectionLimit() u32 {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return public_http_connection_ceiling;
     const limit = std.posix.getrlimit(.NOFILE) catch return public_http_connection_ceiling;
@@ -8498,8 +8630,8 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         .max_route_body_size = @import("antfly_public_limits").max_route_body_bytes,
         .max_streamed_body_size = native_checkpoint_upload_limit,
         // Bound aggregate request-body buffering across HTTP/1 and HTTP/2.
-        // Four maximum-sized public requests may complete while excess uploads
-        // are shed before allocator pressure becomes systemic.
+        // Reserve four ordinary public bodies, or one larger explicitly
+        // registered route body after normalization; shed excess uploads.
         .request_body_buffer_budget_bytes = 256 * 1024 * 1024,
         // This is a transport safeguard for every H1 request body. Keep it
         // independent from admission.query.max_concurrent_requests.
@@ -13647,7 +13779,7 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expect(!cfg.reuse_port);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
-    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), cfg.request_body_buffer_budget_bytes);
+    try std.testing.expectEqual(@max(@as(usize, 256 * 1024 * 1024), @import("antfly_public_limits").max_route_body_bytes), cfg.request_body_buffer_budget_bytes);
     try std.testing.expectEqual(@as(?usize, native_checkpoint_upload_limit), cfg.max_streamed_body_size);
     try std.testing.expect(cfg.max_connections >= 1);
     try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
@@ -14735,6 +14867,9 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
             // The background driver can advance the same durable intent
             // between work selection and its revision-fenced acknowledgement.
             // Retry from fresh work, exactly as the production driver does.
+            // Prepared-owner lease admission can also yield to concurrent
+            // maintenance without changing this durable publication decision.
+            error.StorageOwnerAdmissionPending,
             error.ForeignKeyParentSchemaPending,
             error.GenerationAdmissionPending,
             error.IndexBuildPending,
@@ -16062,6 +16197,16 @@ test "standalone canceled initial self FK retires exact private owners after res
         metadata.deinit();
     };
     try std.testing.expect(metadata.localFkPublicationSupported());
+    try metadata.provisionRestoreOwners();
+    try std.testing.expect(metadata.empty_provisioning_cut != null);
+    {
+        // Unchanged empty rounds must avoid catalog materialization entirely.
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        metadata.alloc = failing.allocator();
+        defer metadata.alloc = alloc;
+        try metadata.provisionRestoreOwners();
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
     const schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
@@ -16104,6 +16249,8 @@ test "standalone canceled initial self FK retires exact private owners after res
     const began = try LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .fk_initial_create_begin = plan });
     alloc.free(began);
     try metadata.provisionRestoreOwners();
+    // A new private publication invalidates the empty cut and primes owners.
+    try std.testing.expect(metadata.empty_provisioning_cut == null);
     try std.testing.expectEqual(@as(usize, 2), server.kernel_owner_source.?.ownerCountForTest());
 
     const first_work_json = try metadata.lifecycle_store.?.fkInitialCreateWorkJson(alloc, group_id, 0);
@@ -16522,7 +16669,11 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
     var source = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", source_root, source_path, runtime.ptr(), null, .local);
     defer source.deinit();
     source.vector_source_storage_allowed = false;
+    // A known-empty private catalog may already have a cached cut when HA
+    // changes its authority binding, without changing its durable revision.
+    source.empty_provisioning_cut = .{ .store = source.lifecycle_store.?, .revision = source.durable_revision };
     try LocalStandaloneMetadata.bindHotStandbyMetadata(&source, .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
+    try std.testing.expect(source.empty_provisioning_cut == null);
     try LocalStandaloneMetadata.createTable(&source, alloc, "replicated", .{});
     const first_revision = source.durable_revision;
     const first_lsn = primary.lastLsn();
@@ -16553,24 +16704,29 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
         try target.reloadLifecycleProjectionLocked();
         try std.testing.expectEqual(first_revision, target.durable_revision);
         try std.testing.expect(target.findTableByNameLocked("replicated") == null);
+        target.empty_provisioning_cut = .{ .store = target.lifecycle_store.?, .revision = target.durable_revision };
         if (fail_first_refresh) {
             var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
             target.alloc = failing.allocator();
             defer target.alloc = alloc;
             try std.testing.expectError(error.OutOfMemory, LocalStandaloneMetadata.applyHotStandbyMetadata(&target, first.record));
             try std.testing.expectEqual(@as(u64, 0), target.durable_revision);
+            try std.testing.expect(target.empty_provisioning_cut == null);
             try std.testing.expect(target.hot_standby_projected_effect_digest == null);
             try std.testing.expectEqual(first_revision, try target.lifecycle_store.?.standaloneRevision());
         }
         try LocalStandaloneMetadata.applyHotStandbyMetadata(&target, first.record);
         try std.testing.expect(target.findTableByNameLocked("replicated") != null);
         try std.testing.expectEqual(first_revision, target.durable_revision);
+        try std.testing.expect(target.empty_provisioning_cut == null);
+        target.empty_provisioning_cut = .{ .store = target.lifecycle_store.?, .revision = target.durable_revision };
         {
             var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
             target.alloc = failing.allocator();
             defer target.alloc = alloc;
             // An exact duplicate does not allocate a second whole projection.
             try LocalStandaloneMetadata.applyHotStandbyMetadata(&target, first.record);
+            try std.testing.expect(target.empty_provisioning_cut != null);
         }
         var lsn = first_lsn + 1;
         while (lsn <= final_lsn) : (lsn += 1) {
@@ -16582,9 +16738,11 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
                 defer target.alloc = alloc;
                 try LocalStandaloneMetadata.applyHotStandbyMetadata(&target, entry.record);
                 try std.testing.expectEqual(first_revision, target.durable_revision);
+                try std.testing.expect(target.empty_provisioning_cut != null);
             } else {
                 try LocalStandaloneMetadata.applyHotStandbyMetadata(&target, entry.record);
                 try std.testing.expectEqual(first_revision + 1, target.durable_revision);
+                try std.testing.expect(target.empty_provisioning_cut == null);
             }
         }
         var snapshot = try LocalStandaloneMetadata.catalogAdminSnapshot(&target);
@@ -19013,7 +19171,7 @@ test "system catalog standalone replacement invalidates same-revision routing an
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
     defer metadata.deinit();
     const epoch = metadata.epoch;
-    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, .{}, false);
     defer old.release();
     const old_plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
     defer old_plan.release();
@@ -19039,7 +19197,7 @@ test "system catalog standalone replacement invalidates same-revision routing an
     }, .{});
     defer alloc.free(replacement);
     try metadata.loadCatalogBytes(replacement);
-    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, .{}, false);
     defer current.release();
     const plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
     defer plan.release();
@@ -19601,6 +19759,18 @@ test "system catalog resolver curation standalone record commits retain large de
     bounded.reset();
     _ = try source.systemCatalog(bounded.allocator(), .{}, .{ .resolver_authority_mutate = write });
     try std.testing.expectEqual(definition.ptr, metadata.manager.tables.get(7).?.indexes_json.ptr);
+    const current_cut = try store.standaloneRevision();
+    const current_namespace = namespace;
+    namespace.revision = 3;
+    namespace.state.suppress.keys = &.{"entity/other"};
+    write.patches = &.{try domain.records.difference(a, current_namespace, namespace)};
+    write.catalog_revision = current_cut;
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "unrelated", .indexes_json = "{}" } });
+    try std.testing.expectError(error.CatalogGenerationChanged, source.systemCatalog(a, .{}, .{ .resolver_authority_mutate = write }));
+    // A current catalog cut cannot turn a namespace CAS conflict into a retry.
+    write.catalog_revision = try store.standaloneRevision();
+    write.patches = &.{try domain.records.difference(a, before, namespace)};
+    try std.testing.expectError(error.ResolverCurationConflict, source.systemCatalog(a, .{}, .{ .resolver_authority_mutate = write }));
 }
 
 test "standalone shared document state follows metadata HA replay and fenced ownership" {
@@ -20138,6 +20308,50 @@ test "SQL scope retirement standalone reservation and recovery use the native ow
     }
 }
 
+test "index alias standalone catalog survives restart and rejects stale writers and target deletion" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"queryable\":true,\"complete\":true}", .{});
+    var committed: []const u8 = undefined;
+    {
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try LocalStandaloneMetadata.createTable(&metadata, alloc, "docs", .{});
+        try LocalStandaloneMetadata.createIndex(&metadata, alloc, "docs", "v1", "{\"type\":\"full_text\"}");
+        try LocalStandaloneMetadata.createIndex(&metadata, alloc, "docs", "v2", "{\"type\":\"full_text\"}");
+        const before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("docs").?.*);
+        var first = before;
+        first.indexes_json = try aliases.put(a, before.indexes_json, "live", .{ .index = "v1", .idempotency_key = "1" }, ready, 1);
+        try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, first);
+        var swapped = first;
+        swapped.indexes_json = try aliases.put(a, first.indexes_json, "live", .{ .index = "v2", .expected_index = "v1", .idempotency_key = "2" }, ready, 2);
+        try LocalStandaloneMetadata.replaceTableDefinition(&metadata, first, swapped);
+        try std.testing.expectError(error.TableGenerationChanged, LocalStandaloneMetadata.replaceTableDefinition(&metadata, first, swapped));
+        try std.testing.expectError(error.IndexReferencedByAlias, LocalStandaloneMetadata.dropIndex(&metadata, alloc, "docs", "v2"));
+        committed = try a.dupe(u8, swapped.indexes_json);
+    }
+    var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer reopened.deinit();
+    const table = reopened.findTableByNameLocked("docs").?.*;
+    try std.testing.expectEqualStrings(committed, table.indexes_json);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, table.indexes_json, .{});
+    try std.testing.expectEqualStrings("v2", try aliases.resolve(parsed, "live"));
+    try std.testing.expect((try aliases.replay(a, parsed, "live", .{ .index = "v2", .expected_index = "v1", .idempotency_key = "2" })) != null);
+    var rolled = table;
+    rolled.indexes_json = try aliases.put(a, table.indexes_json, "live", .{ .index = "v1", .expected_index = "v2", .idempotency_key = "3" }, ready, 3);
+    try LocalStandaloneMetadata.replaceTableDefinition(&reopened, table, rolled);
+    try LocalStandaloneMetadata.dropIndex(&reopened, alloc, "docs", "v2");
+}
+
 test "privacy standalone progress retains routing and join planning generations" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -20159,7 +20373,7 @@ test "privacy standalone progress retains routing and join planning generations"
     installed.indexes_json = try privacy.install(a, "{}", resource);
     try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
     before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
-    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    const old = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, .{}, false);
     defer old.release();
     const old_plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
     defer old_plan.release();
@@ -20171,7 +20385,7 @@ test "privacy standalone progress retains routing and join planning generations"
     try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, replacement);
     try std.testing.expectEqual(epoch, metadata.epoch);
     try std.testing.expect(metadata.durable_revision > durable);
-    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, null, false);
+    const current = try LocalStandaloneMetadata.acquireRoutingGeneration(&metadata, .{}, false);
     defer current.release();
     const plan = (try LocalStandaloneMetadata.acquireJoinPlanning(&metadata, .{})).?;
     defer plan.release();
@@ -20389,4 +20603,114 @@ test "standalone shared catalog resumes private restore and publishes atomically
         try std.testing.expectEqual(@as(usize, 1), calls);
         try std.testing.expect(server.kernel_owner_source == null);
     }
+}
+
+test "index alias standalone snapshot install preserves swaps receipts and stale CAS fences" {
+    const a = std.testing.allocator;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/alias-snapshot", .{tmp.sub_path});
+    var source = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = root });
+    defer source.deinit();
+    const group: u64 = 21;
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"complete\":true}", .{});
+    const request: aliases.Request = .{ .index = "a", .idempotency_key = "first" };
+    const first: antfly.metadata.TableRecord = .{ .table_id = 42, .name = "docs", .indexes_json = try aliases.put(scratch, "{\"a\":{\"type\":\"full_text\"},\"b\":{\"type\":\"full_text\"}}", "live", request, ready, 1) };
+    try source.applyStandaloneCommand(group, .{ .upsert_table = first });
+    var second = first;
+    second.indexes_json = try aliases.put(scratch, first.indexes_json, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "second" }, ready, 2);
+    try source.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = first, .replacement = second } });
+    const snapshot = try source.snapshotBuilder().buildSnapshot(scratch, group);
+    var restored = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(scratch, "{s}-restored", .{root}) });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(scratch, group, 100, snapshot));
+    const current = (try restored.tableByName(a, group, "docs")).?;
+    defer antfly.metadata.table_manager.freeTable(a, current);
+    const decoded = try std.json.parseFromSliceLeaky(std.json.Value, scratch, current.indexes_json, .{});
+    try std.testing.expectEqualStrings("b", try aliases.resolve(decoded, "live"));
+    try std.testing.expectEqualStrings("a", (try aliases.replay(scratch, decoded, "live", request)).?.index);
+    try std.testing.expect(current.query_indexes_json.len != 0);
+    try restored.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = first, .replacement = first } });
+    const after = (try restored.tableByName(a, group, "docs")).?;
+    defer antfly.metadata.table_manager.freeTable(a, after);
+    try std.testing.expectEqualStrings(second.indexes_json, after.indexes_json);
+}
+
+test "index alias standalone graph CAS rejects convergence before durable publication" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "docs", .{});
+    for ([_][]const u8{ "g1", "g2" }) |name| try LocalStandaloneMetadata.createIndex(&metadata, alloc, "docs", name, "{\"type\":\"graph\"}");
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"complete\":true}", .{});
+    const before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("docs").?.*);
+    var installed = before;
+    installed.indexes_json = try aliases.put(a, before.indexes_json, "left", .{ .index = "g1", .idempotency_key = "1" }, ready, 1);
+    installed.indexes_json = try aliases.put(a, installed.indexes_json, "right", .{ .index = "g2", .idempotency_key = "2" }, ready, 2);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
+    _ = try metadata.statusSource().systemCatalog(a, .{}, .{ .mutate = .{ .mutation = .{ .kind = .graph, .action = .create, .name = "knowledge", .source_json =
+        \\{"labels":[{"name":"D","table":"docs"}],"relationships":[{"name":"R1","index":"left","source_label":"D","target_label":"D","stored_type":"edge"},{"name":"R2","index":"right","source_label":"D","target_label":"D","stored_type":"edge"}]}
+    } } });
+    var converged = installed;
+    converged.indexes_json = try aliases.put(a, installed.indexes_json, "left", .{ .index = "g2", .expected_index = "g1", .idempotency_key = "3" }, ready, 3);
+    const revision = metadata.durable_revision;
+    try std.testing.expectError(error.IndexAliasGraphConflict, LocalStandaloneMetadata.replaceTableDefinition(&metadata, installed, converged));
+    try std.testing.expectEqual(revision, metadata.durable_revision);
+    try std.testing.expectEqualStrings(installed.indexes_json, metadata.findTableByNameLocked("docs").?.indexes_json);
+}
+
+test "index alias standalone protected migration commits authored DDL through definition CAS" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    var committed: []const u8 = undefined;
+    {
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try LocalStandaloneMetadata.createTable(&metadata, alloc, "docs", .{});
+        try LocalStandaloneMetadata.createIndex(&metadata, alloc, "docs", "a", "{\"type\":\"full_text\"}");
+        const before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("docs").?.*);
+        var protected = before;
+        protected.indexes_json = try privacy.install(a, before.indexes_json, try privacy.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null));
+        try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, protected);
+        try LocalStandaloneMetadata.createIndex(&metadata, alloc, "docs", "b", "{\"type\":\"full_text\"}");
+        const added = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("docs").?.*);
+        const ready = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"complete\":true}", .{});
+        var pinned = added;
+        pinned.indexes_json = try aliases.put(a, added.indexes_json, "live", .{ .index = "b", .idempotency_key = "1" }, ready, 1);
+        try LocalStandaloneMetadata.replaceTableDefinition(&metadata, added, pinned);
+        try LocalStandaloneMetadata.dropIndex(&metadata, alloc, "docs", "a");
+        committed = try a.dupe(u8, metadata.findTableByNameLocked("docs").?.indexes_json);
+        try std.testing.expectError(error.IndexReferencedByAlias, LocalStandaloneMetadata.dropIndex(&metadata, alloc, "docs", "b"));
+    }
+    var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer reopened.deinit();
+    const table = reopened.findTableByNameLocked("docs").?.*;
+    try std.testing.expectEqualStrings(committed, table.indexes_json);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, table.indexes_json, .{});
+    try std.testing.expect(!parsed.object.contains("a"));
+    try std.testing.expectEqualStrings("b", try aliases.resolve(parsed, "live"));
 }

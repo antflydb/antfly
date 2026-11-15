@@ -83,6 +83,7 @@ pub const Directory = struct {
 pub const Descriptor = struct { manifest: local.serverless_manifest_artifact_ref.ArtifactRef, ordinal: usize };
 pub const Descriptors = std.StringHashMapUnmanaged(Descriptor);
 pub const Read = struct {
+    locator: ?struct { ptr: *anyopaque, record: *const fn (*anyopaque, Ref) anyerror!void } = null,
     /// Generation-owned descriptor routing. Shared physical sources never
     /// decide which generation's file manifest a reader must retain.
     descriptors: ?*const Descriptors = null,
@@ -91,6 +92,7 @@ pub const Read = struct {
     context: local.serverless_query_lake_read_context.Context,
     cancellation: Cancellation,
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
+    allow_pack_read_ahead: bool = true,
     fn check(self: Read) !void {
         try self.context.ensureActive();
         if (self.cache) |cached| try cached.context.ensureActive();
@@ -100,9 +102,165 @@ pub const Read = struct {
 /// Seed a bounded working set through the exact same verified caches used by
 /// demand reads. The rest of the index remains remote and fills on misses.
 pub fn warmBounded(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
+    return warmMode(a, read, ref, maximum_bytes, false);
+}
+pub fn warmOpening(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
+    return warmMode(a, read, ref, maximum_bytes, true);
+}
+/// Selector discovery is cheaper than warming a segment. Later canonical
+/// routes still need their physical pack versions when the metadata/working
+/// set budget deliberately stops opening payloads after the first 32 routes.
+pub fn warmLocators(a: A, read: Read, ref: Ref) !void {
+    if (read.locator == null or ref.byte_len > 512 * 1024) return;
+    try read.check();
+    try recordDirectoryLocators(read, try loadDirectory(a, read, ref));
+}
+fn recordDirectoryLocators(read: Read, directory: Directory) !void {
+    if (read.locator) |hook| for (directory.blocks) |piece| try hook.record(hook.ptr, piece.retainedArtifact());
+}
+test "external lake cold working set locators cover late physical packs beyond the old block prefix" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("late-payload-locators");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(51), 1, std.testing.io);
+    const bytes = try sa.alloc(u8, 9 * pack_bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @intCast(i / pack_bytes);
+    const ref = try publish(a, sa, &store, bytes, .none);
+    const Probe = struct {
+        ids: std.StringHashMapUnmanaged(void) = .empty,
+        a: A,
+        fn record(raw: *anyopaque, pack: Ref) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.ids.put(self.a, pack.artifact_id, {});
+        }
+    };
+    var probe: Probe = .{ .a = sa };
+    const read: Read = .{ .store = store, .cache = null, .context = .{}, .cancellation = .none, .locator = .{ .ptr = &probe, .record = Probe.record } };
+    try warmLocators(sa, read, ref);
+    try std.testing.expectEqual(@as(usize, 9), probe.ids.count());
+    _ = try warmOpening(sa, read, ref, 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 9), probe.ids.count());
+}
+/// Publication-only second pass, after every navigation root has priority.
+/// Tiny complete segments fit in the same opening bundle; large archive
+/// segments retain selective demand reads rather than arbitrary prefixes.
+pub fn warmSmall(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
+    if (ref.byte_len > maximum_bytes or ref.byte_len > 256 * 1024) return 0;
+    const directory = try loadDirectory(a, read, ref);
+    if (directory.bytes > 256 * 1024) return 0;
+    var spent: usize = @intCast(ref.byte_len);
+    for (directory.blocks) |piece| {
+        if (piece.ref.byte_len > maximum_bytes -| spent) break;
+        try read.check();
+        var held = try readPieceLease(a, read.store, piece, read.cancellation, read.cache);
+        spent += @intCast(piece.ref.byte_len);
+        held.deinit();
+    }
+    return spent;
+}
+/// Publication-owned working set, independent of query history. Complete
+/// bounded ranking sections serve arbitrary terms; compact identities/columns
+/// remove decoder discovery round trips without copying a large archive body.
+/// Every captured unit retains its original authenticated range identity.
+pub fn warmWorkingSet(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
+    if (maximum_bytes == 0) return 0;
+    try read.check();
+    const directory = try loadDirectory(a, read, ref);
+    var data = try load(a, read, ref);
+    defer data.deinit(a);
+    var reader = try local.segment.RangeSegmentReader.init(a, data.source(), .{});
+    reader.owns_source = false;
+    defer reader.deinit();
+    var selected: [64]Range = undefined;
+    var count: usize = 0;
+    // A large inverted section keeps demand-driven postings, but its complete
+    // bounded dictionary and norms can still remove dependent term discovery.
+    for (reader.fields) |field| for (field.sections) |section| {
+        if (section.section_type != .inverted_text or section.length == 0 or count == selected.len) continue;
+        const view = (try reader.sectionView(field.name, .inverted_text)).?;
+        if (view.length <= maximum_bytes) {
+            selected[count] = .{ .offset = @intCast(view.offset), .len = @intCast(view.length) };
+            count += 1;
+        } else {
+            const inverted = try local.section_inverted.RangeInvertedIndexReader.init(a, view, pack_bytes);
+            const begin = if (inverted.norms_length != 0) @min(inverted.blocks_offset, inverted.norms_offset) else inverted.blocks_offset;
+            if (view.length - begin <= maximum_bytes) {
+                selected[count] = .{ .offset = @intCast(view.offset + begin), .len = @intCast(view.length - begin) };
+                count += 1;
+            }
+        }
+    };
+    if (reader.id_bytes_length != 0 and reader.id_bytes_length <= maximum_bytes and count < selected.len) {
+        selected[count] = .{ .offset = @intCast(reader.stored_offset + 21 + @as(u64, reader.doc_count) * 24 + @as(u64, reader.num_blocks) * 12), .len = @intCast(reader.id_bytes_length) };
+        count += 1;
+    }
+    for (reader.fields) |field| for (field.sections) |section| {
+        if (section.section_type != .columnar_stored or section.length == 0 or section.length > 256 * 1024 or count == selected.len) continue;
+        const view = (try reader.sectionView(field.name, .columnar_stored)).?;
+        selected[count] = .{ .offset = @intCast(view.offset), .len = @intCast(view.length) };
+        count += 1;
+    };
+    var spent: usize = 0;
+    // Selection order gives ranking priority. One physical span per adjacent
+    // run amortizes producer I/O; capture still authenticates every 64 KiB unit.
+    const seen = try a.alloc(bool, directory.blocks.len);
+    defer a.free(seen);
+    @memset(seen, false);
+    for (selected[0..count]) |range| {
+        var needed: u64 = 0;
+        for (directory.blocks, seen) |piece, captured| {
+            if (!captured and piece.offset < range.offset + range.len and piece.offset + piece.ref.byte_len > range.offset) needed += piece.ref.byte_len;
+        }
+        // A complete useful section either fits or stays demand-driven. Do
+        // not spend the remaining envelope on an arbitrary posting prefix.
+        if (needed > maximum_bytes - spent) continue;
+        var index: usize = 0;
+        while (index < directory.blocks.len) {
+            const piece = directory.blocks[index];
+            if (seen[index] or piece.offset >= range.offset + range.len or piece.offset + piece.ref.byte_len <= range.offset or piece.ref.byte_len > maximum_bytes - spent) {
+                index += 1;
+                continue;
+            }
+            var end = index + 1;
+            var bytes: usize = @intCast(piece.ref.byte_len);
+            if (piece.pack) |pack| while (end < directory.blocks.len) : (end += 1) {
+                const next = directory.blocks[end];
+                if (seen[end] or next.offset >= range.offset + range.len or next.offset != piece.offset + bytes or next.pack == null or !std.mem.eql(u8, next.pack.?.artifact_id, pack.artifact_id) or next.pack_offset != piece.pack_offset + bytes or next.ref.byte_len > maximum_bytes - spent - bytes) break;
+                bytes += @intCast(next.ref.byte_len);
+            };
+            var group: ?CoalescedRead = if (piece.pack) |pack| .{ .planned = true, .store = read.store, .pack = pack, .start = piece.pack_offset, .length = bytes, .logical_end = piece.offset + bytes, .cancellation = read.cancellation, .a = a, .pieces = directory.blocks[index..end] } else null;
+            defer if (group) |*value| value.deinit();
+            for (directory.blocks[index..end], index..) |unit, at| {
+                try read.check();
+                var held = try readPieceLeaseCoalesced(a, read.store, unit, read.cancellation, read.cache, if (group) |*value| value else null, false);
+                defer held.deinit();
+                if (read.cache) |cache| if (cache.capture) |capture| try capture.record(capture.ptr, unit.ref.artifact_id, try stores.sha256DigestFromChecksum(unit.ref.checksum), held.bytes());
+                seen[at] = true;
+                spent += @intCast(unit.ref.byte_len);
+            }
+            index = end;
+        }
+    }
+    return spent;
+}
+fn warmMode(a: A, read: Read, ref: Ref, maximum_bytes: usize, opening_only: bool) !usize {
     if (ref.byte_len > maximum_bytes or ref.byte_len > 512 * 1024) return 0;
     try read.check();
     const directory = try loadDirectory(a, read, ref);
+    if (read.locator != null) {
+        // Metadata is already copied into opening bundles. The scarce inline
+        // selector budget belongs to original packs still read on demand.
+        // The directory is already bounded; deduplication and lookup admission
+        // belong to the publication locator collector, not an arbitrary block
+        // prefix that misses later packs selected by a different query.
+        try recordDirectoryLocators(read, directory);
+    }
     var spent: usize = @intCast(ref.byte_len);
     var bundled = false;
     if (directory.metadata_bundle) |bundle| if (bundle.byte_len <= maximum_bytes -| spent) {
@@ -111,20 +269,64 @@ pub fn warmBounded(a: A, read: Read, ref: Ref, maximum_bytes: usize) !usize {
         spent += bytes.len;
         bundled = true;
     };
-    for ([_][]const Piece{ if (bundled) &.{} else directory.metadata, directory.blocks }) |pieces| {
-        // Cover dictionary/locator opening pages and a bounded sample of
-        // posting/source blocks; actual query blocks remain in the shared
-        // memory/disk cache after their first authenticated demand read.
-        for (pieces, 0..) |piece, index| {
-            if (index == 4) break;
-            if (piece.ref.byte_len > maximum_bytes -| spent) break;
-            try read.check();
-            var held = try readPieceLease(a, read.store, piece, read.cancellation, read.cache);
-            spent += @intCast(piece.ref.byte_len);
-            held.deinit();
-        }
+    // Opening metadata is the publication's authenticated navigation manifest.
+    // Cover it before spending the allowance on arbitrary posting prefixes.
+    if (!bundled) for (directory.metadata) |piece| {
+        if (piece.ref.byte_len > maximum_bytes -| spent) break;
+        try read.check();
+        var held = try readPieceLease(a, read.store, piece, read.cancellation, read.cache);
+        spent += @intCast(piece.ref.byte_len);
+        held.deinit();
+    };
+    if (opening_only) return spent;
+    var recent: [16]u32 = undefined;
+    const preferred = if (read.cache) |cached| cached.cache.text_demand.recent(@TypeOf(cached.cache.text_demand).identity(cached.scope, ref.artifact_id), &recent) else &.{};
+    // Replay actual demand first. No hints is a bounded cold-start fallback;
+    // hints never authorize a block or survive outside the cache scope.
+    const fallback = [_]u32{ 0, 1, 2, 3 };
+    for (if (preferred.len != 0) preferred else &fallback) |index| {
+        if (index >= directory.blocks.len) continue;
+        const piece = directory.blocks[index];
+        if (piece.ref.byte_len > maximum_bytes -| spent) continue;
+        try read.check();
+        var held = try readPieceLease(a, read.store, piece, read.cancellation, read.cache);
+        spent += @intCast(piece.ref.byte_len);
+        held.deinit();
     }
     return spent;
+}
+
+test "external lake seekable warming prioritizes late demand within the byte allowance" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("warm-demand");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    const bytes = try a.alloc(u8, 8 * block_bytes);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @intCast(i / block_bytes);
+    const ref = try publish(a, a, &store, bytes, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const routing = try loadDirectory(scratch.allocator(), .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, ref);
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const scope: [32]u8 = @splat(3);
+    cache.text_demand.record(@TypeOf(cache.text_demand).identity(scope, ref.artifact_id), 6);
+    const allowance: usize = @intCast(ref.byte_len + block_bytes);
+    const spent = try warmBounded(scratch.allocator(), .{ .store = store, .cache = .{ .cache = &cache, .scope = scope, .context = .{} }, .context = .{}, .cancellation = .none }, ref, allowance);
+    try std.testing.expect(spent <= allowance);
+    for ([_]usize{ 6, 0 }) |index| {
+        const piece = routing.blocks[index];
+        var held = try cache.lookupImmutableBlockLease(a, scope, piece.ref.artifact_id, @intCast(piece.ref.byte_len), try stores.sha256DigestFromChecksum(piece.ref.checksum), .{});
+        defer if (held) |*lease| lease.deinit();
+        try std.testing.expect((held != null) == (index == 6));
+        if (held) |lease| try std.testing.expectEqualSlices(u8, bytes[piece.offset..][0..@intCast(piece.ref.byte_len)], lease.bytes());
+    }
 }
 fn upload(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation) !Ref {
     var writer = store.*;
@@ -134,6 +336,9 @@ fn upload(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: C
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
 fn initialMetadata(a: A, source: local.index.SegmentSource) ![]const Range {
+    return initialMetadataMode(a, source, true);
+}
+fn initialMetadataMode(a: A, source: local.index.SegmentSource, delivery: bool) ![]const Range {
     const length = std.math.cast(usize, source.len()) orelse return error.NativeLakeTextCorpusTooLarge;
     var footer: [24]u8 = undefined;
     // Opaque/legacy fixtures keep their existing all-block representation.
@@ -149,6 +354,30 @@ fn initialMetadata(a: A, source: local.index.SegmentSource) ![]const Range {
         .offset = @intCast(reader.stored_offset + 21 + @as(u64, reader.doc_count) * 24),
         .len = @as(usize, reader.num_blocks) * 8,
     });
+    if (delivery) {
+        // Navigation needed to locate winning identities belongs in opening
+        // metadata when compact. Payload IDs and stored bodies remain selective.
+        const identity_table = 21 + @as(u64, reader.doc_count) * 24 + @as(u64, reader.num_blocks) * 12;
+        if (reader.num_blocks != 0 and identity_table <= 384 * 1024) try ranges.append(a, .{ .offset = @intCast(reader.stored_offset), .len = @intCast(identity_table) });
+        var column_navigation: usize = 0;
+        var column_sections: usize = 0;
+        for (reader.fields) |field| for (field.sections) |section| {
+            if (section.section_type != .columnar_stored or section.length == 0 or column_navigation >= 128 * 1024 or column_sections == 8) continue;
+            column_sections += 1;
+            const view = (try reader.sectionView(field.name, .columnar_stored)).?;
+            var column = try local.section_source_column.Reader.init(a, view);
+            defer column.deinit();
+            const directory = column.directory.range orelse continue;
+            const directory_bytes: usize = @as(usize, column.directory.num_chunks) * @as(usize, if (column.directory.indexed) 16 else 8);
+            if (directory_bytes > 64 * 1024 or directory_bytes + 28 > 128 * 1024 - column_navigation) continue;
+            column_navigation += directory_bytes + 28;
+            try ranges.append(a, .{ .offset = @intCast(view.offset), .len = @intCast(@min(8, view.length)) });
+            if (view.length >= 8) try ranges.append(a, .{ .offset = @intCast(view.offset + view.length - 8), .len = 8 });
+            try ranges.append(a, .{ .offset = @intCast(directory.offset), .len = 4 });
+            if (directory_bytes != 0) try ranges.append(a, .{ .offset = @intCast(directory.offset + (if (column.directory.data_start == 4) 4 + column.directory.payload_length else 4)), .len = directory_bytes });
+            if (column.directory.data_start == 4 and directory.length >= 8) try ranges.append(a, .{ .offset = @intCast(directory.offset + directory.length - 8), .len = 8 });
+        };
+    }
     const tail = if (reader.paged_source) |paged| paged.directory.offset else std.mem.readInt(u64, footer[0..8], .big);
     try ranges.append(a, .{ .offset = @intCast(tail), .len = length - @as(usize, @intCast(tail)) });
     for (reader.fields) |field| for (field.sections) |section| {
@@ -184,7 +413,9 @@ fn initialMetadata(a: A, source: local.index.SegmentSource) ![]const Range {
     var metadata_length: usize = 0;
     for (merged.items) |range| metadata_length = try std.math.add(usize, metadata_length, range.len);
     // Oversized optional navigation stays in authenticated native blocks.
-    return if (metadata_length <= pack_bytes and metadata_length < length / 2) merged.items else &.{};
+    if (metadata_length <= pack_bytes and metadata_length < length / 2) return merged.items;
+    if (delivery) return initialMetadataMode(a, source, false);
+    return &.{};
 }
 fn packedPiece(a: A, pack: Ref, offset: usize, pack_offset: usize, bytes: []const u8) !Piece {
     var digest: [32]u8 = undefined;
@@ -619,12 +850,16 @@ const PhysicalWarm = struct {
         std.heap.page_allocator.destroy(self);
     }
     fn retain(self: @This(), digest: [32]u8) !ServingCache.VerifiedLease {
+        return self.retainValue(.{ .bytes = self.lease.bytes(), .digest = digest });
+    }
+    /// Consume the full owner while returning only its authenticated slice.
+    /// Unit admission copies once; denied residency keeps this shared owner.
+    fn retainValue(self: @This(), value: ServingCache.VerifiedBytes) !ServingCache.VerifiedLease {
         var owned = self.lease;
         errdefer owned.deinit();
         const holder = try std.heap.page_allocator.create(@This());
         holder.* = self;
-        const bytes = owned.bytes();
-        return .{ .value = .{ .bytes = bytes, .digest = digest }, .owner = .{ .bytes = bytes, .owner = .{ .shared = .{ .ptr = holder, .release_fn = release } } } };
+        return .{ .value = value, .owner = .{ .bytes = value.bytes, .owner = .{ .shared = .{ .ptr = holder, .release_fn = release } } } };
     }
 };
 fn requiredRange(a: A, store: stores.ArtifactStore, id: []const u8, offset: u64, length: usize, token: Cancellation, publication: bool) ![]u8 {
@@ -639,6 +874,8 @@ fn requiredRange(a: A, store: stores.ArtifactStore, id: []const u8, offset: u64,
     return bytes;
 }
 const CoalescedRead = struct {
+    /// Explicit selected spans must not grow to unrelated whole-pack reads.
+    planned: bool = false,
     publication: bool = false,
     store: stores.ArtifactStore,
     pack: Ref,
@@ -703,7 +940,7 @@ const CoalescedRead = struct {
             const start = self.pieces[first].pack_offset;
             const last = self.pieces[end - 1];
             const length: usize = @intCast(last.pack_offset + last.ref.byte_len - start);
-            const bytes = self.store.getRangeAllocWithCancellationUsingAllocator(a, self.pack.artifact_id, start, length, self.cancellation) catch |err| {
+            const bytes = artifacts.readPhysicalRange(a, self.store, self.pack.artifact_id, start, length, self.cancellation, cache) catch |err| {
                 try self.cancellation.check();
                 cache.context.ensureActive() catch return error.Canceled;
                 if (err == error.OutOfMemory) return err;
@@ -711,7 +948,6 @@ const CoalescedRead = struct {
                 first = end;
                 continue;
             };
-            cache.cache.recordPhysicalRead(bytes.len);
             for (self.pieces[first..end]) |piece| {
                 const offset: usize = @intCast(piece.pack_offset - start);
                 const value: anyerror!ServingCache.VerifiedBytes = if (bytes.len != length) error.ArtifactIntegrityMismatch else ServingCache.VerifiedBytes.authenticate(bytes[offset..][0..@intCast(piece.ref.byte_len)], try stores.sha256DigestFromChecksum(piece.ref.checksum));
@@ -821,8 +1057,7 @@ const CoalescedRead = struct {
             // A concurrent flight may cover a different requested subset,
             // or this unit became warm while its leader was being planned.
             // A single-unit direct fallback cannot form a flight cycle.
-            const bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(a, self.pack.artifact_id, piece.pack_offset, @intCast(piece.ref.byte_len), self.cancellation);
-            cache.cache.recordPhysicalRead(bytes.len);
+            const bytes = try artifacts.readPhysicalRange(a, self.store, self.pack.artifact_id, piece.pack_offset, @intCast(piece.ref.byte_len), self.cancellation, cache);
             errdefer a.free(bytes);
             const value = try ServingCache.VerifiedBytes.authenticate(bytes, try stores.sha256DigestFromChecksum(piece.ref.checksum));
             return .{ .value = value, .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
@@ -838,7 +1073,54 @@ const CoalescedRead = struct {
     }
 };
 fn readPieceLease(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
-    return readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null, false);
+    var lease = try readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null, false);
+    errdefer lease.deinit();
+    if (cached) |cache| {
+        if (cache.locator) |hook| try hook.record(hook.ptr, piece.retainedArtifact());
+        if (cache.capture) |capture| try capture.record(capture.ptr, piece.ref.artifact_id, try stores.sha256DigestFromChecksum(piece.ref.checksum), lease.bytes());
+    }
+    return lease;
+}
+/// A demanded posting/source block is the only trigger. Small immutable packs
+/// amortize serial range latency, bounded by 16x amplification, one MiB per
+/// pack, one eighth of cache capacity and eight MiB per request. Archive-wide
+/// segments are never enumerated or prefetched. Cache hits spend no allowance.
+fn readAheadPiece(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: artifacts.CachedRead) !?ServingCache.VerifiedLease {
+    const pack = piece.pack orelse return null;
+    if (pack.byte_len > pack_bytes or pack.byte_len > piece.ref.byte_len *| 16 or pack.byte_len > cached.cache.max_bytes / 8 or cached.capture != null) return null;
+    if (piece.pack_offset > pack.byte_len or piece.ref.byte_len > pack.byte_len - piece.pack_offset) return error.InvalidNativeLakeTextCorpus;
+    const digest = try stores.sha256DigestFromChecksum(pack.checksum);
+    var admission: ?local.sql_parallel_scheduler.Scheduler.IoLease = null;
+    defer if (admission) |lease| lease.release();
+    var held = (try cached.cache.lookupImmutableBlockLease(a, cached.scope, pack.artifact_id, @intCast(pack.byte_len), digest, cached.context)) orelse cold: {
+        const trace = cached.context.trace orelse return null;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&cached.scope);
+        hash.update(pack.artifact_id);
+        hash.update(&digest);
+        var failure_key: [32]u8 = undefined;
+        hash.final(&failure_key);
+        if (trace.readAheadFailed(failure_key)) return null;
+        admission = local.sql_parallel_scheduler.global().reserveIo(@intCast(pack.byte_len * 2)) orelse return null;
+        if (!trace.reserveReadAhead(pack.byte_len)) return null;
+        break :cold artifacts.readArtifactLease(a, store, pack, cancellation, cached) catch |err| {
+            try cached.context.ensureActive();
+            try cancellation.check();
+            if (err == error.Canceled or err == error.DeadlineExceeded) return err;
+            // Optional provider failures cannot replace the required range's
+            // own result. Remember failures only within this outer request.
+            trace.failReadAhead(failure_key);
+            return null;
+        };
+    };
+    var owns = true;
+    defer if (owns) held.deinit();
+    const bytes = held.bytes()[@intCast(piece.pack_offset)..][0..@intCast(piece.ref.byte_len)];
+    const verified = try ServingCache.VerifiedBytes.authenticate(bytes, try stores.sha256DigestFromChecksum(piece.ref.checksum));
+    try cached.context.ensureActive();
+    try cancellation.check();
+    owns = false;
+    return try (PhysicalWarm{ .lease = held }).retainValue(verified);
 }
 fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead, publication: bool) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
     if (piece.pack == null) {
@@ -876,11 +1158,16 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
         const length: usize = @intCast(piece.ref.byte_len);
         const digest = try stores.sha256DigestFromChecksum(piece.ref.checksum);
         if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context)) |lease| return lease;
+        // A completed coalesced flight is already verified demand data.
+        // Reuse it before considering another speculative whole-pack fetch.
+        if (coalesced) |group| if (group.shared) |lease| {
+            const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+            if (try result.get(piece)) |value| return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, try PhysicalPin.retain(lease, value));
+        };
+        if (!publication and !(if (coalesced) |group| group.planned else false)) if (try readAheadPiece(a, store, piece, cancellation, cache)) |verified| return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);
         const verified = if (coalesced) |group| try group.verifiedLease(a, piece, cache) else direct: {
-            var provider = store;
-            const bytes = try provider.getRangeAllocWithCancellationUsingAllocator(a, piece.pack.?.artifact_id, piece.pack_offset, length, cancellation);
+            const bytes = try artifacts.readPhysicalRange(a, store, piece.pack.?.artifact_id, piece.pack_offset, length, cancellation, cache);
             errdefer a.free(bytes);
-            cache.cache.recordPhysicalRead(bytes.len);
             break :direct ServingCache.VerifiedLease{ .value = try ServingCache.VerifiedBytes.authenticate(bytes, digest), .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
         };
         return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);
@@ -998,9 +1285,9 @@ const Owner = struct {
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             if (self.cancelled.load(.acquire)) return true;
-            self.capability.check() catch return true;
-            if (self.capability.cache) |cache| cache.context.ensureActive() catch return true;
-            return false;
+            if (self.capability.context.isCancelled()) return true;
+            if (self.capability.cache) |cache| if (cache.context.isCancelled()) return true;
+            return if (self.capability.cancellation.ptr) |ptr| if (self.capability.cancellation.is_cancelled_fn) |check| check(ptr) else false else false;
         }
         const WorkerPin = struct {
             lease: local.serverless_query_lake_decoded_cache.Lease,
@@ -1014,17 +1301,21 @@ const Owner = struct {
                 std.heap.page_allocator.destroy(self);
             }
         };
-        fn warm(self: *@This(), pieces: []const Piece, pin: ?*WorkerPin) anyerror!void {
+        fn warm(self: *@This(), pieces: []const Piece, pin: ?*WorkerPin, submitted_ns: u64, class: local.serverless_query_lake_read_context.IoClass) anyerror!void {
+            if (self.capability.context.trace) |trace| trace.add("prefetch_queue_nanoseconds", @import("antfly_platform").time.monotonicNs() -| submitted_ns);
             // Navigation belongs to the worker, so completion releases the pin
             // even when this segment is never visited by the query again.
             defer if (pin) |lease| lease.release();
             try self.capability.check();
             const token: Cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
             var cached = self.capability.cache;
-            if (cached) |*cache| cache.context.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+            if (cached) |*cache| {
+                cache.context.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+                cache.context.io_class = class;
+            }
             const first = pieces[0];
             const last = pieces[pieces.len - 1];
-            var group: ?CoalescedRead = if (first.pack != null) .{ .store = self.capability.store, .pack = first.pack.?, .start = first.pack_offset, .length = last.offset + @as(usize, @intCast(last.ref.byte_len)) - first.offset, .logical_end = last.offset + @as(usize, @intCast(last.ref.byte_len)), .cancellation = token, .a = std.heap.page_allocator, .pieces = pieces } else null;
+            var group: ?CoalescedRead = if (first.pack != null) .{ .store = self.capability.store, .pack = first.pack.?, .start = first.pack_offset, .length = last.offset + @as(usize, @intCast(last.ref.byte_len)) - first.offset, .logical_end = last.offset + @as(usize, @intCast(last.ref.byte_len)), .cancellation = token, .a = std.heap.page_allocator, .pieces = pieces, .planned = true } else null;
             defer if (group) |*value| value.deinit();
             for (pieces) |piece| {
                 try self.capability.check();
@@ -1049,11 +1340,15 @@ const Owner = struct {
             self.recent_cursor = (self.recent_cursor + 1) % self.recent_pages.len;
         }
         fn reap(self: *@This(), io: std.Io) void {
-            for (&self.pending, &self.offsets, &self.directory_pins) |*slot, *offset, *pin| {
+            for (&self.pending, &self.offsets, &self.lengths, &self.directory_pins) |*slot, *offset, length, *pin| {
                 if (slot.*) |*task| {
                     if (!task.isComplete()) continue;
                     const succeeded = if (task.await(io)) |_| true else |_| false;
-                    if (succeeded) self.rememberPage(offset.*.? / block_bytes);
+                    if (succeeded) {
+                        var page_ = offset.*.? / block_bytes;
+                        const last_page = (offset.*.? + length - 1) / block_bytes;
+                        while (page_ <= last_page) : (page_ += 1) self.rememberPage(page_);
+                    }
                     slot.* = null;
                     offset.* = null;
                     if (pin.*) |owned| owned.destroy();
@@ -1094,9 +1389,12 @@ const Owner = struct {
                 if (block) |i| if (piece.pack) |pack| {
                     var end = i + 1;
                     var finish = piece.offset + piece.ref.byte_len;
-                    while (end < directory.blocks.len) : (end += 1) {
+                    while (end < directory.blocks.len and end - i < 32) : (end += 1) {
                         const next = directory.blocks[end];
-                        if (next.offset != finish or next.offset >= start + length or next.pack == null or !std.mem.eql(u8, next.pack.?.artifact_id, pack.artifact_id) or next.pack_offset != piece.pack_offset + finish - piece.offset) break;
+                        // One adjacent payload block amortizes a posting-header hint
+                        // and its next decoder pull. Physical adjacency, pack bounds
+                        // and the shared request allowance cap amplification.
+                        if (next.offset != finish or next.offset >= @max(start + length, piece.offset + 2 * block_bytes) or next.pack == null or !std.mem.eql(u8, next.pack.?.artifact_id, pack.artifact_id) or next.pack_offset != piece.pack_offset + finish - piece.offset) break;
                         finish += next.ref.byte_len;
                     }
                     pieces = directory.blocks[i..end];
@@ -1123,16 +1421,25 @@ const Owner = struct {
                 while (slot < self.pending.len and self.pending[slot] != null) : (slot += 1) {}
                 // A full speculative queue yields instead of stalling WAND
                 // on an unvisited range. Required reads recycle consumed slots.
-                if (slot == self.pending.len) return;
+                if (slot == self.pending.len) {
+                    if (cached.context.trace) |trace| trace.add("prefetch_declined", 1);
+                    return;
+                }
+                if (cached.context.trace) |trace| if (!trace.reserveReadAhead(offset - piece.offset)) {
+                    trace.add("prefetch_declined", 1);
+                    return;
+                };
                 const worker_pin: ?*WorkerPin = if (pin) |owned| blk: {
                     const worker = std.heap.page_allocator.create(WorkerPin) catch return;
                     worker.* = .{ .lease = owned.lease.retain() };
                     break :blk worker;
                 } else null;
-                self.pending[slot] = local.sql_parallel_scheduler.global().submitIoTransient(io, @as(usize, @intCast(offset - piece.offset)) * 2, warm, .{ self, pieces, worker_pin }) orelse {
+                self.pending[slot] = local.sql_parallel_scheduler.global().submitIoTransient(io, @as(usize, @intCast(offset - piece.offset)) * 2, warm, .{ self, pieces, worker_pin, @import("antfly_platform").time.monotonicNs(), if (metadata != null) local.serverless_query_lake_read_context.IoClass.navigation else local.serverless_query_lake_read_context.IoClass.payload }) orelse {
                     if (worker_pin) |owned| owned.destroy();
+                    if (cached.context.trace) |trace| trace.add("prefetch_declined", 1);
                     return;
                 };
+                if (cached.context.trace) |trace| trace.add("prefetch_submitted", 1);
                 self.directory_pins[slot] = worker_pin;
                 self.offsets[slot] = piece.offset;
                 self.lengths[slot] = offset - piece.offset;
@@ -1171,6 +1478,7 @@ const Owner = struct {
                 .text_page => &cached.cache.text_pages,
             };
             const held = lane.lookup(key) orelse return null;
+            if (cached.context.trace) |trace| trace.add("decoded_cache_hits", 1);
             errdefer held.release();
             try checkContext(self);
             try cached.context.ensureActive();
@@ -1227,7 +1535,19 @@ const Owner = struct {
             if (self.cancelled.load(.acquire)) return error.Canceled;
             // Required broad reads coalesce ranges themselves; speculative
             // per-page GETs would duplicate that provider request.
-            try self.owner.read(self.capability.*, offset, out);
+            var capability = self.capability.*;
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            for (self.offsets, self.lengths) |pending_offset, length| if (pending_offset) |position| {
+                if (out.len != 0 and position < offset +| out.len and offset < position +| length) {
+                    // Reuse the bounded physical flight already in progress.
+                    // A whole-pack read-ahead here would issue a second,
+                    // larger GET for the same header/payload dependency.
+                    capability.allow_pack_read_ahead = false;
+                    break;
+                }
+            };
+            self.mutex.unlock();
+            try self.owner.read(capability, offset, out);
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
             if (out.len != 0) {
@@ -1437,16 +1757,21 @@ const Owner = struct {
                         if (following.offset != piece.offset + length or following.offset >= requested_end or following.pack == null or !std.mem.eql(u8, following.pack.?.artifact_id, pack.artifact_id) or following.pack_offset != piece.pack_offset + length) break;
                         length += @intCast(following.ref.byte_len);
                     }
-                    group = .{ .publication = publication, .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = transport, .pieces = directory.blocks[index..next] };
+                    group = .{ .planned = !capability.allow_pack_read_ahead, .publication = publication, .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = transport, .pieces = directory.blocks[index..next] };
                 };
             }
-            var lease = try readPieceLeaseCoalesced(transport, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null, publication);
+            var piece_cache = capability.cache;
+            if (piece_cache) |*cache| cache.context.io_class = if (metadata != null) .navigation else .payload;
+            var lease = try readPieceLeaseCoalesced(transport, capability.store, piece, capability.cancellation, piece_cache, if (group) |*value| value else null, publication);
             defer lease.deinit();
             const data = lease.bytes();
             try capability.check();
             const within = offset - piece.offset;
             const take = @min(out.len - done, data.len - within);
             @memcpy(out[done..][0..take], data[within..][0..take]);
+            if (!publication) if (block) |index| if (self.directory_ref) |ref| if (capability.cache) |cached| {
+                cached.cache.text_demand.record(@TypeOf(cached.cache.text_demand).identity(cached.scope, ref.artifact_id), index);
+            };
             if (block) |index| if (self.directory_ref == null) {
                 @import("antfly_platform").sync.lockYielding(&self.mutex);
                 self.loaded[index] = true;
@@ -1495,11 +1820,11 @@ pub fn routedReader(a: A, source: local.index.SegmentSource) !local.segment.Segm
     const descriptor = if (read.descriptors) |routes| routes.get(owner.directory_ref.?.artifact_id) orelse return error.InvalidNativeLakeTextCorpus else Descriptor{ .manifest = owner.manifest_ref orelse return error.InvalidNativeLakeTextCorpus, .ordinal = owner.manifest_ordinal };
     const manifest = descriptor.manifest;
     const corpus = @import("lake_index_native_text.zig");
-    const lease: ?decoded.Owned(corpus.FileGroup) = if (read.cache) |cached| try decoded.acquire(corpus.FileGroup, cached, read.store, manifest, read.cancellation, corpus.loadCachedFile) else null;
+    const lease: ?decoded.Owned(corpus.SegmentAdmissions) = if (read.cache) |cached| try decoded.acquire(corpus.SegmentAdmissions, cached, read.store, manifest, read.cancellation, corpus.loadCachedAdmissions) else null;
     defer if (lease) |owned| owned.release();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const group = if (lease) |owned| owned.value.* else try corpus.loadCachedFile(arena.allocator(), read.store, manifest, read.cancellation, null);
+    const group = if (lease) |owned| owned.value.* else try corpus.loadCachedAdmissions(arena.allocator(), read.store, manifest, read.cancellation, null);
     const index = descriptor.ordinal;
     if (index >= group.segments.len or group.admissions.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
     const ref = owner.directory_ref.?;
@@ -1804,7 +2129,8 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     const owner: *Owner = @ptrCast(@alignCast(physical.ranges.ptr));
     var cache = local.serverless_query_lake_serving_cache.Cache.init(std.heap.page_allocator);
     defer cache.deinit();
-    var capability: Read = .{ .store = store, .cache = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io } }, .context = .{ .io = std.testing.io }, .cancellation = .none };
+    var trace: local.serverless_query_lake_read_context.IoTrace = .{};
+    var capability: Read = .{ .store = store, .cache = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io, .trace = &trace } }, .context = .{ .io = std.testing.io, .trace = &trace }, .cancellation = .none };
     var source = try Owner.bind(owner, a, &capability);
     var open = true;
     defer if (open) source.close();
@@ -1822,6 +2148,11 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     try source.readInto(block_bytes * 3, &sample);
     try std.testing.expectEqual(@as(u8, 3), sample[0]);
     try std.testing.expectEqual(@as(u64, 2), cache.stats.provider_reads);
+    // A header hint also batches the bounded adjacent payload block. The next
+    // decoder pull must not introduce another dependent object-store RTT.
+    try source.readInto(block_bytes * 17, &sample);
+    try std.testing.expectEqual(@as(u8, 17), sample[0]);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats.provider_reads);
     // A warm required unit returns while a larger overlapping speculative
     // task is gated. This catches accidental joining of the whole pack.
     const Gated = struct {
@@ -1837,6 +2168,10 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
             var out: [1]u8 = undefined;
             try input.readInto(block_bytes * 3, &out);
             try std.testing.expectEqual(@as(u8, 3), out[0]);
+            // A cold dependency covered by pending speculation must remain a
+            // bounded range read, never an overlapping whole-pack GET.
+            try input.readInto(block_bytes * 8, &out);
+            try std.testing.expectEqual(@as(u8, 8), out[0]);
         }
     };
     var gated: Gated = .{};
@@ -1845,6 +2180,7 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     query.offsets[0] = 0;
     query.lengths[0] = pack_bytes;
     try gated.started.wait(std.testing.io);
+    const before_required_bytes = cache.stats.provider_bytes;
     var required = try std.testing.io.concurrent(Gated.required, .{ &gated, &source });
     var required_open = true;
     defer {
@@ -1859,7 +2195,12 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     try completed;
     try ready;
     try std.testing.expect(remained_speculative);
+    try std.testing.expectEqual(@as(u64, block_bytes), cache.stats.provider_bytes - before_required_bytes);
     query.drain(false);
+    // Keep the failure fixture on its original required-range path; the
+    // transfer-amplification assertion above deliberately enabled read-ahead.
+    capability.cache.?.context.trace = null;
+    capability.context.trace = null;
     // Speculative failures remain invisible until that block is required.
     const Denied = struct {
         fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
@@ -2479,6 +2820,38 @@ test "external lake seekable metadata opens all field navigation with two authen
     var store = fs.artifactStore();
     store.upload_scope = try stores.UploadScope.forPublication(@splat(19), 1, std.testing.io);
     const ref = try publish(ca, ca, &store, bytes, .none);
+    {
+        const opening = @import("lake_index_text_opening_pack.zig");
+        var capture_cache = ServingCache.initWithMemoryLimit(a, 0);
+        defer capture_cache.deinit();
+        var collector: opening.Collector = .{ .a = a, .out = ca, .store = &store, .cancellation = .none, .version = 2, .max_packs = 4 };
+        defer collector.deinit();
+        const capture_read: Read = .{ .store = store, .cache = .{ .cache = &capture_cache, .scope = @splat(2), .context = .{}, .capture = .{ .ptr = &collector, .record = opening.Collector.capture } }, .context = .{}, .cancellation = .none };
+        _ = try warmOpening(ca, capture_read, ref, 1024 * 1024);
+        const spent = try warmWorkingSet(ca, capture_read, ref, 2 * 1024 * 1024);
+        try std.testing.expect(spent != 0 and spent <= 2 * 1024 * 1024);
+        try std.testing.expectEqual(@as(usize, 0), try warmWorkingSet(ca, capture_read, ref, block_bytes - 1));
+        try collector.flush();
+        var warm_cache = ServingCache.init(a);
+        defer warm_cache.deinit();
+        const seeded: artifacts.CachedRead = .{ .cache = &warm_cache, .scope = @splat(2), .context = .{} };
+        for (collector.refs.items) |pack| try opening.warmPublication(a, store, pack, store.upload_scope.?.domain, seeded, .none);
+        const before = warm_cache.snapshot().provider_reads;
+        const opened = try load(a, .{ .store = store, .cache = seeded, .context = .{}, .cancellation = .none }, ref);
+        var index = try local.index.IndexWriter.init(a);
+        defer index.deinit();
+        try index.addSegmentWithIdData(1, opened);
+        var result = try local.search_search.execute(a, index.snapshot(), .{ .query = .{ .match = .{ .field = "body", .text = "needle" } }, .k = 4, .include_stored = false });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 4), result.hits.len);
+        for (result.hits) |hit| try std.testing.expect((try index.snapshot().storedIdScoped(ca, hit.doc_id)) != null);
+        // Ranking and winner identities must hit the captured immutable units,
+        // including a fresh reader's dictionary, norms and posting pulls.
+        try std.testing.expectEqual(before, warm_cache.snapshot().provider_reads);
+        var expired = capture_read;
+        expired.context.deadline_ns = 0;
+        try std.testing.expectError(error.DeadlineExceeded, warmWorkingSet(ca, expired, ref, 2 * 1024 * 1024));
+    }
     var cache = ServingCache.init(a);
     defer cache.deinit();
     const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(2), .context = .{ .io = std.testing.io } };
@@ -2777,4 +3150,117 @@ test "external lake content block reuse survives shifted offsets restart and int
     defer identical.deinit();
     _ = try publishSourceReusing(a, out, &store, .{ .contiguous = changed }, .none, null, identical);
     try std.testing.expectEqual(@as(u64, 0), identical.uploaded_bytes);
+}
+
+test "external lake demanded pack read ahead reuses distant blocks and respects request limits" {
+    const a = std.testing.allocator;
+    const Fs = @import("../serverless/artifacts/fs_store.zig").FsStore;
+    var directory = try local.common_test_directory.TestDirectory.init("demanded-pack");
+    defer directory.cleanup();
+    var fs = try Fs.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(42), 1, std.testing.io);
+    const bytes = try a.alloc(u8, pack_bytes);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / block_bytes);
+    const ref = try publish(a, a, &store, bytes, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    const data = try load(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, ref);
+    var source = data.native;
+    defer source.close();
+    const owner: *Owner = @ptrCast(@alignCast(source.ranges.ptr));
+    var cache = ServingCache.init(a);
+    defer cache.deinit();
+    var trace: local.serverless_query_lake_read_context.IoTrace = .{};
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(42), .context = .{ .trace = &trace } };
+    for ([_]usize{ 0, 15, 7 }) |index| {
+        var piece = try readPieceLeaseCoalesced(a, store, owner.directory.blocks[index], .none, cached, null, false);
+        defer piece.deinit();
+        try std.testing.expectEqualSlices(u8, bytes[index * block_bytes ..][0..block_bytes], piece.bytes());
+    }
+    try std.testing.expectEqual(@as(u64, 1), trace.snapshot().provider_reads);
+    try std.testing.expectEqual(@as(u64, pack_bytes), trace.snapshot().provider_bytes);
+    try std.testing.expectEqual(@as(u64, pack_bytes), trace.snapshot().read_ahead_bytes);
+    // Cache authority cannot cross credential scopes; an exhausted request
+    // reads just the independent demanded unit in the new scope.
+    var exhausted: local.serverless_query_lake_read_context.IoTrace = .{};
+    try std.testing.expect(exhausted.reserveReadAhead(8 * pack_bytes));
+    var restricted = cached;
+    restricted.scope = @splat(43);
+    restricted.context.trace = &exhausted;
+    var sparse = try readPieceLeaseCoalesced(a, store, owner.directory.blocks[15], .none, restricted, null, false);
+    defer sparse.deinit();
+    try std.testing.expectEqual(@as(u64, block_bytes), exhausted.snapshot().provider_bytes);
+    // A tiny cache and capture/publication paths keep exact range behavior.
+    cache.max_bytes = block_bytes;
+    try std.testing.expectEqual(@as(?ServingCache.VerifiedLease, null), try readAheadPiece(a, store, owner.directory.blocks[0], .none, cached));
+    // A damaged optional whole-pack fetch must not poison a valid independent
+    // requested range, including when the damage is in an unrelated sibling.
+    cache.max_bytes = 64 * pack_bytes;
+    var fresh: local.serverless_query_lake_read_context.IoTrace = .{};
+    var fallback = cached;
+    fallback.scope = @splat(44);
+    fallback.context.trace = &fresh;
+    const Corrupt = struct {
+        fn get(_: *anyopaque, _: A, _: []const u8, _: usize, _: Cancellation) anyerror![]u8 {
+            return error.ArtifactIntegrityMismatch;
+        }
+    };
+    var damaged_vtable = store.vtable.*;
+    damaged_vtable.get_bounded_alloc_with_cancellation = Corrupt.get;
+    var damaged = store;
+    damaged.vtable = &damaged_vtable;
+    var surviving = try readPieceLeaseCoalesced(a, damaged, owner.directory.blocks[15], .none, fallback, null, false);
+    defer surviving.deinit();
+    try std.testing.expectEqualSlices(u8, bytes[15 * block_bytes ..][0..block_bytes], surviving.bytes());
+    var next_survivor = try readPieceLeaseCoalesced(a, damaged, owner.directory.blocks[7], .none, fallback, null, false);
+    defer next_survivor.deinit();
+    try std.testing.expectEqualSlices(u8, bytes[7 * block_bytes ..][0..block_bytes], next_survivor.bytes());
+    try std.testing.expectEqual(@as(u64, 1), fresh.snapshot().provider_errors);
+    var expired = cached;
+    expired.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, readPieceLeaseCoalesced(a, store, owner.directory.blocks[0], .none, expired, null, false));
+}
+
+test "external lake read ahead tiny publication seeding covers all blocks and declines archive segments" {
+    const a = std.testing.allocator;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const Fs = @import("../serverless/artifacts/fs_store.zig").FsStore;
+    var directory = try local.common_test_directory.TestDirectory.init("tiny-opening");
+    defer directory.cleanup();
+    var fs = try Fs.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(45), 1, std.testing.io);
+    const bytes = try sa.alloc(u8, 512 * 1024);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / block_bytes);
+    const tiny = try publish(a, sa, &store, bytes[0 .. 128 * 1024], .none);
+    const large = try publish(a, sa, &store, bytes, .none);
+    const root = try loadDirectory(sa, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, tiny);
+    const Sink = struct {
+        pieces: []const Piece,
+        seen: [64]bool = @splat(false),
+        total: usize = 0,
+        fn capture(raw: *anyopaque, id: []const u8, digest: [32]u8, data: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (self.pieces, 0..) |piece, i| if (std.mem.eql(u8, id, piece.ref.artifact_id)) {
+                _ = try ServingCache.VerifiedBytes.authenticate(data, digest);
+                if (!self.seen[i]) self.total += data.len;
+                self.seen[i] = true;
+            };
+        }
+    };
+    var sink: Sink = .{ .pieces = root.blocks };
+    try std.testing.expect(root.blocks.len <= sink.seen.len);
+    var cache = ServingCache.initWithMemoryLimit(a, 0);
+    defer cache.deinit();
+    const read: Read = .{ .store = store, .cache = .{ .cache = &cache, .scope = @splat(45), .context = .{}, .capture = .{ .ptr = &sink, .record = Sink.capture } }, .context = .{}, .cancellation = .none };
+    _ = try warmSmall(sa, read, tiny, 512 * 1024);
+    try std.testing.expectEqual(@as(usize, 128 * 1024), sink.total);
+    for (sink.seen[0..root.blocks.len]) |seen| try std.testing.expect(seen);
+    try std.testing.expectEqual(@as(usize, 0), try warmSmall(sa, read, large, 512 * 1024));
 }

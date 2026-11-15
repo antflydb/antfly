@@ -201,6 +201,7 @@ from .cohere_embedder_config_provider import CohereEmbedderConfigProvider
 from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from .cohere_reranker_config import CohereRerankerConfig
 from .cohere_reranker_config_provider import CohereRerankerConfigProvider
+from .commit_requires import CommitRequires
 from .committed_mutation_outcome import CommittedMutationOutcome
 from .committed_mutation_outcome_status import CommittedMutationOutcomeStatus
 from .composed_query_source import ComposedQuerySource
@@ -987,6 +988,10 @@ from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
+from .index_alias import IndexAlias
+from .index_alias_request import IndexAliasRequest
+from .index_alias_request_require import IndexAliasRequestRequire
+from .index_alias_require import IndexAliasRequire
 from .index_execution_config import IndexExecutionConfig
 from .index_maintenance_owner_proof import IndexMaintenanceOwnerProof
 from .index_maintenance_request import IndexMaintenanceRequest
@@ -1268,6 +1273,7 @@ from .join_type import JoinType
 from .kernel_jit_config import KernelJitConfig
 from .kernel_jit_mode import KernelJitMode
 from .key_range import KeyRange
+from .lake_bulk_build_algorithm import LakeBulkBuildAlgorithm
 from .lake_catalog_commit_request import LakeCatalogCommitRequest
 from .lake_catalog_commit_request_requirements_item import LakeCatalogCommitRequestRequirementsItem
 from .lake_catalog_commit_request_updates_item import LakeCatalogCommitRequestUpdatesItem
@@ -1282,6 +1288,7 @@ from .lake_catalog_response import LakeCatalogResponse
 from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
 from .lake_catalog_response_state import LakeCatalogResponseState
 from .leann_index_config import LeannIndexConfig
+from .leann_index_config_media_vectors import LeannIndexConfigMediaVectors
 from .leann_index_config_quantizer import LeannIndexConfigQuantizer
 from .leann_index_config_vector_storage import LeannIndexConfigVectorStorage
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
@@ -2938,6 +2945,7 @@ __all__ = (
     "CohereEmbedderConfigTruncate",
     "CohereRerankerConfig",
     "CohereRerankerConfigProvider",
+    "CommitRequires",
     "CommittedMutationOutcome",
     "CommittedMutationOutcomeStatus",
     "ComposedQuerySource",
@@ -3716,6 +3724,10 @@ __all__ = (
     "ImageURLContentPartType",
     "IncompleteDetails",
     "IncompleteDetailsReason",
+    "IndexAlias",
+    "IndexAliasRequest",
+    "IndexAliasRequestRequire",
+    "IndexAliasRequire",
     "IndexExecutionConfig",
     "IndexMaintenanceOwnerProof",
     "IndexMaintenanceRequest",
@@ -3997,6 +4009,7 @@ __all__ = (
     "KernelJitConfig",
     "KernelJitMode",
     "KeyRange",
+    "LakeBulkBuildAlgorithm",
     "LakeCatalogCommitRequest",
     "LakeCatalogCommitRequestRequirementsItem",
     "LakeCatalogCommitRequestUpdatesItem",
@@ -4011,6 +4024,7 @@ __all__ = (
     "LakeCatalogResponseMetadata",
     "LakeCatalogResponseState",
     "LeannIndexConfig",
+    "LeannIndexConfigMediaVectors",
     "LeannIndexConfigQuantizer",
     "LeannIndexConfigVectorStorage",
     "LegacyGraphDocumentQuery",

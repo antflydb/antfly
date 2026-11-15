@@ -457,6 +457,35 @@ pub fn parseNamespaceUnsuppressEntityBody(allocator: std.mem.Allocator, body: []
     return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Inspect an index alias
+pub const GetNamespaceTableIndexAliasPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
+/// Atomically create or swap an index alias
+pub const PutNamespaceTableIndexAliasPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
+/// Parse the JSON request body for putNamespaceTableIndexAlias.
+pub fn parsePutNamespaceTableIndexAliasBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexAliasRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexAliasRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Conditionally delete an index alias
+pub const DeleteNamespaceTableIndexAliasPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
 /// List indexes for an explicit namespace table
 pub const ListNamespaceTableIndexesPathParams = struct {
     /// Database name
@@ -1515,6 +1544,29 @@ pub fn parseUnsuppressEntityBody(allocator: std.mem.Allocator, body: []const u8)
     return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Inspect an index alias
+pub const GetTableIndexAliasPathParams = struct {
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
+/// Atomically create or swap an index alias
+pub const PutTableIndexAliasPathParams = struct {
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
+/// Parse the JSON request body for putTableIndexAlias.
+pub fn parsePutTableIndexAliasBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexAliasRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexAliasRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Conditionally delete an index alias
+pub const DeleteTableIndexAliasPathParams = struct {
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
 /// List all indexes for a table
 pub const ListIndexesPathParams = struct {
     /// Name of the table
@@ -2214,6 +2266,9 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress", .operation_id = "namespaceSuppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge", .operation_id = "namespaceUnmergeEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress", .operation_id = "namespaceUnsuppressEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "getNamespaceTableIndexAlias", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "putNamespaceTableIndexAlias", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "deleteNamespaceTableIndexAlias", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes", .operation_id = "listNamespaceTableIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "getNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
@@ -2325,6 +2380,9 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:suppress", .operation_id = "suppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:unmerge", .operation_id = "unmergeEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:unsuppress", .operation_id = "unsuppressEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "getTableIndexAlias", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "putTableIndexAlias", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "deleteTableIndexAlias", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
@@ -2459,6 +2517,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "namespaceSuppressEntity")) @compileError("ServerRouter: Impl missing required method 'namespaceSuppressEntity'");
         if (!@hasDecl(Impl, "namespaceUnmergeEntity")) @compileError("ServerRouter: Impl missing required method 'namespaceUnmergeEntity'");
         if (!@hasDecl(Impl, "namespaceUnsuppressEntity")) @compileError("ServerRouter: Impl missing required method 'namespaceUnsuppressEntity'");
+        if (!@hasDecl(Impl, "getNamespaceTableIndexAlias")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTableIndexAlias'");
+        if (!@hasDecl(Impl, "putNamespaceTableIndexAlias")) @compileError("ServerRouter: Impl missing required method 'putNamespaceTableIndexAlias'");
+        if (!@hasDecl(Impl, "deleteNamespaceTableIndexAlias")) @compileError("ServerRouter: Impl missing required method 'deleteNamespaceTableIndexAlias'");
         if (!@hasDecl(Impl, "listNamespaceTableIndexes")) @compileError("ServerRouter: Impl missing required method 'listNamespaceTableIndexes'");
         if (!@hasDecl(Impl, "getNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTableIndex'");
         if (!@hasDecl(Impl, "createNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'createNamespaceTableIndex'");
@@ -2570,6 +2631,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "suppressEntity")) @compileError("ServerRouter: Impl missing required method 'suppressEntity'");
         if (!@hasDecl(Impl, "unmergeEntity")) @compileError("ServerRouter: Impl missing required method 'unmergeEntity'");
         if (!@hasDecl(Impl, "unsuppressEntity")) @compileError("ServerRouter: Impl missing required method 'unsuppressEntity'");
+        if (!@hasDecl(Impl, "getTableIndexAlias")) @compileError("ServerRouter: Impl missing required method 'getTableIndexAlias'");
+        if (!@hasDecl(Impl, "putTableIndexAlias")) @compileError("ServerRouter: Impl missing required method 'putTableIndexAlias'");
+        if (!@hasDecl(Impl, "deleteTableIndexAlias")) @compileError("ServerRouter: Impl missing required method 'deleteTableIndexAlias'");
         if (!@hasDecl(Impl, "listIndexes")) @compileError("ServerRouter: Impl missing required method 'listIndexes'");
         if (!@hasDecl(Impl, "getIndex")) @compileError("ServerRouter: Impl missing required method 'getIndex'");
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
@@ -2702,6 +2766,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key:suppress", httpx.Handler.bind(self.impl, namespaceSuppressEntity));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key:unmerge", httpx.Handler.bind(self.impl, namespaceUnmergeEntity));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/entities/:key:unsuppress", httpx.Handler.bind(self.impl, namespaceUnsuppressEntity));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/index-aliases/:aliasName", httpx.Handler.bind(self.impl, getNamespaceTableIndexAlias));
+            try server.put("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/index-aliases/:aliasName", httpx.Handler.bind(self.impl, putNamespaceTableIndexAlias));
+            try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/index-aliases/:aliasName", httpx.Handler.bind(self.impl, deleteNamespaceTableIndexAlias));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes", httpx.Handler.bind(self.impl, listNamespaceTableIndexes));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, getNamespaceTableIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createNamespaceTableIndex));
@@ -2813,6 +2880,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/entities/:key:suppress", httpx.Handler.bind(self.impl, suppressEntity));
             try server.post("/tables/:tableName/entities/:key:unmerge", httpx.Handler.bind(self.impl, unmergeEntity));
             try server.post("/tables/:tableName/entities/:key:unsuppress", httpx.Handler.bind(self.impl, unsuppressEntity));
+            try server.get("/tables/:tableName/index-aliases/:aliasName", httpx.Handler.bind(self.impl, getTableIndexAlias));
+            try server.put("/tables/:tableName/index-aliases/:aliasName", httpx.Handler.bind(self.impl, putTableIndexAlias));
+            try server.delete("/tables/:tableName/index-aliases/:aliasName", httpx.Handler.bind(self.impl, deleteTableIndexAlias));
             try server.get("/tables/:tableName/indexes", httpx.Handler.bind(self.impl, listIndexes));
             try server.get("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, getIndex));
             try server.post("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createIndex));
@@ -3306,6 +3376,36 @@ pub fn ServerRouter(comptime Impl: type) type {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             return impl.namespaceUnsuppressEntity(ctx, database_name, namespace_name, table_name, key);
+        }
+
+        /// Inspect an index alias
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}
+        fn getNamespaceTableIndexAlias(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const alias_name = ctx.param("aliasName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: aliasName" });
+            return impl.getNamespaceTableIndexAlias(ctx, database_name, namespace_name, table_name, alias_name);
+        }
+
+        /// Atomically create or swap an index alias
+        /// PUT /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}
+        fn putNamespaceTableIndexAlias(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const alias_name = ctx.param("aliasName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: aliasName" });
+            return impl.putNamespaceTableIndexAlias(ctx, database_name, namespace_name, table_name, alias_name);
+        }
+
+        /// Conditionally delete an index alias
+        /// DELETE /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}
+        fn deleteNamespaceTableIndexAlias(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const alias_name = ctx.param("aliasName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: aliasName" });
+            return impl.deleteNamespaceTableIndexAlias(ctx, database_name, namespace_name, table_name, alias_name);
         }
 
         /// List indexes for an explicit namespace table
@@ -4248,6 +4348,30 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.unsuppressEntity(ctx, table_name, key);
         }
 
+        /// Inspect an index alias
+        /// GET /tables/{tableName}/index-aliases/{aliasName}
+        fn getTableIndexAlias(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const alias_name = ctx.param("aliasName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: aliasName" });
+            return impl.getTableIndexAlias(ctx, table_name, alias_name);
+        }
+
+        /// Atomically create or swap an index alias
+        /// PUT /tables/{tableName}/index-aliases/{aliasName}
+        fn putTableIndexAlias(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const alias_name = ctx.param("aliasName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: aliasName" });
+            return impl.putTableIndexAlias(ctx, table_name, alias_name);
+        }
+
+        /// Conditionally delete an index alias
+        /// DELETE /tables/{tableName}/index-aliases/{aliasName}
+        fn deleteTableIndexAlias(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const alias_name = ctx.param("aliasName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: aliasName" });
+            return impl.deleteTableIndexAlias(ctx, table_name, alias_name);
+        }
+
         /// List all indexes for a table
         /// GET /tables/{tableName}/indexes
         fn listIndexes(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -4860,6 +4984,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn namespaceSuppressEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespaceUnmergeEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespaceUnsuppressEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn getNamespaceTableIndexAlias(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response
+//   fn putNamespaceTableIndexAlias(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response
+//   fn deleteNamespaceTableIndexAlias(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response
 //   fn listNamespaceTableIndexes(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
@@ -4971,6 +5098,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn suppressEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn unmergeEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn unsuppressEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn getTableIndexAlias(self: *Impl, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response
+//   fn putTableIndexAlias(self: *Impl, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response
+//   fn deleteTableIndexAlias(self: *Impl, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response

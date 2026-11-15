@@ -61,6 +61,15 @@ pub const CatchUpStats = struct {
         return self.last_applied_sequence;
     }
 
+    /// Successful replay already visited this prefix, including metadata-only
+    /// publications whose callback correctly reported no projection mutation.
+    /// Target admission still proves completeness for the unvisited suffix and
+    /// validates global native cardinality; this is not completion credit.
+    pub fn targetAdvanceFromSequence(self: @This(), from_sequence: u64, target_sequence: u64) u64 {
+        if (self.partial_yields != 0) return from_sequence;
+        return @max(from_sequence, @min(self.last_sequence, target_sequence));
+    }
+
     pub fn shouldTryTargetAdvance(self: @This(), from_sequence: u64, target_sequence: u64) bool {
         // A partially applied record must never be skipped by a target advance.
         return self.applied_entries == 0 and self.partial_yields == 0 and target_sequence > from_sequence;
@@ -837,7 +846,7 @@ const ReplayChunkBuilder = struct {
                 try self.appendKeys(&self.changed_doc_keys, &self.seen_changed_docs, record.changed_doc_keys, null);
                 try self.appendKeys(&self.deleted_doc_keys, &self.seen_deleted_docs, record.deleted_doc_keys, null);
                 try self.appendKeys(&self.overwritten_doc_keys, &self.seen_overwritten_docs, record.overwritten_doc_keys, null);
-                if (self.index_ref.kind == .full_text) try self.appendKeys(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, .full_text);
+                try self.appendKeys(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, .full_text);
             },
             .dense_vector, .sparse_vector => {
                 // Each record is atomic: a later artifact mutation cancels an
@@ -945,8 +954,7 @@ const ReplayChunkBuilder = struct {
         if (self.index_ref.kind != .graph) {
             bytes +|= keyAdmissionBytes(&self.overwritten_doc_keys, &self.seen_overwritten_docs, record.overwritten_doc_keys, 0, null, &key_space);
         }
-        if (self.index_ref.kind != .algebraic)
-            bytes +|= keyAdmissionBytes(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, 0, self.index_ref.kind, &key_space);
+        bytes +|= keyAdmissionBytes(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, 0, self.index_ref.kind, &key_space);
         if (self.index_ref.kind == .dense_vector)
             bytes +|= @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) *| self.estimatedDenseVectorBytes();
         if (key_space.compact_bytes != 0) bytes +|= key_space.compact_bytes +| @sizeOf(KeyBlock);
@@ -1042,8 +1050,7 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
         const record = change_journal_mod.decodeBinaryRecordBorrowedScratchSelected(builder.scratch_alloc, payload, builder.decode_scratch, .{
             .changed_doc_keys = builder.index_ref.kind != .graph,
             .overwritten_doc_keys = builder.index_ref.kind != .graph,
-            .changed_artifact_keys = builder.index_ref.kind != .algebraic,
-            .asset_roots_only = builder.index_ref.kind == .full_text,
+            .asset_roots_only = builder.index_ref.kind == .full_text or builder.index_ref.kind == .algebraic,
         }) catch |err| {
             if (err == error.OutOfMemory) {
                 if (builder.scratch_budget) |budget| {
@@ -1096,8 +1103,7 @@ fn recordEstimatedBytesForIndex(record: change_journal_mod.Record, kind: db_type
 
 fn recordItemCountForIndex(record: change_journal_mod.Record, kind: db_types.IndexKind) usize {
     return switch (kind) {
-        .full_text => record.changed_doc_keys.len + record.deleted_doc_keys.len + record.overwritten_doc_keys.len + countAssetArtifactKeys(record.changed_artifact_keys),
-        .algebraic => record.changed_doc_keys.len + record.deleted_doc_keys.len + record.overwritten_doc_keys.len,
+        .full_text, .algebraic => record.changed_doc_keys.len + record.deleted_doc_keys.len + record.overwritten_doc_keys.len + countAssetArtifactKeys(record.changed_artifact_keys),
         .dense_vector, .sparse_vector => record.changed_doc_keys.len + record.deleted_doc_keys.len + record.overwritten_doc_keys.len + countEmbeddingArtifactKeys(record.changed_artifact_keys) + countAssetArtifactKeys(record.changed_artifact_keys),
         .graph => record.deleted_doc_keys.len + countGraphArtifactKeys(record.changed_artifact_keys),
     };
@@ -2872,7 +2878,7 @@ test "catchUpIndex delivers root-only asset repair metadata to serving consumers
     var record = try change_journal_mod.recordFromDerivedBatch(a, .{ .sequence = 1, .changed_artifact_keys = &.{root} }, 1);
     defer change_journal_mod.deinitRecord(a, &record);
     try appendChangeJournalRecord(&journal, a, record);
-    for ([_]db_types.IndexKind{ .full_text, .dense_vector, .sparse_vector, .graph }) |kind| {
+    for ([_]db_types.IndexKind{ .full_text, .algebraic, .dense_vector, .sparse_vector, .graph }) |kind| {
         var capture: TestApplyCapture = .{ .alloc = a };
         defer capture.deinit();
         const stats = try catchUpIndex(a, replay_source_mod.Source.fromJournal(&journal), .{ .name = "consumer", .kind = kind }, 0, null, &capture, testApplyCapture, null, null);

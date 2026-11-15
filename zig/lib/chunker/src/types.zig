@@ -216,7 +216,7 @@ pub const SourceReference = struct {
     uri: []const u8,
     mime_type: []const u8,
     version: []const u8,
-    version_kind: enum { strong_etag, s3_version_id } = .strong_etag,
+    version_kind: enum { strong_etag, s3_version_id, file_sha256 } = .strong_etag,
     length: u64,
 };
 

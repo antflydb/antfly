@@ -27,12 +27,21 @@ def test_composite_elapsed_duration():
 
 
 def test_exact_bucket_limit():
-    options = dict(
-        timestamp="ts", measurement="v", start="2026-01-01T00:00:00Z", end="2026-01-01T02:46:40Z", every="1s"
+    series_query(
+        timestamp="ts",
+        measurement="v",
+        start="2026-01-01T00:00:00Z",
+        end="2026-01-01T02:46:40Z",
+        every="1s",
     )
-    series_query(**options)
     with pytest.raises(ValueError, match="10000"):
-        series_query(**dict(options, end="2026-01-01T02:46:40.000000001Z"))
+        series_query(
+            timestamp="ts",
+            measurement="v",
+            start="2026-01-01T00:00:00Z",
+            end="2026-01-01T02:46:40.000000001Z",
+            every="1s",
+        )
 
 
 def test_series_grouping_excludes_null_keys():

@@ -164,6 +164,31 @@ pub const Hydrator = struct {
             for (fields) |field| try self.accept(self.ptr, a, i, field, local.api_json_helpers.extractJsonPathValue(parsed, field) orelse return error.InvalidNativeLakeTextCorpus);
         }
     };
+    fn prefetchTile(self: *Hydrator, snapshot: *const local.index.IndexSnapshot, fields: []const []const u8, docs: []const u32) !void {
+        var planned: usize = 0;
+        var remaining_columns = self.columns.len;
+        while (planned < docs.len) {
+            const resolved = snapshot.resolveDocId(docs[planned]) orelse return error.InvalidNativeLakeTextCorpus;
+            const segment = try snapshot.readSegment(resolved.seg_idx);
+            const base = docs[planned] - resolved.local_id;
+            const end = base + segment.reader.doc_count;
+            var next = planned + 1;
+            while (next < docs.len and docs[next] < end) : (next += 1) {}
+            const physical = segment.reader.source();
+            if (physical == .ranges and physical.ranges.prefetch != null) {
+                for (fields[0..@min(fields.len, remaining_columns)]) |field| {
+                    remaining_columns -= 1;
+                    var cursor = try self.column(&segment.reader, field);
+                    if (cursor == null) if (std.mem.indexOfScalar(u8, field, '.')) |dot| {
+                        cursor = try self.column(&segment.reader, field[0..dot]);
+                    };
+                    if (cursor) |value| _ = value.prefetchSelected(docs[planned..next], base, end);
+                }
+                try segment.reader.prefetchStoredIdentities(docs[planned..next], base, end);
+            }
+            planned = next;
+        }
+    }
     pub fn visitRows(self: *Hydrator, a: A, snapshot: *const local.index.IndexSnapshot, input: Input, fields: []const []const u8, visitor: Visitor) !void {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
@@ -173,10 +198,23 @@ pub const Hydrator = struct {
         const permutation = try scratch.allocator().alloc(Entry, input.len);
         var row = std.heap.ArenaAllocator.init(a);
         defer row.deinit();
-        for (0..input.len) |i| {
-            if (i % batch_limit == 0) try input.check();
-            const doc = input.document(input.ptr, i);
-            permutation[i] = .{ .doc = doc, .position = i };
+        for (permutation, 0..) |*entry, i| entry.* = .{ .doc = input.document(input.ptr, i), .position = i };
+        std.mem.sort(Entry, permutation, {}, struct {
+            fn less(_: void, l: Entry, r: Entry) bool {
+                return l.doc < r.doc;
+            }
+        }.less);
+        const sorted_docs = try scratch.allocator().alloc(u32, permutation.len);
+        for (permutation, sorted_docs) |entry, *doc| doc.* = entry.doc;
+        // Validate identities in physical order, planning one bounded tile
+        // before any of its reads. Output positions still refer to ranked rows.
+        for (permutation, 0..) |entry, at| {
+            if (at % batch_limit == 0) {
+                try input.check();
+                try self.prefetchTile(snapshot, fields, sorted_docs[at..@min(input.len, at + batch_limit)]);
+            }
+            const i = entry.position;
+            const doc = entry.doc;
             _ = row.reset(.retain_capacity);
             const resolved = snapshot.resolveDocId(doc) orelse return error.InvalidNativeLakeTextCorpus;
             const segment = try snapshot.readSegment(resolved.seg_idx);
@@ -195,13 +233,6 @@ pub const Hydrator = struct {
                 try visitor.stored(row.allocator(), i, stored.data, fields);
             }
         }
-        std.mem.sort(Entry, permutation, {}, struct {
-            fn less(_: void, l: Entry, r: Entry) bool {
-                return l.doc < r.doc;
-            }
-        }.less);
-        const sorted_docs = try scratch.allocator().alloc(u32, permutation.len);
-        for (permutation, sorted_docs) |entry, *doc| doc.* = entry.doc;
         for (fields) |field| for (permutation, 0..) |entry, at| {
             if (at % batch_limit == 0) try input.check();
             const i = entry.position;
@@ -218,6 +249,10 @@ pub const Hydrator = struct {
             if (cursor) |value| value.control = .{ .ptr = &input, .check_fn = Input.checkToken };
             defer if (cursor) |value| {
                 value.control = .none;
+            };
+            if (cursor) |value| if (at == 0 or (snapshot.resolveDocId(permutation[at - 1].doc) orelse return error.InvalidNativeLakeTextCorpus).seg_idx != resolved.seg_idx) {
+                const base = entry.doc - resolved.local_id;
+                _ = value.prefetchSelected(sorted_docs[at..], base, base + segment.reader.doc_count);
             };
             const previous_chunk = if (cursor) |value| value.chunk else null;
             if (tail == null) if (cursor) |value| if (try value.text(resolved.local_id)) |text| {
@@ -701,4 +736,60 @@ test "external lake bounded window profiles native result vectors outlive cursor
     try Run.run(a, writer.snapshot(), value.keys());
     var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ writer.snapshot(), value.keys() });
+}
+
+test "external lake bounded window profiles winner tile plans native identities and columns before delivery" {
+    const a = std.testing.allocator;
+    const docs = [_]local.introducer.TextDocument{
+        .{ .id = "one", .stored_data = "{\"body\":\"one\",\"counter\":1}", .stored_source = .{ .object = .empty }, .text_fields = &.{} },
+        .{ .id = "two", .stored_data = "{\"body\":\"two\",\"counter\":2}", .stored_source = .{ .object = .empty }, .text_fields = &.{} },
+    };
+    var data = std.heap.ArenaAllocator.init(a);
+    defer data.deinit();
+    var inputs = docs;
+    for (&inputs) |*doc| doc.stored_source = try std.json.parseFromSliceLeaky(std.json.Value, data.allocator(), doc.stored_data, .{});
+    const bytes = try local.introducer.buildSegmentFromTextWithAnalysisOptions(a, &inputs, &local.search_analysis.default_analyzer, .{}, .{ .store_source_columns = true });
+    defer a.free(bytes);
+    const Probe = struct {
+        bytes: []const u8,
+        hints: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset > self.bytes.len or out.len > self.bytes.len - offset) return error.InvalidData;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn prefetch(raw: *anyopaque, offset: u64, length: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(offset <= self.bytes.len and length <= self.bytes.len - offset);
+            self.hints += 1;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var probe: Probe = .{ .bytes = bytes };
+    var writer = try local.index.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .{ .native = .{ .ranges = .{ .ptr = &probe, .length = bytes.len, .read_into = Probe.read, .prefetch = Probe.prefetch, .close = Probe.close } } });
+    probe.hints = 0;
+    const Rows = struct {
+        probe: *Probe,
+        delivered: usize = 0,
+        fn doc(_: *anyopaque, i: usize) u32 {
+            return @intCast(1 - i % 2);
+        }
+        fn key(_: *anyopaque, _: A, i: usize) ![]const u8 {
+            return if (i % 2 == 0) "two" else "one";
+        }
+        fn accept(raw: *anyopaque, _: A, i: usize, field: []const u8, value: std.json.Value) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.probe.hints != 0);
+            if (std.mem.eql(u8, field, "body")) try std.testing.expectEqualStrings(if (i % 2 == 0) "two" else "one", value.string) else try std.testing.expectEqual(@as(i64, if (i % 2 == 0) 2 else 1), value.integer);
+            self.delivered += 1;
+        }
+    };
+    var rows: Rows = .{ .probe = &probe };
+    var hydrator = Hydrator.init(a);
+    defer hydrator.deinit();
+    try hydrator.visitRows(a, writer.snapshot(), .{ .ptr = &rows, .len = 4, .document = Rows.doc, .key = Rows.key }, &.{ "body", "counter" }, .{ .ptr = &rows, .accept = Rows.accept });
+    try std.testing.expectEqual(@as(usize, 8), rows.delivered);
+    try std.testing.expectEqual(@as(usize, 2), hydrator.column_opens);
 }

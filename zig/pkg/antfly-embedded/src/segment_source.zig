@@ -29,6 +29,19 @@ pub const MappedArtifact = struct {
     bytes: []align(std.heap.page_size_min) u8,
     context: ?*anyopaque = null,
     release: ?*const fn (*anyopaque) void = null,
+    /// Optional positional-read optimization. It may only read the pinned
+    /// inode, and returns false when unavailable; the mapping remains authority.
+    /// Checked dispatch preserves I/O failures across compiled storage owners.
+    try_read_into: ?*const fn (*anyopaque, usize, []u8) anyerror!bool = null,
+    read_dispatch: callback_abi.CallbackDispatch = ReadBoundary.local_dispatch,
+    const ReadBoundary = callback_abi.Boundary(struct { try_read_into: *const fn (*anyopaque, usize, []u8) anyerror!bool });
+
+    pub fn readAllAt(self: MappedArtifact, out: []u8, offset: usize) !void {
+        if (offset > self.bytes.len or out.len > self.bytes.len - offset) return error.EndOfStream;
+        if (out.len == 0) return;
+        if (self.try_read_into) |read| if (try ReadBoundary.call("try_read_into", self.read_dispatch, read, .{ self.context.?, offset, out })) return;
+        @memcpy(out, self.bytes[offset..][0..out.len]);
+    }
 
     pub fn deinit(self: *MappedArtifact) void {
         if (@import("builtin").os.tag != .freestanding) std.posix.munmap(self.bytes);

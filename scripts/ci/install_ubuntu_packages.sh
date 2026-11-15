@@ -18,11 +18,23 @@
 # mirrors can briefly serve indexes from different publication generations;
 # retry fresh metadata while retaining APT's signature and checksum checks.
 set -euo pipefail
+sources=${ANTFLY_UBUNTU_APT_SOURCES:-/etc/apt/sources.list.d/ubuntu.sources}
+apt_options=(-o Acquire::Retries=3)
+if [[ -f "$sources" ]]; then
+  # These build dependencies come from Ubuntu itself. An unrelated Git PPA
+  # in the runner image must not make official package setup depend on
+  # Launchpad availability. Scope both refresh and resolution to the same
+  # distribution sources, retaining Ubuntu's signature policy.
+  apt_options+=(-o "Dir::Etc::sourcelist=$sources" -o Dir::Etc::sourceparts=-)
+elif [[ -n ${ANTFLY_UBUNTU_APT_SOURCES:-} ]]; then
+  echo "Configured Ubuntu APT sources file is missing: $sources" >&2
+  exit 1
+fi
 for attempt in 1 2 3; do
-  if sudo apt-get -o Acquire::Retries=3 \
+  if sudo apt-get "${apt_options[@]}" \
       -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true \
       -o APT::Update::Error-Mode=any update; then
-    sudo apt-get -o Acquire::Retries=3 install -y "$@"
+    sudo apt-get "${apt_options[@]}" install -y "$@"
     exit 0
   else
     status=$?

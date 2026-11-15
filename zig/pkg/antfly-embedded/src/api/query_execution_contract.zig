@@ -111,6 +111,7 @@ pub const BackgroundTextStatsFieldRequestInput = struct {
 };
 
 pub const TextStatsRequestInput = struct {
+    _privacy_policy_version: ?std.json.Value = null,
     _native_cut: ?std.json.Value = null,
     _identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
@@ -163,6 +164,7 @@ pub const OwnedAlgebraicTensorExpr = query_contract.OwnedAlgebraicTensorExprEnve
 pub const OwnedAlgebraicTensorProgram = query_contract.OwnedAlgebraicTensorProgramEnvelope;
 
 pub const ParsedExplicitTextStatsRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
     identity_read_generation: ?u64 = null,
     resolved_doc_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null,
     items: []OwnedTextStatsFieldRequest = &.{},
@@ -176,6 +178,7 @@ pub const ParsedExplicitTextStatsRequest = struct {
 };
 
 pub const ParsedBackgroundTextStatsRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
     identity_read_generation: ?u64 = null,
     resolved_doc_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null,
     items: []OwnedBackgroundTextStatsFieldRequest = &.{},
@@ -230,11 +233,18 @@ pub fn parseTextStatsRequest(
 ) !ParsedTextStatsRequest {
     var parsed = try std.json.parseFromSlice(TextStatsRequestInput, alloc, body, .{});
     defer parsed.deinit();
+    const version = if (parsed.value._privacy_policy_version) |value| try query_contract.parsePrivacyPolicyVersion(value) else null;
     if (parsed.value.query_request) |query_value| {
         if (parsed.value._resolved_doc_filter != null) return error.InvalidQueryRequest;
         const encoded_query = try std.json.Stringify.valueAlloc(alloc, query_value, .{});
         defer alloc.free(encoded_query);
-        return .{ .query_request = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query) };
+        var owned = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query);
+        errdefer owned.deinit(alloc);
+        if (version) |expected| {
+            if (owned.req.privacy_policy_version) |nested| if (!std.mem.eql(u8, &expected, &nested)) return error.InvalidQueryRequest;
+            owned.req.privacy_policy_version = expected;
+        }
+        return .{ .query_request = owned };
     }
     if (parsed.value.fields) |fields_value| {
         var resolved_doc_filter = if (parsed.value._resolved_doc_filter) |filter_value|
@@ -268,6 +278,7 @@ pub fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .explicit_fields = .{
+            .privacy_policy_version = version,
             .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
@@ -307,12 +318,44 @@ pub fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .background_fields = .{
+            .privacy_policy_version = version,
             .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
         } };
     }
     return error.InvalidQueryRequest;
+}
+
+test "local query contract text stats wire preserves privacy controls and rejects unknown metadata" {
+    const a = std.testing.allocator;
+    const version = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for ([_][]const u8{ "none", version }) |value| {
+        const expected: [64]u8 = if (std.mem.eql(u8, value, "none")) @splat(0) else version.*;
+        const bodies = [_][]const u8{
+            "\"fields\":[{\"field\":\"body\",\"terms\":[\"alpha\"]}]",
+            "\"background_fields\":[{\"aggregation_name\":\"sig\",\"field\":\"body\",\"terms\":[\"alpha\"],\"background_query\":{\"match_all\":{}}}]",
+            "\"query_request\":{}",
+        };
+        for (bodies) |body| {
+            const wire = try std.fmt.allocPrint(a, "{{\"_privacy_policy_version\":\"{s}\",{s}}}", .{ value, body });
+            defer a.free(wire);
+            var parsed = try parseTextStatsRequest(a, "docs", wire);
+            defer parsed.deinit(a);
+            const actual = switch (parsed) {
+                .explicit_fields => |request| request.privacy_policy_version,
+                .background_fields => |request| request.privacy_policy_version,
+                .query_request => |request| request.req.privacy_policy_version,
+            };
+            try std.testing.expect(actual != null);
+            try std.testing.expectEqualSlices(u8, &expected, &actual.?);
+        }
+    }
+    try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(a, "docs", "{\"_privacy_policy_version\":\"bad\",\"fields\":[]}"));
+    try std.testing.expectError(error.UnknownField, parseTextStatsRequest(a, "docs", "{\"unexpected\":true,\"fields\":[]}"));
+    const conflicting = try std.fmt.allocPrint(a, "{{\"_privacy_policy_version\":\"{s}\",\"query_request\":{{\"_privacy_policy_version\":\"none\"}}}}", .{version});
+    defer a.free(conflicting);
+    try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(a, "docs", conflicting));
 }
 
 pub fn identityGenerationFromTextStatsResolvedFilter(
@@ -678,9 +721,58 @@ pub fn appendJsonFieldU32(
 }
 
 pub fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
+    // Large legal scan boundaries must not require a second full-size escaped
+    // allocation before copying into the request body. Preserve the caller's
+    // prefix on failure, while retaining ownership of any grown buffer.
+    const aliases_output = value.len != 0 and out.capacity != 0 and
+        @intFromPtr(value.ptr) < @intFromPtr(out.items.ptr) + out.capacity and
+        @intFromPtr(out.items.ptr) < @intFromPtr(value.ptr) + value.len;
+    const retained = if (aliases_output) try alloc.dupe(u8, value) else null;
+    defer if (retained) |copy| alloc.free(copy);
+    const prefix_len = out.items.len;
+    var writer = std.Io.Writer.Allocating.fromArrayList(alloc, out);
+    defer out.* = writer.toArrayList();
+    errdefer writer.writer.end = prefix_len;
+    writer.writer.print("{f}", .{std.json.fmt(retained orelse value, .{})}) catch return error.OutOfMemory;
+}
+
+test "local query contract JSON string append reuses wire capacity and preserves failed prefixes" {
+    var bytes: [32 * 1024 + 2]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    defer output.deinit(bounded.allocator());
+    try output.ensureTotalCapacityPrecise(bounded.allocator(), bytes.len);
+    const input: [32 * 1024]u8 = @splat('x');
+    try appendJsonString(bounded.allocator(), &output, &input);
+    try std.testing.expectEqual(bytes.len, output.items.len);
+    try std.testing.expectEqualStrings(&input, output.items[1 .. output.items.len - 1]);
+    try std.testing.expectEqual(@as(u8, '"'), output.items[0]);
+    try std.testing.expectEqual(@as(u8, '"'), output.items[output.items.len - 1]);
+    const original = output.items;
+    // The final quote fits, but no additional string can fit. Failed appends
+    // must restore the original logical bytes without discarding their owner.
+    try std.testing.expectError(error.OutOfMemory, appendJsonString(bounded.allocator(), &output, "more"));
+    try std.testing.expectEqual(original.ptr, output.items.ptr);
+    try std.testing.expectEqualStrings(original, output.items);
+    const a = std.testing.allocator;
+    var aliased: std.ArrayListUnmanaged(u8) = .empty;
+    defer aliased.deinit(a);
+    try aliased.ensureTotalCapacityPrecise(a, 4);
+    try aliased.appendSlice(a, "seed");
+    try appendJsonString(a, &aliased, aliased.items);
+    try std.testing.expectEqualStrings("seed\"seed\"", aliased.items);
+    var escaped: std.ArrayListUnmanaged(u8) = .empty;
+    defer escaped.deinit(a);
+    for ([_][]const u8{ "", "a\"b\\c\n\r\t\x00\x1f", "β🙂" }) |text| {
+        escaped.clearRetainingCapacity();
+        try escaped.appendSlice(a, "[1,");
+        try appendJsonString(a, &escaped, text);
+        try escaped.append(a, ']');
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, escaped.items, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.array.items[0].integer);
+        try std.testing.expectEqualStrings(text, parsed.value.array.items[1].string);
+    }
 }
 
 pub const indexes_openapi = @import("antfly_indexes_openapi");
@@ -3363,6 +3455,12 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.document_authority_mode != .none) {
         try appendJsonFieldName(alloc, &out, &first, "_document_authority");
         const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .mode = req.document_authority_mode, .group = req.document_authority_group, .defer_stored_projection = req.defer_stored_projection }, .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    if (req.index_alias_fences.len != 0) {
+        try appendJsonFieldName(alloc, &out, &first, "_index_alias_fences");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, req.index_alias_fences, .{});
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }

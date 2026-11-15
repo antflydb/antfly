@@ -608,6 +608,25 @@ pub fn artifactRevisionKey(namespace: Namespace, artifact_key: []const u8) [arti
     return result;
 }
 
+const producer_scope_prefix = "\x00\x00__artifact_publication__:producer-scope-revision:v1:";
+pub const ProducerScopeRevisionKey = [producer_scope_prefix.len + 32]u8;
+pub fn producerScopeRevisionKey(namespace: Namespace, document: []const u8, stream: []const u8) ProducerScopeRevisionKey {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(&namespace);
+    bytes(&hash, document);
+    bytes(&hash, stream);
+    var key: ProducerScopeRevisionKey = undefined;
+    @memcpy(key[0..producer_scope_prefix.len], producer_scope_prefix);
+    hash.final(key[producer_scope_prefix.len..][0..32]);
+    return key;
+}
+pub fn producerScopeRevision(txn: anytype, namespace: Namespace, document: []const u8, stream: []const u8) !?Position {
+    const raw = txn.get(&producerScopeRevisionKey(namespace, document, stream)) catch |err| if (err == error.NotFound) return null else return err;
+    const position = try Position.decode(raw);
+    try position.requireNamespace(namespaceFromBytes(namespace));
+    return position;
+}
+
 pub fn artifactRevision(txn: anytype, namespace: Namespace, artifact_key: []const u8) !?Position {
     const raw = txn.get(&artifactRevisionKey(namespace, artifact_key)) catch |err| switch (err) {
         error.NotFound => return null,
@@ -917,6 +936,7 @@ pub fn validateRequest(alloc: std.mem.Allocator, request: anytype) !void {
     try command.validate(alloc);
     const defaults: @TypeOf(request) = .{};
     inline for (@typeInfo(@TypeOf(request)).@"struct".field_names, @typeInfo(@TypeOf(request)).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, reflected_name, "artifact_publication") and
             !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "timestamp"))
         {

@@ -200,6 +200,10 @@ pub const GeneratedEnrichmentRequest = struct {
     /// instead of extracting a single source_field.
     source_template: []const u8 = "",
     expected_dims: u32 = 0,
+    /// Provenance of an elided embedding; checked before re-embedding.
+    expected_source_hash: ?u64 = null,
+    /// Fallback proof for legacy artifacts without an immutable producer revision.
+    expected_vector_digest: ?u64 = null,
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []const u8 = "",
@@ -233,9 +237,25 @@ pub const GeneratedEnrichmentRequest = struct {
     /// Replay sequence of the source document change. This is attached when a
     /// cached request plan is instantiated for a pending journal group.
     sequence: u64 = 0,
-    /// Document-owned reprocess generation, resolved once before execution.
+    /// Document/producer-owned reprocess epoch, resolved once before execution.
+    /// Monotonic across model configuration changes, including rollbacks.
     /// Zero preserves legacy source-hash identities.
     reprocess_generation: u64 = 0,
+};
+
+pub const PreparedProducer = struct {
+    definition: [32]u8,
+    doc_key: []const u8,
+    revision: ?[32]u8 = null,
+
+    pub fn identity(self: @This()) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&self.definition);
+        hash.update(self.doc_key);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
 };
 
 pub const GeneratedEnrichmentRef = struct {

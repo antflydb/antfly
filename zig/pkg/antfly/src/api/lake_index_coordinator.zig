@@ -142,7 +142,7 @@ fn executePhysical(a: A, io: std.Io, table: local.common_topology_records.TableR
         artifact_reads.enableWriteCache(a, 8 * 1024 * 1024);
         defer artifact_reads.close();
         var handle = artifact_reads.store();
-        return publication.buildWithReuse(a, &handle, table, source, store.identity, context, cancellation, clock, lease, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = context }, policy) catch |err| {
+        return publication.buildWithReuse(a, &handle, table, source, store.identity, context, cancellation, clock, lease, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = try catalog.desiredFingerprint(a, table), .context = context }, policy) catch |err| {
             artifact_cause.* = artifact_reads.cause();
             return err;
         };
@@ -154,7 +154,7 @@ fn executePhysical(a: A, io: std.Io, table: local.common_topology_records.TableR
 /// obligation; do not mistake a matching definition signature for available
 /// derived storage. Transient provider errors retain the existing obligation.
 fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, cancellation: Cancellation) !bool {
-    if (ready.namespace == null or ready.reader_protocol != catalog.native_reader_protocol) return false;
+    if (ready.namespace == null or (ready.reader_protocol < catalog.minimum_reader_protocol or ready.reader_protocol > catalog.native_reader_protocol)) return false;
     const directory = ready.directory orelse return false;
     var cloud_binding = try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, &store.implementation, ready, cancellation);
     defer if (cloud_binding) |*held| held.deinit();
@@ -188,6 +188,10 @@ fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, ca
     // Unsupported declarations remain an explicit repair obligation.
     for (document.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version != @import("lake_index_native_text.zig").metadata_version) return false;
+        // Old readers interpret recent runs as one all-recipe cohort. Upgrade
+        // vector publications before issuing independently prepared recipe cuts;
+        // compatible text-only generations keep their existing fast recovery.
+        if (ready.reader_protocol < 102 and (declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment)) return false;
     }
     return true;
 }
@@ -444,7 +448,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         .schema_version = 1,
         .columns = &.{},
         .external_base_source = binding,
-        .external_indexes = .{ .catalog_json = mock.table.lake_index_catalog_json, .indexes_json = mock.table.indexes_json, .desired = catalog.desiredFingerprint(mock.table) },
+        .external_indexes = .{ .catalog_json = mock.table.lake_index_catalog_json, .indexes_json = mock.table.indexes_json, .desired = try catalog.desiredFingerprint(a, mock.table) },
     };
     var selected = (try selection.select(a, query_table, &source, &store, .{}, .required)).?;
     defer selected.deinit();
@@ -874,7 +878,7 @@ test "external lake lease tolerates target read schema finalization" {
     const a = std.testing.allocator;
     const tables = @import("../metadata/table_manager.zig");
     var table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = "target", .read_schema_json = "previous" };
-    const signature: catalog.Signature = .{ .desired = catalog.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+    const signature: catalog.Signature = .{ .desired = try catalog.desiredFingerprint(a, table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
     const initial = try catalog.encode(a, try (catalog.State{}).begin(signature, @splat(1), 100, 10));
     defer a.free(initial);
     table.lake_index_catalog_json = initial;
@@ -912,7 +916,7 @@ test "external lake lease tolerates target read schema finalization" {
     defer if (renewal.owned) |bytes| a.free(bytes);
     defer if (renewal.owned_read_schema) |bytes| a.free(bytes);
     // Derived read schema is deliberately excluded from the publication recipe.
-    try std.testing.expectEqual(signature.desired, catalog.desiredFingerprint(mock.current));
+    try std.testing.expectEqual(signature.desired, try catalog.desiredFingerprint(a, mock.current));
     try renewal.pulse();
     try std.testing.expectEqual(@as(usize, 2), mock.calls);
     try std.testing.expectEqual(@as(usize, 1), mock.reads);
@@ -933,7 +937,7 @@ test "external lake lease rebase fences recipes storage leases expiry and ambigu
     for (std.meta.tags(Case)) |mode| {
         errdefer std.debug.print("lake lease rebase case={s}\n", .{@tagName(mode)});
         var table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = "target", .read_schema_json = "previous" };
-        const signature: catalog.Signature = .{ .desired = catalog.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+        const signature: catalog.Signature = .{ .desired = try catalog.desiredFingerprint(a, table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
         const initial_state = try (catalog.State{}).begin(signature, @splat(1), 100, 10);
         const initial = try catalog.encode(a, initial_state);
         defer a.free(initial);

@@ -30,6 +30,100 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ZigValidationScopeTests(unittest.TestCase):
+    def test_sdk_zig_outputs_use_the_existing_build_volume(self):
+        workflow = (ROOT / ".github/workflows/sdks-ci.yml").read_text()
+        block = workflow.split("      - name: Prepare SDK build caches\n", 1)[1]
+        command = textwrap.dedent(
+            block.split("run: |\n", 1)[1].split("\n      - name:", 1)[0]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, volume = root / "checkout", root / "volume"
+            (checkout / "zig").mkdir(parents=True)
+            env_file = root / "env"
+            subprocess.run(
+                ["bash", "-c", command],
+                cwd=checkout,
+                check=True,
+                env={
+                    **os.environ,
+                    "GITHUB_WORKSPACE": str(checkout),
+                    "SDK_CI_WORK_DIR": str(volume),
+                    "GITHUB_ENV": str(env_file),
+                },
+            )
+            for local, destination in (
+                (".zig-cache", "zig-cache"),
+                ("zig-out", "zig-out"),
+            ):
+                output = checkout / "zig" / local / "probe"
+                output.write_text("artifact")
+                self.assertEqual(
+                    (volume / destination / "probe").read_text(), "artifact"
+                )
+            self.assertIn(
+                f"ZIG_GLOBAL_CACHE_DIR={checkout}/zig/.zig-cache/global",
+                env_file.read_text(),
+            )
+
+    def test_owner_cache_policy_overrides_setup_zig_defaults(self):
+        workflow = (ROOT / ".github/workflows/zig-owner-qualification.yml").read_text()
+        jobs = dict(
+            re.findall(r"\n  ([\w-]+):\n(.*?)(?=\n  [\w-]+:\n|\Z)", workflow, re.DOTALL)
+        )
+        selected = [
+            block
+            for block in jobs.values()
+            if "Place compiler caches on the build runner volume" in block
+        ]
+        self.assertEqual(len(selected), 3)
+        for index, block in enumerate(selected):
+            self.assertLess(
+                block.index("uses: mlugg/setup-zig"),
+                block.index("Place compiler caches"),
+            )
+            step = block.split(
+                "      - name: Place compiler caches on the build runner volume\n", 1
+            )[1]
+            command = textwrap.dedent(
+                step.split("run: |\n", 1)[1].split("\n      - ", 1)[0]
+            )
+            with self.subTest(job=index), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                checkout, volume = root / "checkout", root / "volume"
+                (checkout / "zig").mkdir(parents=True)
+                volume.mkdir()
+                env_file = root / "env"
+                # Reproduce the preceding action's cache override. The step
+                # must replace it rather than relying on workflow-level env.
+                env_file.write_text(
+                    f"ZIG_LOCAL_CACHE_DIR={checkout}/.zig-cache\nZIG_GLOBAL_CACHE_DIR={checkout}/.zig-cache\n"
+                )
+                subprocess.run(
+                    ["bash", "-c", command.replace("/mnt/cache", str(volume))],
+                    cwd=checkout,
+                    check=True,
+                    env={
+                        **os.environ,
+                        "GITHUB_WORKSPACE": str(checkout),
+                        "GITHUB_ENV": str(env_file),
+                    },
+                )
+                actual = dict(
+                    line.split("=", 1) for line in env_file.read_text().splitlines()
+                )
+                self.assertEqual(
+                    actual["ZIG_LOCAL_CACHE_DIR"], str(checkout / "zig/.zig-cache")
+                )
+                self.assertEqual(
+                    Path(actual["ZIG_LOCAL_CACHE_DIR"]).resolve(),
+                    (volume / "operation-owners/zig-cache").resolve(),
+                )
+                self.assertEqual(
+                    actual["ZIG_GLOBAL_CACHE_DIR"],
+                    str(checkout / "zig/.zig-cache/global"),
+                )
+
     def test_vopr_qualification_is_an_optional_admitted_suite(self):
         config = json.loads((ROOT / ".github/scripts/pr-ci-config.json").read_text())
         suite = next(suite for suite in config["suites"] if suite["id"] == "vopr")
@@ -292,7 +386,7 @@ class ZigValidationScopeTests(unittest.TestCase):
         # coverage. Full validation must not hide a failed specialized lane.
         aggregate = blocks["e2e-full"]
         self.assertIn(
-            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance, better-auth]",
+            "e2e-base-low-fd, embedded-sdk-native, source-sdk-native, pgwire-driver-conformance, better-auth]",
             aggregate,
         )
         self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
@@ -322,6 +416,7 @@ class ZigValidationScopeTests(unittest.TestCase):
                         "LOW_FD_RESULT": low_fd,
                         "REQUIRE_LOW_FD": required,
                         "NATIVE_SDK_RESULT": native,
+                        "SOURCE_SDK_RESULT": "success",
                         "PGWIRE_DRIVER_RESULT": "success",
                         "BETTER_AUTH_RESULT": "success",
                     },
@@ -336,6 +431,18 @@ class ZigValidationScopeTests(unittest.TestCase):
         self.assertFalse(
             selected(
                 "better-auth",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
+        self.assertTrue(selected("source-sdk-native"))
+        self.assertTrue(selected("source-sdk-native", full=True))
+        self.assertTrue(selected("source-sdk-native", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "source-sdk-native",
                 **{
                     "needs.e2e-base-build.result": "failure",
                     "needs.e2e-full-build.result": "skipped",
@@ -372,12 +479,14 @@ class ZigValidationScopeTests(unittest.TestCase):
         for job in ("e2e-base", "e2e-full"):
             command = textwrap.dedent(blocks[job].split("run: |\n", 1)[1])
             command = command.split("\n- uses:", 1)[0]
-            for driver, auth in (
-                ("success", "success"),
-                ("failure", "success"),
-                ("skipped", "success"),
-                ("success", "failure"),
-                ("success", "skipped"),
+            for driver, auth, source in (
+                ("success", "success", "success"),
+                ("failure", "success", "success"),
+                ("skipped", "success", "success"),
+                ("success", "failure", "success"),
+                ("success", "skipped", "success"),
+                ("success", "success", "failure"),
+                ("success", "success", "skipped"),
             ):
                 with self.subTest(job=job, driver=driver):
                     result = subprocess.run(
@@ -390,6 +499,7 @@ class ZigValidationScopeTests(unittest.TestCase):
                             "LOW_FD_RESULT": "success",
                             "REQUIRE_LOW_FD": "true",
                             "NATIVE_SDK_RESULT": "success",
+                            "SOURCE_SDK_RESULT": source,
                             "PGWIRE_DRIVER_RESULT": driver,
                             "BETTER_AUTH_RESULT": auth,
                         },
@@ -398,7 +508,7 @@ class ZigValidationScopeTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         result.returncode == 0,
-                        driver == auth == "success",
+                        driver == auth == source == "success",
                         result.stderr,
                     )
 
@@ -424,15 +534,25 @@ class ZigValidationScopeTests(unittest.TestCase):
             self.assertNotIn(name, native)
         for command in (
             "node pkg/antfly-embedded/wasm_client_test.mjs",
-            "build wasm-test inference-wasm",
-            "zig build inference-wasm -Dwebgpu=true",
-            "zig build inference-wasm -Dwasm-memory-model=wasm64",
-            "zig build wasm -Dwasm=true -j1",
-            "zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64",
+            "build wasm-test -Dmetal=false -j1",
+            "build inference-wasm -Dmetal=false -j1",
+            "--report reports/wasm-webgpu-build.json build inference-wasm -Dwebgpu=true",
+            "--report reports/wasm-inference64-build.json build inference-wasm -Dwasm-memory-model=wasm64",
+            "--report ../../reports/wasm-abi32-build.json build wasm -Dwasm=true -j1",
+            "--report ../../reports/wasm-abi64-build.json build wasm -Dwasm=true -Dwasm-memory-model=wasm64",
             "node web/test-wasm-abi.mjs wasm32",
             "node web/test-wasm-abi.mjs wasm64",
         ):
             self.assertIn(command, wasm)
+        self.assertIn("Install glibc-linked Zig", wasm)
+        self.assertNotIn("mlugg/setup-zig", wasm)
+        self.assertIn("--report reports/wasm-embedded-build.json", wasm)
+        self.assertIn("--report reports/wasm-inference-build.json", wasm)
+        self.assertLess(
+            wasm.index("build wasm-test -Dmetal=false -j1"),
+            wasm.index("build inference-wasm -Dmetal=false -j1"),
+        )
+        self.assertIn("path: zig/reports/wasm-*-build.json", wasm)
         libraries, evaluation = models.split(
             "      - name: Exercise real Lite extraction through public graph APIs", 1
         )
@@ -593,6 +713,9 @@ class ZigValidationScopeTests(unittest.TestCase):
             "zig/pkg/antfly-embedded/src/capi/sql.zig",
             "scripts/ci/test-embedded-sdk-native.sh",
             "scripts/ci/test_embedded_sdk_native.py",
+            "scripts/ci/check_source_native.py",
+            "go/pkg/sources/native_integration_test.go",
+            "examples/grepstein/main.go",
             "scripts/pgwire_drivers/rust/src/main.rs",
             "scripts/test_pgwire_drivers.py",
         }

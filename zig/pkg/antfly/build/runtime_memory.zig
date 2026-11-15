@@ -273,6 +273,29 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
     };
 }
 
+/// Linked test consumers can omit DWARF without changing Debug safety or test
+/// selection. Symbol mode is part of this measured profile, never inferred from
+/// the optimization level. Unmeasured hosts retain the authored fallback.
+pub fn linkedTestCompileMaxRss(name: []const u8, host: std.Target, target: std.Target, optimize: ?std.lang.Optimize, stripped_default_selection: bool, authored: usize) usize {
+    const public_contract = std.mem.eql(u8, name, "public-api-parity");
+    const public_integration = std.mem.eql(u8, name, "public-api-integration");
+    if (!public_contract and !public_integration)
+        return testCompileMaxRss(name, host, target, optimize, authored);
+    const gib = 1024 * 1024 * 1024;
+    const baseline = std.Target.Cpu.baseline(target.cpu.arch, target.os);
+    if (stripped_default_selection and optimize == .debug and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        host.os.tag == .linux and host.cpu.arch == .x86_64 and host.abi == .gnu and
+        target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
+        target.cpu.model == baseline.model and target.cpu.features.eql(baseline.features))
+    {
+        // Native Nix glibc Zig, run 43621672224: 11,473,981,440 and
+        // 11,961,499,648 bytes. Peak + 10%, rounded up to whole GiB.
+        return @max(authored, @as(usize, if (public_contract) 12 else 13) * gib);
+    }
+    return testCompileMaxRss(name, host, target, optimize, @max(authored, 15 * gib));
+}
+
 /// Test objects have different working sets from runtime archives. Keep
 /// measured floors at their compilation boundary.
 pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target, optimize: ?std.lang.Optimize, authored: usize) usize {
@@ -306,6 +329,9 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
             // larger peak plus 10%, rounded up to 128 MiB. Qualified local
             // SDK profiles retain their independent claims below.
             .{ .name = test_owner_names.capi_contract, .mib = 20_096 },
+            // Complete native Debug unit gate on SDK 27.0 reached
+            // 19,627,360,256 bytes; apply the same 10% / 128 MiB rule.
+            .{ .name = "api-docid-tests", .mib = 21_888 },
             .{ .name = "data-runtime-tests", .mib = 15_616 },
             .{ .name = "data-runtime-implementation-tests", .mib = 21_888 },
         };
@@ -317,10 +343,11 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
         const floors = [_]struct { name: []const u8, gib: usize }{
             .{ .name = "metadata-unit-lane-a-tests", .gib = 22 },
             .{ .name = "metadata-unit-lane-b-tests", .gib = 22 },
-            // Native Debug/SDK 26.5 measured 23,968,071,680 bytes.
-            // Reserve >=25% headroom; this is compiler memory, not runtime.
+            // Native SQL parity compilation needs the measured 28GiB floor.
             .{ .name = "public-api-parity", .gib = 28 },
             .{ .name = "api-docid-tests", .gib = 18 },
+            // Keep the integration subset at its mainline measured parent floor.
+            .{ .name = "public-api-integration", .gib = 22 },
             .{ .name = "api-auth-tests", .gib = 17 },
             .{ .name = "api-derived-coverage-tests", .gib = 17 },
             .{ .name = "raft-unit-tests", .gib = 17 },
@@ -350,7 +377,10 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
         // rounded to whole GiB, fits the 20 GiB scheduler with room for
         // small compilers instead of forcing a failed-claim recompilation.
         .{ .name = test_owner_names.capi_contract, .gib = 18 },
-        .{ .name = "public-api-parity", .gib = 20 },
+        // Unstripped native Debug, run 43624778060. These peaks must not
+        // be replaced by the stripped CI profile above.
+        .{ .name = "public-api-parity", .gib = 23 },
+        .{ .name = "public-api-integration", .gib = 22 },
         .{ .name = "data-runtime-tests", .gib = 14 },
         .{ .name = "standalone-runtime-owner-tests", .gib = 16 },
         .{ .name = "data-runtime-implementation-tests", .gib = 18 },
@@ -640,8 +670,8 @@ test "linked LLVM Debug test reservations cover native peaks without lowering au
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const gib = 1024 * 1024 * 1024;
-    const names = [_][]const u8{ "public-api-parity", "data-runtime-tests" };
-    const peaks = [_]usize{ 16_964_825_088, 11_133_898_752 };
+    const names = [_][]const u8{"data-runtime-tests"};
+    const peaks = [_]usize{11_133_898_752};
     for (names, peaks) |name, peak| {
         const claim = testCompileMaxRss(name, linux, linux, .debug, 7 * gib);
         try std.testing.expect(claim >= peak + peak / 4);
@@ -776,6 +806,7 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
         .{ .name = test_owner_names.root_unit, .peak = 17_932_107_776 },
         .{ .name = test_owner_names.api_storage_authority, .peak = 12_037_652_480 },
         .{ .name = test_owner_names.capi_contract, .peak = 19_145_900_032 },
+        .{ .name = "api-docid-tests", .peak = 20_845_002_752 },
         .{ .name = "data-runtime-tests", .peak = 14_813_134_848 },
         .{ .name = "data-runtime-implementation-tests", .peak = 20_858_257_408 },
     }) |sample| {
@@ -789,6 +820,8 @@ test "expanded Darwin Debug claims cover complete peaks with bounded headroom" {
         try std.testing.expectEqual(7 * gib, testCompileMaxRss(sample.name, macos, linux, .debug, 7 * gib));
     }
     const budget = 36 * gib * 4 / 5;
+    try std.testing.expect(testCompileMaxRss("api-docid-tests", macos, macos, .debug, 0) + 7 * gib <= budget);
+    try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-docid-tests", linux, linux, .debug, 7 * gib));
     try std.testing.expect(testCompileMaxRss("root-unit-tests", macos, macos, .debug, 0) + 10 * gib <= budget);
     // The expanded data graph can still overlap a seven-GiB owner. Its
     // measured footprint no longer permits the old nine-GiB pairing.
@@ -889,5 +922,27 @@ test "native Linux ARM64 CPU Debug API claim covers its measured peak" {
             else => 12,
         };
         try std.testing.expectEqual(expected_gib * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+    }
+}
+
+test "public API test claims distinguish measured symbol profiles and retain small-owner overlap" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const gib = 1024 * 1024 * 1024;
+    const names = [_][]const u8{ "public-api-parity", "public-api-integration" };
+    const stripped_peaks = [_]usize{ 11_473_981_440, 11_961_499_648 };
+    const unstripped_peaks = [_]usize{ 21_511_946_240, 21_357_522_944 };
+    for (names, stripped_peaks, unstripped_peaks) |name, stripped_peak, unstripped_peak| {
+        const stripped = linkedTestCompileMaxRss(name, linux, linux, .debug, true, 0);
+        const unstripped = linkedTestCompileMaxRss(name, linux, linux, .debug, false, 0);
+        const required = stripped_peak + (stripped_peak + 9) / 10;
+        try std.testing.expect(stripped >= required and stripped < required + gib);
+        try std.testing.expect(unstripped >= unstripped_peak + (unstripped_peak + 9) / 10);
+        try std.testing.expect(stripped + 7 * gib <= 20 * gib);
+        try std.testing.expect(linkedTestCompileMaxRss(name, macos, macos, .debug, false, 0) >=
+            testCompileMaxRss("public-api-parity", macos, macos, .debug, 15 * gib));
+        try std.testing.expectEqual(24 * gib, linkedTestCompileMaxRss(name, linux, linux, .debug, true, 24 * gib));
+        try std.testing.expectEqual(15 * gib, linkedTestCompileMaxRss(name, macos, linux, .debug, true, 0));
+        try std.testing.expectEqual(15 * gib, linkedTestCompileMaxRss(name, linux, linux, .safe, true, 0));
     }
 }

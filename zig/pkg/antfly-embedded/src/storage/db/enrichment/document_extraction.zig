@@ -1360,6 +1360,7 @@ pub const NativeTextConfig = struct {
 pub const ChecksumAlgorithm = enum { sha256 };
 
 pub const Config = struct {
+    cancellation: PdfCancellationProbe = .{},
     filename: []const u8 = "",
     content_type: []const u8 = "",
     etag: []const u8 = "",
@@ -2650,6 +2651,71 @@ pub fn isValidSha256Hex(value: []const u8) bool {
     return true;
 }
 
+/// Shared byte identity for precommit and supervised extraction. Compose the
+/// already computed download digest when available; policy changes invalidate
+/// both execution paths identically without a second pass over source bytes.
+pub fn contentFingerprintAlloc(
+    alloc: Allocator,
+    source_url: []const u8,
+    config_json: []const u8,
+    config: Config,
+    configured_content_type: []const u8,
+    configured_filename: []const u8,
+    downloaded_content_type: []const u8,
+    data: []const u8,
+) ![]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    var source_url_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source_url, &source_url_digest, .{});
+    const identity = source_url_digest;
+    return contentFingerprintFromDigestAlloc(alloc, &identity, config_json, config, configured_content_type, configured_filename, downloaded_content_type, &digest);
+}
+
+/// Source identity is SHA-256 of the fetch URL; content digest is SHA-256 of
+/// the verified download. Hashing parameters identically avoids regenerating
+/// precomputed artifacts when their source first enters background replay.
+pub fn contentFingerprintFromDigestAlloc(
+    alloc: Allocator,
+    source_identity: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    config_json: []const u8,
+    config: Config,
+    configured_content_type: []const u8,
+    configured_filename: []const u8,
+    downloaded_content_type: []const u8,
+    content_digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) ![]u8 {
+    const native_text = config.native_text;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashRenderPolicy(&hasher, config);
+    hasher.update("antfly.document-extraction.fingerprint.v4\x00");
+    hasher.update(source_identity);
+    for ([_][]const u8{ config_json, native_text_extraction_identity, @tagName(native_text.policy), configured_content_type, configured_filename, downloaded_content_type }) |field| {
+        var size: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size, @intCast(field.len), .little);
+        hasher.update(&size);
+        hasher.update(field);
+    }
+    for ([_]u64{
+        @intCast(native_text.quality.min_chars),
+        @intCast(native_text.quality.garbled_min_words),
+        @intCast(native_text.quality.garbled_sample_words),
+        @bitCast(native_text.quality.max_single_char_word_ratio),
+        @intCast(native_text.quality.min_line_chars),
+        @bitCast(native_text.quality.max_corrupted_line_ratio),
+        @bitCast(native_text.quality.max_font_corruption),
+        @bitCast(native_text.quality.max_replacement_ratio),
+    }) |value| {
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, value, .little);
+        hasher.update(&encoded);
+    }
+    hasher.update(content_digest);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try hexBytesAlloc(alloc, &digest);
+}
+
 /// Verified identity binds the digest and extraction inputs, including the URL
 /// extension predicates used for routing. Hosts and signed query parameters
 /// do not affect it. An unresolved response MIME requires download first.
@@ -2909,6 +2975,7 @@ pub fn extractDownloadedStreaming(
     config: Config,
     sink: UnitSink,
 ) !void {
+    try config.cancellation.check();
     var marking = UnconfiguredGeneratedTextSink{ .alloc = alloc, .config = &config, .inner = sink };
     return extractDownloadedStreamingUnmarked(alloc, downloaded, source_url, config, marking.sink());
 }
@@ -2923,14 +2990,14 @@ fn extractDownloadedStreamingUnmarked(
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
-        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.native_text, config.ocr_mode, config.pdf_decode_limits, sink);
+        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.native_text, config.ocr_mode, config.pdf_decode_limits, config.cancellation, sink);
     }
     if (config.route_preset == .explicit_only) {
         try streamUnsupportedResult(sink, content_type, "no_configured_route_matched");
         return;
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.native_text, config.ocr_mode, config.pdf_decode_limits, sink);
+        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.native_text, config.ocr_mode, config.pdf_decode_limits, config.cancellation, sink);
     }
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitStreaming(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags, sink);
@@ -2971,10 +3038,11 @@ fn extractWithRouteStreaming(
     native_text: NativeTextConfig,
     ocr_mode: OcrMode,
     pdf_decode_limits: pdf.reader.DecodeLimits,
+    cancellation: PdfCancellationProbe,
     sink: UnitSink,
 ) !void {
     switch (route.extractor_type) {
-        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, native_text, ocr_mode, pdf_decode_limits, sink),
+        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, native_text, ocr_mode, pdf_decode_limits, cancellation, sink),
         .html => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags, sink),
         .text => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "document", "text", false, sink),
         .email => return try streamBufferedExtraction(alloc, try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"), sink),
@@ -3313,8 +3381,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
     };
 }
 
-fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, decode_limits: pdf.reader.DecodeLimits, sink: UnitSink) !void {
-    var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
+fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, decode_limits: pdf.reader.DecodeLimits, cancellation: PdfCancellationProbe, sink: UnitSink) !void {
+    var parsed = try pdf.reader.Reader.initWithDecodeLimitsAndCancellation(alloc, bytes, decode_limits, cancellation);
     defer parsed.deinit();
     parsed.setTextExtractionPolicy(native_text.policy);
 

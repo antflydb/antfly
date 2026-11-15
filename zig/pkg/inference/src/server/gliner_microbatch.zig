@@ -163,9 +163,11 @@ pub const BoundaryCohort = struct {
     }
 };
 
-pub fn classificationBudget(limits: memory.Limits, config: span.EncoderConfig, sequence: usize, rows: usize) !memory.RunBudget {
+pub fn classificationBudget(limits: memory.Limits, config: span.EncoderConfig, sequence: usize, rows: usize, workspace_bytes: usize) !memory.RunBudget {
     if (rows == 0 or rows > 8 or sequence == 0 or sequence > 512) return error.InvalidMicrobatchLimits;
-    const device = try std.math.mul(usize, try span.deviceScratchUpperBound(config, sequence), rows);
+    const activations = try std.math.mul(usize, try span.deviceScratchUpperBound(config, sequence), rows);
+    // All projections share one workspace; physical rows multiply only activations.
+    const device = try std.math.add(usize, activations, workspace_bytes);
     var budget = memory.RunBudget.init(limits);
     try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = 32 * 1024 * 1024, .scratch_tier = .host });
     try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = device, .scratch_tier = .backend });
@@ -237,13 +239,17 @@ test "gliner microbatch classification counts every padded row and never widens 
     const config = span.EncoderConfig{ .deberta = .{} };
     const one = try span.deviceScratchUpperBound(config, 128);
     const limits = memory.Limits{ .backend_limit_bytes = one * 2, .scratch_limit_bytes = 32 * 1024 * 1024 + one * 2 };
-    const budget = try classificationBudget(limits, config, 128, 2);
+    const budget = try classificationBudget(limits, config, 128, 2, 0);
     try std.testing.expectEqual(one * 2, budget.backend_scratch_bytes);
     try std.testing.expectEqualDeep(limits, budget.limits);
-    try std.testing.expectError(error.MemoryBudgetExceeded, classificationBudget(limits, config, 128, 3));
-    _ = try classificationBudget(limits, config, 128, 1);
-    try std.testing.expectError(error.InvalidMicrobatchLimits, classificationBudget(limits, config, 513, 1));
-    try std.testing.expectError(error.InvalidMicrobatchLimits, classificationBudget(limits, config, 128, 9));
+    const workspace = 32 * 1024 * 1024;
+    const with_workspace = try classificationBudget(.{}, config, 128, 2, workspace);
+    try std.testing.expectEqual(one * 2 + workspace, with_workspace.backend_scratch_bytes);
+    try std.testing.expectError(error.MemoryBudgetExceeded, classificationBudget(limits, config, 128, 2, workspace));
+    try std.testing.expectError(error.MemoryBudgetExceeded, classificationBudget(limits, config, 128, 3, 0));
+    _ = try classificationBudget(limits, config, 128, 1, 0);
+    try std.testing.expectError(error.InvalidMicrobatchLimits, classificationBudget(limits, config, 513, 1, 0));
+    try std.testing.expectError(error.InvalidMicrobatchLimits, classificationBudget(limits, config, 128, 9, 0));
 }
 
 test "gliner microbatch classification output admission outlives independent consumers and clone failures" {

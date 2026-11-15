@@ -55,6 +55,9 @@ pub const Capability = extern struct {
 pub const BorrowedAllocator = struct {
     backing: A,
     capacity: ?Capability,
+    /// Owner-wide provenance includes allocations outside private map/transport
+    /// budgets. Only failed raw allocations set it; resize refusal is normal.
+    backing_allocation_failed: std.atomic.Value(bool) = .init(false),
     pub fn init(backing: A, capacity: ?Capability) !BorrowedAllocator {
         if (capacity) |value| try value.validate();
         return .{ .backing = backing, .capacity = capacity };
@@ -70,7 +73,10 @@ pub const BorrowedAllocator = struct {
     const vtable: A.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *BorrowedAllocator = @ptrCast(@alignCast(raw));
-        return self.backing.rawAlloc(len, alignment, ra);
+        return self.backing.rawAlloc(len, alignment, ra) orelse {
+            self.backing_allocation_failed.store(true, .monotonic);
+            return null;
+        };
     }
     fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *BorrowedAllocator = @ptrCast(@alignCast(raw));
@@ -85,3 +91,13 @@ pub const BorrowedAllocator = struct {
         self.backing.rawFree(bytes, alignment, ra);
     }
 };
+
+test "external lake execution backing OOM provenance survives successful allocations" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var borrowed = try BorrowedAllocator.init(failing.allocator(), null);
+    const bytes = try borrowed.allocator().alloc(u8, 1);
+    borrowed.allocator().free(bytes);
+    try std.testing.expect(!borrowed.backing_allocation_failed.load(.monotonic));
+    try std.testing.expectError(error.OutOfMemory, borrowed.allocator().alloc(u8, 1));
+    try std.testing.expect(borrowed.backing_allocation_failed.load(.monotonic));
+}

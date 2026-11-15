@@ -187,11 +187,86 @@ pub const RequestLimits = struct {
     sequence_tokens: usize = 198,
 };
 pub const cuda_batch_items: usize = 8;
-const legacy_cuda_limits = RequestLimits{ .request_items = cuda_batch_items, .prepared_sequences = cuda_batch_items, .sequence_tokens = 512 };
+// Both pinned artifacts compose larger requests from eight-row physical batches.
+pub const cuda_request_items: usize = 32;
+// Six square attention projections and two FFN projections in each layer.
+pub const cuda_q8_projection_mirror_bytes: usize = 24 * (6 * 1024 * 1024 + 2 * 1024 * 4096) * @sizeOf(f16);
+const legacy_cuda_limits = RequestLimits{ .request_items = cuda_request_items, .prepared_sequences = cuda_request_items, .sequence_tokens = 512 };
 pub const metal_batch_items: usize = 8;
 
-/// The two immutable precision variants share the measured request geometry.
-/// Their numerical and serving evidence remain independently captured.
+/// Execution tuning for the exact dense DeBERTa Decide artifact. These are
+/// internal physical-forward limits; the public request envelope is unchanged.
+pub const MetalExecutionPolicy = struct {
+    batch_items: usize = 8,
+    padded_batch_tokens: usize = 1000,
+    reuse_batch_padding: bool = true,
+    packed_qkv_cache_bytes: usize = 512 * 1024 * 1024,
+    attention_scratch_bytes: usize = 32 * 1024 * 1024,
+};
+
+pub fn metalExecutionPolicy(identity: Identity) ?MetalExecutionPolicy {
+    return if (isLegacyDecide(identity) or isLegacyDecideQ8(identity)) .{} else null;
+}
+
+/// Shared physical-forward policy for loaded-model, benchmark and HTTP callers.
+/// Only an authenticated pinned artifact receives these execution limits.
+pub const ExecutionBatchPolicy = struct {
+    batch_items: usize,
+    padded_batch_tokens: usize,
+    reuse_batch_padding: bool = false,
+};
+
+pub fn executionBatchPolicy(identity: Identity, backend: Backend) ?ExecutionBatchPolicy {
+    if (backend == .metal) {
+        const policy = metalExecutionPolicy(identity) orelse return null;
+        return .{ .batch_items = policy.batch_items, .padded_batch_tokens = policy.padded_batch_tokens, .reuse_batch_padding = policy.reuse_batch_padding };
+    }
+    if (backend == .cuda and (isLegacyDecide(identity) or isLegacyDecideQ8(identity)))
+        return .{ .batch_items = cuda_batch_items, .padded_batch_tokens = cuda_batch_items * legacy_cuda_limits.sequence_tokens };
+    return null;
+}
+
+test "Decide CUDA execution batches bind both pinned artifacts without changing Metal" {
+    for ([_]Identity{ legacyIdentity(), pinned_legacy_q8_identity }) |identity| {
+        const cuda = executionBatchPolicy(identity, .cuda).?;
+        try std.testing.expectEqual(@as(usize, 8), cuda.batch_items);
+        try std.testing.expectEqual(@as(usize, 4096), cuda.padded_batch_tokens);
+        try std.testing.expect(!cuda.reuse_batch_padding);
+        const metal = executionBatchPolicy(identity, .metal).?;
+        try std.testing.expectEqual(@as(usize, 8), metal.batch_items);
+        try std.testing.expectEqual(@as(usize, 1000), metal.padded_batch_tokens);
+        try std.testing.expect(metal.reuse_batch_padding);
+        try std.testing.expect(executionBatchPolicy(identity, .native) == null);
+        var changed = identity;
+        changed.weight.sha256[0] ^= 1;
+        try std.testing.expect(executionBatchPolicy(changed, .cuda) == null);
+    }
+    try std.testing.expect(executionBatchPolicy(pinned_fp32_identity, .cuda) == null);
+}
+
+/// Conservative admission hint, never an execution or qualification grant.
+/// The loader still authenticates the complete consumed identity before
+/// installing the policy. Unknown weights may only be over-reserved here.
+pub fn metalPolicySidecarHint(config: ?Digest, encoder: ?Digest) bool {
+    return digestMatches(config orelse return false, legacy_config) and
+        digestMatches(encoder orelse return false, legacy_encoder_config);
+}
+
+test "GLiNER Decide Metal policy binds the dense artifact and keeps admission conservative" {
+    var identity = legacyIdentity();
+    const policy = metalExecutionPolicy(identity).?;
+    try std.testing.expectEqual(@as(usize, 8), policy.batch_items);
+    try std.testing.expectEqual(@as(usize, 1000), policy.padded_batch_tokens);
+    try std.testing.expect(metalPolicySidecarHint(identity.sidecars.config, identity.sidecars.encoder_config));
+    identity.weight.sha256[0] = if (identity.weight.sha256[0] == '0') '1' else '0';
+    try std.testing.expect(metalExecutionPolicy(identity) == null);
+    try std.testing.expect(metalPolicySidecarHint(identity.sidecars.config, identity.sidecars.encoder_config));
+    try std.testing.expect(!metalPolicySidecarHint(null, identity.sidecars.encoder_config));
+    try std.testing.expect(metalExecutionPolicy(pinned_fp32_identity) == null);
+}
+
+/// Variant-specific limits supplement the legacy native policy. CUDA FP32
+/// request cardinality is checked separately by requireRequestIdentity.
 pub fn requestLimits(identity: Identity) !?RequestLimits {
     const variant = try require(identity);
     if (variant == .decide_deberta_q8) return legacy_cuda_limits;
@@ -208,6 +283,7 @@ pub fn requireRequestIdentity(identity: Identity, backend: Backend, items: usize
     // Native and Metal retain the existing request envelope. Metal's physical
     // batches are bounded independently; larger requests use multiple forwards.
     // The processor still enforces per-sequence and per-item split limits.
+    if ((variant == .decide_deberta or variant == .decide_deberta_q8) and backend == .metal) return;
     if (variant == .decide_deberta and backend != .cuda) return;
     if (variant == .decide_deberta_q8) {
         if (backend != .cuda) return error.UnsupportedGlinerDecisionBackend;
@@ -237,6 +313,16 @@ fn legacyIdentity() Identity {
         },
     };
 }
+
+pub const pinned_legacy_fp32_identity = legacyIdentity();
+
+pub const pinned_legacy_q8_identity = blk: {
+    var identity = legacyIdentity();
+    identity.inventory.all_f32 = false;
+    identity.weight = digestFromPin(legacy_q8_encoder);
+    identity.weight_companion = digestFromPin(legacy_q8_head);
+    break :blk identity;
+};
 
 test "GLiNER Decide qualification binds exact loaded legacy identity" {
     var identity = legacyIdentity();
@@ -329,10 +415,10 @@ test "GLiNER Decide Q8 CUDA qualification binds both exact files and bounded req
     identity.weight = digestFromPin(legacy_q8_encoder);
     identity.weight_companion = digestFromPin(legacy_q8_head);
     try std.testing.expectEqual(QualifiedVariant.decide_deberta_q8, try require(identity));
-    for ([_]usize{ 1, 2, 4, 8 }) |n| try requireRequestIdentity(identity, .cuda, n, n, 512);
-    for ([_]Backend{ .native, .metal, .other }) |backend|
+    for ([_]usize{ 1, 2, 4, 8, 9, 16, 32 }) |n| try requireRequestIdentity(identity, .cuda, n, n, 512);
+    for ([_]Backend{ .native, .other }) |backend|
         try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireRequestIdentity(identity, backend, 1, 1, 64));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 9, 9, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 33, 33, 64));
     try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 2, 64));
     try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 1, 513));
     try std.testing.expect(!supportsSpanExtraction(identity));
@@ -355,15 +441,15 @@ test "GLiNER Decide Q8 CUDA qualification binds both exact files and bounded req
 
 test "GLiNER Decide CUDA legacy geometry stays bounded without changing native policy" {
     const identity = legacyIdentity();
-    for ([_]usize{ 1, 2, 4, 8 }) |n| try requireRequestIdentity(identity, .cuda, n, n, 512);
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 9, 9, 64));
+    for ([_]usize{ 1, 2, 4, 8, 9, 16, 32 }) |n| try requireRequestIdentity(identity, .cuda, n, n, 512);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 33, 33, 64));
     try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 2, 64));
     try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 1, 513));
     try requireRequestIdentity(identity, .native, 2, 2, 512);
     try requireRequestIdentity(identity, .metal, 2, 2, 512);
 }
 
-test "GLiNER Decide Metal FP32 batching preserves split tasks and rejects Q8" {
+test "GLiNER Decide Metal FP32 and Q8 batching preserve split tasks" {
     const identity = legacyIdentity();
     // Eight is a physical forward limit, not a replacement for the established
     // public request cardinality and serial split-task envelope.
@@ -373,5 +459,9 @@ test "GLiNER Decide Metal FP32 batching preserves split tasks and rejects Q8" {
     q8.weight = digestFromPin(legacy_q8_encoder);
     q8.weight_companion = digestFromPin(legacy_q8_head);
     q8.inventory.all_f32 = false;
-    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireRequestIdentity(q8, .metal, 2, 2, 64));
+    for ([_]usize{ 1, 8, 32, 128 }) |n| try requireRequestIdentity(q8, .metal, n, n, 512);
+    try requireRequestIdentity(q8, .metal, 8, 64, 512);
+    try std.testing.expectEqualDeep(metalExecutionPolicy(identity).?, metalExecutionPolicy(q8).?);
+    q8.weight_companion.?.sha256[0] ^= 1;
+    try std.testing.expect(metalExecutionPolicy(q8) == null);
 }

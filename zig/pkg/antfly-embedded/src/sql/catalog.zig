@@ -560,6 +560,9 @@ pub const Table = struct {
     /// External bindings are read-only and pinned by the serving cursor.
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     external_indexes: ?ExternalIndexes = null,
+    /// Execution-owned catalog cut for resolving explicit index aliases.
+    /// Never retain this in a schema or prepared-plan cache.
+    index_catalog_json: []const u8 = "{}",
     columns: []const Column,
     /// Optional directory retained by the same immutable owner as columns.
     column_index: ?*const std.StringHashMapUnmanaged(usize) = null,
@@ -1331,7 +1334,7 @@ pub const ColumnPage = struct {
             .dictionary_bytes => |values| .{ .string = values.at(index) },
             .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, alloc, values[index], .{ .allocate = .alloc_always, .parse_numbers = false }),
             .decimal128 => |values| .{ .string = try values.text(alloc, index) },
-            .vector_f32 => return error.UnsupportedSqlExecution,
+            .vector_f32 => try column.values.jsonAt(alloc, index),
         };
         return .{ .value = value, .sql_null = false };
     }
@@ -1893,6 +1896,7 @@ pub const Backend = struct {
         abort: *const fn (*anyopaque) void,
     };
     pub const PreparedRead = struct { name: ast.Name, relation: ReadRelation };
+    index_attribution: ?struct { ptr: *anyopaque, bind: *const fn (*anyopaque, ?@import("cypher").backend.IndexObserver) void } = null,
     distributed_join: ?DistributedJoin = null,
     distributed_context: @import("../api/operation.zig").RequestContext = .{},
     /// Immutable name/type scope pinned by one statement-effect binding.

@@ -16,15 +16,31 @@
 //! Checked allocation-failure campaigns with optional successful-allocation traces.
 const std = @import("std");
 
+pub const CheckedAllocator = struct {
+    safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true }),
+    traces: bool,
+
+    pub fn init() !CheckedAllocator {
+        return .{ .traces = try allocationTracesEnabled() };
+    }
+
+    pub fn allocator(self: *@This()) std.mem.Allocator {
+        return if (self.traces) std.testing.allocator else self.safe.allocator();
+    }
+
+    pub fn deinit(self: *@This()) void {
+        if (self.safe.deinit() != 0) @panic("video test allocator leaked");
+    }
+};
+
 pub fn checkAllAllocationFailures(comptime run: anytype, args: anytype) !void {
     // Keep exhaustive failure injection and SafeAllocator's leak, mismatch,
     // double-free and write-after-free checks. Capturing successful allocation
     // stacks in every replay dominates these repeated campaigns on Darwin.
     // FailingAllocator still retains the stack of the injected failure.
-    var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
-    defer if (safe.deinit() != 0) @panic("video test allocator leaked");
-    const traces = try allocationTracesEnabled();
-    try std.testing.checkAllAllocationFailures(if (traces) std.testing.allocator else safe.allocator(), run, args);
+    var checked = try CheckedAllocator.init();
+    defer checked.deinit();
+    try std.testing.checkAllAllocationFailures(checked.allocator(), run, args);
 }
 
 fn allocationTracesEnabled() !bool {

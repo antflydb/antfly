@@ -50,6 +50,31 @@ test('Laya upstream and native folders share a normalized config without mutatin
 });
 
 const root = process.env.LAYA_MODEL, wasmPath = process.env.EXTRACTION_WASM;
+test('tiny Laya tokenization rejects partial prefixes of unknown words', { skip: !wasmPath }, async () => {
+  const { instance } = await WebAssembly.instantiate(await readFile(wasmPath), { env: {} });
+  const wasm = instance.exports, abi = createWasmAbi(wasm);
+  const json = new Uint8Array(await layaFixture().get('tokenizer.json').arrayBuffer());
+  const jsonPtr = abi.alloc(json.length);
+  abi.copyBytesIn(jsonPtr, json);
+  let tokenizer = 0;
+  try {
+    tokenizer = wasm.load_tokenizer(jsonPtr, abi.size(json.length));
+    assert.notEqual(tokenizer, 0);
+    // Independent tokenizers==0.21.4 WordPiece IDs. Known prefixes must be
+    // rolled back when the suffix cannot be encoded, not retained before UNK.
+    for (const [text, expected] of [
+      ['not', [1]], ['statement', [1]], ['state no', [5, 13]],
+      ['false: no, the statement does not hold', [14, 10, 13, 1, 1, 1, 1, 1, 1]],
+    ]) {
+      const bytes = new TextEncoder().encode(text), ptr = abi.alloc(bytes.length), out = abi.alloc(64 * 4);
+      try {
+        abi.copyBytesIn(ptr, bytes);
+        const count = wasm.tokenize_raw(tokenizer, ptr, abi.size(bytes.length), out, 64);
+        assert.deepEqual(Array.from(abi.readCopy(Int32Array, out, count)), expected, text);
+      } finally { abi.free(out, 64 * 4); abi.free(ptr, bytes.length); }
+    }
+  } finally { if (tokenizer) wasm.unload_tokenizer(tokenizer); abi.free(jsonPtr, json.length); }
+});
 test('tiny Laya WASM: packed layouts, pointer, two-stage, Q8 and OpenDecider', { skip: !wasmPath, timeout: 120000 }, async () => {
   const { instance } = await WebAssembly.instantiate(await readFile(wasmPath), { env: {} });
   const session = new ExtractionSession(instance.exports, createWasmAbi(instance.exports));
@@ -73,11 +98,14 @@ test('tiny Laya WASM: packed layouts, pointer, two-stage, Q8 and OpenDecider', {
       assert.deepEqual(output.data[0].decisions.map(d => d.type), ['choice', 'score', 'boolean']);
       if (precision === 'fp32' && Object.keys(extra).length === 0) {
         // Stable numerical regression baseline for the deterministic tiny
-        // checkpoint. Released-model oracle tests run separately when present.
+        // checkpoint. Verified with upstream Laya common.py at 6a5819129e,
+        // torch 2.6.0, transformers 4.51.3 and tokenizers 0.21.4. The boolean
+        // default contains unknown words whose former partial-prefix leakage
+        // produced the obsolete snapshot. Released-model oracles run separately.
         const expected = [
           { label: 'fetch', probabilities: [0.33324423, 0.33341044, 0.33334532], act: 0.53863657 },
           { label: 'high', probabilities: [0.33296826, 0.33311945, 0.33391225], act: 0.54081124 },
-          { label: 'true', probabilities: [0.49963111, 0.50036889], act: 0.53691679 },
+          { label: 'true', probabilities: [0.49929258, 0.50070739], act: 0.53753626 },
         ];
         for (const [i, decision] of output.data[0].decisions.entries()) {
           assert.equal(decision.label, expected[i].label);

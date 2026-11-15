@@ -24,6 +24,23 @@ const execution_context = @import("antfly_inference_execution_context");
 const httpx = @import("httpx");
 const std = @import("std");
 
+const chunker = @import("inference_chunker");
+const Config = @import("types.zig").Config;
+pub const ChunkInputFn = *const fn (*anyopaque, std.mem.Allocator, []const u8, chunker.Input, Config) anyerror![]chunker.Chunk;
+pub const ChunkInputWithContextFn = *const fn (*anyopaque, std.mem.Allocator, []const u8, chunker.Input, Config, execution_context.RequestContext) anyerror![]chunker.Chunk;
+pub const ChunkPageWithContextFn = *const fn (*anyopaque, std.mem.Allocator, []const u8, chunker.Input, Config, execution_context.RequestContext) anyerror!chunker.types.ChunkPage;
+pub const CallbackBoundary = runtime_callback_abi.Boundary(struct {
+    chunk_page_with_context: ?ChunkPageWithContextFn = null,
+    chunk_input: ?ChunkInputFn = null,
+    chunk_input_with_context: ?ChunkInputWithContextFn = null,
+});
+
+pub const DispatchAccounting = struct {
+    ptr: *anyopaque,
+    begin: *const fn (*anyopaque) anyerror!u64,
+    finish: *const fn (*anyopaque, u64) void,
+};
+
 pub const Provider = struct {
     ptr: ?*anyopaque = null,
     boundary_dispatch: ?runtime_callback_abi.CallbackDispatch = null,
@@ -31,6 +48,7 @@ pub const Provider = struct {
     chunk_input_with_context_callback: ?*const anyopaque = null,
     chunk_page_with_context_callback: ?*const anyopaque = null,
     execution: execution_context.Context = .{},
+    dispatch_accounting: ?DispatchAccounting = null,
     owned_allocator: ?std.mem.Allocator = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
@@ -42,6 +60,7 @@ pub const Provider = struct {
     /// durable providers must copy request/catalog-owned routing values.
     pub fn ownExecutionStrings(self: Provider, alloc: std.mem.Allocator) !Provider {
         var owned = self;
+        owned.dispatch_accounting = null;
         // A second durable copy must never alias or free the first copy's
         // ownership bookkeeping. Only the execution slices are treated as
         // borrowed inputs to this construction.

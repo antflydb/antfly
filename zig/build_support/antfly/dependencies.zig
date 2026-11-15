@@ -322,6 +322,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const cypher_mod = @import("../../lib/cypher/build_support.zig").addSteps(b, .{
         .root = b.path("lib/cypher"),
         .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .target = target,
         .optimize = optimize,
         .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, .safe),
@@ -1030,6 +1031,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     hf_tokenizer_tests.root_module.addImport("antfly_platform", platform_mod);
     hf_tokenizer_tests.root_module.addImport("antfly_grapheme", regex_mod.import_table.get("antfly_grapheme").?);
     const run_hf_tokenizer_tests = b.addRunArtifact(hf_tokenizer_tests);
+    // Fixture paths are relative to the Zig build root, regardless of the
+    // directory invoking `zig build --build-file`.
+    run_hf_tokenizer_tests.setCwd(b.path("."));
     const hf_tokenizer_test_step = b.step(
         "lib-tokenizer-test",
         "Run Hugging Face tokenizer tests",
@@ -1350,6 +1354,21 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     inference_host_mod.addImport("antfly_inference_worker_rpc", inference_worker_rpc_mod);
     inference_host_mod.addImport("antfly_inference_worker_wire", inference_worker_wire_mod);
     inference_host_mod.addImport("antfly_inference_provider_failure", inference_provider_failure_mod);
+    const content_security_tests = b.step("inference-content-security-test", "Qualify live policy snapshots across local and worker inference boundaries");
+    for ([_]*std.Build.Module{ inference_bridge_mod, inference_worker_wire_mod, inference_host_mod, inference_server_mod, inference_worker_rpc_mod }) |module| {
+        const tests = b.addTest(.{ .root_module = module, .filters = &.{ "content security snapshot", "local source policy", "model aware media local source" } });
+        content_security_tests.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    const worker_transport_tests = b.step("inference-worker-transport-test", "Qualify bounded native worker framing, admission, cancellation and policy transport");
+    for ([_]*std.Build.Module{ inference_worker_wire_mod, inference_worker_rpc_mod }) |module| {
+        const tests = b.addTest(.{ .root_module = module });
+        worker_transport_tests.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    const worker_discovery_tests = b.addTest(.{ .root_module = inference_host_mod, .filters = &.{"worker discovery prefers the CLI OS path"} });
+    worker_transport_tests.dependOn(&b.addRunArtifact(worker_discovery_tests).step);
+
     // Native products always reuse the compiled Apache owners. Source-only
     // targets keep their own target implementation without a product toggle.
     const shared_inference_core = (target.result.os.tag == .macos or target.result.os.tag == .linux) and
@@ -1510,6 +1529,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .vector = vector_mod,
         .vectorindex = vectorindex_mod,
         .hash = hash_mod,
+        .compress = b.createModule(.{ .root_source_file = b.path("lib/compress/src/mod.zig"), .target = target, .optimize = optimize }),
         .matcher = matcher_mod,
         .resolver = resolver_mod,
         .casbin = casbin_mod,
@@ -1571,6 +1591,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_test_mod.addImport("antfly_casbin", casbin_mod);
     sql_test_mod.addImport("cypher", cypher_mod);
     sql_test_mod.addImport("antfly-json", json_mod);
+    sql_test_mod.addImport("antfly_vector", vector_mod);
     sql_test_mod.addImport("antfly_platform", platform_mod);
     sql_test_mod.addImport("antfly_generating", generating_mod);
     sql_test_mod.addImport("antfly_structured", structured_mod);

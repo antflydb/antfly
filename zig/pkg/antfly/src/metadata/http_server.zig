@@ -292,6 +292,8 @@ pub const AdminSource = struct {
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        linearizable_routing_token: ?*const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.CatalogRoutingChangeToken = null,
+        owner_readiness: ?*const fn (*anyopaque, metadata_api.OwnerReadinessRequest, operation.RequestContext) anyerror!metadata_api.OwnerReadiness = null,
         privacy_policy_binding: ?*const fn (*anyopaque, []const u8, operation.RequestContext) anyerror!metadata_api.PrivacyPolicyBinding = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         wait_for_routing_change: ?*const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, confirm_absence: bool) anyerror!metadata_api.CatalogRoutingChangeResult = null,
@@ -728,6 +730,8 @@ pub const AdminSource = struct {
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
+                .linearizable_routing_token = metadataServiceRoutingToken,
+                .owner_readiness = metadataServiceOwnerReadiness,
                 .privacy_policy_binding = metadataServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
@@ -802,6 +806,8 @@ pub const AdminSource = struct {
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
+                .linearizable_routing_token = metadataHttpServiceRoutingToken,
+                .owner_readiness = metadataHttpServiceOwnerReadiness,
                 .privacy_policy_binding = metadataHttpServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
@@ -1037,6 +1043,23 @@ pub const AdminSource = struct {
         try svc.ensureLinearizableReadWithContext(request);
         try request.ensureActive();
         return try svc.catalogTableRoutingSnapshot(table_name, request.deadline_ns);
+    }
+
+    fn metadataServiceRoutingToken(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingChangeToken {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        try svc.ensureLinearizableReadWithContext(request);
+        const token = try svc.catalogRoutingChangeToken();
+        try request.ensureActive();
+        return token;
+    }
+
+    fn metadataServiceOwnerReadiness(ptr: *anyopaque, input: metadata_api.OwnerReadinessRequest, request: operation.RequestContext) !metadata_api.OwnerReadiness {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        const result = try svc.ownerReadiness(input, .{ .deadline_ns = request.deadline_ns, .io = request.deadline_io, .cancellation = request.cancellation });
+        try request.ensureActive();
+        return result;
     }
 
     fn metadataServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.PrivacyPolicyBinding {
@@ -1561,6 +1584,23 @@ pub const AdminSource = struct {
         return try svc.catalogTableRoutingSnapshot(table_name, request.deadline_ns);
     }
 
+    fn metadataHttpServiceRoutingToken(ptr: *anyopaque, request: operation.RequestContext) !metadata_api.CatalogRoutingChangeToken {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        try svc.ensureLinearizableReadWithContext(request);
+        const token = try svc.catalogRoutingChangeToken();
+        try request.ensureActive();
+        return token;
+    }
+
+    fn metadataHttpServiceOwnerReadiness(ptr: *anyopaque, input: metadata_api.OwnerReadinessRequest, request: operation.RequestContext) !metadata_api.OwnerReadiness {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try request.ensureActive();
+        const result = try svc.ownerReadiness(input, .{ .deadline_ns = request.deadline_ns, .io = request.deadline_io, .cancellation = request.cancellation });
+        try request.ensureActive();
+        return result;
+    }
+
     fn metadataHttpServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.PrivacyPolicyBinding {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         try svc.ensureLinearizableReadWithContext(request);
@@ -2067,6 +2107,8 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableRoutingSnapshot));
         try server.post(routes.Routes.internal_table_routing_snapshot, httpx.Handler.bind(self, metadataTableRoutingSnapshot));
         try server.post(routes.Routes.internal_linearizable_table_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableTableRoutingSnapshot));
+        try server.post(routes.Routes.internal_routing_token, httpx.Handler.bind(self, metadataRoutingToken));
+        try server.post(routes.Routes.internal_owner_readiness, httpx.Handler.bind(self, metadataOwnerReadiness));
         try server.post(routes.Routes.internal_privacy_policy_binding, httpx.Handler.bind(self, metadataPrivacyPolicyBinding));
         try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));
@@ -2699,6 +2741,30 @@ pub const MetadataHttpServer = struct {
         return self.trackedRoutingSnapshotJsonUntil(ctx, result);
     }
 
+    fn metadataRoutingToken(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        const capture = self.source.vtable.linearizable_routing_token orelse return ctx.status(404).text("routing token unsupported");
+        const token = capture(self.source.ptr, request) catch |err| return metadataReadError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return ctx.json(token);
+    }
+
+    fn metadataOwnerReadiness(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const body = (try ctx.body()) orelse "";
+        var parsed = std.json.parseFromSlice(metadata_api.OwnerReadinessRequest, ctx.allocator, body, .{ .allocate = .alloc_always }) catch return ctx.status(400).text("invalid owner readiness request");
+        defer parsed.deinit();
+        if (parsed.value.table_id == 0 or parsed.value.owners.len == 0 or parsed.value.owners.len > 1024) return ctx.status(400).text("invalid owner readiness request");
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        const capture = self.source.vtable.owner_readiness orelse return ctx.status(503).text("owner readiness unavailable");
+        const result = capture(self.source.ptr, parsed.value, request) catch |err| return metadataReadError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return ctx.json(result);
+    }
+
     fn metadataPrivacyPolicyBinding(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
         var parsed = parseTableRoutingSnapshotRequest(ctx) catch return ctx.status(400).text("invalid privacy binding request");
@@ -3020,6 +3086,10 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.IndexReferencedByAlias or err == error.IndexAliasGraphConflict or err == error.PrivacyManagedGraph or err == error.PrivacyUnknownArtifactSource) {
+            try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
+            return ctx.status(409).text(@errorName(err));
+        }
         if (err == error.ResolverCurationConflict) {
             try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
             return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
@@ -4105,13 +4175,20 @@ pub const MetadataHttpServer = struct {
         const split_request = parseSplitRequest(ctx.allocator, (try ctx.body()) orelse "") catch
             return ctx.status(400).text("invalid split request");
         defer ctx.allocator.free(split_request.split_key);
-        self.tableOperations().requestSplit(ctx.allocator, requestContext(ctx), table_name, split_request) catch |err| return switch (err) {
-            error.TableNotFound, error.RangeNotFound => ctx.status(404).text("not found"),
-            error.DocIdentityNamespaceMismatch => ctx.status(409).text("doc identity namespace mismatch"),
-            error.SplitInProgress, error.ConflictingSplitTransition => ctx.status(409).text("split already in progress"),
-            error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
-            error.Canceled, error.DeadlineExceeded => metadataReadError(ctx, err),
-            else => ctx.status(400).text("invalid split request"),
+        try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
+        self.tableOperations().requestSplit(ctx.allocator, requestContext(ctx), table_name, split_request) catch |err| {
+            if (metadata_authority.isRetryableError(err) or err == error.MetadataMutationOutcomeUnknown or err == error.MetadataMutationNotApplied)
+                return metadataMutationError(ctx, err);
+            if (err == error.MetadataProposalApplyTimeout)
+                return metadataMutationError(ctx, error.MetadataMutationOutcomeUnknown);
+            return switch (err) {
+                error.TableNotFound, error.RangeNotFound => ctx.status(404).text("not found"),
+                error.DocIdentityNamespaceMismatch => ctx.status(409).text("doc identity namespace mismatch"),
+                error.SplitInProgress, error.ConflictingSplitTransition => ctx.status(409).text("split already in progress"),
+                error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+                error.Canceled, error.DeadlineExceeded => metadataReadError(ctx, err),
+                else => ctx.status(400).text("invalid split request"),
+            };
         };
         return ctx.status(202).text("accepted");
     }
@@ -4122,12 +4199,19 @@ pub const MetadataHttpServer = struct {
         defer ctx.allocator.free(table_name);
         const merge_request = parseMergeRequest(ctx.allocator, (try ctx.body()) orelse "") catch
             return ctx.status(400).text("invalid merge request");
-        self.tableOperations().requestMerge(ctx.allocator, requestContext(ctx), table_name, merge_request) catch |err| return switch (err) {
-            error.TableNotFound, error.RangeNotFound => ctx.status(404).text("not found"),
-            error.DocIdentityNamespaceMismatch => ctx.status(409).text("doc identity namespace mismatch"),
-            error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
-            error.Canceled, error.DeadlineExceeded => metadataReadError(ctx, err),
-            else => ctx.status(400).text("invalid merge request"),
+        try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
+        self.tableOperations().requestMerge(ctx.allocator, requestContext(ctx), table_name, merge_request) catch |err| {
+            if (metadata_authority.isRetryableError(err) or err == error.MetadataMutationOutcomeUnknown or err == error.MetadataMutationNotApplied)
+                return metadataMutationError(ctx, err);
+            if (err == error.MetadataProposalApplyTimeout)
+                return metadataMutationError(ctx, error.MetadataMutationOutcomeUnknown);
+            return switch (err) {
+                error.TableNotFound, error.RangeNotFound => ctx.status(404).text("not found"),
+                error.DocIdentityNamespaceMismatch => ctx.status(409).text("doc identity namespace mismatch"),
+                error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
+                error.Canceled, error.DeadlineExceeded => metadataReadError(ctx, err),
+                else => ctx.status(400).text("invalid merge request"),
+            };
         };
         return ctx.status(202).text("accepted");
     }
@@ -6728,10 +6812,11 @@ test "metadata http server preserves extension-owned table drop conflicts" {
     );
 }
 
-test "metadata http server replaces a table definition through compare-and-swap" {
+test "index alias metadata http server replaces a table definition through compare-and-swap" {
     const FakeSource = struct {
         replaced: bool = false,
         reject_not_leader: bool = false,
+        rejection: ?anyerror = null,
 
         fn iface(self: *@This()) AdminSource {
             return .{
@@ -6767,6 +6852,7 @@ test "metadata http server replaces a table definition through compare-and-swap"
         fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.reject_not_leader) return error.NotLeader;
+            if (self.rejection) |err| return err;
             if (expected.table_id != 42 or !std.mem.eql(u8, expected.description, "original")) return error.TableGenerationChanged;
             try std.testing.expectEqual(@as(u64, 42), replacement.table_id);
             try std.testing.expectEqualStrings("docs", replacement.name);
@@ -6841,6 +6927,19 @@ test "metadata http server replaces a table definition through compare-and-swap"
         http_common.metadata_mutation_not_admitted_value,
         rejected_response.headers.get(http_common.metadata_mutation_not_admitted_header).?,
     );
+    source.reject_not_leader = false;
+    for ([_]anyerror{ error.IndexReferencedByAlias, error.IndexAliasGraphConflict }) |err| {
+        source.rejection = err;
+        inline for (.{ MetadataHttpServer.metadataReplaceTableDefinition, MetadataHttpServer.metadataReplaceTableDefinitionStamped }) |handler| {
+            var conflict = try server.executeTypedHandlerWithBodyForTest(.PUT, "/internal/v1/tables/docs/definition", &table_params,
+                \\{"expected":{"table_id":42,"name":"docs","description":"original"},"definition":{"table_id":42,"name":"docs","description":"restored"}}
+            , handler);
+            defer conflict.deinit();
+            try std.testing.expectEqual(@as(u16, 409), conflict.status.code);
+            try std.testing.expectEqualStrings(@errorName(err), conflict.body.?);
+            try std.testing.expectEqualStrings(routes.Routes.raft_mutation_outcome_not_proposed, conflict.headers.get(routes.Routes.raft_mutation_outcome_header).?);
+        }
+    }
 }
 
 test "metadata http server registers nodes and marks node stores draining for shutdown" {
@@ -8256,6 +8355,7 @@ test "metadata http server rejects split and merge during active doc identity re
 test "metadata http server maps source split merge doc identity conflicts" {
     const FakeSource = struct {
         split_count: usize = 0,
+        failure: anyerror = error.DocIdentityNamespaceMismatch,
         merge_count: usize = 0,
 
         fn iface(self: *@This()) AdminSource {
@@ -8323,7 +8423,7 @@ test "metadata http server maps source split merge doc identity conflicts" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqualStrings("doc:m", req.split_key);
             self.split_count += 1;
-            return error.DocIdentityNamespaceMismatch;
+            return self.failure;
         }
 
         fn requestMerge(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: MergeRequest) !void {
@@ -8332,7 +8432,7 @@ test "metadata http server maps source split merge doc identity conflicts" {
             try std.testing.expectEqual(@as(u64, 10), req.donor_group_id);
             try std.testing.expectEqual(@as(u64, 9), req.receiver_group_id);
             self.merge_count += 1;
-            return error.DocIdentityNamespaceMismatch;
+            return self.failure;
         }
     };
 
@@ -8352,6 +8452,28 @@ test "metadata http server maps source split merge doc identity conflicts" {
 
     try std.testing.expectEqual(@as(usize, 1), source.split_count);
     try std.testing.expectEqual(@as(usize, 1), source.merge_count);
+    for ([_]anyerror{
+        error.NotLeader,
+        error.MetadataLinearizableReadTimeout,
+        error.MetadataMutationOutcomeUnknown,
+        error.MetadataProposalApplyTimeout,
+        error.MetadataMutationNotApplied,
+    }) |failure| {
+        source.failure = failure;
+        var unavailable_split = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs/split", &table_params, "{\"split_key\":\"doc:m\"}", MetadataHttpServer.metadataRequestTableSplit);
+        defer unavailable_split.deinit();
+        var unavailable_merge = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs/merge", &table_params, "{\"donor_group_id\":10,\"receiver_group_id\":9}", MetadataHttpServer.metadataRequestTableMerge);
+        defer unavailable_merge.deinit();
+        for ([_]*httpx.Response{ &unavailable_split, &unavailable_merge }) |response| {
+            try std.testing.expectEqual(@as(u16, 503), response.status.code);
+            const outcome = response.headers.get(routes.Routes.raft_mutation_outcome_header).?;
+            try std.testing.expectEqualStrings(
+                if (failure == error.NotLeader) routes.Routes.raft_mutation_outcome_not_proposed else if (failure == error.MetadataMutationNotApplied) routes.Routes.raft_mutation_outcome_not_applied else routes.Routes.raft_mutation_outcome_unknown,
+                outcome,
+            );
+            try std.testing.expectEqual(failure == error.NotLeader, response.headers.get(http_common.metadata_mutation_not_admitted_header) != null);
+        }
+    }
 }
 
 test "metadata merge request validation rejects incompatible doc identity namespaces" {

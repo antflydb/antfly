@@ -422,9 +422,9 @@ pub fn distanceToQueryF16(
     metric: DistanceMetric,
 ) f32 {
     return switch (metric) {
-        .l2_squared => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .l2_squared),
-        .inner_product => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .inner_product),
-        .cosine => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .cosine),
+        .l2_squared => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .l2_squared, false).distance,
+        .inner_product => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .inner_product, false).distance,
+        .cosine => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .cosine, false).distance,
     };
 }
 
@@ -446,11 +446,7 @@ pub fn distanceToQueryF16Bounded(
     candidate_scale: f32,
     metric: DistanceMetric,
 ) BoundedDistance {
-    const query_norm = switch (metric) {
-        .inner_product => norm(query),
-        .cosine => query_measure,
-        .l2_squared => 0,
-    };
+    const query_norm = projectionQueryNormUpper(query);
     return distanceToQueryF16BoundedWithQueryNorm(
         query,
         query_measure,
@@ -472,7 +468,6 @@ pub fn distanceToQueryF16BoundedWithQueryNorm(
     candidate_scale: f32,
     metric: DistanceMetric,
 ) BoundedDistance {
-    const score_distance = distanceToQueryF16(query, query_measure, candidate, candidate_scale, metric);
     var error_norm_squared: f64 = 0;
     var candidate_norm_squared: f64 = 0;
     for (candidate) |component_f16| {
@@ -487,13 +482,7 @@ pub fn distanceToQueryF16BoundedWithQueryNorm(
     const error_norm = error_norm_raw + 8.0 * std.math.floatEps(f32) * (error_norm_raw + 1.0);
     const candidate_norm_raw: f32 = @floatCast(@sqrt(candidate_norm_squared));
     const candidate_norm = @max(0, candidate_norm_raw - 8.0 * std.math.floatEps(f32) * (candidate_norm_raw + 1.0));
-    return boundedDistanceFromProjectionMetadata(
-        score_distance,
-        query_norm,
-        error_norm,
-        candidate_norm,
-        metric,
-    );
+    return certifiedDistanceToQueryF16(query, query_measure, query_norm, candidate, candidate_scale, error_norm, candidate_norm, metric);
 }
 
 /// Completes a float16 candidate score using quantization metadata persisted
@@ -604,13 +593,68 @@ fn widenF16x8(values: [8]f16) @Vector(8, f32) {
     return @floatCast(@as(@Vector(8, f16), values));
 }
 
+const ProjectionScore = struct { distance: f32, norm_squared: f32 };
+
+/// Upper query norm computed once per scoring request. Accumulate in f64 so
+/// subnormal or large f32 components cannot silently invalidate a certificate.
+pub fn projectionQueryNormUpper(query: []const f32) f32 {
+    var squared: f64 = 0;
+    for (query) |value| squared += @as(f64, value) * value;
+    return @floatCast(@sqrt(squared) * (1 + 8 * math.floatEps(f32)));
+}
+
+/// Bounds the authoritative f32 score, including both reconstruction error
+/// and arithmetic in the projection and full-vector kernels. The candidate
+/// norm is accumulated in the same SIMD pass as the score. Magnitudes for
+/// which the relative-error model is unsafe decline pruning with +inf.
+pub fn certifiedDistanceToQueryF16(
+    query: []const f32,
+    query_measure: f32,
+    query_norm_upper: f32,
+    candidate: []const f16,
+    candidate_scale: f32,
+    error_norm: f32,
+    decoded_norm_lower_bound: f32,
+    metric: DistanceMetric,
+) BoundedDistance {
+    const scored = switch (metric) {
+        .l2_squared => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .l2_squared, true),
+        .inner_product => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .inner_product, true),
+        .cosine => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .cosine, true),
+    };
+    var bounded = boundedDistanceFromProjectionMetadata(scored.distance, query_norm_upper, error_norm, decoded_norm_lower_bound, metric);
+    // Four SIMD accumulators each consume at most ceil(dims/32) terms.
+    // Two roundings per iteration plus 64 for merges/reductions/scalar tails
+    // bounds the longest dependency chain in both full and projection kernels.
+    const lane_steps = (candidate.len + 31) / 32;
+    const neps = (@as(f64, @floatFromInt(lane_steps)) * 2 + 64) * math.floatEps(f32);
+    const unsafe = BoundedDistance{ .distance = scored.distance, .error_bound = math.inf(f32) };
+    if (neps >= 0.125 or !math.isFinite(query_norm_upper) or !math.isFinite(scored.norm_squared) or
+        !math.isFinite(error_norm) or error_norm < 0) return unsafe;
+    const gamma = neps / (1 - neps);
+    const q = @as(f64, query_norm_upper) / (1 - gamma);
+    const v = @sqrt(@max(@as(f64, scored.norm_squared), 0)) / (1 - gamma) + @as(f64, error_norm);
+    const safe_max = @as(f64, math.floatMax(f32)) / 4;
+    if (q * q < math.floatMin(f32) or v * v < math.floatMin(f32) or q * v > safe_max or
+        (metric == .l2_squared and (q + v) * (q + v) > safe_max) or
+        (metric == .cosine and (q * q > safe_max or v * v > safe_max))) return unsafe;
+    const guard = switch (metric) {
+        .inner_product => 8 * gamma * q * v,
+        .l2_squared => 8 * gamma * (q + v) * (q + v),
+        .cosine => 32 * gamma,
+    };
+    bounded.error_bound += @as(f32, @floatCast(guard + math.floatMin(f32)));
+    return bounded;
+}
+
 fn distanceToQueryF16Metric(
     query: []const f32,
     query_measure: f32,
     candidate: []const f16,
     candidate_scale: f32,
     comptime metric: DistanceMetric,
-) f32 {
+    comptime certify: bool,
+) ProjectionScore {
     std.debug.assert(query.len == candidate.len);
     std.debug.assert(std.math.isFinite(candidate_scale) and candidate_scale > 0);
     const SimdF32 = @Vector(8, f32);
@@ -634,6 +678,12 @@ fn distanceToQueryF16Metric(
         const c1: SimdF32 = widenF16x8(candidate[i + 8 ..][0..8].*) * scale_vec;
         const c2: SimdF32 = widenF16x8(candidate[i + 16 ..][0..8].*) * scale_vec;
         const c3: SimdF32 = widenF16x8(candidate[i + 24 ..][0..8].*) * scale_vec;
+        if (certify and metric != .cosine) {
+            norm0 += c0 * c0;
+            norm1 += c1 * c1;
+            norm2 += c2 * c2;
+            norm3 += c3 * c3;
+        }
         switch (metric) {
             .l2_squared => {
                 const d0 = q0 - c0;
@@ -668,6 +718,7 @@ fn distanceToQueryF16Metric(
     var norm_squared: f32 = @reduce(.Add, norm0 + norm1 + norm2 + norm3);
     while (i < query.len) : (i += 1) {
         const value = @as(f32, @floatCast(candidate[i])) * candidate_scale;
+        if (certify and metric != .cosine) norm_squared += value * value;
         switch (metric) {
             .l2_squared => {
                 const diff = query[i] - value;
@@ -681,14 +732,14 @@ fn distanceToQueryF16Metric(
         }
     }
 
-    return switch (metric) {
+    return .{ .norm_squared = norm_squared, .distance = switch (metric) {
         .l2_squared => @max(0, sum),
         .inner_product => -sum,
         .cosine => if (query_measure == 0 or norm_squared == 0)
             1
         else
             1 - sum / (query_measure * @sqrt(norm_squared)),
-    };
+    } };
 }
 
 /// Compute cosine similarity between two vectors.
@@ -903,4 +954,97 @@ test "random orthogonal transformer round trips" {
     for (original, restored) |expected, actual| {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
     }
+}
+
+test "exact projection screening guards cancellation in inner products" {
+    var query: [128]f32 = undefined;
+    var source: [128]f32 = undefined;
+    var values: [128]f16 = undefined;
+    var error_squared: f64 = 0;
+    for (&query, &source, &values, 0..) |*q, *v, *half, i| {
+        q.* = if (i % 2 == 0) 10_000 else -10_000;
+        v.* = 100 + @as(f32, @floatFromInt(i % 7)) * 0.001;
+        half.* = @floatCast(v.*);
+        const delta = @as(f64, v.*) - @as(f64, @as(f32, half.*));
+        error_squared += delta * delta;
+    }
+    const error_norm: f32 = @floatCast(@sqrt(error_squared) * 1.00001);
+    const query_norm_upper = projectionQueryNormUpper(&query);
+    const projection_distance = distanceToQueryF16(&query, 0, &values, 1, .inner_product);
+    const bounded = certifiedDistanceToQueryF16(&query, 0, query_norm_upper, &values, 1, error_norm, 0, .inner_product);
+    const exact = distanceToQuery(&query, 0, &source, .inner_product);
+    try std.testing.expect(@abs(exact - projection_distance) <= bounded.error_bound);
+    try std.testing.expect(projection_distance - bounded.error_bound <= exact);
+}
+
+test "exact projection screening contains authoritative scores across scales and metrics" {
+    var random_state = std.Random.DefaultPrng.init(0xc37e_5ca1);
+    const random = random_state.random();
+    var query_storage: [3072]f32 = undefined;
+    var source_storage: [3072]f32 = undefined;
+    var values_storage: [3072]f16 = undefined;
+    const dimensions = [_]usize{ 1, 7, 8, 15, 31, 32, 33, 40, 127, 128, 1536, 3072 };
+    // Cartesian coverage: every dimension sees every scale and metric.
+    for (dimensions) |dims| for ([_]f32{ 1e-12, 1, 1e12 }) |candidate_scale| {
+        for (0..3) |_| {
+            const query = query_storage[0..dims];
+            const source = source_storage[0..dims];
+            const values = values_storage[0..dims];
+            var error_squared: f64 = 0;
+            var decoded_squared: f64 = 0;
+            for (query, source, values) |*q, *v, *half| {
+                q.* = (random.float(f32) * 2 - 1) * candidate_scale;
+                v.* = (random.float(f32) * 2 - 1) * candidate_scale;
+                half.* = @floatCast(v.* / candidate_scale);
+                const decoded: f32 = @as(f32, half.*) * candidate_scale;
+                const delta = @as(f64, v.*) - decoded;
+                error_squared += delta * delta;
+                decoded_squared += @as(f64, decoded) * decoded;
+            }
+            const error_norm: f32 = @floatCast(@sqrt(error_squared) * 1.00001);
+            const decoded_lower: f32 = @floatCast(@sqrt(decoded_squared) * 0.99999);
+            const query_norm_upper = projectionQueryNormUpper(query);
+            for ([_]DistanceMetric{ .inner_product, .cosine, .l2_squared }) |metric| {
+                const measure: f32 = switch (metric) {
+                    .inner_product => 0,
+                    .cosine => norm(query),
+                    .l2_squared => dot(query, query),
+                };
+                const bounded = certifiedDistanceToQueryF16(query, measure, query_norm_upper, values, candidate_scale, error_norm, decoded_lower, metric);
+                const exact = distanceToQuery(query, measure, source, metric);
+                try std.testing.expectEqual(distanceToQueryF16(query, measure, values, candidate_scale, metric), bounded.distance);
+                try std.testing.expect(bounded.distance - bounded.error_bound <= exact);
+                try std.testing.expect(exact <= bounded.distance + bounded.error_bound);
+            }
+        }
+    };
+}
+
+test "exact projection screening declines unsafe magnitudes and degenerate norms" {
+    const half = [_]f16{ 1, -1 };
+    for ([_]DistanceMetric{ .inner_product, .cosine, .l2_squared }) |metric| {
+        for ([_][2]f32{ .{ 0, 0 }, .{ 1e-30, -1e-30 } }) |query| {
+            const measure: f32 = switch (metric) {
+                .inner_product => 0,
+                .cosine => norm(&query),
+                .l2_squared => dot(&query, &query),
+            };
+            const bounded = certifiedDistanceToQueryF16(&query, measure, projectionQueryNormUpper(&query), &half, 1, 0, 1, metric);
+            try std.testing.expectEqual(math.inf(f32), bounded.error_bound);
+        }
+        const query = [_]f32{ 1, 0 };
+        for ([_]f32{ 1e-30, 1e30 }) |candidate_scale| {
+            const bounded = certifiedDistanceToQueryF16(&query, 1, projectionQueryNormUpper(&query), &half, candidate_scale, 0, candidate_scale, metric);
+            try std.testing.expectEqual(math.inf(f32), bounded.error_bound);
+        }
+        const invalid = certifiedDistanceToQueryF16(&query, 1, projectionQueryNormUpper(&query), &half, 1, math.nan(f32), 1, metric);
+        try std.testing.expectEqual(math.inf(f32), invalid.error_bound);
+    }
+    const query = [_]f32{ 1, 0 };
+    const near_zero = certifiedDistanceToQueryF16(&query, 1, projectionQueryNormUpper(&query), &half, 1e-20, 0, 1e-20, .cosine);
+    try std.testing.expectEqual(math.inf(f32), near_zero.error_bound);
+    // Even at ordinary magnitudes, normalization is uncertifiable when the
+    // reconstruction error reaches the lower norm endpoint.
+    const ambiguous = certifiedDistanceToQueryF16(&query, 1, projectionQueryNormUpper(&query), &half, 1, 1, 1, .cosine);
+    try std.testing.expectEqual(math.inf(f32), ambiguous.error_bound);
 }

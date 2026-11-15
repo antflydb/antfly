@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-11-02
+Last updated: 2026-11-10
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -302,7 +302,7 @@ python3 zig/tools/check_query_owner_cache.py --report .benchmark-results/compile
 |---|---|---|
 | Physical storage | Table/shard lifetime, DB/LSM/index loops, local plans, batches, transactions, snapshots, restore, maintenance, Lite and public CAPI exports | HTTP, auth, cluster routing, remote topology, model execution |
 | Server storage adapter | Server/Raft adaptation over the physical owner, live DB ownership and admission | Complete local-query code generation |
-| Local query owner | Complete search/graph/text/algebraic/preflight operations, parsing, read-generation leases, aggregations and response ownership | DB lifetime, per-record cross-owner callbacks, a second index implementation |
+| Local query dispatcher | Checked whole-operation dispatch through the opaque query ABI | Physical query implementations, storage layouts, DB lifetime or per-record cross-owner callbacks |
 | Distributed/standalone | Table routing, topology, leadership, fanout, merge, distributed transactions, HA control, standalone startup/shutdown | Physical DB, index-manager, LSM, enrichment implementation or a second inference implementation |
 | API kernel | HTTP, auth, public validation, request translation and protocol handlers | Provisioned DB ownership, physical query execution or Raft apply |
 | Serverless | Published-artifact orchestration and serverless requests | Provisioned storage ownership, physical index execution or cluster Raft apply |
@@ -385,13 +385,13 @@ warm builds, then verifies these source changes:
 
 | Changed source | Required rebuild | Required reuse |
 |---|---|---|
-| Read coordination | Distributed and local-query archives, affected consumer objects/links | Storage adapter and unrelated runtime/test objects |
+| Read coordination | `antfly-storage-kernel` and distributed archives, affected consumer objects/links | Opaque local-query dispatcher and unrelated runtime/test objects |
 | Write coordination | Distributed runtime and affected consumer objects/links | Other runtime archives and unrelated test objects |
-| Query-provider implementation | Local-query archive and final links | Storage adapter and consumer objects |
+| Opaque query dispatcher | Local-query archive and final links | Storage adapter, physical storage and consumer objects |
 | Storage-adapter implementation | Storage adapter and final links | Local-query archive and consumer objects |
-| Physical DB/local query | Storage and local-query archives and final test links | Unrelated runtime archives and consumer/owner test objects |
+| Physical DB/query implementation | `antfly-storage-kernel` archive and final test links | Opaque local-query dispatcher, unrelated runtime archives and consumer/owner test objects |
 | Owner or consumer test root | Its test object and final link | Every runtime archive and unrelated test objects |
-| Storage ABI contract | Storage, distributed runtime, owner tests | CLI, inference, enrichment |
+| Storage ABI contract | Storage, distributed runtime, owner tests | Opaque local-query dispatcher, CLI, inference, enrichment |
 
 This expensive check runs with `zig-full / build-cache`. The lightweight
 configuration fixtures remain useful for option and generator dependencies.
@@ -1865,6 +1865,15 @@ The same qualification measured the API document identity/restore root at
 floor is 18 GiB with the same profile guards and headroom. The object now has
 the explicit name `api-docid-tests` for attribution and can be qualified via
 `zig build antfly-api-docid-test` without rebuilding unrelated unit roots.
+A subsequent full native Apple Silicon Debug unit gate on 2026-11-10 with
+Zig 0.17.0 / SDK 27.0 reached 19,627,360,256 bytes and exceeded that claim.
+A separate cold compile completed in 208 seconds at `0e93ceb9b6`, with
+20,845,002,752 bytes of child RSS high-water and a sampled lifetime physical
+high-water of 20,843,347,968 bytes. The native Darwin Debug floor is now
+21,888 MiB: the larger complete peak plus 10%, rounded up to 128 MiB. This
+still permits a 7 GiB sibling within the default 28.8 GiB compiler budget on
+a 36 GiB host. Linux, optimized and cross-compiled profiles retain their
+existing reservations.
 The API auth and derived-coverage roots measured 13,895,155,712 and
 14,097,039,360 bytes. Both receive a 17 GiB native Darwin Debug floor under
 the same guards; they retain their existing focused targets and now use
@@ -2297,3 +2306,59 @@ headroom. With a 32 GiB aggregate budget, distributed work can overlap the
 API, while the storage archive must wait. Other owners, build modes,
 backends, custom CPU targets and sanitizer profiles retain their claims.
 The build policy regression checks the measured margin and overlap limits.
+
+### Public API contract and integration compiler owners (2026-11-14)
+
+The public API unit gate compiles transport/SQL contracts and its six native
+cluster integration fixtures as separate objects. Both remain part of the
+aggregate unit gate. The previous combined object reached 22,614,532,096 bytes
+against a 20 GiB claim in run 43565377975. Splitting separates fixture
+ownership, but does not by itself qualify the unstripped unit memory budget.
+
+`zig build public-api-parity-test` runs both owners. Runtime filters are checked
+against their combined inventory, including rejection of unmatched filters.
+The aggregate unit and integration gates use that same audited owner group,
+so a filter selecting only one shard does not fail in its empty sibling.
+An explicit `-Dtest-filter` retains the single-owner focused compile path so
+the selected test is not compiled and executed in both owners. The dedicated
+`inference-evaluation-graph-test` also follows the moved integration fixture.
+
+`zig build public-api-parity-compile` compiles both default owners without
+running their fixtures. The opt-in compile-cost workflow supports this target
+and uses the same pinned glibc-linked Nix Zig as production Linux CI. Select
+Debug with `strip: true` when qualifying CI unit reservations. Use
+`strip: false` to measure local Debug builds with symbols; those peaks have
+separate reservations and must not qualify the stripped CI profile. The workflow keeps
+its disposable output on the ARC cache volume and removes it after retaining
+the measurements. Focused CAPI and storage-owner-source profiles additionally
+accept a literal `test_filter` and retain per-test timing output.
+
+The paired native Linux measurements show why symbol configuration must be
+part of admission qualification:
+
+| Profile run | Symbols | Contract object peak | Integration object peak |
+| --- | --- | ---: | ---: |
+| 43621672224 | stripped Debug | 11,473,981,440 B | 11,961,499,648 B |
+| 43624778060 | unstripped Debug | 21,511,946,240 B | 21,357,522,944 B |
+| 43634863201 | stripped Debug, refreshed after main merge | 11,489,120,256 B | 11,489,062,912 B |
+
+Both use baseline x86_64 GNU/Linux and pinned glibc-linked Nix Zig 0.17.0.
+The stripped result cannot qualify an unstripped reservation. CI now explicitly
+uses `-Doptimize=debug -Dstrip=true`: safety checks, error-return tracing and test
+selection remain enabled, while DWARF is omitted. CI stack dumps consequently
+have less symbol detail; reproduce a failure locally with `-Dstrip=false` for
+source-level debugging. Local build defaults remain unstripped.
+
+The matched stripped contract/integration reservations are 12/13 GiB, each
+covering its measured peak plus 10%, rounded up. Both allow a 7 GiB owner to
+overlap within the existing 20 GiB budget. Unstripped native Linux Debug instead
+reserves 23/22 GiB from its own measurements; it needs an aggregate budget that
+can admit those objects. Other host/optimization profiles keep their prior
+fallbacks. No runner resources or CI aggregate budget were increased.
+
+The large resolver curation fixture keeps 17 profiles, 17,000 aliases and both
+at-most-eight edge-visit assertions, including reopen. Transactional warm
+projection setup avoids draining unrelated empty producers; the separate
+small legacy-adoption fixture retains the complete maintenance lifecycle.
+Matched local CPU Debug runs (`-Dmetal=false -Dstrip=true`) measured 94.6 s
+before this fixture isolation and 12.6 s afterward, excluding compilation.

@@ -299,6 +299,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // shared storage engine. Link that owner independently of storage discovery.
     if (antfly_imports.image_native_contract != null or antfly_imports.pdf_native_contract != null)
         embedded_api_mod.linkLibrary(native_enrichment);
+    // Contract tests can render shared PDF templates directly from their
+    // local C API root. Its consumer must link the compute owner even when
+    // no embedded API facade (or installed shared library) is reachable.
+    if (antfly_imports.shared_pdf_templates)
+        capi_root_mod.linkLibrary(native_enrichment);
     const native_storage = if (antfly_imports.storage_boundary.shared_core) blk: {
         const owner_options = b.addOptions();
         owner_options.addOption(bool, "shared_storage_core", true);

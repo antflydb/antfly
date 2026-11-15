@@ -2594,12 +2594,73 @@ export interface paths {
          *     reader, transcriber, extractor, and document-extraction producers are
          *     all supported, as are dense and sparse embedding producers. Embedding
          *     reprocessing regenerates vectors even when the source chunks are unchanged.
-         *     Embedding requests are committed durably and queued for supervised
-         *     inference. Acceptance does not wait for inference; inspect index coverage
-         *     and repair issues for the eventual outcome.
+         *     Embedding requests and document-extraction requests on servers with an
+         *     enrichment runtime are committed durably and queued for supervised
+         *     inference. Acceptance does not wait for inference. For extraction, inspect
+         *     the artifact generation, merge status and per-page failures; for embeddings,
+         *     inspect index coverage and repair issues. Embedded databases without an
+         *     enrichment runtime execute document extraction inline.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/index-aliases/{aliasName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        /** Inspect an index alias */
+        get: operations["getTableIndexAlias"];
+        /**
+         * Atomically create or swap an index alias
+         * @description Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
+         */
+        put: operations["putTableIndexAlias"];
+        post?: never;
+        /**
+         * Conditionally delete an index alias
+         * @description Requires table administration and the exact ETag returned by GET. The whole table-definition CAS prevents concurrent swaps or recreations from being deleted. Physical indexes and retained PUT idempotency receipts remain unchanged. A retry after successful deletion returns 404; a stale validator against a recreated alias returns 412.
+         */
+        delete: operations["deleteTableIndexAlias"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        /** Inspect an index alias */
+        get: operations["getNamespaceTableIndexAlias"];
+        /**
+         * Atomically create or swap an index alias
+         * @description Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
+         */
+        put: operations["putNamespaceTableIndexAlias"];
+        post?: never;
+        /**
+         * Conditionally delete an index alias
+         * @description Requires table administration and the exact ETag returned by GET. The whole table-definition CAS prevents concurrent swaps or recreations from being deleted. Physical indexes and retained PUT idempotency receipts remain unchanged. A retry after successful deletion returns 404; a stale validator against a recreated alias returns 412.
+         */
+        delete: operations["deleteNamespaceTableIndexAlias"];
         options?: never;
         head?: never;
         patch?: never;
@@ -5436,8 +5497,14 @@ export interface paths {
          *     token deltas. Each event contains a `ChatCompletionChunk` object.
          *     A successful stream ends with `data: [DONE]`. If generation or stream
          *     writing fails after the HTTP response starts, the server instead emits
-         *     an `event: error` frame whose data is a plain-text error message, then
-         *     closes the stream without a `[DONE]` frame.
+         *     an `event: error` frame and closes without a `[DONE]` frame. Permanent
+         *     inference-budget failures carry a JSON `Error` object with
+         *     `error: MODEL_RESOURCE_LIMIT` (admission policy) or
+         *     `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+         *     and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+         *     The HTTP status remains
+         *     unchanged once streaming starts. Clients must also accept plain-text
+         *     error frames from older servers and other failure paths.
          *
          *     ## Input Format
          *
@@ -7976,6 +8043,8 @@ export interface components {
          */
         SQLResponse: {
             notices?: components["schemas"]["SQLNotice"][];
+            /** @description Concrete graph index names selected from the statement catalog cut. */
+            resolved_indexes?: string[];
             columns: components["schemas"]["SQLColumn"][];
             rows: unknown[][];
             /**
@@ -9643,7 +9712,7 @@ export interface components {
             unresolved: number;
             /**
              * Format: uint64
-             * @description Number of selected repair records or indexes skipped because another repair pass already owns them.
+             * @description Number of selected repair records or indexes still in progress after this pass, including queued native producer work and work owned by another repair pass.
              */
             in_progress: number;
             /**
@@ -9763,7 +9832,12 @@ export interface components {
              */
             advance?: boolean;
         };
-        /** @description Durable table repair job state. */
+        /**
+         * @description Durable table repair job state. In result, work counters accumulate across
+         *     passes, while unresolved and in_progress describe only the latest bounded
+         *     pass. Earlier failures remain represented by cumulative failure counters,
+         *     debt_remaining, and the current remaining_failures summary.
+         */
         TableRepairJob: {
             /**
              * Format: uint64
@@ -10185,14 +10259,40 @@ export interface components {
         };
         ByteRange: string[];
         /**
-         * @description Synchronization level for batch operations:
+         * @description Admission prerequisite independent of sync_level. Explicit none commits the
+         *     source without precomputing enrichments. direct_enrichments requires eligible
+         *     document-local producers to succeed, committing their outputs and coverage
+         *     atomically with the source; producer failure rejects the whole batch.
+         *     Artifact-source stages, committed graph/neighbor context, grouped producers,
+         *     protected producers and PDF page-image embeddings remain asynchronous.
+         *     Configured producers with no eligible request reject the requirement.
+         *     Direct admission has an 8 MiB and 16384-row budget for the complete mutation,
+         *     including source keys/values, artifact effects, deletions, coverage, revisions,
+         *     counters and replay payload. Both the submitted source envelope and final
+         *     physical effect set must fit; this is not an artifact-only allowance.
+         *     Supported by embedded batches, server/Raft writes and distributed transactions.
+         *     Raft prepares on the leader and replays immutable effects without inference.
+         *     Transactions reserve the complete envelope before voting prepared; their
+         *     conservative reservation can reject a batch below the final physical limit.
+         *     Serverless supports source-local pipeline stages through conditional atomic
+         *     WAL batches (at most 1024 mutations and 8 MiB including WAL framing).
+         *     Backends without that capability reject before source admission.
+         *     Omission retains legacy embedded precomputation for enrichments/full_index
+         *     during the compatibility window; other surfaces retain their existing waits.
+         * @enum {string}
+         */
+        CommitRequires: "none" | "direct_enrichments";
+        /**
+         * @description Response acknowledgment/publication barrier, independent of commit_requires:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
-         *     - "write": Wait for the write to be durably applied to the local key-value store
+         *     - "write": Wait for durable application to the local key-value store
          *     - "full_text": Wait for full-text index WAL write
-         *     - "enrichments": Precompute enrichments before committing the document. A synchronous
-         *       producer failure rejects the write; post-commit worker failures retain the document
-         *       and may return `committed_repair_required`.
-         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+         *     - "enrichments": Wait for this write's enrichment publication
+         *     - "full_index": Wait for full-text, enrichment and vector-index publication
+         *     A post-commit wait failure never rolls back the source. Terminal background
+         *     failures may return committed_repair_required. During the embedded migration
+         *     window, omitting commit_requires retains legacy precomputation for enrichments
+         *     and full_index; explicit none disables that implicit admission prerequisite.
          * @default propose
          * @enum {string}
          */
@@ -11598,6 +11698,7 @@ export interface components {
              *     ]
              */
             transforms?: components["schemas"]["Transform"][];
+            commit_requires?: components["schemas"]["CommitRequires"];
             sync_level?: components["schemas"]["SyncLevel"];
         };
         BatchResponse: {
@@ -11657,6 +11758,12 @@ export interface components {
          *     or maintaining referential integrity across tables.
          */
         MultiBatchRequest: {
+            /**
+             * @description Default admission prerequisite for tables without an explicit commit_requires.
+             *     A table-level value overrides this default. Staged transaction statements
+             *     retain the strongest prerequisite selected for each table.
+             */
+            commit_requires?: components["schemas"]["CommitRequires"];
             /**
              * @description Map of table names to batch operations for that table.
              *     Each entry follows the same format as a single-table BatchRequest.
@@ -11726,6 +11833,12 @@ export interface components {
          *     its own read set and submits the full transaction in one request.
          */
         TransactionCommitRequest: {
+            /**
+             * @description Default admission prerequisite for tables without an explicit commit_requires.
+             *     A table-level value overrides this default. Staged transaction statements
+             *     retain the strongest prerequisite selected for each table.
+             */
+            commit_requires?: components["schemas"]["CommitRequires"];
             /**
              * @description Set of keys that were read during the transaction, with their observed versions.
              *     The server verifies these versions still match before committing writes.
@@ -14130,7 +14243,12 @@ export interface components {
              *
              *     - `0.0` = fastest, lowest recall
              *     - `0.5` = balanced default
-             *     - `1.0` = highest recall
+             *     - `1.0` = exact dense top-k over the eligible indexed vectors
+             *
+             *     Full effort on dense HBC indexes establishes exactness using certified bounds and
+             *     authoritative scoring. It may examine every eligible vector;
+             *     latency scales with corpus size and can be substantially higher
+             *     than approximate search at values below `1.0`.
              *
              *     When omitted, Antfly uses the balanced default effort (`0.5`) unless
              *     lower-level vector search overrides are provided internally.
@@ -14521,6 +14639,8 @@ export interface components {
             limits?: components["schemas"]["GraphQueryLimits"];
         };
         GraphQueryResult: {
+            /** @description Concrete graph index names selected from the statement catalog cut. */
+            resolved_indexes?: string[];
             /** @enum {integer} */
             wire_version: 1;
             columns: string[];
@@ -15470,6 +15590,8 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /** @description Concrete index names selected for this query before embedding and execution. */
+            resolved_indexes?: string[];
             /**
              * @description Ranking contract for a composed result.
              * @enum {string}
@@ -18778,6 +18900,11 @@ export interface components {
          * @enum {string}
          */
         DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
+        /**
+         * @description Offline clustering algorithm for fresh native Parquet lake HBC indexes.
+         * @enum {string}
+         */
+        LakeBulkBuildAlgorithm: "lloyd" | "emeans";
         /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
         ArtifactIndexSource: {
             /** @description Stable name of a generated artifact stream. */
@@ -18809,10 +18936,10 @@ export interface components {
              */
             quantizer?: "rabitq" | "pq";
             /**
-             * @description Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+             * @description Whether document embeddings stay stored after the graph covers them. "auto" (the default when the index has its own embedder) keeps only a small stub for each embedding computed from text (a field, a text-only template, or a text chunk) and re-embeds a few such candidates per query, while embeddings computed from media (images, audio windows, model outputs) stay stored. "transient" stubs every covered embedding, so it requires inputs that re-embed from text: no media chunkers. "persistent" keeps every embedding, and is the only choice for external vectors, indexes fed by other enrichments, and the pq quantizer.
              * @enum {string}
              */
-            vector_storage?: "transient" | "persistent";
+            vector_storage?: "auto" | "transient" | "persistent";
             /**
              * @description Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
              * @default 0
@@ -18825,10 +18952,21 @@ export interface components {
              */
             bound_scale?: number;
             /**
-             * @description Candidates recomputed per batch. 0 uses k.
+             * @description Candidates recomputed per batch. 0 uses k for bounded search and 128 for full-effort search.
              * @default 0
              */
             batch_size?: number;
+            /**
+             * @description Time a query may spend re-embedding candidates whose stored vectors were dropped. If the budget is spent before scoring finishes, the search returns an incomplete-coverage error; retry with a larger budget. 0 means no limit.
+             * @default 0
+             */
+            reembed_budget_ms?: number;
+            /**
+             * @description How vectors that cannot be re-embedded from text (images, audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector. "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-embedding. Requires "auto" or "transient" storage.
+             * @default full
+             * @enum {string}
+             */
+            media_vectors?: "full" | "int8";
         };
         /**
          * @description How an HBC dense index with quantization_bits above 1 uses its extended codes (not
@@ -18863,6 +19001,13 @@ export interface components {
              * @default false
              */
             sparse?: boolean;
+            /** @description Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates. */
+            lake_bulk_build?: components["schemas"]["LakeBulkBuildAlgorithm"];
+            /**
+             * Format: int64
+             * @description Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+             */
+            lake_bulk_build_max_input_bytes?: number;
             /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
             dimension?: number;
             /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
@@ -19288,6 +19433,8 @@ export interface components {
             scorer_json?: string;
             /** @enum {string} */
             candidate_search?: "" | "exact_key" | "prefix" | "ann";
+            /** @description Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching. */
+            candidate_key_prefix?: string;
             candidate_ann_index?: string;
             /** Format: uint */
             candidate_limit?: number;
@@ -20431,6 +20578,9 @@ export interface components {
             external_vector_space?: string;
             /** @default false */
             sparse?: boolean;
+            lake_bulk_build?: components["schemas"]["LakeBulkBuildAlgorithm"];
+            /** Format: int64 */
+            lake_bulk_build_max_input_bytes?: number;
             dimension?: number;
             field?: string;
             /** @description Embedding artifact streams indexed together as independent vector members. */
@@ -24257,6 +24407,26 @@ export interface components {
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
         };
+        IndexAlias: {
+            index: string;
+            previous_index?: string | null;
+            /** Format: int64 */
+            swapped_at_ms: number;
+            /** @enum {string} */
+            require: "queryable" | "complete";
+            idempotency_key: string;
+            readiness: components["schemas"]["IndexReadinessStatus"];
+        };
+        IndexAliasRequest: {
+            index: string;
+            expected_index?: string;
+            /**
+             * @default complete
+             * @enum {string}
+             */
+            require?: "queryable" | "complete";
+            idempotency_key: string;
+        };
         IndexMaintenanceOwnerProof: {
             group_id: string;
             generation: string;
@@ -24827,6 +24997,18 @@ export interface components {
             input_index?: number;
             /** @description Extraction failure stage, when known */
             stage?: string;
+            /** @description Blocking inference budget (host, backend, combined, scratch, or kv), when known */
+            budget?: string;
+            /**
+             * Format: uint64
+             * @description Required working-set bytes, including resident resources, for the blocking budget
+             */
+            required_bytes?: number;
+            /**
+             * Format: uint64
+             * @description Configured bytes allowed by the blocking budget
+             */
+            limit_bytes?: number;
         };
         /** @description Actionable retry contract for temporary inference-capacity failures. */
         InferenceTransientCapacityError: {
@@ -31294,19 +31476,19 @@ export interface components {
         ChunkSourceReference: {
             /** @enum {string} */
             type: "source";
-            /** @description HTTP(S) or S3 object URI resolved through configured content security and credentials. */
+            /** @description HTTP(S), S3, or absolute file:// URI resolved through configured content security and credentials. Local files require an explicit remote_content.security.allowed_paths allowlist. */
             uri: string;
             mime_type: string;
-            /** @description Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read. */
+            /** @description Quoted strong HTTP/S3 ETag, immutable S3 version ID, or lowercase SHA-256 hex digest for file_sha256. Local files are verified in a bounded streaming scan; unchanged files reuse a bounded process-local verification cache across continuation pages. Size, inode, mtime and ctime are checked around every range read. */
             version: string;
             /**
-             * @description Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+             * @description Defaults to strong_etag. S3 version IDs require S3 sources; file_sha256 requires a local file URI.
              * @enum {string}
              */
-            version_kind?: "strong_etag" | "s3_version_id";
+            version_kind?: "strong_etag" | "s3_version_id" | "file_sha256";
             /**
              * Format: int64
-             * @description Exact immutable object length, verified against Content-Range.
+             * @description Exact immutable object length, verified against Content-Range or local file metadata.
              */
             length: number;
         };
@@ -38016,6 +38198,278 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    /** @description Strong validator required by conditional alias deletion */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    putTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexAliasRequest"];
+            };
+        };
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description This index kind or runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    deleteTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header: {
+                "If-Match": string;
+            };
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Alias deleted; physical indexes remain available by name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Concurrent catalog change or a dependent catalog binding */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Alias changed since the supplied ETag was read */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description If-Match is required */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description The metadata runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    /** @description Strong validator required by conditional alias deletion */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    putNamespaceTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexAliasRequest"];
+            };
+        };
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description This index kind or runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    deleteNamespaceTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header: {
+                "If-Match": string;
+            };
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Alias deleted; physical indexes remain available by name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Concurrent catalog change or a dependent catalog binding */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Alias changed since the supplied ETag was read */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description If-Match is required */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description The metadata runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listIndexes: {

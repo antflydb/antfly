@@ -1428,13 +1428,15 @@ test "catalog resolves model-neutral Gemma 4 attention topologies" {
         .kv_heads = 1,
         .sequence_length = 256,
     }, 8, 9)) == null);
-    try std.testing.expect((try resolve(signature, .{
+    const portable = (try resolve(signature, .{
         .rows = 1,
         .head_dim = 512,
         .query_heads = 16,
         .kv_heads = 1,
         .sequence_length = 256,
-    }, 8, 0)) == null);
+    }, 8, 0)) orelse return error.ExpectedPortableKernel;
+    try std.testing.expectEqualStrings(resolved.kernel_id, portable.kernel_id);
+    try std.testing.expectEqual(resolved.fingerprint(), portable.fingerprint());
 }
 
 test "catalog resolves long-context SM89 split-K online decode without widening visibility" {
@@ -1710,11 +1712,13 @@ test "catalog resolves exact SM89 Q6_K Q8_1 argmax family shapes" {
         .input_dim = 4096,
         .output_dim = 262_144,
     }, 8, 9)) == null);
-    try std.testing.expect((try resolve(signature, .{
+    const portable = (try resolve(signature, .{
         .rows = 1,
         .input_dim = 2560,
         .output_dim = 262_144,
-    }, 8, 0)) == null);
+    }, 8, 0)) orelse return error.ExpectedPortableKernel;
+    try std.testing.expectEqualStrings(resolved.kernel_id, portable.kernel_id);
+    try std.testing.expectEqual(resolved.fingerprint(), portable.fingerprint());
 
     var f32_signature = signature;
     f32_signature.small_batch_matmul.activation = .f32;

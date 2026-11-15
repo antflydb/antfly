@@ -67,6 +67,7 @@ pub const Limits = struct {
 };
 pub const Column = describe.Column;
 pub const Output = struct {
+    resolved_indexes: ?[]const []const u8 = null,
     columns: []const Column = &.{},
     rows: []const []const Json = &.{},
     native_rows: ?[]const []const Datum = null,
@@ -93,7 +94,7 @@ pub const Output = struct {
     /// representation. Keep the public result envelope explicit at every ABI.
     pub fn jsonStringify(self: Output, writer: anytype) !void {
         if (self.native_rows != null) return error.WriteFailed;
-        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt, .catalog_receipt = self.catalog_receipt, .notices = self.notices });
+        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt, .catalog_receipt = self.catalog_receipt, .notices = self.notices, .resolved_indexes = self.resolved_indexes });
     }
 };
 /// An execution-scoped allocator whose control state outlives returned rows or
@@ -313,7 +314,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
         }
         const rendered = try @import("explain.zig").renderMeasuredWithContext(arena, explanation, binding, if (explanation.analyze) &profile else null, backend, prepared_parameters, .{ .planning_ns = planning_ns, .preparation_peak_bytes = preparation_peak, .memory_bytes = limits.retained_bytes, .scan_rows = limits.scan_rows, .scan_pages = limits.scan_pages, .batch_rows = limits.execution_batch_rows });
         const row = try arena.dupe(Json, &.{.{ .string = rendered }});
-        return .{ .columns = try arena.dupe(Column, &.{.{ .name = "QUERY PLAN", .type = .string }}), .rows = try arena.dupe([]const Json, &.{row}), .command_tag = "EXPLAIN" };
+        return .{ .columns = try arena.dupe(Column, &.{.{ .name = "QUERY PLAN", .type = .string }}), .rows = try arena.dupe([]const Json, &.{row}), .command_tag = "EXPLAIN", .resolved_indexes = try resolvedGraphIndexNames(arena, binding) };
     }
     const ddl = @import("ddl_runtime.zig");
     if (compiled.statement == .catalog_ddl) if (compiled.statement.catalog_ddl.population) |intent| {
@@ -373,12 +374,15 @@ fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: c
     if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
         manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
     };
+    var attribution = try IndexAttribution.init(arena, binding);
+    if (backend.index_attribution) |host| host.bind(host.ptr, attribution.observer());
+    defer if (backend.index_attribution) |host| host.bind(host.ptr, null);
     const context = Context{ .alloc = alloc, .arena = arena, .backend = statement_backend, .binding = binding, .parameters = prepared_parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink, .typed_output = sink != null };
     const stage = if (limits.profile) |profile| try profile.registerStage(@tagName(compiled.statement), if (binding.table) |table| table.physical_name else null) else null;
     const started = if (limits.profile) |profile| profile.now() else null;
     const rows_before = if (limits.profile) |profile| profile.result_rows else 0;
     const spill_before = if (context.spill) |spill| spill.written_bytes else 0;
-    const output = context.run(compiled.statement) catch |err| {
+    var output = context.run(compiled.statement) catch |err| {
         if (limits.profile) |profile| profile.record(stage, started, 0, false, true);
         return err;
     };
@@ -386,6 +390,7 @@ fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: c
     if (limits.profile) |profile| {
         profile.spill_written_bytes = if (context.spill) |spill| spill.written_bytes - spill_before else 0;
     }
+    output.resolved_indexes = attribution.value();
     return output;
 }
 
@@ -409,6 +414,67 @@ const AnalyzeDrain = struct {
         }
     }
 };
+pub const IndexAttribution = struct {
+    a: std.mem.Allocator,
+    names: std.ArrayList([]const u8) = .empty,
+    pub fn init(a: std.mem.Allocator, bound: describe.BoundStatement) !@This() {
+        var self: @This() = .{ .a = a };
+        if (try resolvedGraphIndexNames(a, bound)) |names| try self.names.appendSlice(a, names);
+        return self;
+    }
+    pub fn observer(self: *@This()) @import("cypher").backend.IndexObserver {
+        return .{ .ptr = self, .record = record };
+    }
+    fn record(ptr: *anyopaque, name: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (self.names.items) |prior| if (std.mem.eql(u8, prior, name)) return;
+        const owned = try self.a.dupe(u8, name);
+        errdefer self.a.free(owned);
+        try self.names.append(self.a, owned);
+    }
+    pub fn value(self: @This()) ?[]const []const u8 {
+        return if (self.names.items.len == 0) null else self.names.items;
+    }
+};
+
+pub fn resolvedGraphIndexNames(a: std.mem.Allocator, bound: describe.BoundStatement) !?[]const []const u8 {
+    const relation = bound.relation;
+
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |name| a.free(name);
+        names.deinit(a);
+    }
+    if (relation) |relations| for (relations.scans) |scan| if (scan.table.graph) |graph| {
+        const selected = try @import("cypher").dependencies.selectedIndexes(scratch.allocator(), graph.definition.query, graph.graph);
+        for (selected) |name| {
+            const found = for (names.items) |prior| {
+                if (std.mem.eql(u8, prior, name)) break true;
+            } else false;
+            if (!found) {
+                const owned = try a.dupe(u8, name);
+                errdefer a.free(owned);
+                try names.append(a, owned);
+            }
+        }
+    };
+    for ([_]?*const describe.BoundStatement{ bound.insert_source, bound.returning, if (bound.joined_mutation) |joined| joined.input else null, if (bound.joined_mutation) |joined| joined.returning_binding else null, if (bound.merge_mutation) |merge| merge.input else null }) |child| if (child) |nested| {
+        for (try resolvedGraphIndexNames(scratch.allocator(), nested.*) orelse &.{}) |name| {
+            const duplicate = for (names.items) |prior| {
+                if (std.mem.eql(u8, prior, name)) break true;
+            } else false;
+            if (!duplicate) {
+                const owned = try a.dupe(u8, name);
+                errdefer a.free(owned);
+                try names.append(a, owned);
+            }
+        }
+    };
+    if (names.items.len == 0) return null;
+    return try names.toOwnedSlice(a);
+}
 
 pub const RowSink = struct {
     ptr: *anyopaque,
@@ -7538,7 +7604,9 @@ test "external lake SQL finalized join state preserves empty globals HAVING and 
 }
 
 test "external lake SQL plain count consumes resident and spilled typed join partials" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     for ([_][]const u8{
         "SELECT COUNT(*) FROM (VALUES (1),(1)) l(k) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k",
         "SELECT COUNT(*) FROM (VALUES (NULL),(NULL)) l(k) JOIN (VALUES (NULL),(NULL)) r(k) ON l.k=r.k",

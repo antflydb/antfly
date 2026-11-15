@@ -98,6 +98,46 @@ pub const Service = struct {
         };
     }
 
+    /// The complete primary and direct-output postimages cross one durable
+    /// visibility boundary. A stale optimistic read set publishes no prefix.
+    pub fn ingestPreparedBatch(self: *Service, req: api_types.IngestBatchRequest, fence: wal_mod.types.CatalogFence) !api_types.IngestBatchResult {
+        return self.ingestPreparedBatchWithReadSet(req, fence, &.{});
+    }
+
+    pub fn ingestPreparedBatchWithReadSet(self: *Service, req: api_types.IngestBatchRequest, fence: wal_mod.types.CatalogFence, documents: []const []const u8) !api_types.IngestBatchResult {
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(self.alloc, 64 * 1024 * 1024);
+        defer quota.deinit();
+        return self.ingestPreparedBatchBounded(req, fence, documents, quota.allocator()) catch |err| {
+            if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
+            return err;
+        };
+    }
+
+    fn ingestPreparedBatchBounded(self: *Service, req: api_types.IngestBatchRequest, fence: wal_mod.types.CatalogFence, documents: []const []const u8, backing: Allocator) !api_types.IngestBatchResult {
+        if (!self.wal.supportsCatalogFences()) return error.CommitRequirementUnavailable;
+        const operation = req.operation_id orelse return error.InvalidWalOperationId;
+        if (req.mutations.len == 0) return .{ .namespace = try self.alloc.dupe(u8, req.namespace), .mutation_count = 0, .start_lsn = 0, .end_lsn = 0 };
+        if (req.mutations.len > 1024) return error.CommitRequirementTooLarge;
+        var arena = std.heap.ArenaAllocator.init(backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const payloads = try a.alloc([]const u8, req.mutations.len);
+        var bytes: usize = 0;
+        for (req.mutations, payloads) |mutation, *payload| {
+            if (mutation.kind == .prepared) {
+                const prepared = try @import("../build/document_facts.zig").parseEnrichedBody(mutation.body orelse return error.InvalidDocumentMutation);
+                try @import("../enrichment/worker.zig").validateDirectBody(a, prepared.body);
+            } else if (mutation.kind != .delete or mutation.body != null) return error.InvalidDocumentMutation;
+            payload.* = try api_codec.encodeMutationAlloc(a, mutation);
+            bytes = std.math.add(usize, bytes, payload.len + 32) catch return error.CommitRequirementTooLarge;
+            if (bytes > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
+        }
+        const namespace = try self.alloc.dupe(u8, req.namespace);
+        errdefer self.alloc.free(namespace);
+        const result = try self.wal.appendPreparedWithReadSet(req.namespace, req.timestamp_ns, payloads, operation, fence, documents);
+        return .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = result.start_lsn, .end_lsn = result.end_lsn };
+    }
+
     pub fn ingestTableBatch(self: *Service, req: api_types.TableIngestBatchDomainRequest) !api_types.TableIngestBatchResult {
         var result = try self.ingestBatch(.{
             .namespace = req.table_name,
@@ -342,6 +382,7 @@ fn cleanupTmp(path: [*:0]const u8) void {
 test "model aware media serverless public ingestion rejects internal checkpoint payloads before any WAL append" {
     var service = Service{ .alloc = std.testing.allocator, .wal = undefined, .builder = undefined };
     for ([_]api_types.DocumentMutation{
+        .{ .kind = .catalog, .doc_id = "private", .body = "{}" },
         .{ .kind = .checkpoint, .doc_id = "private", .body = "AFDCP001{}" },
         .{ .kind = .enriched, .doc_id = "private", .body = "{}" },
         .{ .kind = .upsert, .doc_id = "private", .body = "AFDEN001" },
@@ -354,7 +395,7 @@ test "model aware media serverless public ingestion rejects internal checkpoint 
 }
 
 pub fn validatePublicMutation(alloc: Allocator, mutation: api_types.DocumentMutation) !void {
-    if (mutation.kind == .checkpoint or mutation.kind == .enriched) return error.InvalidDocumentMutation;
+    if (mutation.kind != .upsert and mutation.kind != .delete) return error.InvalidDocumentMutation;
     if (mutation.body) |bytes| {
         if (@import("../build/document_facts.zig").isInternalBody(bytes)) return error.InvalidDocumentMutation;
         // Check the whole batch before appending any mutation. JSON
@@ -364,4 +405,48 @@ pub fn validatePublicMutation(alloc: Allocator, mutation: api_types.DocumentMuta
             else => false, // Plain text is a supported document body.
         }) return error.InvalidDocumentMutation;
     }
+}
+
+test "commit requirements serverless prepared batch commits source outputs and deletes atomically" {
+    const a = std.testing.allocator;
+    const objectstore = @import("objectstore");
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var indexed = try wal_mod.IndexedObjectStore.init(a, client, "db", "prepared");
+    defer indexed.deinit();
+    indexed.catalog_fences_enabled = true;
+    var wal = indexed.walStore();
+    var service = Service.init(a, &wal, undefined);
+    var initial = try service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &.{.{ .kind = .upsert, .doc_id = "victim", .body = "{}" }} });
+    defer initial.deinit(a);
+    const body = "{\"text\":\"source\",\"generated\":\"ready\"}";
+    const prepared = try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(a, body, 6);
+    defer a.free(prepared);
+    const request: api_types.IngestBatchRequest = .{ .namespace = "docs", .timestamp_ns = 2, .operation_id = "gate", .mutations = &.{ .{ .kind = .prepared, .doc_id = "new", .body = prepared }, .{ .kind = .delete, .doc_id = "victim" } } };
+    try std.testing.expectError(error.VersionConflict, service.ingestPreparedBatchWithReadSet(request, .{ .latest_lsn = 0 }, &.{"victim"}));
+    try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
+    const invalid_body = try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(a, "{\"text\":\"source\",\"chunk_embeddings\":[4]}", 6);
+    defer a.free(invalid_body);
+    try std.testing.expectError(error.InvalidDocumentBody, service.ingestPreparedBatch(.{ .namespace = "docs", .timestamp_ns = 2, .operation_id = "invalid", .mutations = &.{.{ .kind = .prepared, .doc_id = "poison", .body = invalid_body }} }, .{ .latest_lsn = 1 }));
+    try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
+    var result = try service.ingestPreparedBatch(request, .{ .latest_lsn = 1 });
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), result.start_lsn);
+    try std.testing.expectEqual(@as(u64, 3), result.end_lsn);
+    var replay = try service.ingestPreparedBatch(request, .{ .latest_lsn = 1 });
+    defer replay.deinit(a);
+    try std.testing.expectEqual(result.start_lsn, replay.start_lsn);
+    try std.testing.expectEqual(result.end_lsn, replay.end_lsn);
+    const records = try wal.readFromAlloc("docs", 2);
+    defer wal_mod.freeRecords(a, records);
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+    const first = try api_codec.decodeMutationView(records[0].payload);
+    try std.testing.expectEqual(api_types.MutationKind.prepared, first.kind);
+    const postimage = try @import("../build/document_facts.zig").parseEnrichedBody(first.body.?);
+    try std.testing.expectEqualStrings(body, postimage.body);
+    try std.testing.expectEqual(@as(u64, 6), postimage.source_input_bytes);
+    try std.testing.expectEqual(api_types.MutationKind.delete, (try api_codec.decodeMutationView(records[1].payload)).kind);
+    try std.testing.expectError(error.InvalidDocumentMutation, service.ingestBatch(request));
 }

@@ -36,6 +36,56 @@ pytestmark = [
 ]
 
 
+def _wait_for_native_indexes_ready(raw, call, debug_logs, name, text, after=None):
+    deadline = time.monotonic() + 90
+
+    def probe(*, bounded=True):
+        # A fresh-source query schedules publication without changing
+        # the definition, preserving the reuse-versus-rebuild proof.
+        # Bound only readiness traffic. The original full-budget query below
+        # decides success once the published indexes are queryable.
+        response = raw(
+            "POST",
+            f"/tables/{name}/query",
+            {**text, "timeout_ms": 1000} if bounded else text,
+        )
+        deadline_expired = (
+            bounded
+            and response.status_code == 504
+            and response.json().get("code") == "query_timeout"
+            and response.json().get("retryable") is True
+        )
+        assert response.ok or response.status_code in (409, 503) or deadline_expired, (
+            response.text + debug_logs()
+        )
+        return response
+
+    probe()
+    while True:
+        # Pending queries can hold coherent-read admission for seconds.
+        # Poll published readiness while the owner builds, then confirm
+        # the new revision with the same query instead of continuously
+        # competing with publication for owner admission.
+        indexes = call("GET", f"/tables/{name}/indexes")
+        assert all(i["status"]["readiness"]["state"] != "failed" for i in indexes), (
+            json.dumps(indexes) + debug_logs()
+        )
+        revision = next(
+            i["status"].get("published_revision")
+            for i in indexes
+            if i["config"]["name"] == "text"
+        )
+        if (
+            revision is not None
+            and revision != after
+            and all(i["status"]["readiness"]["queryable"] for i in indexes)
+        ):
+            if probe(bounded=False).ok:
+                return revision
+        assert time.monotonic() < deadline, str(indexes) + debug_logs()
+        time.sleep(0.1)
+
+
 @pytest.mark.parametrize(
     "file_format",
     ["parquet", pytest.param("iceberg", marks=pytest.mark.iceberg_integration)],
@@ -299,68 +349,47 @@ def test_logical_identity_reuses_reordered_native_indexes(
         }
 
         def ready(name, after=None):
-            deadline = time.monotonic() + 90
-            while True:
-                # Fresh-source query failure schedules publication without a
-                # definition change, so it cannot disguise a rebuild as reuse.
-                response = raw("POST", f"/tables/{name}/query", text)
-                assert response.ok or response.status_code in (409, 503), (
-                    response.text + server.debug_logs()
-                )
-                indexes = call("GET", f"/tables/{name}/indexes")
-                assert all(
-                    i["status"]["readiness"]["state"] != "failed" for i in indexes
-                ), json.dumps(indexes) + server.debug_logs()
-                revision = next(
-                    i["status"].get("published_revision")
-                    for i in indexes
-                    if i["config"]["name"] == "text"
-                )
-                if (
-                    response.ok
-                    and revision is not None
-                    and revision != after
-                    and all(i["status"]["readiness"]["queryable"] for i in indexes)
-                ):
-                    return revision
-                assert time.monotonic() < deadline, str(indexes) + server.debug_logs()
-                time.sleep(0.1)
+            return _wait_for_native_indexes_ready(
+                raw, call, server.debug_logs, name, text, after
+            )
 
         def states():
-            result = []
-            for path in (server.root / "artifacts").rglob("*"):
-                if not path.is_file():
-                    continue
-                payload = path.read_bytes()
-                begin = payload.find(b'{"version":')
-                if begin < 0:
-                    continue
-                try:
-                    value = json.loads(payload[begin:])
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                if (
-                    isinstance(value, dict)
-                    and "values_recipe" in value
-                    and "current" in value
-                ):
-                    if value.get("version") == 2:
-                        spaces = {
-                            view["id"]: view for view in value["coordinate_spaces"]
-                        }
-                        value["reused"] = [
-                            {
-                                "name": binding["name"],
-                                **{
-                                    k: v
-                                    for k, v in spaces[binding["space"]].items()
-                                    if k != "id"
-                                },
-                            }
-                            for binding in value["index_bindings"]
-                        ]
-                    result.append((path.stat().st_mtime_ns, value))
-            return [value for _, value in sorted(result, key=lambda item: item[0])]
+            # Check the serving cut returned by the real query. Builders also
+            # upload private checkpoint proofs; filesystem order/mtime never
+            # makes those proofs published index authority.
+            result = call("POST", "/tables/logical/query", text)
+            token = result["remote_snapshot"]
+            assert token.startswith("lake2:"), token
+
+            def artifact(artifact_id):
+                checksum = artifact_id.split(":")[1]
+                paths = list((server.root / "artifacts").rglob(checksum))
+                assert paths, artifact_id
+                payload = paths[0].read_bytes()
+                if payload.startswith(b"AFOBJ001"):
+                    payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
+                assert hashlib.sha256(payload).hexdigest() == checksum, artifact_id
+                return json.loads(payload)
+
+            envelope = artifact(token.removeprefix("lake2:"))
+            state = artifact(envelope["state"]["id"])
+            reference = state["publication"]["row_identity"]
+            assert reference is not None, state
+            value = artifact(reference["artifact_id"])
+            if value.get("version") == 2:
+                spaces = {view["id"]: view for view in value["coordinate_spaces"]}
+                value["reused"] = [
+                    {
+                        "name": binding["name"],
+                        **{
+                            k: v
+                            for k, v in spaces[binding["space"]].items()
+                            if k != "id"
+                        },
+                    }
+                    for binding in value["index_bindings"]
+                ]
+            return [value]
 
         attach("logical", True)
         revision = ready("logical")

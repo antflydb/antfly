@@ -70,6 +70,10 @@ func publishCmd(args []string) error {
 	if err = readCorpusJSON(filepath.Join(*state, "sources.json"), &cfg); err != nil {
 		return err
 	}
+	profile, err := processingProfile(cfg.Profile)
+	if err != nil {
+		return err
+	}
 	client, err := google.DefaultClient(context.Background(), "https://www.googleapis.com/auth/devstorage.read_write")
 	if err != nil {
 		return err
@@ -107,8 +111,9 @@ func publishCmd(args []string) error {
 		}
 		seen[record.ID] = true
 		count++
-		if record.Document["mime_type"] != "application/pdf" {
-			return fmt.Errorf("v1 publication supports PDFs only")
+		mime, _ := record.Document["mime_type"].(string)
+		if !profile.accepts(mime) {
+			return fmt.Errorf("profile %s cannot publish %s", profile.Name, mime)
 		}
 		meta, ok := record.Document["metadata"].(map[string]any)
 		if !ok {

@@ -99,6 +99,24 @@ pub const SyncLevel = enum {
     full_index,
 };
 
+/// Admission prerequisite, independent of the response visibility barrier.
+/// Optional at ingress to retain the embedded legacy migration boundary.
+pub const CommitRequires = enum {
+    none,
+    direct_enrichments,
+
+    pub fn strongest(previous: ?CommitRequires, incoming: ?CommitRequires) ?CommitRequires {
+        if (previous == .direct_enrichments or incoming == .direct_enrichments) return .direct_enrichments;
+        return previous orelse incoming;
+    }
+};
+
+pub fn parseCommitRequires(value: std.json.Value) !?CommitRequires {
+    if (value == .null) return null;
+    if (value != .string) return error.InvalidBatchRequest;
+    return std.meta.stringToEnum(CommitRequires, value.string) orelse error.InvalidBatchRequest;
+}
+
 pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
     if (std.mem.eql(u8, text, "propose")) return .propose;
     if (std.mem.eql(u8, text, "write")) return .write;
@@ -134,4 +152,5 @@ pub const PublicBatchRequest = struct {
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
     sync_level: SyncLevel = .write,
+    commit_requires: ?CommitRequires = null,
 };

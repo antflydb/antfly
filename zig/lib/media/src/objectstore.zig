@@ -93,7 +93,9 @@ pub fn Adapter(comptime store: type) type {
                 .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancellation.cancelled },
             }) catch |err| {
                 try control.check();
-                return err;
+                // Providers may reject the pin before returning a response.
+                // Preserve the adapter's version-change contract in either case.
+                return if (err == error.PreconditionFailed) error.SourceVersionChanged else err;
             };
             defer result.deinit(self.allocator);
             try control.check();

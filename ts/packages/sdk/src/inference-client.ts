@@ -82,7 +82,10 @@ export class InferenceAPIError extends Error {
     readonly retryable: boolean | undefined,
     readonly inputIndex?: number,
     readonly stage?: string,
-    readonly responseHeaders?: Record<string, string>
+    readonly responseHeaders?: Record<string, string>,
+    readonly budget?: string,
+    readonly requiredBytes?: number,
+    readonly limitBytes?: number
   ) {
     super(`inference request failed (${status}): ${detail}`);
     this.name = "InferenceAPIError";
@@ -354,7 +357,7 @@ export class InferenceClient {
       request.context_management !== undefined || request.kv_cache !== undefined;
     let sawContextAttestation = false;
     for await (const frame of parseSSEFrames(body)) {
-      if (frame.event === "error") throw new Error(`Generation stream failed: ${frame.data}`);
+      if (frame.event === "error") throw inferenceStreamError(frame.data);
       if (frame.data.trim() === "[DONE]") {
         if (requiresContextAttestation && !sawContextAttestation) {
           throw new Error("Generation server did not attest the requested context policy");
@@ -939,8 +942,9 @@ export class InferenceClient {
         if (!completed) throw new Error("Dictation stream ended before completion");
         return;
       }
+      if (frame.event === "error") throw inferenceStreamError(frame.data);
       const event = JSON.parse(frame.data) as components["schemas"]["InferenceDictationEvent"];
-      if (frame.event === "error" || event.type === "error") {
+      if (event.type === "error") {
         throw new Error(event.message ?? event.error ?? "Dictation failed");
       }
       if (event.type === "dictation.transcript") {
@@ -1082,6 +1086,23 @@ function validateExtractionV2Response(
   }
 }
 
+function inferenceStreamError(data: string): Error {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(data);
+  } catch {
+    // Older servers and unclassified errors retain plain-text SSE frames.
+  }
+  if (typeof payload === "object" && payload !== null) {
+    const error = payload as Partial<InferenceError>;
+    if (typeof error.error === "string" || typeof error.message === "string") {
+      // The transport has already returned 200; classification is in the body.
+      return inferenceAPIError(200, error);
+    }
+  }
+  return new Error(`Generation stream failed: ${data}`);
+}
+
 function inferenceAPIError(
   status: number,
   error: InferenceError | unknown,
@@ -1125,7 +1146,21 @@ function inferenceAPIError(
       ? payload.input_index
       : undefined;
   const stage = typeof payload.stage === "string" ? payload.stage : undefined;
-  return new InferenceAPIError(status, code, detail, retryable, inputIndex, stage, responseHeaders);
+  const budget = typeof payload.budget === "string" ? payload.budget : undefined;
+  const validBytes = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  return new InferenceAPIError(
+    status,
+    code,
+    detail,
+    retryable,
+    inputIndex,
+    stage,
+    responseHeaders,
+    budget,
+    validBytes(payload.required_bytes),
+    validBytes(payload.limit_bytes)
+  );
 }
 
 // Retain only valid retry metadata, never arbitrary response headers or bodies.

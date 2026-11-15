@@ -24,7 +24,10 @@ const A = std.mem.Allocator;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const Storage = local.storage_lsm_backend.Storage;
 pub const chunk_bytes = 256 * 1024;
-pub const max_chunks = 65536;
+// Chunk references live in paged trees. This bounds ordinals without imposing
+// the old 16 GiB generation ceiling or allocating a corpus-sized reference list.
+pub const max_chunks = std.math.maxInt(u32);
+pub const max_inline_chunks = 65536;
 pub const max_root_bytes = 16 * 1024 * 1024;
 const native_directory = @import("lake_index_native_directory.zig");
 /// Attempt-local proof of the descriptor a native producer actually opened.
@@ -58,7 +61,7 @@ pub const File = struct {
             try root.validate();
             if (self.chunks.len != 0 or root.records != expected) return error.InvalidNativeLakeFiles;
         } else {
-            if (self.chunks.len != expected) return error.InvalidNativeLakeFiles;
+            if (self.chunks.len != expected or self.chunks.len > max_inline_chunks) return error.InvalidNativeLakeFiles;
             for (self.chunks, 0..) |ref, ordinal| {
                 if (ref.byte_len != @min(chunk_bytes, self.bytes - @as(u64, @intCast(ordinal)) * chunk_bytes)) return error.InvalidNativeLakeFiles;
                 try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
@@ -78,7 +81,7 @@ pub const Root = struct {
     pub fn validate(self: Root) !void {
         if (std.mem.allEqual(u8, &self.domain, 0)) return error.InvalidNativeLakeFiles;
         if (self.version == 2) {
-            if (self.files.len != 0 or self.file_count > 8192 or self.chunk_count > max_chunks) return error.InvalidNativeLakeFiles;
+            if (self.files.len != 0 or self.chunk_count > max_chunks) return error.InvalidNativeLakeFiles;
             if (self.directory) |root| {
                 try root.validate();
                 if (root.records != self.file_count) return error.InvalidNativeLakeFiles;
@@ -230,8 +233,9 @@ pub fn publishBytes(out: A, path: []const u8, bytes: []const u8, store: *stores.
     const budget = OutputBudget.from(output_budget);
     if (!validPath(path)) return error.InvalidNativeLakeFiles;
     try stores.chargeReadBudget(budget.generation, bytes.len);
-    const chunks = try out.alloc(artifacts.ChunkRef, std.math.divCeil(usize, bytes.len, chunk_bytes) catch return error.InvalidNativeLakeFiles);
-    if (chunks.len > max_chunks) return error.NativeLakeFilesTooLarge;
+    const count = std.math.divCeil(usize, bytes.len, chunk_bytes) catch return error.InvalidNativeLakeFiles;
+    if (count > max_inline_chunks) return error.NativeLakeFilesTooLarge;
+    const chunks = try out.alloc(artifacts.ChunkRef, count);
     var begin: usize = 0;
     while (begin < chunks.len) {
         const end = @min(chunks.len, begin + stores.ArtifactStore.max_upload_batch);
@@ -311,7 +315,7 @@ pub fn sortExtents(extents: []Extent) void {
     }.less);
 }
 fn validateExtents(extents: []const Extent) !void {
-    if (extents.len > 8192) return error.InvalidNativeLakeFiles;
+    if (extents.len > std.math.maxInt(u32)) return error.InvalidNativeLakeFiles;
     for (extents, 0..) |extent, i| {
         if (!validPath(extent.path) or (i != 0 and !std.mem.lessThan(u8, extents[i - 1].path, extent.path))) return error.InvalidNativeLakeFiles;
         if (extent.data) |data| if (data.len != extent.bytes) return error.InvalidNativeLakeFiles;
@@ -393,6 +397,43 @@ pub fn publishCheckpoint(a: A, out: A, checkpoint: *const local.storage_lsm_back
     try root.validate();
     return root;
 }
+/// Publish a pinned source plane directly into an authenticated file tree.
+/// One batch owns at most 32 file descriptors; neither file count nor chunk
+/// count requires an inline generation root. The prefix is part of each key.
+pub fn publishCheckpointPaged(a: A, checkpoint: *const local.storage_lsm_backend.Backend.NativeCheckpoint, prior: Root, prefix: []const u8, store: *stores.ArtifactStore, token: Cancellation, output_budget: anytype, reuse: ?Reuse) !Root {
+    if (checkpoint.run_paths.len != checkpoint.run_ids.len or checkpoint.run_paths.len >= std.math.maxInt(u32)) return error.InvalidNativeLakeFiles;
+    var result = prior;
+    const budget = OutputBudget.from(output_budget);
+    var first: usize = 0;
+    while (first < checkpoint.run_paths.len + 1) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const out = arena.allocator();
+        const end = @min(first + 32, checkpoint.run_paths.len + 1);
+        const changes = try out.alloc(native_directory.FileChange, end - first);
+        for (changes, first..) |*change, ordinal| {
+            try token.check();
+            var file = if (ordinal == 0)
+                try publishBytes(out, try std.fmt.allocPrint(out, "{s}manifest.bin", .{prefix}), checkpoint.manifest_bytes, store, token, budget, reuse)
+            else source: {
+                const physical = checkpoint.run_paths[ordinal - 1];
+                const name = try std.fmt.allocPrint(out, "{s}runs/{d}.tbl", .{ prefix, checkpoint.run_ids[ordinal - 1] });
+                break :source try publishPrefix(a, out, checkpoint.storage, physical, name, try checkpoint.storage.fileSize(physical), store, token, budget, reuse);
+            };
+            file = try native_directory.pageFile(a, out, store, prior.domain, file, token, budget.work);
+            change.* = .{ .path = file.path, .file = file };
+        }
+        std.mem.sort(native_directory.FileChange, changes, {}, struct {
+            fn less(_: void, left: native_directory.FileChange, right: native_directory.FileChange) bool {
+                return std.mem.lessThan(u8, left.path, right.path);
+            }
+        }.less);
+        result = try native_directory.applyChanges(a, store, result, changes, token, budget.work);
+        first = end;
+    }
+    return result;
+}
+
 /// Paths must be the exact files of a pinned native checkpoint, never an
 /// unbounded directory census containing mutable or obsolete generations.
 pub fn publishFiles(a: A, out: A, source: Storage, source_root: []const u8, paths: []const []const u8, store: *stores.ArtifactStore, cancellation: Cancellation, output_budget: anytype, reuse: ?Reuse) !Root {
@@ -409,7 +450,7 @@ pub fn publishFiles(a: A, out: A, source: Storage, source_root: []const u8, path
         const size = try source.fileSize(physical);
         const n = std.math.cast(usize, size / chunk_bytes + @intFromBool(size % chunk_bytes != 0)) orelse return error.NativeLakeFilesTooLarge;
         total = std.math.add(usize, total, n) catch return error.NativeLakeFilesTooLarge;
-        if (total > max_chunks) return error.NativeLakeFilesTooLarge;
+        if (total > max_inline_chunks) return error.NativeLakeFilesTooLarge;
         try stores.chargeReadBudget(budget.generation, size);
         const chunks = try out.alloc(artifacts.ChunkRef, n);
         var begin: usize = 0;
@@ -485,7 +526,16 @@ pub const Reader = struct {
         // Concurrent loaders never allocate through the native owner's arena.
         const a = std.heap.page_allocator;
         var mapped = if (self.cache) |cached| @import("lake_index_native_text.zig").CachedSegments{ .store = self.store, .cache = .{ .cache = cached.cache, .scope = cached.scope, .context = self.context } } else null;
-        return if (mapped) |*loader| try loader.loader().load(loader, a, ref, self.cancellation) else local.index.SegmentData.fromOwnedHeap(try artifacts.readArtifact(a, self.store, ref, self.cancellation, null));
+        return (if (mapped) |*loader| loader.loader().load(loader, a, ref, self.cancellation) else owned: {
+            const bytes = artifacts.readArtifact(a, self.store, ref, self.cancellation, null) catch |err| break :owned err;
+            break :owned local.index.SegmentData.fromOwnedHeap(bytes);
+        }) catch |err| switch (err) {
+            // A declared file exists in the immutable generation. Missing
+            // backing chunks are unavailable derived artifacts, not missing
+            // logical files that an LSM open may initialize as an empty store.
+            error.FileNotFound, error.NotFound, error.ObjectNotFound => error.LakeIndexArtifactUnavailable,
+            else => err,
+        };
     }
     fn awaitBlock(self: *Reader, block: *Block) !*Block {
         errdefer block.release();
@@ -583,10 +633,17 @@ pub const Reader = struct {
         try self.context.ensureActive();
         try self.cancellation.check();
     }
+    fn immutableFailure(err: anyerror) anyerror {
+        return switch (err) {
+            error.FileNotFound, error.NotFound, error.ObjectNotFound => error.LakeIndexArtifactUnavailable,
+            else => err,
+        };
+    }
     fn file(self: *Reader, path: []const u8) !File {
         try self.check();
         if (!std.mem.startsWith(u8, path, self.prefix) or path.len <= self.prefix.len or path[self.prefix.len] != '/') return error.FileNotFound;
-        return (try self.navigation.lookup(self.root, self.store, path[self.prefix.len + 1 ..], self.cancellation, self.cache)) orelse error.FileNotFound;
+        const found = self.navigation.lookup(self.root, self.store, path[self.prefix.len + 1 ..], self.cancellation, self.cache) catch |err| return immutableFailure(err);
+        return found orelse error.FileNotFound;
     }
     fn readInto(raw: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
         const self = from(raw);
@@ -597,7 +654,7 @@ pub const Reader = struct {
         if (out.len == 0) return;
         const first: usize = @intCast(offset / chunk_bytes);
         const last: usize = @intCast((offset + out.len - 1) / chunk_bytes);
-        const refs = try self.navigation.chunks(metadata.allocator(), self.root, self.store, entry, first, last - first + 1, self.cancellation, self.cache);
+        const refs = self.navigation.chunks(metadata.allocator(), self.root, self.store, entry, first, last - first + 1, self.cancellation, self.cache) catch |err| return immutableFailure(err);
         // Start at most two requested successor chunks, and join them before
         // returning so no task can outlive this request's reader/context.
         var tasks: [2]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
@@ -1526,4 +1583,35 @@ test "external lake native capture stays serial through opaque SQL backing quota
     const captured = try publishPrefix(memory.allocator(), out, source.storage(), "/candidate/manifest.bin", "manifest.bin", bytes.len, &parallel, .none, &generation, null);
     try std.testing.expectEqual(@as(usize, 0), memory.live);
     for (file.chunks, captured.chunks) |old, current| try std.testing.expectEqualStrings(old.artifact_id, current.artifact_id);
+}
+
+test "external lake execution missing native chunks remain artifact failures" {
+    const a = std.testing.allocator;
+    for (0..3) |failure| {
+        var temporary = try local.common_test_directory.TestDirectory.init("missing-native-chunk");
+        defer temporary.cleanup();
+        var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+        defer fs.deinit();
+        var store = fs.artifactStore();
+        store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const out = arena.allocator();
+        var remaining: u64 = 1024 * 1024;
+        var descriptor = try publishBytes(out, "manifest.bin", "manifest", &store, .none, &remaining, null);
+        const chunk_id = descriptor.chunks[0].artifact_id;
+        descriptor = try native_directory.pageFile(a, out, &store, @splat(7), descriptor, .none, null);
+        const root = try native_directory.applyChanges(a, &store, .{ .version = 2, .domain = @splat(7) }, &.{.{ .path = descriptor.path, .file = descriptor }}, .none, null);
+        var reader: Reader = .{ .root = root, .prefix = "/missing", .store = store, .context = .{}, .scratch = a };
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(u64, 8), try reader.storage().fileSize("/missing/manifest.bin"));
+        try std.testing.expectError(error.FileNotFound, reader.storage().fileSize("/missing/not-declared"));
+        const PageStore = @import("../serverless/graph_segment/page_store.zig").PageStore;
+        const page_id = if (failure == 1) try PageStore.identity(root.domain, descriptor.chunk_root.?) else if (failure == 2) try PageStore.identity(root.domain, root.directory.?) else undefined;
+        try store.deleteWithCancellation(if (failure == 0) chunk_id else &page_id, .none);
+        // Avoid using decoded descriptors from the initial existence checks.
+        reader.deinit();
+        reader = .{ .root = root, .prefix = "/missing", .store = store, .context = .{}, .scratch = a };
+        try std.testing.expectError(error.LakeIndexArtifactUnavailable, reader.storage().readFileRangeAlloc(a, "/missing/manifest.bin", 0, 8));
+    }
 }

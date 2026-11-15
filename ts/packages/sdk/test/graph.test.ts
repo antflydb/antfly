@@ -1,5 +1,5 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 
 import http from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";

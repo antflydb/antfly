@@ -16,7 +16,7 @@
 //! Media compute has no dependency on the DB owner protocol. Its version and
 //! request layouts evolve independently; only semantic failure identity is shared.
 const failure = @import("runtime_failure_abi");
-pub const abi_version: u32 = 4;
+pub const abi_version: u32 = 5;
 pub const Allocator = @import("runtime_memory_abi").Allocator;
 pub const Status = failure.Status;
 pub const FailureIdentity = failure.FailureIdentity;
@@ -69,6 +69,7 @@ pub const EnrichmentExtractRequest = extern struct {
     callback_ctx: ?*anyopaque = null,
     on_begin: ?EnrichmentStreamBeginFn = null,
     on_units_json: ?*const fn (?*anyopaque, BorrowedBytes) callconv(.c) Status = null,
+    cancellation: PdfCancellation = .{},
     max_decoded_stream_bytes: u64 = 64 * 1024 * 1024,
     max_working_set_bytes: u64 = 96 * 1024 * 1024,
 };

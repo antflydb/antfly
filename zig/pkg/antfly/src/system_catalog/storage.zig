@@ -1407,6 +1407,28 @@ fn sqlExtensionReferences(backing: std.mem.Allocator, txn: *docstore.DocStore.Tx
     }
 }
 
+fn graphTablePrefix(a: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
+    return std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:system_catalog_name:{d}:graph_table:{d}:", .{ group_id, table_id });
+}
+fn graphTableKey(a: std.mem.Allocator, group_id: u64, table_id: u64, graph_id: u64) ![]u8 {
+    const prefix = try graphTablePrefix(a, group_id, table_id);
+    defer a.free(prefix);
+    return std.fmt.allocPrint(a, "{s}{d}", .{ prefix, graph_id });
+}
+pub fn graphsForTable(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) ![]const domain.Resource {
+    const prefix = try graphTablePrefix(a, group_id, table_id);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
+    var entry = try cursor.seekAtOrAfter(prefix);
+    while (entry) |kv| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+        const record = try std.json.parseFromSliceLeaky(domain.Resource, a, kv.value, .{ .allocate = .alloc_always });
+        if (record.kind != .graph or !std.mem.eql(u8, kv.key, try graphTableKey(a, group_id, table_id, record.id))) return error.InvalidCatalogRecord;
+        try out.append(a, record);
+    }
+    return out.items;
+}
 fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
     try sqlExtensionReferences(alloc, txn, group_id, r, true);
     try r.validateLogicalRelationId();
@@ -1428,6 +1450,11 @@ fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     const child_json = try std.json.Stringify.valueAlloc(alloc, r, .{});
     defer alloc.free(child_json);
     try txn.put(child_key, child_json);
+    if (r.kind == .graph) for (r.graph_tables) |table| {
+        const key = try graphTableKey(alloc, group_id, table.table_id, r.id);
+        defer alloc.free(key);
+        try txn.put(key, child_json);
+    };
     if (r.kind == .role) {
         var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_privileges.Role, alloc, r.source_json, .{ .allocate = .alloc_always });
         defer parsed.deinit();
@@ -1505,6 +1532,20 @@ fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
     }
     try @import("temporary_namespace_index.zig").stage(alloc, txn, group_id, r, false);
     try @import("authorization_storage.zig").resourceDependency(alloc, txn, group_id, r, false);
+    if (r.kind == .graph) for (r.graph_tables, 0..) |table, ordinal| {
+        var repeated = false;
+        for (r.graph_tables[0..ordinal]) |prior| if (prior.table_id == table.table_id) {
+            repeated = true;
+            break;
+        };
+        if (repeated) continue;
+        const key = try graphTableKey(alloc, group_id, table.table_id, r.id);
+        defer alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    };
     const child_key = try childKey(alloc, group_id, r);
     defer alloc.free(child_key);
     txn.delete(child_key) catch |err| switch (err) {

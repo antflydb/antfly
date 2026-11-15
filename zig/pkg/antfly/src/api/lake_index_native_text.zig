@@ -810,6 +810,27 @@ pub const Inventory = struct {
         for (self.manifests) |manifest| if (manifest) |owned| owned.release();
     }
 };
+/// Ranking needs authenticated segment admissions, not physical source routes.
+/// Source-page expansion and physical proofs remain on the winner hydration
+/// path. This separate decoded type cannot satisfy a full FileGroup lease.
+pub const SegmentAdmissions = struct {
+    segments: []const artifacts.ChunkRef,
+    admissions: []const local.segment.SegmentReader.Admission,
+    selected: []const text_directory.Interval = &.{},
+};
+pub fn loadCachedAdmissions(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !SegmentAdmissions {
+    if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
+    const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+    const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
+    defer a.free(bytes);
+    const group = try std.json.parseFromSliceLeaky(SegmentAdmissions, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    if (group.selected.len != 0 or group.segments.len == 0 or group.segments.len > max_segments or group.admissions.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
+    for (group.segments, group.admissions) |segment, admission| {
+        try text_directory.validateRef(segment, scope.domain);
+        try admission.validate();
+    }
+    return group;
+}
 pub fn loadCachedFile(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !FileGroup {
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
     return loadFileManifest(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, scope.domain, cancellation, cache);

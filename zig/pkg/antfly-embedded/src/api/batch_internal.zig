@@ -93,6 +93,47 @@ test "ordered artifact inventory private batch roundtrip rejects public and mixe
     accept.merge_replication.?.transition_id += 1;
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, encodeBatchRequest(alloc, accept));
 }
+test "internal isolated controls preserve neutral document versions across owner and forwarded codecs" {
+    const a = std.testing.allocator;
+    const inventory = @import("../storage/db/artifact_inventory.zig");
+    const catalogs: inventory.Catalogs = .{};
+    const requests = [_]db_mod.types.BatchRequest{
+        .{ .activate_range_tracking = true },
+        .{ .artifact_catalog = .{
+            .namespace = @splat(1),
+            .catalogs = catalogs,
+            .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(a) },
+        } },
+        .{ .relational_topology = .{ .action = .begin, .fence = .{
+            .transition_id = 1,
+            .admission_epoch = 1,
+            .attempt = 1,
+            .owner_group_id = 3,
+            .peer_group_id = 4,
+            .role = .child_generation_source,
+            .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .catalog_digest = @splat(5),
+        } } },
+    };
+    for (requests) |request| {
+        for ([_]bool{ false, true }) |owner| {
+            const bytes = if (owner) try encodeOwnerBatchRequest(a, request) else try encodeBatchRequest(a, request);
+            defer a.free(bytes);
+            var decoded = try parseInternalBatchRequest(a, bytes);
+            defer decoded.deinit(a);
+            try std.testing.expectEqualDeep(request, decoded.req);
+            // A second forwarding hop must retain the same private command,
+            // including the strict catalog-only validation before encoding.
+            const forwarded = try encodeBatchRequest(a, decoded.req);
+            defer a.free(forwarded);
+            var next = try parseInternalBatchRequest(a, forwarded);
+            defer next.deinit(a);
+            try std.testing.expectEqualDeep(request, next.req);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, forwarded));
+        }
+    }
+}
+
 test "artifact publication upload control is private, bounded, and single purpose" {
     const alloc = std.testing.allocator;
     const transport = @import("../storage/db/artifact_publication_transport.zig");
@@ -234,9 +275,28 @@ test "signed write admission is internal-only and survives the replicated batch 
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
     var parsed = try parseInternalBatchRequest(alloc, encoded);
     defer parsed.deinit(alloc);
+    @memset(encoded, 0xa5);
     try std.testing.expectEqualStrings(req.row_policy_principal_proof, parsed.req.row_policy_principal_proof);
     try std.testing.expectEqualStrings(req.row_policy_database, parsed.req.row_policy_database);
     try std.testing.expectEqual(req.row_policy_admitted_at_seconds, parsed.req.row_policy_admitted_at_seconds);
+    const forwarded = try encodeBatchRequest(alloc, parsed.req);
+    defer alloc.free(forwarded);
+    var next = try parseInternalBatchRequest(alloc, forwarded);
+    defer next.deinit(alloc);
+    try std.testing.expectEqualStrings(req.row_policy_principal_proof, next.req.row_policy_principal_proof);
+    try std.testing.expectEqualStrings(req.row_policy_database, next.req.row_policy_database);
+}
+
+test "signed write admission ownership survives every parser allocation failure" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var owned = try parseInternalBatchRequest(alloc, "{\"inserts\":{\"row\":{}},\"_row_policy_principal_proof\":\"proof\",\"_row_policy_database\":\"main\",\"_row_policy_admitted_at_seconds\":123}");
+            defer owned.deinit(alloc);
+            try std.testing.expectEqualStrings("proof", owned.req.row_policy_principal_proof);
+            try std.testing.expectEqualStrings("main", owned.req.row_policy_database);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "index maintenance internal batch codec owns binary proof and rejects public bypass" {
@@ -499,6 +559,7 @@ test "merge page tail binding cannot be downgraded to snapshot only wire" {
 pub const OwnedBatchRequest = struct {
     prepared_domain_rows: ?@import("../schema/domain_handoff.zig").Owned = null,
     writes: []db_types.BatchWrite = &.{},
+    prepared_enrichments_json: ?[]u8 = null,
     deletes: [][]const u8 = &.{},
     transforms: []db_types.DocumentTransform = &.{},
     graph_writes: []db_types.GraphEdgeWrite = &.{},
@@ -547,6 +608,7 @@ pub const OwnedBatchRequest = struct {
     req: db_types.BatchRequest = .{},
 
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
+        if (self.prepared_enrichments_json) |json| alloc.free(json);
         @import("relational_integrity_wire.zig").free(alloc, self.integrity);
         if (self.integrity_commands) |*commands| commands.deinit();
         if (self.graph_endpoint_cleanup_guards) |*guards| guards.deinit();
@@ -642,6 +704,23 @@ pub const public_codec = @import("batch.zig");
 /// Borrow public buffers for a synchronous storage/coordinator call. Every
 /// private field remains its default; public data cannot grant owner authority.
 pub const fromPublic = db_types.fromPublicMutation;
+
+test "internal batch commit requirements survive native owner and forwarded codecs" {
+    const a = std.testing.allocator;
+    for ([_]?db_mod.types.CommitRequires{ null, .none, .direct_enrichments }) |requirement| {
+        const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write, .commit_requires = requirement };
+        const wire = try encodeBatchRequest(a, request);
+        defer a.free(wire);
+        var forwarded = try parseInternalBatchRequest(a, wire);
+        defer forwarded.deinit(a);
+        try std.testing.expectEqual(requirement, forwarded.req.commit_requires);
+        const native = try encodeOwnerBatchRequest(a, forwarded.req);
+        defer a.free(native);
+        var owner = try parseOwnerBatchRequest(a, native);
+        defer owner.deinit(a);
+        try std.testing.expectEqual(requirement, owner.req.commit_requires);
+    }
+}
 
 pub fn takePublic(owned: *public_codec.OwnedBatchRequest) OwnedBatchRequest {
     const result_value: OwnedBatchRequest = .{ .writes = owned.writes, .deletes = owned.deletes, .transforms = owned.transforms, .graph_writes = owned.graph_writes, .graph_deletes = owned.graph_deletes, .req = fromPublic(owned.req) };
@@ -744,12 +823,13 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
     const document_versions_envelope = versioned and input_value.array.items.len == 2 and input_value.array.items[0] == .string and (std.mem.eql(u8, input_value.array.items[0].string, "document-revisions-batch-v1") or std.mem.eql(u8, input_value.array.items[0].string, "row-semantics-batch-v4"));
     var domain_envelope = false;
     var trigger_envelope = false;
+    const prepared_envelope = versioned and input_value.array.items.len == 2 and input_value.array.items[0] == .string and std.mem.eql(u8, input_value.array.items[0].string, "prepared-enrichments-batch-v1");
     const root_value = if (versioned) blk: {
         const entries = input_value.array.items;
         if (!allow_internal or entries.len != 2 or entries[0] != .string) return error.InvalidBatchRequest;
-        trigger_envelope = std.mem.eql(u8, entries[0].string, "row-semantics-batch-v3") or (document_versions_envelope and entries[1] == .object and entries[1].object.contains("_trigger_receipts"));
-        domain_envelope = std.mem.eql(u8, entries[0].string, "row-semantics-batch-v2") or ((trigger_envelope or document_versions_envelope) and entries[1] == .object and entries[1].object.contains("_prepared_domain_rows"));
-        if (!document_versions_envelope and !trigger_envelope and !domain_envelope and !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1")) return error.InvalidBatchRequest;
+        trigger_envelope = std.mem.eql(u8, entries[0].string, "row-semantics-batch-v3") or ((prepared_envelope or document_versions_envelope) and entries[1] == .object and entries[1].object.contains("_trigger_receipts"));
+        domain_envelope = std.mem.eql(u8, entries[0].string, "row-semantics-batch-v2") or ((prepared_envelope or trigger_envelope or document_versions_envelope) and entries[1] == .object and entries[1].object.contains("_prepared_domain_rows"));
+        if (!prepared_envelope and !document_versions_envelope and !trigger_envelope and !domain_envelope and !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1")) return error.InvalidBatchRequest;
         break :blk entries[1];
     } else input_value;
     if (root_value != .object) return error.InvalidBatchRequest;
@@ -765,11 +845,12 @@ fn parseBatchValue(alloc: std.mem.Allocator, input_value: std.json.Value, allow_
     // protocols, including protocols absent from an ordinary row batch.
     var out: OwnedBatchRequest = .{};
     errdefer out.deinit(alloc);
-    try parseBatchRowsAndControls(alloc, root, allow_internal, versioned, domain_envelope, &out);
+    try parseBatchRowsAndControls(alloc, root, allow_internal, versioned, domain_envelope, prepared_envelope, &out);
     try parseTriggerPreparation(alloc, root, trigger_envelope, &out);
-    try parseBatchTransitions(alloc, root, allow_internal, local_owner, document_versions_envelope, &out);
+    try parseBatchTransitions(alloc, root, allow_internal, local_owner, document_versions_envelope or prepared_envelope, &out);
     try finishBatchRequest(root, allow_internal, local_owner, versioned, &out);
-    if (allow_internal and requiresDocumentVersionsEnvelope(out.req) != document_versions_envelope) return error.InvalidBatchRequest;
+    if (allow_internal and !prepared_envelope and requiresDocumentVersionsEnvelope(out.req) != document_versions_envelope) return error.InvalidBatchRequest;
+    if (prepared_envelope != (out.req.prepared_enrichments_json != null or out.req.commit_requires == .direct_enrichments)) return error.InvalidBatchRequest;
     return out;
 }
 
@@ -813,7 +894,20 @@ noinline fn parseTriggerPreparation(alloc: std.mem.Allocator, root: std.json.Obj
     out.req.trigger_preparation_proof = out.trigger_preparation_proof orelse "";
 }
 
-noinline fn parseBatchRowsAndControls(alloc: std.mem.Allocator, root: std.json.ObjectMap, allow_internal: bool, versioned: bool, domain_envelope: bool, out: *OwnedBatchRequest) !void {
+noinline fn parseBatchRowsAndControls(alloc: std.mem.Allocator, root: std.json.ObjectMap, allow_internal: bool, versioned: bool, domain_envelope: bool, prepared_envelope: bool, out: *OwnedBatchRequest) !void {
+    var control_field_count = root.count();
+    if (versioned) {
+        if (root.contains("_document_version_scheme")) control_field_count -= 1;
+        if (root.get("_timestamp_ns")) |value| if (try parseInternalU64(value) == 0) {
+            control_field_count -= 1;
+        };
+    }
+    out.prepared_enrichments_json = if (root.get("_prepared_enrichments")) |value| blk: {
+        if (!allow_internal or !prepared_envelope or value != .object) return error.InvalidBatchRequest;
+        break :blk try std.json.Stringify.valueAlloc(alloc, value, .{});
+    } else null;
+    out.req.prepared_enrichments_json = out.prepared_enrichments_json;
+    out.req.commit_requires = if (root.get("commit_requires")) |value| try @import("../storage/db/mutation_values.zig").parseCommitRequires(value) else null;
     out.relational_index_owner_control = if (root.get("_relational_index_owner_control")) |value| control: {
         if (!allow_internal or versioned) return error.InvalidBatchRequest;
         // Exact control framing rejects unknown effects before normalization.
@@ -983,7 +1077,7 @@ noinline fn parseBatchRowsAndControls(alloc: std.mem.Allocator, root: std.json.O
     if (out.row_policy_publication) |publication| {
         // Internal batch encoding always emits empty inserts/deletes. Nothing
         // else may share this control entry, even an otherwise inert field.
-        if (publication.value.table_id == 0 or publication.value.expected_generation == 0 or publication.value.expected_catalog_epoch == 0 or publication.value.owner_group_id == 0 or root.count() != 5 or out.row_policy_install_bundle == null or
+        if (publication.value.table_id == 0 or publication.value.expected_generation == 0 or publication.value.expected_catalog_epoch == 0 or publication.value.owner_group_id == 0 or control_field_count != 5 or out.row_policy_install_bundle == null or
             root.get("inserts") == null or root.get("deletes") == null or root.get("sync_level") == null or out.writes.len != 0 or out.deletes.len != 0)
             return error.InvalidBatchRequest;
     } else if (out.row_policy_install_bundle != null) return error.InvalidBatchRequest;
@@ -1087,7 +1181,7 @@ noinline fn parseBatchRowsAndControls(alloc: std.mem.Allocator, root: std.json.O
         decoder.decode(bytes, encoded.string) catch return error.InvalidBatchRequest;
     }
     out.merge_proof_adoption = if (root.get("_merge_proof_adoption")) |value| control: {
-        if (!allow_internal or root.count() != 5) return error.InvalidBatchRequest;
+        if (!allow_internal or control_field_count != 5) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
         if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
         const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
@@ -1207,8 +1301,22 @@ noinline fn parseBatchTransitions(alloc: std.mem.Allocator, root: std.json.Objec
         break :sync_level db_types.SyncLevel.propose;
     };
 
+    const graph_endpoint_cleanup = if (root.get("_graph_endpoint_cleanup")) |value| blk: {
+        if (!allow_internal or value != .bool) return error.InvalidBatchRequest;
+        break :blk value.bool;
+    } else false;
+
     out.req.document_version_scheme = scheme: {
-        const value = root.get("_document_version_scheme") orelse break :scheme if (!allow_internal or local_owner) .admit_current else .legacy;
+        // Isolated control commands never assign ordinary document versions.
+        // Preserve their neutral request default across forwarding and native
+        // owner calls: choosing legacy here adds an adjunct that their strict
+        // single-purpose validators correctly reject. Ordinary unmarked row
+        // replay retains its historical legacy interpretation.
+        const isolated_control = graph_endpoint_cleanup or out.req.activate_range_tracking or out.relational_topology != null or out.relational_generation_gc != null or
+            out.row_policy_publication != null or out.artifact_catalog != null or out.group_source != null or
+            out.resolver_review != null or out.artifact_publication != null or out.artifact_publication_transport != null or
+            out.leann_record_index != null or out.merge_proof_adoption != null;
+        const value = root.get("_document_version_scheme") orelse break :scheme if (!allow_internal or local_owner or isolated_control) .admit_current else .legacy;
         if (!allow_internal or !document_versions_envelope) return error.InvalidBatchRequest;
         const version = try parseInternalU64(value);
         break :scheme switch (version) {
@@ -1980,13 +2088,14 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
+    const prepared = req.prepared_enrichments_json != null or req.commit_requires == .direct_enrichments;
     const triggers = req.trigger_receipts.len != 0;
     const document_versions = requiresDocumentVersionsEnvelope(req);
-    const versioned = document_versions or triggers or requiresRowSemanticsEnvelope(req.writes, req.predicates);
+    const versioned = prepared or document_versions or triggers or requiresRowSemanticsEnvelope(req.writes, req.predicates);
     const domains = @import("../schema/domain_handoff.zig").present(req.writes);
     try DomainHandoff.requireUniqueKeys(alloc, req.writes);
     if (domains and req.merge_page != null) return error.InvalidBatchRequest;
-    if (document_versions) try writer.writeAll(if (triggers or domains) "[\"row-semantics-batch-v4\"," else "[\"document-revisions-batch-v1\",") else if (triggers) try writer.writeAll("[\"row-semantics-batch-v3\",") else if (domains) try writer.writeAll("[\"row-semantics-batch-v2\",") else if (versioned) try writer.writeAll("[\"row-semantics-batch-v1\",");
+    if (prepared) try writer.writeAll("[\"prepared-enrichments-batch-v1\",") else if (document_versions) try writer.writeAll(if (triggers or domains) "[\"row-semantics-batch-v4\"," else "[\"document-revisions-batch-v1\",") else if (triggers) try writer.writeAll("[\"row-semantics-batch-v3\",") else if (domains) try writer.writeAll("[\"row-semantics-batch-v2\",") else if (versioned) try writer.writeAll("[\"row-semantics-batch-v1\",");
 
     try writer.writeAll("{\"inserts\":{");
     for (if (req.merge_page != null) &.{} else req.writes, 0..) |write, i| {
@@ -2466,6 +2575,11 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_types.BatchRequest,
         }
         try writer.writeByte('}');
     }
+    if (req.prepared_enrichments_json) |json| {
+        try writer.writeAll(",\"_prepared_enrichments\":");
+        try writer.writeAll(json);
+    }
+    if (req.commit_requires) |requirement| try writer.print(",\"commit_requires\":\"{s}\"", .{@tagName(requirement)});
     try writer.print(",\"sync_level\":\"{s}\"}}", .{syncLevelName(req.sync_level)});
     if (versioned) try writer.writeByte(']');
     return try out.toOwnedSlice();
@@ -3613,6 +3727,13 @@ test "internal batch graph endpoint cleanup command isolates planned effects" {
     var parsed = try parseInternalBatchRequest(alloc, encoded);
     defer parsed.deinit(alloc);
     try std.testing.expect(parsed.req.graph_endpoint_cleanup_planned);
+    try std.testing.expectEqual(.admit_current, parsed.req.document_version_scheme);
+    try db_mod.types.validateGraphEndpointCleanupCommand(parsed.req);
+    const forwarded = try encodeBatchRequest(alloc, parsed.req);
+    defer alloc.free(forwarded);
+    var forwarded_parsed = try parseInternalBatchRequest(alloc, forwarded);
+    defer forwarded_parsed.deinit(alloc);
+    try db_mod.types.validateGraphEndpointCleanupCommand(forwarded_parsed.req);
     try std.testing.expectEqualStrings("hub", parsed.req.graph_endpoint_cleanup_guards[0].endpoint);
     try std.testing.expectEqual(@as(u64, 0), parsed.req.graph_endpoint_cleanup_guards[0].generation);
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{job} }));
@@ -3895,7 +4016,8 @@ test "time series document revision wire discriminates legacy replay and epoch a
         try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, bytes));
         var decoded = try parseInternalBatchRequest(a, bytes);
         defer decoded.deinit(a);
-        try std.testing.expectEqual(scheme, decoded.req.document_version_scheme);
+        // Unmarked private controls normalize legacy/admission policy to neutral.
+        try std.testing.expectEqual(if (scheme == .revision_v1) scheme else .admit_current, decoded.req.document_version_scheme);
         try std.testing.expectEqual(@as(u64, 0), decoded.req.timestamp_ns);
     }
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, "{\"_timestamp_ns\":\"1\",\"_document_version_scheme\":1}"));
@@ -3977,4 +4099,49 @@ test "range tracking activation codec preserves isolated control across revision
     request.document_version_scheme = .admit_current;
     request.writes = &.{.{ .key = "a", .value = "{}" }};
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
+}
+
+test "distributed txn private control wire keeps document revision metadata independent of effects" {
+    const a = std.testing.allocator;
+    const inventory = @import("../storage/db/artifact_inventory.zig");
+    const catalogs: inventory.Catalogs = .{ .indexes = "AIDX\x02\x00\x00\x00\x00\x00\x00\x00", .enrichments = "[]", .resolvers = "[]" };
+    const upload = @import("../storage/db/artifact_publication_transport.zig");
+    const hashes = [_]upload.Digest{upload.chunkDigest(0, "data")};
+    const requests = [_]db_mod.types.BatchRequest{
+        .{ .activate_range_tracking = true, .sync_level = .write },
+        .{ .row_policy_publication = .{ .table_id = 7, .expected_generation = 11, .expected_catalog_epoch = 13, .expected_phase = .pending_install, .owner_group_id = 17, .expected_descriptor_digest = @splat(0xab) }, .row_policy_install_bundle = "{\"table_id\":7}" },
+        .{ .artifact_catalog = .{ .namespace = @splat(1), .binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(a) }, .catalogs = catalogs } },
+        .{ .artifact_publication_transport = .{ .action = .begin, .namespace = @splat(1), .publication_digest = @splat(2), .command_digest = @splat(3), .encoded_len = 4, .chunk_hashes = &hashes } },
+        .{ .group_source = .{ .action = .activate_catalog, .artifact = "group", .definition = .{ .table_incarnation = 1, .configuration = @splat(1) }, .namespace = @splat(1), .backfill = .{ .route = .{ .value = "" } } } },
+        .{ .resolver_review = .{ .namespace = @splat(1), .resolver = "resolver", .document = "doc", .source_artifact = "source", .resolution_artifact = "resolution", .local_id = "local", .expected_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .config_generation = 1, .curation_revision = 1, .decision = .suppressed, .table = "table", .key = "" } },
+        .{ .leann_record = .{ .index_name = "vector", .record = "record" } },
+        .{ .graph_endpoint_cleanup = true },
+        .{ .merge_proof_adoption = .{ .transition_id = 7, .attempt = .{ .donor_term = 3, .sequence = 4 }, .source_pin = @splat(1), .proof_digest = @splat(2), .record_digest = @splat(3) } },
+    };
+    for (requests) |request| for ([_]db_mod.types.DocumentVersionScheme{ .admit_current, .legacy, .revision_v1 }) |scheme| {
+        var versioned = request;
+        versioned.document_version_scheme = scheme;
+        const bytes = try encodeBatchRequest(a, versioned);
+        defer a.free(bytes);
+        try std.testing.expectError(error.InvalidBatchRequest, @import("batch.zig").parseBatchRequest(a, bytes));
+        var decoded = try parseInternalBatchRequest(a, bytes);
+        defer decoded.deinit(a);
+        // Unmarked private controls normalize legacy/admission policy to neutral.
+        try std.testing.expectEqual(if (scheme == .revision_v1) scheme else .admit_current, decoded.req.document_version_scheme);
+        if (scheme == .revision_v1 and (request.row_policy_publication != null or request.merge_proof_adoption != null)) {
+            // These controls historically forbid an authored timestamp. Only
+            // the revision envelope's mandatory zero field is structural.
+            var altered = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+            defer altered.deinit();
+            try altered.value.array.items[1].object.put(altered.arena.allocator(), "_timestamp_ns", .{ .integer = 1 });
+            const nonzero = try std.json.Stringify.valueAlloc(a, altered.value, .{});
+            defer a.free(nonzero);
+            try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, nonzero));
+        }
+        // Excluding revision transport metadata must never relax the sole
+        // control entry's prohibition on user mutations.
+        versioned.writes = &.{.{ .key = "not-a-control", .value = "{}" }};
+        const mixed_error = if (versioned.artifact_catalog != null) error.InvalidArtifactCatalogCommand else if (versioned.group_source != null) error.InvalidGroupedSourceCommand else if (versioned.resolver_review != null) error.InvalidResolverCurationRequest else error.InvalidBatchRequest;
+        try std.testing.expectError(mixed_error, encodeBatchRequest(a, versioned));
+    };
 }

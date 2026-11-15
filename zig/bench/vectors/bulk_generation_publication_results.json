@@ -1,0 +1,118 @@
+{
+  "scope": "Real encoded generation-map publication with an in-memory immutable provider, followed by reopened lookup of every captured generation and byte length; operation-local cold reads and traversal snapshots are charged to the writer owner",
+  "records_per_case": 16384,
+  "durable_leaf_records": 128,
+  "scope_seed": {
+    "domain_byte": 31,
+    "fencing_token": 1,
+    "nonce_byte": 5
+  },
+  "policies": "128-record incremental default versus 4096-record admitted fresh fused bulk journal; both have a 1 MiB record-payload flush threshold",
+  "writer_allocator_limit_bytes": 67108864,
+  "results": [
+    {
+      "records": 16384,
+      "batch_records": 128,
+      "puts": 13625,
+      "reads": 13352,
+      "written_bytes": 122272584,
+      "flushes": 128,
+      "pending_peak": 30848,
+      "allocator_peak": 6266396,
+      "elapsed_ns": 1325315000
+    },
+    {
+      "records": 16384,
+      "batch_records": 4096,
+      "puts": 1092,
+      "reads": 7822,
+      "written_bytes": 10892012,
+      "flushes": 4,
+      "pending_peak": 987136,
+      "allocator_peak": 5556343,
+      "elapsed_ns": 518807000
+    }
+  ],
+  "metadata_put_reduction_fraction": 0.9198532110091743,
+  "limitations": [
+    "Metadata API counts and encoded bytes, not measured GCS HTTP request counts or whole-build throughput",
+    "One local shared-host timing observation per policy; peaks depend on bounded scheduling overlap",
+    "Scripted provider supplies one immutable generation per map-node key; separate lifecycle/provider fixtures cover version changes, retries, cancellation and failed publication"
+  ],
+  "live_correctness_validation": {
+    "timestamp_utc": "2026-11-13T02:32:25Z",
+    "rows": 1024,
+    "status": "qualified",
+    "executable_sha256": "67df940572971836fcb3aa5ad8842850a2c7f13f05ae99fdac5bbfb2abeed8c9",
+    "native_ns": 15976422000,
+    "worker_wall_ns": 23060123166,
+    "supervisor_wall_seconds": 25.06982729100855,
+    "peak_rss_bytes": 53280768,
+    "owner_memory": [
+      {
+        "role": "generation_map",
+        "peak_bytes": 95486,
+        "limit_bytes": 67108864
+      },
+      {
+        "role": "transport",
+        "peak_bytes": 2814588,
+        "limit_bytes": 134217728
+      },
+      {
+        "role": "build",
+        "peak_bytes": 35280326,
+        "limit_bytes": 1073741824
+      }
+    ],
+    "generation_work": [
+      {
+        "batch_records": 4096,
+        "batch_bytes": 1048576,
+        "flushes": 3,
+        "peak_pending_records": 46,
+        "peak_pending_bytes": 10994
+      }
+    ],
+    "source_operations": [
+      {
+        "operation": "source_seal",
+        "elapsed_ns": 1391000,
+        "error_name": null
+      },
+      {
+        "operation": "source_recovery_manifest",
+        "elapsed_ns": 11000,
+        "error_name": null
+      },
+      {
+        "operation": "source_pin_checkpoint",
+        "elapsed_ns": 12000,
+        "error_name": null
+      },
+      {
+        "operation": "source_checkpoint_publish",
+        "elapsed_ns": 1705373000,
+        "error_name": null
+      },
+      {
+        "operation": "source_sample_publish",
+        "elapsed_ns": 783411000,
+        "error_name": null
+      },
+      {
+        "operation": "source_identity_directory",
+        "elapsed_ns": 131415000,
+        "error_name": null
+      },
+      {
+        "operation": "source_receipt_save",
+        "elapsed_ns": 408202000,
+        "error_name": null
+      }
+    ],
+    "final_sample_complete": true,
+    "sampler_stopped": true,
+    "scope": "Live GCS ADC build and reopen/recall with frozen input hashes and unchanged source generation; correctness only, no paired scale speedup claim"
+  }
+}

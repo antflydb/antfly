@@ -30,8 +30,12 @@ import time
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-build", action="store_true")
+    parser.add_argument("--binary", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
+    binary = (args.binary or root / "zig/zig-out/bin/antfly").resolve()
+    if args.binary and not args.no_build:
+        parser.error("--binary requires --no-build to use the supplied installation")
     if not args.no_build:
         build_flags = shlex.split(os.environ.get("ZIG_BUILD_FLAGS", ""))
         subprocess.run(
@@ -65,6 +69,8 @@ def main():
             check=True,
         )
         subprocess.run(["make", "-C", "zig", "build"], cwd=root, check=True)
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        parser.error(f"native executable is missing or not executable: {binary}")
     with tempfile.TemporaryDirectory(prefix=".source-native-ci-", dir=root) as name:
         state = Path(name)
 
@@ -99,7 +105,7 @@ def main():
         with (state / "server.log").open("w+") as log:
             server = subprocess.Popen(
                 [
-                    str(root / "zig/zig-out/bin/antfly"),
+                    str(binary),
                     "standalone",
                     "--config",
                     str(config),
@@ -142,6 +148,9 @@ def main():
                     **os.environ,
                     "GOWORK": "off",
                     "ANTFLY_SOURCES_E2E_URL": f"http://127.0.0.1:{api_port}/db/v1",
+                    "ANTFLY_SOURCES_KNOWLEDGE_RESTART_STATE": str(
+                        state / "knowledge-restart.json"
+                    ),
                 }
                 subprocess.run(
                     [
@@ -152,7 +161,7 @@ def main():
                         "-count=1",
                         "-v",
                         "-run",
-                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence|PDFInputAdmission)$",
+                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence|PDFInputAdmission|SourceKnowledge|SourceKnowledgePrefixResolution|SourceKnowledgeRecipeMigration)$",
                         "-timeout",
                         "4m",
                     ],
@@ -160,6 +169,62 @@ def main():
                     env=env,
                     check=True,
                     timeout=270,
+                )
+                subprocess.run(
+                    [
+                        "go",
+                        "-C",
+                        "go/pkg/sources",
+                        "run",
+                        "./examples/source-knowledge",
+                        "--endpoint",
+                        env["ANTFLY_SOURCES_E2E_URL"],
+                        "--catalog",
+                        str(state / "knowledge-catalog.json"),
+                    ],
+                    cwd=root,
+                    env=env,
+                    check=True,
+                    timeout=150,
+                )
+                # Reopen the same durable owner and qualify migrated recipes,
+                # shared curation and owner retraction without rebuilding inputs.
+                command = server.args
+                server.terminate()
+                server.wait(timeout=15)
+                server = subprocess.Popen(
+                    command, cwd=root, stdout=log, stderr=subprocess.STDOUT
+                )
+                deadline = time.monotonic() + 45
+                while True:
+                    if server.poll() is not None:
+                        raise RuntimeError("native owner exited during restart")
+                    try:
+                        with socket.create_connection(
+                            ("127.0.0.1", api_port), timeout=0.2
+                        ):
+                            break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("restarted native owner did not listen")
+                        time.sleep(0.1)
+                subprocess.run(
+                    [
+                        "go",
+                        "-C",
+                        "go/pkg/sources",
+                        "test",
+                        "-count=1",
+                        "-v",
+                        "-run",
+                        "^TestNativeSourceKnowledgeAfterRestart$",
+                        "-timeout",
+                        "3m",
+                    ],
+                    cwd=root,
+                    env=env,
+                    check=True,
+                    timeout=210,
                 )
             except BaseException:
                 log.flush()

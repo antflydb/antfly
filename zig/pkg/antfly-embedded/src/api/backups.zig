@@ -2653,7 +2653,13 @@ pub fn createTableRequestFromManifest(alloc: std.mem.Allocator, manifest: *const
     errdefer request.deinit(alloc);
     // Restore policy/consumers but never source-owned privacy checkpoints.
     // The request takes ownership before any validation that may fail.
-    request.indexes_json = try @import("../privacy/catalog.zig").prepareRestore(alloc, manifest.indexes_json);
+    const privacy_indexes = try @import("../privacy/catalog.zig").prepareRestore(alloc, manifest.indexes_json);
+    defer alloc.free(privacy_indexes);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var nonce: [32]u8 = undefined;
+    try @import("antfly_platform").entropy.fill(io_impl.io(), &nonce);
+    request.indexes_json = try @import("index_aliases.zig").renewRestoreEpoch(alloc, privacy_indexes, &std.fmt.bytesToHex(nonce, .lower));
     try tables_api.validateStoredIndexesJson(alloc, request.indexes_json.?);
     var bindings = try @import("../system_catalog/native_indexes.zig").read(alloc, manifest.sql_native_indexes_json, request.indexes_json.?);
     defer bindings.deinit();

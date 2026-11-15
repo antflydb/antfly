@@ -11,7 +11,7 @@ browser surface retain their text restrictions. Choice values are strings and
 every question needs a unique name. See the [decision schema](../../specs/openapi/ai/decision.yaml).
 
 `/extract` retains entities, relations, attributes, structured records and
-ordinary classification. Standalone Laya, OpenDecider and EmbeddingGemma
+ordinary classification. Standalone GLiDE, Laya, OpenDecider and EmbeddingGemma
 workflows use `/decisions`. The unreleased extraction decision output and
 Boolean and ordinal decision modes have been removed.
 
@@ -138,6 +138,10 @@ curl --fail-with-body http://127.0.0.1:8080/ai/v1/decisions \
 antfly inference decisions ./models --request decision.json --backend metal
 ```
 
+Repeat `--request` to run several files against one loaded model; the CLI prints
+one JSON response per line. `--repeat N` re-runs the files N times, interleaved,
+and prints each file's median and minimum latency on stderr.
+
 The inference listener serves `/decisions` directly (default port 8090).
 Existing binding methods consume the same JSON: C `antfly_inference_decide_json`,
 Rust `Inference::decide`, Go `Inference.Decide`, Python `Inference.decide`,
@@ -199,7 +203,8 @@ predicates require trained deciders. A database handle alone does not configure
 SQL providers.
 
 Validate quality, thresholds and resource limits on your workload before
-deployment. Preparation and limits are in [Laya](../guides/models/laya.mdx) and
+deployment. Preparation and limits are in [GLiDE](../guides/models/glide.mdx),
+[Laya](../guides/models/laya.mdx) and
 [EmbeddingGemma 2](../guides/models/embeddinggemma2.mdx).
 
 ## Decider cascades

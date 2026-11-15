@@ -41,14 +41,27 @@ const Namespace = struct {
     guard: std.Io.File,
     digest: [32]u8,
     fn open(a: Allocator, io: std.Io, path: []const u8, publication: bool, no_sync: bool) !Namespace {
-        const canonical = if (publication) blk: {
-            const parent = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(path) orelse ".", a);
-            defer a.free(parent);
-            break :blk try std.fs.path.joinZ(a, &.{ parent, std.fs.path.basename(path) });
-        } else try std.Io.Dir.cwd().realPathFileAlloc(io, path, a);
-        errdefer a.free(canonical);
-        const parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(canonical).?, .{});
+        // Capture relative paths once. All subsequent lookups use an absolute
+        // path or a pinned directory handle, so a later cwd change cannot move
+        // the namespace (or its identity marker) into the process directory.
+        var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const absolute = if (std.fs.path.isAbsolute(path))
+            try a.dupe(u8, path)
+        else blk: {
+            const len = try std.Io.Dir.cwd().realPath(io, &cwd_buffer);
+            break :blk try std.fs.path.join(a, &.{ cwd_buffer[0..len], path });
+        };
+        defer a.free(absolute);
+        // Existing files must canonicalize symlink aliases to the same binding.
+        const resolved = if (publication) null else try std.Io.Dir.cwd().realPathFileAlloc(io, absolute, a);
+        defer if (resolved) |value| a.free(value);
+        const target = resolved orelse absolute;
+        const parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(target).?, .{});
         defer parent.close(io);
+        var parent_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const parent_len = try parent.realPath(io, &parent_buffer);
+        const canonical = try std.fs.path.joinZ(a, &.{ parent_buffer[0..parent_len], std.fs.path.basename(target) });
+        errdefer a.free(canonical);
         // The path chooses a bounded location, never the authority to reuse.
         var path_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(canonical, &path_digest, .{});
@@ -306,4 +319,115 @@ test "lite reader epochs guard cross-generation registration and reject replaced
     try std.testing.expectError(error.UnsafeNativeReaderAlias, register(a, io, path, binding, inode, 1, true));
     try std.testing.expectError(error.WouldBlock, scan(a, io, path, binding, inode));
     try std.testing.expectError(error.FileNotFound, namespace.directory.access(io, "identity", .{}));
+}
+
+// Model a cwd change at the first pathname-based lookup, without changing the
+// real process cwd (which would interfere with other tests). Every hook performs
+// the real filesystem operation; only the directory used for cwd is switched.
+test "lite reader epochs keep relative publication in its original directory when cwd changes" {
+    const Probe = struct {
+        var current: std.Io.Dir = undefined;
+        var next: std.Io.Dir = undefined;
+        var changed: bool = false;
+
+        fn base(dir: std.Io.Dir) std.Io.Dir {
+            return if (dir.handle == std.Io.Dir.cwd().handle) current else dir;
+        }
+        fn switchCwd() void {
+            if (changed) return;
+            current = next;
+            changed = true;
+        }
+        fn realPath(_: ?*anyopaque, dir: std.Io.Dir, buffer: []u8) std.Io.Dir.RealPathError!usize {
+            return base(dir).realPath(std.testing.io, buffer);
+        }
+        fn realPathFile(_: ?*anyopaque, dir: std.Io.Dir, path: []const u8, buffer: []u8) std.Io.Dir.RealPathFileError!usize {
+            switchCwd();
+            return base(dir).realPathFile(std.testing.io, path, buffer);
+        }
+        fn openDir(_: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenOptions) std.Io.Dir.OpenError!std.Io.Dir {
+            switchCwd();
+            return base(dir).openDir(std.testing.io, path, options);
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    // Cover both a bare filename and a relative path with directory components.
+    for ([_][]const u8{ "relative.aflite", "nested/relative.aflite" }) |relative| {
+        var intended = std.testing.tmpDir(.{});
+        defer intended.cleanup();
+        var unrelated = std.testing.tmpDir(.{});
+        defer unrelated.cleanup();
+        const root = try intended.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const parent_name = std.fs.path.dirname(relative) orelse ".";
+        if (!std.mem.eql(u8, parent_name, ".")) {
+            try intended.dir.createDir(io, parent_name, .fromMode(0o700));
+            try unrelated.dir.createDir(io, parent_name, .fromMode(0o700));
+        }
+        const data = try intended.dir.createFile(io, relative, .{ .read = true });
+        defer data.close(io);
+        Probe.current = intended.dir;
+        Probe.next = unrelated.dir;
+        Probe.changed = false;
+        var vtable = io.vtable.*;
+        vtable.dirRealPath = Probe.realPath;
+        vtable.dirRealPathFile = Probe.realPathFile;
+        vtable.dirOpenDir = Probe.openDir;
+        const changing_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        const published = try Namespace.open(a, changing_io, relative, true, true);
+        defer published.close(a, io);
+        try std.testing.expect(Probe.changed);
+
+        // A real cwd race must not leave either a bare identity or a namespace
+        // directory in the unrelated location, even if that parent exists.
+        const wrong_parent = try unrelated.dir.openDir(io, parent_name, .{ .iterate = true });
+        defer wrong_parent.close(io);
+        var entries = wrong_parent.iterate();
+        try std.testing.expectEqual(@as(?std.Io.Dir.Entry, null), try entries.next(io));
+        try std.testing.expectError(error.FileNotFound, intended.dir.access(io, "identity", .{}));
+        const expected = try std.fs.path.join(a, &.{ root, relative });
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, published.canonical);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(expected, &digest, .{});
+        const marker = try std.fmt.allocPrint(a, "{s}/.aflite-readers-{x}/identity", .{ parent_name, digest });
+        defer a.free(marker);
+        const identity = try intended.dir.openFile(io, marker, .{});
+        defer identity.close(io);
+        try std.testing.expectEqual(@as(u64, 32), (try identity.stat(io)).size);
+        try std.testing.expectEqual((try published.guard.stat(io)).inode, (try identity.stat(io)).inode);
+        // Reader registration must also resolve the relative database path
+        // before a later cwd change, and recover the publisher's binding.
+        Probe.current = intended.dir;
+        Probe.changed = false;
+        const reopened = try Namespace.open(a, changing_io, relative, false, true);
+        defer reopened.close(a, io);
+        try std.testing.expect(Probe.changed);
+        try std.testing.expectEqualStrings(expected, reopened.canonical);
+        try std.testing.expectEqualSlices(u8, &published.digest, &reopened.digest);
+    }
+}
+
+test "lite reader epochs preserve symlink bindings and reject missing databases" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "target.aflite" });
+    defer a.free(path);
+    const alias = try std.fs.path.join(a, &.{ root, "alias.aflite" });
+    defer a.free(alias);
+    try std.testing.expectError(error.FileNotFound, Namespace.open(a, io, path, false, true));
+    const data = try tmp.dir.createFile(io, "target.aflite", .{ .read = true });
+    defer data.close(io);
+    const published = try Namespace.open(a, io, path, true, true);
+    defer published.close(a, io);
+    try tmp.dir.symLink(io, "target.aflite", "alias.aflite", .{});
+    const reader = try Namespace.open(a, io, alias, false, true);
+    defer reader.close(a, io);
+    try std.testing.expectEqualStrings(published.canonical, reader.canonical);
+    try std.testing.expectEqualSlices(u8, &published.digest, &reader.digest);
 }

@@ -3,7 +3,7 @@
   "architecture": "arm64",
   "schema_version": 1,
   "sdk_version": "27.0",
-  "sha256": "dc5321272b9e2e4371e85b51ab5ea5397a60c88448686f67b8cb691176cdf593",
-  "source_commit": "0296ff31720db2ba5b14f8e489f562d7115c8484",
-  "source_sha256": "82447bc1a2ce177369640d8b9d1dc6a026836a0dd0b3515ee5efa2cf6165f593"
+  "sha256": "496b066b7ddb963ab714661b9904be2ed40c982ae08185d78d2d3693949ba1bb",
+  "source_commit": "efcb964314bb9184ed8a4611cdd2404fc2c549b2",
+  "source_sha256": "fc7c5628c191c676bca01de3f08a43f351466c49e4541bac74394f1bfafedd9d"
 }

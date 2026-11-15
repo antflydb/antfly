@@ -53,7 +53,7 @@ pub const Sweep = struct {
     pub fn next(self: *Sweep, alloc: std.mem.Allocator, source: catalog.CatalogSource, deadline: ?u64) !?Visit {
         if (self.generation == null) {
             self.generation = if (source.vtable.acquire_routing_generation) |acquire|
-                try acquire(source.ptr, deadline, false)
+                try acquire(source.ptr, source.budget(deadline), false)
             else blk: {
                 const routing = try source.routingSource();
                 var snapshot = try routing.eventualSnapshot(deadline);
@@ -94,7 +94,7 @@ test "graph endpoint cleanup routing retains one capture for ten thousand groups
     const Provider = struct {
         current: *catalog.RoutingGeneration,
         captures: usize = 0,
-        fn acquire(ptr: *anyopaque, _: ?u64, authoritative: bool) !*catalog.RoutingGeneration {
+        fn acquire(ptr: *anyopaque, _: catalog.RoutingBudget, authoritative: bool) !*catalog.RoutingGeneration {
             try std.testing.expect(!authoritative);
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.captures += 1;

@@ -289,6 +289,7 @@ func TestRefreshSearchDiscoveryDoesNotAcquireOrExtendAccess(t *testing.T) {
 	require.Equal(t, 2, after.Sources[0].SearchVersion)
 	require.Equal(t, before.Sources[0].ValidUntil, after.Sources[0].ValidUntil)
 	require.Equal(t, before.Sources[0].PublishedRevision, after.Sources[0].PublishedRevision)
+	require.Equal(t, before.Sources[0].AcquisitionID, after.Sources[0].AcquisitionID)
 	// Changed acquisition cannot borrow the previous generation's publication.
 	runner.Profile.Sources[0].Permissions.Public = true
 	runner.Profile.Sources[0].Streams[0].Name = "unpublished"

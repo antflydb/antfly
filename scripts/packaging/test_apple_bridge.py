@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import json
 import os
+import platform
 import subprocess
 import tempfile
 import unittest
@@ -25,6 +27,71 @@ import apple_bridge as bridge
 
 
 class AppleBridgeArtifactTests(unittest.TestCase):
+    @unittest.skipUnless(
+        platform.system() == "Darwin"
+        and platform.machine() == "arm64"
+        and int(platform.mac_ver()[0].split(".")[0]) >= 26,
+        "native ARM64 Apple bridge requires macOS 26 or later",
+    )
+    def test_invalid_generation_budgets_fail_before_model_access(self):
+        library = bridge.verify(bridge.SOURCE.parent.parent / "prebuilt/arm64", "arm64")
+        native = ctypes.CDLL(str(library.resolve()))
+        cancel_type = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p)
+        output_type = ctypes.CFUNCTYPE(
+            ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t
+        )
+        cancel = cancel_type(lambda _: 0)
+        responses = []
+
+        def receive(_context, data, count):
+            responses.append(ctypes.string_at(data, count))
+            return 0
+
+        output = output_type(receive)
+        invoke = native.antfly_apple_invoke
+        invoke.argtypes = [
+            ctypes.c_int32,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            cancel_type,
+            output_type,
+        ]
+        invoke.restype = ctypes.c_int32
+        for budget in (0, -1, 2**31, 2**60, 2**63 - 1, True, "1024", 1.5, None):
+            with self.subTest(budget=budget):
+                request = json.dumps(
+                    {
+                        "messages": [{"role": "user", "text": "Hello"}],
+                        "max_tokens": budget,
+                        "require_completion": True,
+                    }
+                ).encode()
+                self.assertEqual(
+                    invoke(
+                        1,
+                        request,
+                        len(request),
+                        None,
+                        0,
+                        65536,
+                        ctypes.c_void_p(1),
+                        cancel,
+                        output,
+                    ),
+                    1,
+                )
+                self.assertEqual(responses, [])
+        # Invalid requests release the serialized bridge gate and leave the
+        # process usable, even when Apple Intelligence has no installed model.
+        self.assertEqual(
+            invoke(3, b"{}", 2, None, 0, 65536, ctypes.c_void_p(1), cancel, output), 0
+        )
+        self.assertIn("generation_status", json.loads(b"".join(responses)))
+
     def test_parallel_generate_checks_only_after_bridge_build(self):
         makefile = (bridge.ROOT / "Makefile").read_text()
         generate = next(

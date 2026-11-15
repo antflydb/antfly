@@ -1105,3 +1105,453 @@ def test_scaling_readiness_rejects_process_exit_during_second_foreign_reply(
             [{"id": 101}], public_api=True, max_timeout_s=2, label="Data API"
         )
     assert replies[0] == 2
+
+
+def test_lake_readiness_allows_full_budget_after_bounded_probe_timeout(monkeypatch):
+    import test_lake_row_identity as lake
+
+    now = [0.0]
+    monkeypatch.setattr(
+        lake,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        ),
+    )
+    query = {"full_text_search": {"match": "needle", "field": "body"}}
+    queries = []
+
+    def raw(method, path, body):
+        assert (method, path) == ("POST", "/tables/docs/query")
+        queries.append(body)
+        if "timeout_ms" in body:
+            now[0] += 1
+            return SimpleNamespace(
+                ok=False,
+                status_code=504,
+                text="bounded probe expired",
+                json=lambda: {"code": "query_timeout", "retryable": True},
+            )
+        # A valid Debug query may need more than the readiness probe's second.
+        now[0] += 2
+        return SimpleNamespace(ok=True, status_code=200, text="ok")
+
+    revisions = iter(["old", "new"])
+
+    def indexes(method, path):
+        assert (method, path) == ("GET", "/tables/docs/indexes")
+        return [
+            {
+                "config": {"name": "text"},
+                "status": {
+                    "published_revision": next(revisions),
+                    "readiness": {"state": "ready", "queryable": True},
+                },
+            }
+        ]
+
+    assert (
+        lake._wait_for_native_indexes_ready(
+            raw, indexes, lambda: "", "docs", query, after="old"
+        )
+        == "new"
+    )
+    assert queries == [{**query, "timeout_ms": 1000}, query]
+    assert "timeout_ms" not in query
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_constraint_poll_gateway_timeouts_preserve_outer_budget(monkeypatch, ready):
+    import test_backup_restore as backup
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock.now,
+            sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+        ),
+    )
+    calls = []
+
+    def get(url, *, timeout):
+        calls.append(timeout)
+        clock.now += min(timeout, 0.5)
+        response = requests.Response()
+        response.status_code = 200 if ready and len(calls) > 1 else 504
+        response._content = (
+            b'{"state":"enforced"}'
+            if response.status_code == 200
+            else b'{"error":"constraint status deadline exceeded"}'
+        )
+        return response
+
+    assert (
+        backup._wait_for_constraints_enforced(
+            SimpleNamespace(get=get), "http://localhost/db/v1", "docs", timeout_s=3.0
+        )
+        is ready
+    )
+    assert len(calls) >= 2
+    assert all(0 < timeout <= 3 for timeout in calls)
+    assert clock.now <= 3
+
+
+@pytest.mark.parametrize("status", [401, 500, 504])
+def test_resolution_gateway_timeout_retry_requires_read_only_poll(status):
+    from test_resolution import _transient_poll_error
+
+    response = requests.Response()
+    response.status_code = status
+    error = requests.HTTPError(response=response)
+    assert not _transient_poll_error(error)
+    assert _transient_poll_error(error, read_only=True) is (status == 504)
+
+
+@pytest.mark.parametrize("transport_failure", [False, True])
+def test_root_enrollment_reconciles_unknown_outcome_without_replaying(
+    monkeypatch, transport_failure
+):
+    import test_backup_restore as backup
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock.now,
+            sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+        ),
+    )
+    identity = {
+        "node_id": 4,
+        "store_id": 4,
+        "root_incarnation": "123",
+        "public_key": "ab" * 32,
+        "metadata_incarnation": "incarnation",
+    }
+    proof = {"identity": identity, "signature": "cd" * 64}
+    writes = []
+    reads = []
+
+    def response(status, body):
+        import json
+
+        result = requests.Response()
+        result.status_code = status
+        result._content = json.dumps(body).encode()
+        return result
+
+    def post(url, **kwargs):
+        if url.endswith("/enrollment-status"):
+            return get(url, **kwargs)
+        writes.append((url, kwargs))
+        if transport_failure:
+            raise requests.ReadTimeout("reply lost after commit")
+        return response(503, {"error": "MetadataMutationOutcomeUnknown"})
+
+    def get(url, **kwargs):
+        reads.append((url, kwargs))
+        assert kwargs["json"] == identity
+        return response(404, {}) if len(reads) == 1 else response(200, identity)
+
+    backup._enroll_store_root_once(
+        SimpleNamespace(post=post, get=get), "http://metadata/db/v1", proof, timeout_s=1
+    )
+    assert len(writes) == 1
+    assert len(reads) == 2
+    assert clock.now <= 1
+
+
+@pytest.mark.parametrize("status", [401, 409])
+def test_root_enrollment_does_not_retry_permanent_rejection(status):
+    import test_backup_restore as backup
+
+    response = requests.Response()
+    response.status_code = status
+    response._content = b"enrollment rejected"
+    response.url = "http://metadata/db/v1/store-roots/enroll"
+    response.request = requests.Request("POST", response.url).prepare()
+    writes = []
+
+    def post(*args, **kwargs):
+        writes.append(args)
+        return response
+
+    def get(*args, **kwargs):
+        pytest.fail("permanent enrollment rejection must not be polled")
+
+    with pytest.raises((requests.HTTPError, AssertionError)):
+        backup._enroll_store_root_once(
+            SimpleNamespace(post=post, get=get),
+            "http://metadata/db/v1",
+            {"identity": {}},
+        )
+    assert len(writes) == 1
+
+
+def test_standalone_process_observer_runs_before_initial_and_recovery_readiness(
+    tmp_path, monkeypatch
+):
+    events = []
+    processes = []
+    server = object.__new__(e2e_conftest.StandaloneAntflyServer)
+    server.binary = "/unused/antfly"
+    server.host, server.port = "127.0.0.1", 12345
+    server.root = tmp_path
+    server.config_path = None
+    server.inference_host_budget_mb = None
+    server.storage_engine = None
+    server.pgwire_port = server.health_port = None
+    server.url = server.api_url = "http://127.0.0.1:12345"
+    server.log_path = tmp_path / "server.log"
+    server.log_path.touch()
+    server.port_reservations = SimpleNamespace(
+        handoff_to=lambda _ports, launch: launch()
+    )
+    server._poll_metadata_admin_url = lambda: ""
+    server.on_process_started = lambda proc: events.append((proc.pid, "observe"))
+
+    def launch(*_args, **_kwargs):
+        process = SimpleNamespace(pid=len(processes) + 1)
+        processes.append(process)
+        events.append((process.pid, "launch"))
+        return process
+
+    def ready(*_args, **_kwargs):
+        assert events[-1] == (server.proc.pid, "observe")
+        events.append((server.proc.pid, "ready"))
+        return True
+
+    monkeypatch.setattr(
+        e2e_conftest, "_standalone_stateful_command", lambda *_args, **_kwargs: []
+    )
+    monkeypatch.setattr(e2e_conftest.subprocess, "Popen", launch)
+    monkeypatch.setattr(e2e_conftest, "wait_for_server", ready)
+    with server.log_path.open("w") as log:
+        server.log_file = log
+        server._start_process(truncate_logs=False)
+        server._start_process(truncate_logs=False)
+    assert events == [
+        (1, "launch"),
+        (1, "observe"),
+        (1, "ready"),
+        (2, "launch"),
+        (2, "observe"),
+        (2, "ready"),
+    ]
+
+
+@pytest.mark.parametrize("diagnostics_fail", [False, True])
+def test_startup_failure_captures_diagnostics_before_cleanup_and_preserves_error(
+    tmp_path, diagnostics_fail
+):
+    server = object.__new__(e2e_conftest.StandaloneAntflyServer)
+    server.root = tmp_path
+    server.log_path = tmp_path / "server.log"
+    server.log_path.write_text("startup failure details")
+    events = []
+    primary = RuntimeError("startup failed")
+
+    def launch(**_kwargs):
+        raise primary
+
+    def capture(value):
+        events.append("capture")
+        assert value.log_path.read_text() == "startup failure details"
+        if diagnostics_fail:
+            raise OSError("diagnostic disk full")
+
+    def stop(**kwargs):
+        events.append("stop")
+        assert kwargs["test_failed"]
+        server.log_path.unlink()
+        if diagnostics_fail:
+            raise OSError("cleanup failed")
+
+    server._launch_process = launch
+    server.on_startup_failed = capture
+    server.stop = stop
+    with pytest.raises(RuntimeError) as caught:
+        server._start_process(truncate_logs=False)
+    assert caught.value is primary
+    assert events == ["capture", "stop"]
+    if diagnostics_fail:
+        assert len(primary.__notes__) == 2
+
+
+@pytest.mark.parametrize("failure_at", ["observer", "readiness"])
+def test_launch_failure_reaches_diagnostic_hook_before_log_is_deleted(
+    tmp_path, monkeypatch, failure_at
+):
+    server = object.__new__(e2e_conftest.StandaloneAntflyServer)
+    server.binary = "/unused/antfly"
+    server.host, server.port = "127.0.0.1", 12345
+    server.root = tmp_path
+    server.config_path = None
+    server.inference_host_budget_mb = None
+    server.storage_engine = None
+    server.pgwire_port = server.health_port = None
+    server.url = server.api_url = "http://127.0.0.1:12345"
+    server.log_path = tmp_path / "server.log"
+    server.log_path.write_text("complete launch diagnostics")
+    server.port_reservations = SimpleNamespace(handoff_to=lambda _ports, fn: fn())
+    captured, stopped = [], []
+
+    def observe(_proc):
+        if failure_at == "observer":
+            raise RuntimeError("process observer failed")
+
+    def capture(value):
+        captured.append(value.log_path.read_text())
+
+    def stop(**_kwargs):
+        stopped.append(True)
+        server.log_file.close()
+        server.log_path.unlink()
+
+    server.on_process_started = observe
+    server.on_startup_failed = capture
+    server.stop = stop
+    monkeypatch.setattr(
+        e2e_conftest, "_standalone_stateful_command", lambda *_a, **_k: []
+    )
+    monkeypatch.setattr(
+        e2e_conftest.subprocess, "Popen", lambda *_a, **_k: SimpleNamespace(pid=123)
+    )
+    monkeypatch.setattr(e2e_conftest, "wait_for_server", lambda *_a, **_k: False)
+    expected = (
+        "process observer failed" if failure_at == "observer" else "failed to start"
+    )
+    with server.log_path.open("a") as server.log_file:
+        with pytest.raises(RuntimeError, match=expected):
+            server._start_process(truncate_logs=False)
+    assert captured == ["complete launch diagnostics"]
+    assert stopped == [True]
+
+
+def test_root_enrollment_observation_follows_leader_without_replaying(monkeypatch):
+    import json
+    import test_backup_restore as backup
+
+    now = [0.0]
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        ),
+    )
+    identity = {"node_id": 4}
+    writes, reads, budgets = [], [], []
+
+    def resolve(remaining):
+        budgets.append(remaining)
+        now[0] += 0.05
+        # The first status still reaches the old leader; the next follows its successor.
+        return "http://old/db/v1" if len(budgets) <= 2 else "http://new/db/v1"
+
+    def post(url, **kwargs):
+        assert 0 < kwargs["timeout"] <= 1 - now[0]
+        result = requests.Response()
+        if url.endswith("/enroll"):
+            writes.append(url)
+            result.status_code = 503
+            result._content = json.dumps(
+                {"error": "MetadataMutationOutcomeUnknown"}
+            ).encode()
+        else:
+            reads.append(url)
+            assert kwargs["json"] == identity
+            result.status_code = 503 if len(reads) == 1 else 200
+            result._content = (
+                b"NotLeader" if len(reads) == 1 else json.dumps(identity).encode()
+            )
+        return result
+
+    backup._enroll_store_root_once(
+        SimpleNamespace(post=post),
+        "http://unused/db/v1",
+        {"identity": identity},
+        timeout_s=1,
+        resolve_api_url=resolve,
+    )
+    assert writes == ["http://old/db/v1/store-roots/enroll"]
+    assert reads == [
+        "http://old/db/v1/store-roots/enrollment-status",
+        "http://new/db/v1/store-roots/enrollment-status",
+    ]
+    assert len(budgets) == 3 and now[0] < 1
+
+
+def test_root_enrollment_discovery_consumes_the_shared_deadline(monkeypatch):
+    import test_backup_restore as backup
+
+    now = [0.0]
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        ),
+    )
+
+    def resolve(remaining):
+        assert remaining == 1
+        now[0] = 1
+        return "http://leader/db/v1"
+
+    def post(*args, **kwargs):
+        pytest.fail("discovery exhausted the budget before mutation submission")
+
+    with pytest.raises(AssertionError, match="route unavailable"):
+        backup._enroll_store_root_once(
+            SimpleNamespace(post=post),
+            "http://unused/db/v1",
+            {"identity": {}},
+            timeout_s=1,
+            resolve_api_url=resolve,
+        )
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_root_enrollment_rejects_late_success(monkeypatch, uncertain):
+    import json
+    import test_backup_restore as backup
+
+    now = [0.0]
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        ),
+    )
+    calls = []
+    identity = {"node_id": 4}
+
+    def post(url, **kwargs):
+        calls.append(url)
+        result = requests.Response()
+        if uncertain and len(calls) == 1:
+            result.status_code = 503
+            result._content = b'{"error":"MetadataMutationOutcomeUnknown"}'
+        else:
+            now[0] = 2
+            result.status_code = 200
+            result._content = json.dumps(identity).encode()
+        return result
+
+    with pytest.raises(AssertionError, match="exceeded deadline"):
+        backup._enroll_store_root_once(
+            SimpleNamespace(post=post),
+            "http://metadata/db/v1",
+            {"identity": identity},
+            timeout_s=1,
+        )
+    assert sum(url.endswith("/enroll") for url in calls) == 1

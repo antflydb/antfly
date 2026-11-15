@@ -470,6 +470,26 @@ pub const MetadataHttpClient = struct {
         return try self.fetchRoutingSnapshotAt(base_uri, .POST, path, body, budget);
     }
 
+    pub fn fetchRoutingToken(self: *MetadataHttpClient, base_uri: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.CatalogRoutingChangeToken) {
+        return self.fetchCatalogReadAt(metadata_api.CatalogRoutingChangeToken, base_uri, .POST, routes.Routes.internal_routing_token, "{}", budget) catch |err| switch (err) {
+            error.OutOfMemory, error.CatalogRoutingSnapshotTimeout, error.Canceled, error.DeadlineExceeded, error.UnsupportedOperation => return err,
+            error.Cancelled => return error.Canceled,
+            else => return error.StorageReadTemporarilyUnavailable,
+        };
+    }
+
+    pub fn fetchOwnerReadiness(self: *MetadataHttpClient, base_uri: []const u8, request: metadata_api.OwnerReadinessRequest, budget: ?RequestBudget) !std.json.Parsed(metadata_api.OwnerReadiness) {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        return self.fetchCatalogReadAt(metadata_api.OwnerReadiness, base_uri, .POST, routes.Routes.internal_owner_readiness, body, budget) catch |err| switch (err) {
+            error.OutOfMemory, error.CatalogRoutingSnapshotTimeout, error.Canceled, error.DeadlineExceeded, error.UnsupportedOperation => return err,
+            error.Cancelled => return error.Canceled,
+            // Legacy/malformed readiness replies are a peer capability or
+            // availability failure, never an invalid public graph query.
+            else => return error.StorageReadTemporarilyUnavailable,
+        };
+    }
+
     pub fn fetchPrivacyPolicyBinding(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.PrivacyPolicyBinding) {
         const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogTableRoutingSnapshotRequest{ .table_name = table_name }, .{});
         defer self.alloc.free(body);
@@ -500,7 +520,7 @@ pub const MetadataHttpClient = struct {
             .method = method,
             .uri = uri,
             .timeout_ms = default_request_timeout_ms,
-            .max_response_bytes = if (Result == metadata_api.PrivacyPolicyBinding) 4096 else null,
+            .max_response_bytes = if (Result == metadata_api.CatalogRoutingChangeToken or Result == metadata_api.PrivacyPolicyBinding or Result == metadata_api.OwnerReadiness) 4096 else null,
         };
         if (method == .POST) {
             request.body = body orelse "{}";
@@ -2572,6 +2592,12 @@ pub const MetadataHttpClient = struct {
 
     fn mapResponseStatus(resp: http_common.HttpResponse, bad_request_err: ?anyerror, not_found_err: ?anyerror, conflict_err: ?anyerror) !void {
         if (resp.status == 409) {
+            // Domain rejections are definite, not optimistic CAS races. In
+            // particular a privacy caller must not retry the same alias fence
+            // eight times and erase the actionable identity on its public API.
+            inline for (.{ error.IndexReferencedByAlias, error.IndexAliasGraphConflict, error.PrivacyManagedGraph, error.PrivacyUnknownArtifactSource }) |err| {
+                if (std.mem.eql(u8, resp.body, @errorName(err))) return err;
+            }
             for (resp.headers) |header| {
                 if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.table_mutation_error_header) and
                     std.mem.eql(u8, header.value, routes.Routes.table_mutation_error_artifact_dependency))
@@ -6386,4 +6412,26 @@ test "metadata.lake index owner projection read negotiates older peers without w
     executor.status = 503;
     executor.body = "NotLeader";
     try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+}
+
+test "index alias definition conflicts remain definite across metadata forwarding" {
+    const Executor = struct {
+        calls: usize = 0,
+        body: []const u8 = "IndexReferencedByAlias",
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{ .status = 409, .body = try a.dupe(u8, self.body) };
+        }
+    };
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    for ([_][]const u8{ "IndexReferencedByAlias", "IndexAliasGraphConflict" }) |body| {
+        executor.body = body;
+        const before = executor.calls;
+        const expected: anyerror = if (std.mem.eql(u8, body, "IndexReferencedByAlias")) error.IndexReferencedByAlias else error.IndexAliasGraphConflict;
+        try std.testing.expectError(expected, client.replaceTableDefinition("http://metadata.invalid", "docs", "{}"));
+        try std.testing.expectError(expected, client.replaceTableDefinitionStamped("http://metadata.invalid", "docs", "{}"));
+        try std.testing.expectEqual(before + 2, executor.calls);
+    }
 }

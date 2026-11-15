@@ -23,6 +23,17 @@ const Watch = @import("source_watch.zig").Watch;
 const Token = @import("source_watch.zig").Token;
 const Budget = @import("antfly_regex").Budget;
 const inventory = @import("inventory.zig");
+const MembershipRaceTest = if (@import("builtin").is_test) struct {
+    var remaining: usize = 0;
+    fn beforeValidation(journal: *@import("discovery_journal.zig").Journal) void {
+        if (remaining == 0) return;
+        remaining -= 1;
+        // Model an ancestor notification arriving after staging, before the
+        // publication guard. No changed source identity may be accepted here.
+        journal.watch.epoch +%= 1;
+    }
+} else struct {};
+
 pub const Entry = struct {
     blob: *Blob,
     path: []const u8,
@@ -161,7 +172,15 @@ pub const Generation = struct {
             }
         }
         if (previous) |old| if (!clean and old.refs == 1 and j.sources_covered and !w.failed) {
-            if (captureMembership(a, io, o, old, w, j) catch null) |updated| return updated;
+            // Membership staging has the same publication fence as content
+            // refresh. A coalesced ancestor notification can invalidate its
+            // first cut without changing the source namespace. Reconcile a
+            // bounded number of fresh cuts before paying for full discovery.
+            for (0..3) |_| {
+                if (captureMembership(a, io, o, old, w, j) catch null) |updated| return updated;
+                w.poll();
+                if (!j.coverage or !j.sources_covered or w.failed) break;
+            }
         };
         return captureFallback(a, io, o, previous, w, j, clean);
     }
@@ -702,6 +721,7 @@ pub const Generation = struct {
         if (retained + old.budget.live + @sizeOf(Generation) > o.workspace_memory_limit) return null;
         w.poll();
         j.watch.poll();
+        if (@import("builtin").is_test) MembershipRaceTest.beforeValidation(j);
         if (w.failed or w.epoch != epoch or j.watch.epoch != namespace_epoch or !j.namespaceClean()) return null;
         if (j.native.checkpoint() != native_epoch) return null;
         for (stage.entries.items) |entry| if (entry.witness_reused and (entry.blob.token == null or !w.intact(entry.blob.token.?))) return null;
@@ -1628,6 +1648,8 @@ test "membership updates retain canonical identities and visit only affected dir
     var current = try Generation.captureJournal(a, io, &o, null, &watch, &journal);
     defer current.deinit();
     if (!journal.sources_covered or !journal.coverage) return error.SkipZigTest;
+    MembershipRaceTest.remaining = 1;
+    defer MembershipRaceTest.remaining = 0;
     const initial_bytes = current.retainedBytes();
     for (0..24) |iteration| {
         const added = try std.fmt.bufPrint(&buffer, "dir-{d}/new.txt", .{iteration % 32});
@@ -1644,7 +1666,9 @@ test "membership updates retain canonical identities and visit only affected dir
         // Coalesced ancestor notifications can require rechecking every
         // canonical pathname, especially while other suites mutate tmp's
         // siblings. Only affected directories may be enumerated or revisited.
-        try std.testing.expect(current.namespace_directories_scanned <= 5);
+        // At most three fresh publication cuts, each limited to the same
+        // affected directories; never rescan all 32 source directories.
+        try std.testing.expect(current.namespace_directories_scanned <= 3 * 5);
         const rebuilt = try Generation.capture(a, io, &o, null);
         defer rebuilt.deinit();
         try std.testing.expectEqual(rebuilt.path_bytes, current.path_bytes);
@@ -1658,6 +1682,7 @@ test "membership updates retain canonical identities and visit only affected dir
         }
         try std.testing.expect(expected.next() == null);
     }
+    try std.testing.expectEqual(@as(usize, 0), MembershipRaceTest.remaining);
     // Repeated updates retire paths/tree nodes and reuse bounded dense capacity.
     try std.testing.expect(current.retainedBytes() < initial_bytes + 96 * 1024);
 }

@@ -72,6 +72,46 @@ Start a bounded retry or rescan with `POST /tables/customers/privacy/scans`,
 optionally supplying `from_key`, `to_key`, and a page `limit` from 1 to 1000.
 Source updates also schedule inspection through the ordinary producer pipeline.
 
+## Repairing an activation parked before an upgrade
+
+Upgrading the server or correcting a provider does not erase terminal producer
+failures. This includes activations affected by the v0.3.0 text/document
+transport mismatch: their repair ledger can contain `InferenceTransportUnavailable`
+and dependent `ArtifactDependencyFailed` entries even though the provider is
+now healthy. Protected reads continue to fail closed until current receipts and
+consumer publication are complete.
+
+After upgrading and verifying the configured extractor endpoint, inspect the
+policy and its bounded artifact repair ledger:
+
+```http
+GET /tables/customers/privacy
+
+POST /tables/customers/repair/issues
+Content-Type: application/json
+
+{"target":"artifact","limit":50}
+```
+
+Create a fresh privacy scan to explicitly retry inspection and its dependent
+consumers under the **same installed policy**:
+
+```http
+POST /tables/customers/privacy/scans
+Content-Type: application/json
+
+{"limit":100}
+```
+
+The coordinator advances bounded pages; `limit` is a per-page bound, not a cap
+on the total repaired documents. Supply `from_key` and `to_key` when only a
+particular key range needs repair. Poll the returned new `scan_id` until
+`succeeded`; an older failed scan remains historical failure evidence. Verify
+that coverage reports no pending or protected-blocked documents and that
+retrieval returns the redacted projection. If the new scan fails, inspect its
+error codes and repair ledger before retrying again. Do not disable privacy,
+replace the policy, or delete its artifacts to bypass the serving barrier.
+
 ## Producers and execution
 
 The default is the pinned
@@ -282,3 +322,46 @@ Generated Go, Python, and Rust clients expose the corresponding
 `getNamespaceTablePrivacyScan`, `listNamespaceTablePrivacyFindings`, and
 `queryNamespaceTablePrivacyFindings` operations (using each language's naming
 convention).
+
+
+### Index migration while protection is active
+
+With `redact_for_search_and_ai`, create a new physical embedding or full-text
+index through the normal create-index API. Antfly attaches it to the current
+protected artifact graph in the same catalog commit. Existing index generations
+and privacy inspection receipts remain usable. Wait for the new index to become
+complete, then move the serving index alias with `expected_index` set to the old
+physical index. After cutover, delete the unreferenced old physical index through
+the normal delete-index API. Its private chunk/embedding producers retire in the
+same catalog mutation, so later writes no longer invoke its model. Shared
+producers and the protected serving guard remain owned by their surviving
+consumers. Raw external vectors and unsupported graph consumers are rejected.
+Repeating an identical creation request preserves the physical generation.
+
+Semantic policy changes (including producer revision or replacement style)
+replace dependent consumer generations and backfill them under the new policy.
+Identical policy PUTs and execution-only tuning preserve existing generations.
+An alias that still references a changed consumer blocks the policy replacement
+with HTTP 409 `IndexReferencedByAlias`. Remove every alias referencing a changed consumer before changing the policy;
+rebind only after the protected index is complete. To remove an alias, GET
+`/tables/{tableName}/index-aliases/{aliasName}` and DELETE the same path with
+`If-Match` set to that response's exact `ETag`. Missing validators return 428,
+stale validators return 412, and a repeated deletion returns 404. This CAS also
+protects against deleting a concurrently recreated alias or one restored from a backup. Physical indexes and
+retained PUT idempotency receipts remain intact. Protection remains
+active throughout the transition. Alias mutations require metadata protocol 91
+and store artifact-source protocol 4 so older owners cannot misread the new
+validator state. Legacy alias catalogs continue to admit protocol-3 stores
+during rolling upgrades until lifecycle validator state is committed.
+
+Missing producer input does not become a successful replay merely because a retry
+limit elapsed. Its journal window remains pending until input arrives, a durable
+source deletion or generation proves it retired, or explicit repair resolves the
+missing state. Workers park instead of polling the same failed window; source or
+producer commits and explicit repair notifications wake them, including repairs
+at the same replay sequence. Ordinary query visibility waits do not wake an
+unchanged missing-input window. Continuing writes also respect a bounded retry
+backoff; they cannot cause a blocked window to replay at the write rate. A retry
+requires both a notification and an elapsed deadline, so idle workers do not
+poll. Reopening retries retained debt. This applies to
+full-text consumers as well as vector consumers.

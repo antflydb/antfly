@@ -67,3 +67,7 @@ test "system catalog native memory ownership storage root" {
 comptime {
     _ = @import("metadata/storage/sql_notifications_test.zig");
 }
+
+test "metadata alias persistence discovery" {
+    _ = storage.raft_apply_store;
+}

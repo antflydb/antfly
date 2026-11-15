@@ -802,6 +802,9 @@ pub const TestAssetProducer = struct {
     calls: usize = 0,
     generator_calls: usize = 0,
     reader_calls: usize = 0,
+    reader_media_count: usize = 0,
+    reader_source_text_bytes: usize = 0,
+    reader_media_digest: [32]u8 = @splat(0),
     transcriber_calls: usize = 0,
     extractor_calls: usize = 0,
     reader_output: ?[]const u8 = null,
@@ -852,6 +855,9 @@ pub const TestAssetProducer = struct {
             return try std.fmt.allocPrint(alloc, "{{\"relations\":[{{\"type\":\"mentions\",\"target\":{{\"document_id\":{f}}}}}]}}", .{std.json.fmt(request.source_text, .{})});
         }
         if (request.producer_type == .reader) {
+            self.reader_source_text_bytes += request.source_text.len;
+            self.reader_media_count += request.media.len;
+            for (request.media) |media| std.crypto.hash.sha2.Sha256.hash(media.bytes, &self.reader_media_digest, .{});
             if (self.reader_output) |output| return try alloc.dupe(u8, output);
             if (std.mem.eql(u8, request.content_type, "application/json")) {
                 const text = try std.fmt.allocPrint(alloc, "reader:{s}", .{request.source_text});

@@ -15,7 +15,6 @@
 
 //! Real-file, checksum-validated fetch batch replay; never mutates the store.
 const std = @import("std");
-const builtin = @import("builtin");
 const native = @import("antfly_local_sources").storage_vector_block_store;
 const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
 const resources = @import("antfly_local_sources").storage_resource_manager;
@@ -115,18 +114,10 @@ test "vector block complete fetch batch replay benchmark" {
     const expected_checksum = workers[0].checksum;
     const expected_reads = workers[0].reads;
     const expected_bytes = workers[0].bytes;
-    for ([_]bool{ false, true }) |bypass| {
-        if (pipeline and bypass) continue;
-        if (bypass) {
-            if (builtin.os.tag != .macos) continue;
-            // Descriptor-local F_NOCACHE. Device caches may persist.
-            for (opened.blocks) |b| switch (b.shared.payload) {
-                .mapped => |m| if (std.c.fcntl(m.fd, std.c.F.NOCACHE, @as(c_int, 1)) != 0) {
-                    return error.CacheBypassFailed;
-                },
-                .heap => return error.ExpectedMappedFile,
-            };
-        }
+    // Vector mappings now share evictable descriptors with all storage reads.
+    // Applying descriptor-local F_NOCACHE would mutate another reader's cache
+    // policy, so this replay benchmark only measures the shared-cache path.
+    for ([_]bool{false}) |bypass| {
         const concurrencies: []const usize = if (pipeline) &.{ 1, 2, 4, 10 } else &.{ 1, 10 };
         const modes: usize = if (pipeline) 12 else 6;
         for (concurrencies) |concurrency| for (0..4) |round| for (0..modes) |arm| {

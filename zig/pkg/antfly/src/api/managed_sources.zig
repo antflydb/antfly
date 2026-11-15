@@ -27,7 +27,7 @@ const Input = struct {
 };
 pub fn configure(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_id: ?u64, identity: ?api.AuthenticatedIdentity, context: local.api_operation.RequestContext, body: []const u8) ![]u8 {
     if (identity) |value| {
-        if (!api.permissionsAllow(value.permissions, .table, physical, .admin) or api.effectiveRowFilterJson(value, physical) != null) return error.Forbidden;
+        if (!api.permissionsAllow(value.permissions, .table, physical, .admin) or api.hasEffectiveRowFilter(value, physical)) return error.Forbidden;
     }
     if (body.len > 4 * 1024 * 1024) return error.InvalidCreateTableRequest;
     var parsed = try std.json.parseFromSlice(Input, a, body, .{});
@@ -62,7 +62,7 @@ pub fn sourcesHash(bytes: []const u8) [64]u8 {
 }
 
 pub fn status(a: A, server: *api.ApiHttpServer, physical: []const u8, bound_id: ?u64, identity: ?api.AuthenticatedIdentity, context: local.api_operation.RequestContext) ![]u8 {
-    if (identity) |value| if (!api.permissionsAllow(value.permissions, .table, physical, .admin) or api.effectiveRowFilterJson(value, physical) != null) return error.Forbidden;
+    if (identity) |value| if (!api.permissionsAllow(value.permissions, .table, physical, .admin) or api.hasEffectiveRowFilter(value, physical)) return error.Forbidden;
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
     const table = @import("tables.zig").findTableByName(&snapshot, physical) orelse return error.TableNotFound;

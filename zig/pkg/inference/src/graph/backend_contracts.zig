@@ -720,6 +720,10 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
     /// Ordinary preferences retain legacy reuse of any compatible dense slot.
     /// The first policy using this is exact PII DeBERTa F32 Metal mirrors.
     require_preferred_dense_precision: bool = false,
+    /// GLiDE: mirror a native-BF16 checkpoint weight as an F16 slot that
+    /// runs the F32-input TensorOps GEMM at every row count. Other callers
+    /// leave it off.
+    glide_f16_tensor_ops: bool = false,
 };
 
 pub const DecoderRuntimeEnsureLinearSlotRequest = struct {
@@ -736,6 +740,16 @@ pub const DecoderRuntimeApplyLinearRequest = struct {
     out_dim: usize,
     /// See DecoderRuntimeApplyRmsNormLinearRequest.use_transformed_lm_head.
     use_transformed_lm_head: bool = false,
+    /// GLiDE (Metal only): `slot` is a packed `[out_dim, in_dim]` GeGLU input
+    /// projection (gate rows, then value rows). Return
+    /// `gelu_exact(gate) * value` as `[rows, out_dim / 2]`, or null when the
+    /// fused route is unavailable. Other backends must not be asked.
+    glide_geglu_exact: bool = false,
+    /// With `glide_geglu_exact`: also apply this `[hidden, out_dim / 2]`
+    /// down-projection slot and add `glide_residual` (`[rows, hidden]`),
+    /// returning the whole MLP block `[rows, hidden]` (or null).
+    glide_down_slot: ?usize = null,
+    glide_residual: ?CT = null,
 };
 
 pub const DecoderRuntimeApplyLinearLayerNormRequest = struct {
@@ -1440,6 +1454,8 @@ pub const DebertaEncoderFramePlanRequest = struct {
     max_position_embeddings: usize,
     norm_eps: f32,
     layers: []const DebertaEncoderLayerSpec,
+    packed_qkv_cache_bytes: ?usize = null,
+    attention_scratch_bytes: ?usize = null,
 };
 
 pub const DebertaEncoderLayerRequest = struct {

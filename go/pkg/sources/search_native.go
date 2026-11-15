@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -28,6 +29,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/antflydb/antfly/go/pkg/sources/internal/declarations"
 	"github.com/antflydb/antfly/go/pkg/sources/management"
 )
 
@@ -60,6 +62,9 @@ func VectorSpaceIdentity(space VectorSpace) string {
 type nativeSearchIndex struct {
 	Config map[string]any `json:"config"`
 	Status struct {
+		ResolverReplay *struct {
+			Resolvers []nativeKnowledgeResolver `json:"resolvers"`
+		} `json:"resolver_replay"`
 		Readiness struct {
 			State     string `json:"state"`
 			Complete  bool   `json:"complete"`
@@ -75,7 +80,9 @@ type nativeSearchIndex struct {
 
 func decodeSearchIndex(raw []byte) (nativeSearchIndex, error) {
 	var out nativeSearchIndex
-	err := json.Unmarshal(raw, &out)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	err := decoder.Decode(&out)
 	if err == nil && out.Config == nil {
 		err = fmt.Errorf("native index configuration missing")
 	}
@@ -387,53 +394,11 @@ func containsNativeConfig(actual, desired map[string]any) bool {
 // NativeIndexName makes immutable recipe migrations explicit, including fields
 // native readback deliberately redacts. Existing indexes are never overwritten.
 func NativeIndexName(prefix string, config map[string]any) string {
-	raw, _ := json.Marshal(config)
-	sum := sha256.Sum256(raw)
-	return prefix + "-" + hex.EncodeToString(sum[:16])
-}
-func hasWriteOnlyProducer(v any) bool {
-	switch value := v.(type) {
-	case map[string]any:
-		for k, v := range value {
-			if k == "producer" || k == "producer_json" || k == "transcriber" || processingCredentialField(k) {
-				return true
-			}
-			if hasWriteOnlyProducer(v) {
-				return true
-			}
-		}
-	case []any:
-		for _, v := range value {
-			if hasWriteOnlyProducer(v) {
-				return true
-			}
-		}
-	}
-	return false
+	return declarations.NativeIndexName(prefix, config)
 }
 
 func ValidateProcessing(plan *ProcessingDeclaration) error {
-	if plan == nil {
-		return nil
-	}
-	if len(plan.Indexes) > 32 {
-		return fmt.Errorf("too many processing indexes")
-	}
-	names := map[string]bool{}
-	for _, index := range plan.Indexes {
-		if err := validateProcessingSecrets(index.Config); err != nil {
-			return err
-		}
-		if hasWriteOnlyProducer(index.Config) && !strings.HasSuffix(index.Name, NativeIndexName("", index.Config)) {
-			return fmt.Errorf("write-only producer recipes require a content-addressed native index name")
-		}
-
-		if !validBindingName(index.Name) || names[index.Name] || index.Config["type"] == nil {
-			return fmt.Errorf("invalid native index declaration")
-		}
-		names[index.Name] = true
-	}
-	return nil
+	return declarations.ValidateProcessing(plan)
 }
 
 // ObserveSearch checks native bindings once per distinct index, with bounded
@@ -442,8 +407,13 @@ func ValidateProcessing(plan *ProcessingDeclaration) error {
 func ObserveSearch(ctx context.Context, client SearchIndexClient, binding Binding) management.SearchStatus {
 	ctx, stop := context.WithTimeout(ctx, 5*time.Second)
 	defer stop()
-	out := management.SearchStatus{Version: SearchVersion, ObservedAt: int(time.Now().Unix()), Consistency: "unknown", Streams: []management.RepresentationStatus{}, Artifacts: []management.RepresentationStatus{}}
 	cache, failures := observeSearchIndexes(ctx, client, binding)
+	return searchStatusFromIndexes(binding, cache, failures)
+}
+
+func searchStatusFromIndexes(binding Binding, cache map[string]nativeSearchIndex, failures map[string]error) management.SearchStatus {
+	out := management.SearchStatus{Version: SearchVersion, ObservedAt: int(time.Now().Unix()), Consistency: "unknown", Streams: []management.RepresentationStatus{}, Artifacts: []management.RepresentationStatus{}}
+
 	inspect := func(name string) (nativeSearchIndex, error) {
 		if index, ok := cache[name]; ok {
 			return index, nil
@@ -547,52 +517,24 @@ var _ SearchIndexClient = (*Publisher)(nil)
 
 // Processing is driven independently of acquisition. Runtime adapters can call
 // this after desired state persistence, and retry it without provider downloads.
-func ReconcileSourceSearch(ctx context.Context, client SearchIndexClient, source Source) error {
+func ReconcileSourceSearch(ctx context.Context, client SearchIndexClient, source Source, audiences ...string) error {
+	audience := ""
+	if len(audiences) == 1 {
+		audience = audiences[0]
+	}
+	if err := ValidateKnowledgeProcessing(source.Knowledge, source.Processing, audience); err != nil {
+		return err
+	}
 	if err := ValidateSearchBindings(source.SearchVersion, source.Streams, source.Artifacts); err != nil {
 		return err
 	}
-	return ReconcileProcessing(ctx, client, source.Table, source.Processing)
+	if err := ReconcileProcessing(ctx, client, source.Table, source.Processing); err != nil {
+		return err
+	}
+	return ValidateInstalledKnowledge(ctx, client, Binding{Table: source.Table, Knowledge: source.Knowledge}, audience)
 }
 
-func validateProcessingSecrets(value any) error { return validateProcessingSecretsDepth(value, 0) }
-
-func validateProcessingSecretsDepth(value any, depth int) error {
-	if depth > 64 {
-		return fmt.Errorf("processing declaration exceeds depth budget")
-	}
-	switch v := value.(type) {
-	case map[string]any:
-		for key, value := range v {
-			if text, ok := value.(string); ok && text != "" && strings.HasSuffix(key, "_json") {
-				var decoded any
-				if err := json.Unmarshal([]byte(text), &decoded); err != nil {
-					return fmt.Errorf("invalid native processing JSON configuration")
-				}
-				if err := validateProcessingSecretsDepth(decoded, depth+1); err != nil {
-					return err
-				}
-			}
-			if processingCredentialField(key) {
-				if text, ok := value.(string); ok && text != "" && !processingSecretReference(text) {
-					return fmt.Errorf("processing credentials require native secret references")
-				}
-			}
-			if text, ok := value.(string); ok && processingEndpointField(key) && processingURLCredentials(text) {
-				return fmt.Errorf("processing endpoint credentials require native secret references")
-			}
-			if err := validateProcessingSecretsDepth(value, depth+1); err != nil {
-				return err
-			}
-		}
-	case []any:
-		for _, value := range v {
-			if err := validateProcessingSecretsDepth(value, depth+1); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
+func validateProcessingSecrets(value any) error { return declarations.ValidateProcessingSecrets(value) }
 
 // SourceTableConfig declares source ownership predicates as exact keyword
 // columns up front. Inferred prose fields are not an indexed equality contract.
@@ -690,6 +632,14 @@ func observeSearchIndexes(ctx context.Context, client SearchIndexClient, binding
 			}
 		} else {
 			add(stream.Index)
+		}
+	}
+	if binding.Knowledge != nil {
+		for _, g := range binding.Knowledge.Graphs {
+			add(g.Index)
+		}
+		for _, e := range binding.Knowledge.Entities {
+			add(e.Index)
 		}
 	}
 	close(jobs)

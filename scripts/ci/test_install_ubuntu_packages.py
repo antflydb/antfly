@@ -15,6 +15,8 @@
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -24,9 +26,39 @@ SCRIPT = Path(__file__).with_name("install_ubuntu_packages.sh")
 
 
 class InstallUbuntuPackagesTests(unittest.TestCase):
-    def run_install(self, failures, install_status=0):
+    def run_install(
+        self,
+        failures,
+        install_status=0,
+        sources=None,
+        command=None,
+        candidate_installer=False,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            checkout = root / "candidate"
+            checkout.mkdir()
+            if command is not None:
+                # Old admitted candidates have no installer. Only the pinned
+                # workflow checkout supplies the script used by setup.
+                pinned = (
+                    checkout
+                    / ".ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh"
+                )
+                pinned.parent.mkdir(parents=True)
+                pinned.write_bytes(SCRIPT.read_bytes())
+                if candidate_installer:
+                    decoy = checkout / "scripts/ci/install_ubuntu_packages.sh"
+                    decoy.parent.mkdir(parents=True)
+                    decoy.write_text("#!/bin/bash\nexit 88\n")
+            source_env = {}
+            if sources is not None:
+                source = root / "ubuntu.sources"
+                if sources == "present":
+                    source.write_text(
+                        "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu\nSuites: noble\nComponents: main universe\n"
+                    )
+                source_env["ANTFLY_UBUNTU_APT_SOURCES"] = str(source)
             commands = {
                 "sudo": '#!/bin/sh\nexec "$@"\n',
                 "sleep": "#!/bin/sh\nexit 0\n",
@@ -50,20 +82,98 @@ else:
                 path.write_text(body)
                 path.chmod(0o755)
             result = subprocess.run(
-                ["bash", str(SCRIPT), "pkg-config", "build-essential"],
+                ["bash", "-c", command]
+                if command is not None
+                else ["bash", str(SCRIPT), "pkg-config", "build-essential"],
+                cwd=checkout,
                 env={
                     **os.environ,
                     "PATH": f"{root}:{os.environ['PATH']}",
                     "APT_TEST_ROOT": directory,
                     "APT_TEST_FAILURES": str(failures),
                     "APT_TEST_INSTALL_STATUS": str(install_status),
+                    **source_env,
                 },
                 check=False,
             )
-            calls = [
-                json.loads(line) for line in (root / "calls").read_text().splitlines()
-            ]
+            calls = (
+                [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+                if (root / "calls").exists()
+                else []
+            )
             return result.returncode, calls
+
+    def test_zig_workflow_has_no_unverified_package_setup(self):
+        workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text()
+        self.assertNotRegex(workflow, r"\bapt-get\b")
+        self.assertLess(
+            workflow.index(
+                "bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh bzip2 xz-utils time"
+            ),
+            workflow.index("uses: mlugg/setup-zig@"),
+        )
+        self.assertNotRegex(workflow, r"bash scripts/ci/install_ubuntu_packages\.sh")
+        # Every installing job checks out the pinned tool exactly once, before
+        # its first use. Existing dependency checkouts must be reused.
+        installing_jobs = [
+            block
+            for block in re.split(r"^  [\w-]+:\n", workflow, flags=re.MULTILINE)
+            if "bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh "
+            in block
+        ]
+        self.assertTrue(installing_jobs)
+        for block in installing_jobs:
+            self.assertEqual(
+                block.count("name: Check out executing dependency policy"), 1
+            )
+            checkout = block.split(
+                "      - name: Check out executing dependency policy\n", 1
+            )[1]
+            checkout = re.split(r"^      - ", checkout, maxsplit=1, flags=re.MULTILINE)[
+                0
+            ]
+            self.assertIn("ref: ${{ github.workflow_sha }}", checkout)
+            self.assertIn("path: .ci-dependency-policy", checkout)
+            self.assertIn("persist-credentials: false", checkout)
+            self.assertIn("scripts/ci/install_ubuntu_packages.sh", checkout)
+            self.assertLess(
+                block.index("name: Check out executing dependency policy"),
+                block.index(
+                    "bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh "
+                ),
+            )
+        # Run the actual package arguments from every migrated setup variant
+        # through the installer. A transient refresh failure must finish a
+        # verified refresh before installing the exact original package set.
+        commands = set(
+            re.findall(
+                r"(?:run: |^ +)(bash \.ci-dependency-policy/scripts/ci/install_ubuntu_packages\.sh [^\n]+)",
+                workflow,
+                re.MULTILINE,
+            )
+        )
+        self.assertTrue(commands)
+        for command in sorted(commands):
+            with self.subTest(packages=command):
+                packages = shlex.split(command)[2:]
+                status, calls = self.run_install(1, sources="present", command=command)
+                self.assertEqual(status, 0)
+                self.assertEqual([call[-1] for call in calls[:2]], ["update", "update"])
+                self.assertEqual(
+                    calls[2][-(len(packages) + 2) :], ["install", "-y", *packages]
+                )
+                status, calls = self.run_install(5, sources="present", command=command)
+                self.assertEqual(status, 100)
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(all(call[-1] == "update" for call in calls))
+
+    def test_workflow_ignores_candidate_installer(self):
+        command = "bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config"
+        status, calls = self.run_install(0, command=command, candidate_installer=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            calls[-1][-4:], ["install", "-y", "build-essential", "pkg-config"]
+        )
 
     def test_success_installs_once_after_verified_refresh(self):
         status, calls = self.run_install(0)
@@ -73,6 +183,22 @@ else:
         self.assertEqual(
             calls[1][-4:], ["install", "-y", "pkg-config", "build-essential"]
         )
+
+    def test_official_sources_isolate_refresh_and_resolution_from_unrelated_ppas(self):
+        status, calls = self.run_install(1, sources="present")
+        self.assertEqual(status, 0)
+        source = next(
+            arg for arg in calls[0] if arg.startswith("Dir::Etc::sourcelist=")
+        )
+        self.assertTrue(source.endswith("/ubuntu.sources"))
+        for call in calls:
+            self.assertIn(source, call)
+            self.assertIn("Dir::Etc::sourceparts=-", call)
+
+    def test_missing_explicit_sources_never_falls_back_to_unrelated_repositories(self):
+        status, calls = self.run_install(0, sources="missing")
+        self.assertNotEqual(status, 0)
+        self.assertEqual(calls, [])
 
     def test_transient_index_failure_retries_before_installing(self):
         status, calls = self.run_install(1)

@@ -24,6 +24,7 @@ import json
 import os
 import shutil
 import struct
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -69,12 +70,25 @@ def _export_table(table, root):
     def put(key, payload):
         path = objects / key
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(
+        encoded = (
             b"AFOBJ001"
             + struct.pack("<QI", len(payload), 0)
             + hashlib.sha256(payload).hexdigest().encode()
             + payload
         )
+        # Model object PUT semantics: readers see a complete old or new object.
+        # Immutable warehouse objects must also retain their bytes and identity
+        # across exports instead of invalidating every cached manifest.
+        if path.exists() and path.read_bytes() == encoded:
+            return
+        output = tempfile.NamedTemporaryFile(dir=root, prefix=".export-", delete=False)
+        staging = Path(output.name)
+        try:
+            with output:
+                output.write(encoded)
+            os.replace(staging, path)
+        finally:
+            staging.unlink(missing_ok=True)
 
     avro_files = []
     exported_lengths = {}
@@ -96,6 +110,7 @@ def _export_table(table, root):
                         if not k.startswith("avro.")
                     },
                     records,
+                    hashlib.sha256(payload).digest()[:16],
                 )
             )
             continue
@@ -104,12 +119,19 @@ def _export_table(table, root):
         put(path.relative_to(directory).as_posix(), payload)
     # Manifest-list lengths describe the rewritten Avro payloads exactly.
     avro_files.sort(key=lambda entry: bool(entry[4] and "manifest_path" in entry[4][0]))
-    for path, schema, codec, metadata, records in avro_files:
+    for path, schema, codec, metadata, records, sync_marker in avro_files:
         for record in records:
             if "manifest_path" in record:
                 record["manifest_length"] = exported_lengths[record["manifest_path"]]
         out = io.BytesIO()
-        fastavro.writer(out, schema, records, codec=codec, metadata=metadata)
+        fastavro.writer(
+            out,
+            schema,
+            records,
+            codec=codec,
+            metadata=metadata,
+            sync_marker=sync_marker,
+        )
         payload = out.getvalue()
         key = path.relative_to(directory).as_posix()
         exported_lengths["object://antfly/" + key] = len(payload)
@@ -120,6 +142,94 @@ def _export_table(table, root):
         json.dumps(remote(json.loads(latest.read_bytes()))).encode(),
     )
     put("metadata/version-hint.text", b"1\n")
+
+
+def test_iceberg_export_preserves_immutable_objects_across_refresh(tmp_path):
+    fastavro = pytest.importorskip("fastavro")
+    warehouse = tmp_path / "warehouse"
+    metadata = warehouse / "metadata"
+    metadata.mkdir(parents=True)
+    manifest = metadata / "manifest.avro"
+    manifest_list = metadata / "list.avro"
+    with manifest.open("wb") as output:
+        fastavro.writer(
+            output,
+            {
+                "type": "record",
+                "name": "Entry",
+                "fields": [{"name": "data_file", "type": "string"}],
+            },
+            [{"data_file": (warehouse / "part.parquet").as_uri()}],
+        )
+    with manifest_list.open("wb") as output:
+        fastavro.writer(
+            output,
+            {
+                "type": "record",
+                "name": "Manifest",
+                "fields": [
+                    {"name": "manifest_path", "type": "string"},
+                    {"name": "manifest_length", "type": "long"},
+                ],
+            },
+            [
+                {
+                    "manifest_path": manifest.as_uri(),
+                    "manifest_length": manifest.stat().st_size,
+                }
+            ],
+        )
+    first_metadata = metadata / "0001.metadata.json"
+    first_metadata.write_text(
+        json.dumps({"snapshot": 1, "manifest-list": manifest_list.as_uri()})
+    )
+
+    class Table:
+        metadata_location = first_metadata.as_uri()
+
+        def location(self):
+            return warehouse.as_uri()
+
+    table = Table()
+    root = tmp_path / "objects"
+    _export_table(table, root)
+    objects = root / "buckets" / "antfly" / "objects"
+    before = {
+        path.relative_to(objects): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in objects.rglob("*")
+        if path.is_file()
+    }
+    _export_table(table, root)
+    for relative, (payload, modified) in before.items():
+        assert (objects / relative).read_bytes() == payload
+        assert (objects / relative).stat().st_mtime_ns == modified
+    records = list(
+        fastavro.reader(io.BytesIO((objects / "metadata/list.avro").read_bytes()[84:]))
+    )
+    assert records == [
+        {
+            "manifest_path": "object://antfly/metadata/manifest.avro",
+            "manifest_length": len((objects / "metadata/manifest.avro").read_bytes())
+            - 84,
+        }
+    ]
+    second_metadata = metadata / "0002.metadata.json"
+    second_metadata.write_text(
+        json.dumps({"snapshot": 2, "manifest-list": manifest_list.as_uri()})
+    )
+    table.metadata_location = second_metadata.as_uri()
+    _export_table(table, root)
+    for relative, (payload, modified) in before.items():
+        if relative == Path("metadata/v1.metadata.json"):
+            continue  # Only the publication alias advances to the new snapshot.
+        assert (objects / relative).read_bytes() == payload
+        assert (objects / relative).stat().st_mtime_ns == modified
+    assert (
+        json.loads((objects / "metadata/v1.metadata.json").read_bytes()[84:])[
+            "snapshot"
+        ]
+        == 2
+    )
 
 
 def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_path):
@@ -1197,6 +1307,14 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
     failed = True
     try:
 
+        def publication_pending(response):
+            # Fresh receipt-constrained reads can race publication's binding
+            # replacement. Rebind only this exact conflict; keep all deadlines.
+            return response.status_code == 503 or (
+                response.status_code == 409
+                and response.json() == {"error": "catalog changed during query binding"}
+            )
+
         def call(method, path, body=None):
             response = requests.request(
                 method,
@@ -1380,7 +1498,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             )
             if response.ok:
                 break
-            assert response.status_code == 503 and time.monotonic() < deadline, (
+            assert publication_pending(response) and time.monotonic() < deadline, (
                 response.text + server.debug_logs()
             )
             time.sleep(0.1)
@@ -1516,6 +1634,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         assert len(next_page["hits"]["hits"]) == 5, next_page
         hybrid_request = None
         hybrid_first = None
+        stale_sparse_request = None
         if vector_kind:
             embeddings = {}
             if vector_kind in ("dense", "hybrid"):
@@ -1537,7 +1656,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                         value["responses"][0] if "responses" in value else value
                     )
                     break
-                assert response.status_code == 503 and time.monotonic() < deadline, (
+                assert publication_pending(response) and time.monotonic() < deadline, (
                     response.text + server.debug_logs()
                 )
                 time.sleep(0.1)
@@ -1564,6 +1683,24 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 enrichment
             )
             hybrid_request["remote_snapshot"] = hybrid_first["remote_snapshot"]
+
+            # A retained cut covers the recipes selected when it was issued.
+            # Capture the sparse recipe at this same accepted watermark rather
+            # than adding it later to a dense-only cut. Reuse it after updates
+            # and restart to check stale-vector suppression at the pinned cut.
+            stale_sparse_request = dict(
+                query,
+                embeddings={"sparse_native": {"indices": [1], "values": [1]}},
+                filter_query={"term": {"path": "/id", "value": 0}},
+                fields=["id"],
+            )
+            stale_sparse_request.pop("full_text_search")
+            stale_sparse_request.pop("highlight")
+            stale_sparse = call(
+                "POST", "/tables/wal_windows/query", stale_sparse_request
+            )
+            assert stale_sparse["hits"]["hits"] == [], stale_sparse
+            stale_sparse_request["remote_snapshot"] = stale_sparse["remote_snapshot"]
 
             def retained_artifact(artifact_id, *, raw=False):
                 checksum = artifact_id.split(":")[1]
@@ -1647,7 +1784,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     latest = response.json()
                     latest = latest["responses"][0] if "responses" in latest else latest
                     break
-                assert response.status_code == 503 and time.monotonic() < deadline, (
+                assert publication_pending(response) and time.monotonic() < deadline, (
                     response.text + server.debug_logs()
                 )
                 time.sleep(0.1)
@@ -1721,12 +1858,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 }, selected
                 # Replacement vectors use a different coordinate, so querying
                 # the old sparse coordinate cannot return the archived image.
-                stale_vector = dict(
-                    vector_only,
-                    embeddings={"sparse_native": {"indices": [1], "values": [1]}},
-                    filter_query={"term": {"path": "/id", "value": 0}},
+                selected = call(
+                    "POST", "/tables/wal_windows/query", stale_sparse_request
                 )
-                selected = call("POST", "/tables/wal_windows/query", stale_vector)
                 assert selected["hits"]["hits"] == [], selected
             repeated = call("POST", "/tables/wal_windows/query", pinned)
             assert repeated["hits"] == first["hits"]

@@ -200,7 +200,7 @@ pub fn sameDefinition(a: requests.GeneratedEnrichmentRequest, b: requests.Genera
 }
 
 fn definitionField(comptime name: []const u8) bool {
-    return !std.mem.eql(u8, name, "doc_key") and !std.mem.eql(u8, name, "sequence") and !std.mem.eql(u8, name, "reprocess_generation") and !std.mem.eql(u8, name, "consumer_indexes");
+    return !std.mem.eql(u8, name, "expected_vector_digest") and !std.mem.eql(u8, name, "expected_source_hash") and !std.mem.eql(u8, name, "doc_key") and !std.mem.eql(u8, name, "sequence") and !std.mem.eql(u8, name, "reprocess_generation") and !std.mem.eql(u8, name, "consumer_indexes");
 }
 
 /// Stable identity for exactly the fields used by sameDefinition. Framed
@@ -279,7 +279,7 @@ pub fn capture(
     materializer: ?Materializer,
 ) !?Token {
     const authorized = (try authorizeDocument(alloc, txn, request, plan)) orelse return null;
-    try @import("artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, txn, request.doc_key, requests.requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
+    try @import("artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, txn, request.doc_key, requests.requestEmbeddingName(request), request.reprocess_generation);
     if (root == 0) return error.DurableRootIncarnationUnavailable;
     const authority = authorized.authority;
     const producer_generation = authorized.generation;

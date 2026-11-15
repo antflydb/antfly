@@ -444,6 +444,12 @@ pub const Options = struct {
     /// Namespace isolation still applies. Overrides the fixed prefix.
     run_partition_key: ?*const fn ([]const u8) []const u8 = null,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
+    /// Immutable private builders can use the persisted filter through table
+    /// readers without retaining a second filter for every run in memory.
+    retain_bloom_filters: bool = true,
+    /// Borrowed private-builder lifecycle; it must outlive the backend. The
+    /// transport-neutral token preserves callback error provenance across owners.
+    bulk_cancellation: CancellationToken = .none,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
     table_prefix_extractor: lsm_table_file.PrefixExtractor = lsm_table_file.default_prefix_extractor,
     recovery_scratch_retained_cap_bytes: usize = wal_mod.default_replay_scratch_retained_cap_bytes,
@@ -1825,6 +1831,9 @@ pub const Backend = struct {
     run_directory_dirty: bool = true,
     run_directory_generation: u64 = 0,
     retired_run_directories: ?*RunDirectory = null,
+    // Includes the active continuation. Publication must repay retirement
+    // debt even when slow allocator/destructor work consumes the time slice.
+    retired_run_directory_count: usize = 0,
     retired_run_stores: ?*RunStore = null,
     active_compaction_publications: ?*compaction_mod.Publication = null,
     output_cleanup_retry_at_ns: u64 = 0,
@@ -3956,7 +3965,12 @@ pub const Backend = struct {
         defer self.directory_reclaim_in_flight = false;
         var credits: usize = 2048;
         const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and runtime_mod.workNowNs(self) < deadline) {
+        while (credits != 0) {
+            // Keep idle reclamation latency bounded, but do not let a fixed
+            // wall-clock allowance turn sustained publication into unbounded
+            // retained COW generations. Pressure repays a bounded node quantum
+            // outside the mutex; the existing work-credit cap still applies.
+            if (self.retired_run_directory_count <= 8 and runtime_mod.workNowNs(self) >= deadline) break;
             if (self.directory_reclaimer == null) {
                 const directory = self.retired_run_directories orelse break;
                 self.retired_run_directories = directory.retired_next;
@@ -3968,10 +3982,14 @@ pub const Backend = struct {
             const before = quantum;
             const done = self.directory_reclaimer.?.step(self.allocator, &quantum);
             _ = runtime_mod.lockBackend(Backend, self);
-            credits -= before - quantum;
+            // Empty/shared generations can complete without visiting a node.
+            // Charge their header/destructor work too, so pressure never
+            // bypasses the slice's hard work bound.
+            credits -= @max(@as(usize, 1), before - quantum);
             if (done) {
                 self.directory_reclaimer.?.finish(self.allocator);
                 self.directory_reclaimer = null;
+                self.retired_run_directory_count -= 1;
             }
             self.releaseReaderKind(.other);
         }
@@ -5272,6 +5290,72 @@ pub const Backend = struct {
         try compaction_mod.compactOldestPair(Backend, self);
     }
 
+    /// The caller owns a quiescent candidate. Preserve atomic manifest and
+    /// reader handoff while removing per-L0-run cursor residency at publication.
+    pub fn consolidateFreshSnapshot(self: *Backend) !bool {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (self.options.backend.read_only) return error.ReadOnly;
+        if (self.bulkIngestActive()) return false;
+        try self.flushBufferedWritesWithOptionsLocked(.{ .compact = false });
+        return compaction_mod.consolidateFreshSnapshot(Backend, self);
+    }
+
+    /// Seal a quiescent handoff's durable recovery closure, not just its live
+    /// run set. Otherwise a checkpoint plus removal journal can retain a whole
+    /// superseded ingest generation until ordinary checkpoint maintenance runs.
+    /// Reader/version pins and obsolete-file retention still govern deletion.
+    pub fn checkpointRecoveryManifest(self: *Backend) !void {
+        if (self.options.backend.read_only) return error.ReadOnly;
+        if (self.root_dir == null) return;
+        self.background_executor.drain();
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (self.bulkIngestActive()) return error.BulkIngestActive;
+        try self.flushBufferedWritesWithOptionsLocked(.{ .compact = false });
+        if (self.manifest_journal.edit_bytes != 0) {
+            if (!try self.manifest_journal.runCheckpoint(self)) return error.CheckpointBusy;
+        }
+        // A completed bulk plan and retired metadata still own file pins.
+        // Normal unlock slices intentionally leave large retirements queued;
+        // a quiescent source handoff must release those owners before deletion.
+        if (self.bulk_plan_in_flight or self.bulk_plan_reclaim_in_flight or
+            self.store_reclaim_in_flight or self.directory_reclaim_in_flight)
+            return error.CheckpointBusy;
+        _ = self.retireUnneededBulkPlanLocked();
+        while (self.retired_bulk_plans != null) {
+            try self.options.bulk_cancellation.check();
+            self.reclaimBulkPlanningSliceLocked();
+        }
+        while (self.retired_run_stores != null or self.store_reclaimer != null) {
+            try self.options.bulk_cancellation.check();
+            self.reclaimStoreSliceLocked();
+        }
+        while (self.retired_run_directories != null or self.directory_reclaimer != null) {
+            try self.options.bulk_cancellation.check();
+            self.reclaimDirectorySliceLocked();
+        }
+        // The retired Run owners themselves keep version pins until released.
+        // Visit each original entry once, retaining externally pinned snapshots.
+        var visits_left = self.obsolete_run_count + self.obsolete_runs.items.len + 1;
+        self.obsolete_run_drain_remaining = visits_left;
+        while (visits_left != 0 and self.obsolete_runs.items.len != 0) {
+            try self.options.bulk_cancellation.check();
+            const visited = self.drainUnpinnedObsoleteRunsWithBudget(@min(visits_left, 128));
+            if (visited == 0) break;
+            visits_left -= visited;
+        }
+        if (self.obsolete_reclaim_in_flight) return error.CheckpointBusy;
+        if (self.obsolete_reclaim_after) |path| self.allocator.free(path);
+        self.obsolete_reclaim_after = null;
+        const failures = self.obsolete_delete_failures;
+        // One complete pass over the quiescent ledger. Pinned/not-yet-due
+        // files stay queued; failed deletes retain their retry record.
+        try self.reconcileObsoletePathsWithBudget(self.obsolete_paths.count(), null);
+        if (self.obsolete_manifest_dirty) try self.persistManifestLocked();
+        if (self.obsolete_delete_failures != failures) return error.ObsoleteFileCleanupFailed;
+    }
+
     pub fn getMergedWithMutable(
         self: *Backend,
         mutable: anytype,
@@ -5393,6 +5477,8 @@ pub const Backend = struct {
     }
 
     pub fn ingestSortedTableEntries(self: *Backend, entries: []const TableEntry) !void {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
         if (self.options.backend.read_only) return error.ReadOnly;
         if (entries.len == 0) return;
 
@@ -6405,6 +6491,7 @@ pub const Backend = struct {
             std.debug.assert(job.step(self.allocator, &credits));
             job.finish(self.allocator);
             self.directory_reclaimer = null;
+            self.retired_run_directory_count -= 1;
         }
         if (self.pending_directory_closure) |pending| pending.destroy(self);
         for (&self.pending_admissions) |*slot| {
@@ -6444,6 +6531,7 @@ pub const Backend = struct {
         while (self.retired_run_directories) |directory| {
             self.retired_run_directories = directory.retired_next;
             directory.destroy(self.allocator);
+            self.retired_run_directory_count -= 1;
         }
         while (self.retired_read_versions) |version| {
             self.retired_read_versions = version.retired_next;
@@ -6454,6 +6542,7 @@ pub const Backend = struct {
     fn retireRunDirectory(self: *Backend, directory: *RunDirectory) void {
         directory.retired_next = self.retired_run_directories;
         self.retired_run_directories = directory;
+        self.retired_run_directory_count += 1;
     }
 
     pub fn retireCheckpointDirectory(self: *Backend, directory: *RunDirectory) void {
@@ -7566,13 +7655,17 @@ pub const Backend = struct {
     }
 
     fn drainUnpinnedObsoleteRuns(self: *Backend) void {
+        _ = self.drainUnpinnedObsoleteRunsWithBudget(128);
+    }
+
+    fn drainUnpinnedObsoleteRunsWithBudget(self: *Backend, max_visits: usize) usize {
         const epoch = file_pin_release_epoch.load(.acquire);
         if (epoch != self.obsolete_run_pin_epoch) {
             self.obsolete_run_pin_epoch = epoch;
             self.obsolete_run_drain_remaining = self.obsolete_run_count + self.obsolete_runs.items.len + 1;
         }
         var visits: usize = 0;
-        while (self.obsolete_runs.items.len != 0 and visits < 128 and self.obsolete_run_drain_remaining != 0) : (visits += 1) {
+        while (self.obsolete_runs.items.len != 0 and visits < max_visits and self.obsolete_run_drain_remaining != 0) : (visits += 1) {
             self.obsolete_run_drain_remaining -= 1;
             self.obsolete_run_list_cursor %= self.obsolete_runs.items.len;
             var runs = &self.obsolete_runs.items[self.obsolete_run_list_cursor];
@@ -7606,6 +7699,7 @@ pub const Backend = struct {
                 self.obsolete_run_cursor = 0;
             }
         }
+        return visits;
     }
 
     pub fn finalizeWriteReaderRelease(self: *Backend) !void {
@@ -8706,16 +8800,21 @@ pub const Backend = struct {
     }
 
     fn reconcileObsoletePathsForManifest(self: *Backend) !void {
+        try self.reconcileObsoletePathsWithBudget(128, 2 * std.time.ns_per_ms);
+    }
+
+    fn reconcileObsoletePathsWithBudget(self: *Backend, max_visits: usize, slice_ns: ?u64) !void {
         if (self.obsolete_reclaim_in_flight) return;
         self.obsolete_reclaim_in_flight = true;
         defer self.obsolete_reclaim_in_flight = false;
-        const deadline = runtime_mod.workNowNs(self) +| 2 * std.time.ns_per_ms;
+        const deadline = if (slice_ns) |duration| runtime_mod.workNowNs(self) +| duration else null;
         const now_ns = self.nowNs();
         // Bound each maintenance turn, including already-due pinned files.
         // Resume by path against the current root so churn cannot invalidate
         // a borrowed cursor or force a restart from the first pinned file.
-        for (0..128) |_| {
-            if (runtime_mod.workNowNs(self) >= deadline) return;
+        for (0..max_visits) |visit| {
+            if (deadline) |end| if (runtime_mod.workNowNs(self) >= end) return;
+            if (slice_ns == null and visit % 128 == 0) try self.options.bulk_cancellation.check();
             const obsolete = self.obsolete_paths.nextDueAfter(now_ns, self.obsolete_reclaim_after) orelse {
                 if (self.obsolete_reclaim_after) |path| self.allocator.free(path);
                 self.obsolete_reclaim_after = null;
@@ -23137,6 +23236,44 @@ fn implementationTests() type {
             }
         }
 
+        test "lsm manifest credits remain additive across interleaved long-key cohorts" {
+            const a = std.testing.allocator;
+            var prior: State = .{};
+            defer prior.deinit(a);
+            var incoming: State = .{};
+            defer incoming.deinit(a);
+            var combined: State = .{};
+            defer combined.deinit(a);
+            const value = try a.alloc(u8, 250 * 1024);
+            defer a.free(value);
+            @memset(value, 'v');
+            for ([_][]const u8{ "b", "h" }) |key| {
+                try prior.upsert(a, .{}, key, value, false);
+                try combined.upsert(a, .{}, key, value, false);
+            }
+            var key: [16 * 1024]u8 = @splat('k');
+            for ("acegik") |first| {
+                key[0] = first;
+                try incoming.upsert(a, .{}, &key, "value", false);
+                try combined.upsert(a, .{}, &key, "value", false);
+            }
+            var storage = storage_io.MemoryStorage.init(a);
+            defer storage.deinit();
+            var backend = try Backend.open(a, "/manifest-credit-cohorts", .{
+                .storage = storage.storage(),
+                .max_run_file_bytes = 512 * 1024,
+                .max_run_file_physical_bytes = 1024 * 1024,
+            });
+            defer backend.close();
+            const credit = try backend.prepareManifestCredit(&prior, &@as(State, .{})) + try backend.prepareManifestCredit(&incoming, &@as(State, .{}));
+            var outputs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &backend, &combined, 0);
+            defer compaction_mod.discardOutputRuns(Backend, &backend, &outputs);
+            try std.testing.expect(outputs.items.len > 1);
+            const encoded = try repository_mod.encodeManifestAlloc(a, backend.next_run_id, outputs.items, &.{});
+            defer a.free(encoded);
+            try std.testing.expect(encoded.len <= credit);
+        }
+
         test "lsm point leases pin immutable values across flush and overwrite" {
             const alloc = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(alloc);
@@ -26634,4 +26771,18 @@ test "lsm cold optimization writer reuses mutable probe metadata across short li
     std.debug.print("lite mixed writer: 100 batches, metadata allocations={d}\n", .{metadata.alloc_calls - calls});
     try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
     metadata.limit = std.math.maxInt(usize);
+}
+
+test "lsm directory reclamation bounds empty-generation work under pressure" {
+    const a = std.testing.allocator;
+    var backend = Backend.init(a, .{ .wal_enabled = false });
+    defer backend.close();
+    for (0..4096) |_| backend.retireRunDirectory(try RunDirectory.create(a));
+    const before = backend.retired_run_directory_count;
+    _ = runtime_mod.lockBackend(Backend, &backend);
+    backend.reclaimDirectorySliceLocked();
+    const remaining = backend.retired_run_directory_count;
+    backend.mu.unlock();
+    try std.testing.expect(remaining > 0);
+    try std.testing.expect(remaining < before);
 }

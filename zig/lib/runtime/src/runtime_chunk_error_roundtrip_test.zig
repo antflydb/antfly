@@ -35,9 +35,15 @@ fn fail(index: u8) anyerror!u64 {
         5 => error.EmbeddingIdentityMismatch,
         6 => error.InvalidChunkPolicy,
         7 => error.InvalidChunkReplay,
-        8 => error.RelationalCheckViolation,
-        9 => error.DocumentTokenLimitExceeded,
-        10 => error.ReadOutputTruncated,
+        8 => error.DocumentTokenLimitExceeded,
+        9 => error.ReadOutputTruncated,
+        10 => error.StorageOwnerAdmissionPending,
+        11 => error.InputOutput,
+        12 => error.ProcessFdQuotaExceeded,
+        13 => error.SystemFdQuotaExceeded,
+        14 => error.PersistentDescriptorAdmissionExhausted,
+        15 => error.StorageDescriptorPressure,
+        16 => error.RelationalCheckViolation,
         else => 42,
     };
 }
@@ -61,9 +67,11 @@ test "model-aware chunk failures cross independent native error domains" {
     const method: @FieldType(Methods, "fail") = @ptrCast(@alignCast(provider.fail));
     var distinct = false;
     for ([_][]const u8{
-        "StaleChunkContinuation",    "IncompleteChunkCoverage",    "SourceVersionChanged", "MemoryBudgetExceeded",
-        "UnsupportedChunkMediaType", "EmbeddingIdentityMismatch",  "InvalidChunkPolicy",   "InvalidChunkReplay",
-        "RelationalCheckViolation",  "DocumentTokenLimitExceeded", "ReadOutputTruncated",
+        "StaleChunkContinuation",     "IncompleteChunkCoverage",   "SourceVersionChanged",                   "MemoryBudgetExceeded",
+        "UnsupportedChunkMediaType",  "EmbeddingIdentityMismatch", "InvalidChunkPolicy",                     "InvalidChunkReplay",
+        "DocumentTokenLimitExceeded", "ReadOutputTruncated",       "StorageOwnerAdmissionPending",           "InputOutput",
+        "ProcessFdQuotaExceeded",     "SystemFdQuotaExceeded",     "PersistentDescriptorAdmissionExhausted", "StorageDescriptorPressure",
+        "RelationalCheckViolation",
     }, 0..) |name, index| {
         const expected = @import("storage_engine_errors").fromName(name);
         const code: u8 = @intCast(index);
@@ -72,4 +80,17 @@ test "model-aware chunk failures cross independent native error domains" {
     }
     try std.testing.expect(distinct);
     try std.testing.expectEqual(@as(u64, 42), try Boundary.call("fail", provider.dispatch, method, .{@as(u8, 255)}));
+}
+
+test "storage descriptor pressure and IO failures cross independent native error domains" {
+    const provider = antfly_test_chunk_error_provider_v1();
+    const method: @FieldType(Methods, "fail") = @ptrCast(@alignCast(provider.fail));
+    var distinct = false;
+    for ([_][]const u8{ "InputOutput", "ProcessFdQuotaExceeded", "SystemFdQuotaExceeded", "PersistentDescriptorAdmissionExhausted", "StorageDescriptorPressure" }, 11..) |name, index| {
+        const expected = @import("storage_engine_errors").fromName(name);
+        const code: u8 = @intCast(index);
+        distinct = distinct or provider.raw_code(code) != @intFromError(expected);
+        try std.testing.expectError(expected, Boundary.call("fail", provider.dispatch, method, .{code}));
+    }
+    try std.testing.expect(distinct);
 }
