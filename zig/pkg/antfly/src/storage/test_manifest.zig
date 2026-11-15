@@ -25,6 +25,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_catalog_proposal;
     _ = @import("antfly_local_sources").storage_db_authority_invalidation;
     _ = @import("antfly_local_sources").storage_db_mutation_commit_disposition_test;
+    _ = @import("antfly_local_sources").storage_db_commit_requirements;
     _ = @import("antfly_local_sources").storage_db_mutation_plan;
     _ = @import("antfly_local_sources").storage_db_query_cypher_projection;
     _ = @import("antfly_local_sources").storage_db_transform_read_plan;
@@ -534,6 +535,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_graph_publication;
     _ = @import("antfly_local_sources").storage_db_artifact_inventory;
     _ = @import("antfly_local_sources").storage_db_artifact_native_stream;
+    _ = @import("antfly_local_sources").storage_db_prepared_producer_acceptance;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_context;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_dispatch;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_input;

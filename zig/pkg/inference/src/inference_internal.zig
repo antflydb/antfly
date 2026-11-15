@@ -150,6 +150,7 @@ pub const architectures = struct {
 };
 pub const models = struct {
     pub const embedding_gemma2 = @import("models/embedding_gemma2.zig");
+    pub const glide = @import("models/glide.zig");
     pub const gliner_decide_qualification = @import("models/gliner_decide_qualification.zig");
     pub const gliner_specialty_qualification = @import("models/gliner_specialty_qualification.zig");
     pub const tensor_store = @import("models/tensor_store.zig");

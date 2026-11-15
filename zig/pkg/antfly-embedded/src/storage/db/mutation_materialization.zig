@@ -102,6 +102,10 @@ const types = @import("types.zig");
 /// `hbc_mod`) itself imports to return it from `HBCIndex.insertWithMetadataStaged`.
 const vectorindex_hbc_index = @import("antfly_vectorindex").hbc_index;
 
+fn requestContext(writes: anytype) ?@import("antfly_inference_execution_context").RequestContext {
+    return if (@hasField(@TypeOf(writes.*), "context")) writes.context else null;
+}
+
 pub fn ImplementationFor(comptime S: type, comptime D: type) type {
     return struct {
         const Implementation = S;
@@ -1217,7 +1221,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             source_field: []const u8,
             artifact_name: []const u8,
             chunks: []const chunker_mod.Chunk,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             include_payload: bool,
         ) !void {
             var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -1243,7 +1247,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_key: []const u8,
             chunk_text: []const u8,
             pending: *PendingDocumentUnitDenseChunkEmbedding,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
         ) !void {
             const max_batch_items = generatedEmbedBatchItems();
@@ -1266,7 +1270,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_key: []const u8,
             chunk_text: []const u8,
             pending: *PendingDocumentUnitSparseChunkEmbedding,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
         ) !void {
             const max_batch_items = generatedEmbedBatchItems();
@@ -1412,7 +1416,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             doc_key: []const u8,
             artifact_name: []const u8,
             manifest_key: []const u8,
-            artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+            artifact_delete_keys: anytype,
         ) !void {
             try appendOwnedKey(alloc, artifact_delete_keys, manifest_key);
             const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
@@ -1433,12 +1437,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 var block_index: u32 = 0;
                 while (block_index < previous_state.navigation_block_count) : (block_index += 1) {
-                    try artifact_delete_keys.ensureUnusedCapacity(alloc, 1);
-                    artifact_delete_keys.appendAssumeCapacity(try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, block_index));
+                    try appendPreparedOwnedDelete(alloc, artifact_delete_keys, try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, block_index));
                 }
             }
-            try artifact_delete_keys.ensureUnusedCapacity(alloc, 1);
-            artifact_delete_keys.appendAssumeCapacity(try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name));
+            try appendPreparedOwnedDelete(alloc, artifact_delete_keys, try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name));
             try artifact_delete_keys.append(alloc, state_key);
         }
 
@@ -1457,7 +1459,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             error_code: []const u8,
             error_message: []const u8,
             error_stage: []const u8,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
         ) !void {
             var previous_state = DocumentExtractionPreviousState{};
             defer previous_state.deinit(alloc);
@@ -1480,10 +1482,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 error_stage,
             );
             defer alloc.free(manifest);
-            try artifact_writes.append(alloc, .{
-                .key = try alloc.dupe(u8, manifest_key),
-                .value = try alloc.dupe(u8, manifest),
-            });
+            try appendPreparedArtifactCopy(alloc, artifact_writes, manifest_key, manifest);
             // Preserve the last known-good state and child artifacts. The failure
             // manifest makes the source stale and repairable without creating a search
             // outage or losing the prior key set needed for a correct future diff.
@@ -1583,8 +1582,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             source_fingerprint: []const u8,
             state: []const u8,
             generation: u64,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-            artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+            artifact_writes: anytype,
+            artifact_delete_keys: anytype,
         ) !void {
             const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name);
             defer alloc.free(summary_key);
@@ -1638,10 +1637,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer alloc.free(indexed_state);
             const summary = try hierarchy_navigation.summaryValueAlloc(alloc, generation, digest, unit_count, block_count);
             defer alloc.free(summary);
-            try artifact_writes.append(alloc, .{
-                .key = try alloc.dupe(u8, summary_key),
-                .value = try alloc.dupe(u8, summary),
-            });
+            try appendPreparedArtifactCopy(alloc, artifact_writes, summary_key, summary);
 
             var block_index: u32 = 0;
             while (block_index < block_count) : (block_index += 1) {
@@ -1651,26 +1647,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer alloc.free(block_key);
                 const block_value = try hierarchy_navigation.blockValueAlloc(alloc, block_index, descriptors[start..end]);
                 defer alloc.free(block_value);
-                try artifact_writes.append(alloc, .{
-                    .key = try alloc.dupe(u8, block_key),
-                    .value = try alloc.dupe(u8, block_value),
-                });
+                try appendPreparedArtifactCopy(alloc, artifact_writes, block_key, block_value);
             }
 
             const previous_block_count = try documentExtractionStateNavigationBlockCount(alloc, state);
             var obsolete_block = block_count;
             while (obsolete_block < previous_block_count) : (obsolete_block += 1) {
-                try artifact_delete_keys.append(
+                try appendPreparedOwnedDelete(
                     alloc,
+                    artifact_delete_keys,
                     try internal_keys.documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, obsolete_block),
                 );
             }
             const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
             defer alloc.free(state_key);
-            try artifact_writes.append(alloc, .{
-                .key = try alloc.dupe(u8, state_key),
-                .value = try alloc.dupe(u8, indexed_state),
-            });
+            try appendPreparedArtifactCopy(alloc, artifact_writes, state_key, indexed_state);
         }
 
         pub fn appendDocumentExtractionRangeDescriptors(
@@ -1751,7 +1742,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             desired_chunk_keys: []const []const u8,
             chunk_range_base_index: usize,
             previous_child_ranges: []const types.DocumentArtifactChildRange,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
@@ -1808,10 +1799,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
                     const chunk_route = documentExtractionRangeRoute(previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
                     const payload = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, unit_fingerprint, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
-                    try artifact_writes.append(alloc, .{
-                        .key = try alloc.dupe(u8, chunk_key),
-                        .value = try alloc.dupe(u8, payload),
-                    });
+                    try appendPreparedArtifactCopy(alloc, artifact_writes, chunk_key, payload);
 
                     if (text_indexes.len > 0) {
                         const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
@@ -1899,7 +1887,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendEmbeddingArtifactWrite(
             alloc: Allocator,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             base_key: []const u8,
             parent_doc_key: []const u8,
             artifact_name: []const u8,
@@ -2017,7 +2005,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn appendGraphEdgeArtifactWrite(
             alloc: Allocator,
             store: *docstore_mod.DocStore,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             write: types.GraphEdgeWrite,
             generation: u64,
             ttl_duration_ns: u64,
@@ -2623,7 +2611,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             db: anytype,
             items: *std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
             item: PrecomputeAssetProducerBatchItem,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
         ) !void {
@@ -2649,6 +2637,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             out: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
             request: enrichment_types.GeneratedEnrichmentRequest,
             outcome: DerivedCoverageOutcome,
+        ) !void {
+            return appendPrecomputedArtifactCoverageOutcomesForStages(db, alloc, out, request, outcome, true);
+        }
+
+        fn appendPrecomputedArtifactCoverageOutcomesForStages(
+            db: anytype,
+            alloc: Allocator,
+            out: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
+            request: enrichment_types.GeneratedEnrichmentRequest,
+            outcome: DerivedCoverageOutcome,
+            children_complete: bool,
         ) !void {
             // `indexesDependingOnArtifact` and `derivedCoverageAppliesToIndex` both
             // walk live `enrichments`/`dense_indexes`/`sparse_indexes`/`graph_indexes`/
@@ -2676,22 +2675,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const applies = db.derivedCoverageAppliesToIndex(.graph, index_name) or
                     db.derivedCoverageAppliesToIndex(.full_text, index_name);
                 if (!applies) continue;
-                const owned_index_name = try alloc.dupe(u8, index_name);
-                errdefer alloc.free(owned_index_name);
-                const owned_doc_key = try alloc.dupe(u8, request.doc_key);
-                errdefer alloc.free(owned_doc_key);
-                try out.append(alloc, .{
-                    .index_name = owned_index_name,
-                    .doc_key = owned_doc_key,
-                    .outcome = outcome,
-                });
                 const readiness = @import("artifact_producer_readiness.zig");
                 const sources = try S.ownerField(db, "core").*.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
                 defer {
                     for (sources) |source| alloc.free(source);
                     alloc.free(sources);
                 }
+                const all_sources_complete = children_complete or for (sources) |source| {
+                    if (!std.mem.eql(u8, source, requestArtifactName(request))) break false;
+                } else true;
+                if (all_sources_complete) {
+                    const owned_index_name = try alloc.dupe(u8, index_name);
+                    errdefer alloc.free(owned_index_name);
+                    const owned_doc_key = try alloc.dupe(u8, request.doc_key);
+                    errdefer alloc.free(owned_doc_key);
+                    try out.append(alloc, .{ .index_name = owned_index_name, .doc_key = owned_doc_key, .outcome = outcome });
+                }
                 for (sources) |source| {
+                    if (!children_complete and !std.mem.eql(u8, source, requestArtifactName(request))) continue;
                     if (!readiness.localSourceProduced(pinned.plan(), requestArtifactName(request), source)) continue;
                     const scope = try readiness.localScopeAlloc(alloc, index_name, source, pinned.plan());
                     errdefer alloc.free(scope);
@@ -2708,9 +2709,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             request: enrichment_types.GeneratedEnrichmentRequest,
             produced: bool,
         ) !void {
-            const cloned = try enrichment_types.cloneGeneratedRequest(alloc, request);
-            errdefer enrichment_types.freeGeneratedRequest(alloc, cloned);
-            try out.append(alloc, .{ .request = cloned, .produced = produced });
+            var retained = request;
+            retained.consumer_indexes = try alloc.dupe([]u8, request.consumer_indexes);
+            errdefer alloc.free(retained.consumer_indexes);
+            try out.append(alloc, .{ .request = retained, .produced = produced });
         }
 
         pub fn appendPrecomputedCoverageOutcomeMutations(
@@ -2864,7 +2866,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn appendPreparedGraphEdgeArtifactWrite(
             alloc: Allocator,
             store: *docstore_mod.DocStore,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             write: types.GraphEdgeWrite,
             generation: u64,
             ttl_duration_ns: u64,
@@ -3031,7 +3033,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn appendSparseEmbeddingArtifactWrite(
             alloc: Allocator,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             base_key: []const u8,
             artifact_name: []const u8,
             origin: EmbeddingArtifactOrigin,
@@ -3067,7 +3069,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             doc_key: []const u8,
             artifact_name: []const u8,
             desired_chunk_keys: []const []u8,
-            artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+            artifact_delete_keys: anytype,
         ) !void {
             const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", artifact_name);
             defer alloc.free(prefix);
@@ -3110,7 +3112,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
             pending_writes: *const PendingArtifactWriteIndex,
             chunk_deletes: []const []const u8,
-            artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+            artifact_delete_keys: anytype,
             inline_cleanup: *InlineChunkEmbeddingCleanup,
         ) !void {
             if (!requestUsesChunkSource(request)) return;
@@ -3130,7 +3132,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         defer if (text) |owned| alloc.free(owned);
                         if (text != null) continue;
                     }
-                    try artifact_delete_keys.append(alloc, try embeddingArtifactKeyForBaseAlloc(alloc, key, requestEmbeddingName(request)));
+                    try appendPreparedOwnedDelete(alloc, artifact_delete_keys, try embeddingArtifactKeyForBaseAlloc(alloc, key, requestEmbeddingName(request)));
                 }
                 return;
             }
@@ -5012,21 +5014,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             db: anytype,
             item: PrecomputeAssetProducerBatchItem,
             produced: []const u8,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
         ) !void {
             const privacy_output = try @import("../../privacy/materialize.zig").output(alloc, item.source_text, item.request.producer_json, produced);
             defer if (privacy_output) |value| alloc.free(value);
             const validated = privacy_output orelse produced;
-            try artifact_writes.append(alloc, .{
-                .key = try alloc.dupe(u8, item.artifact_key),
-                .value = try alloc.dupe(u8, validated),
-            });
-            try artifact_writes.append(alloc, .{
-                .key = try alloc.dupe(u8, item.state_key),
-                .value = try alloc.dupe(u8, item.state_value),
-            });
+            try appendPreparedArtifactCopy(alloc, artifact_writes, item.artifact_key, validated);
+            try appendPreparedArtifactCopy(alloc, artifact_writes, item.state_key, item.state_value);
 
             const text_indexes: []const []const u8 = item.request.consumer_indexes;
             try appendInlineFullTextDocument(alloc, documents, item.artifact_key, validated, text_indexes);
@@ -6870,13 +6866,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
 
+        /// All retained copies pass through one ownership boundary. A rejected
+        /// budget reservation cannot leak a freshly allocated key or value.
+        fn appendPreparedOwnedDelete(alloc: Allocator, keys: anytype, key: []const u8) !void {
+            errdefer alloc.free(key);
+            try keys.append(alloc, key);
+        }
+
+        fn appendPreparedArtifactCopy(alloc: Allocator, writes: anytype, key: []const u8, value: []const u8) !void {
+            return result_collectors.appendArtifact(alloc, writes, key, value);
+        }
+
         pub fn computeAssetRequestDerived(
             alloc: Allocator,
             db: anytype,
             doc_value: []const u8,
             request: enrichment_types.GeneratedEnrichmentRequest,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-            artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+            artifact_writes: anytype,
+            artifact_delete_keys: anytype,
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
@@ -6885,6 +6892,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution,
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
             preparation_memo: *GeneratedEmbeddingMemo,
+            precompute_mode: execution_resources.GeneratedPrecomputeMode,
+            pending_child_work: *bool,
         ) !void {
             var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
             defer producer_cfg.deinit(alloc);
@@ -6900,7 +6909,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var document_extraction_view: DocumentExtractionCatalogView = .{};
             defer document_extraction_view.deinit(alloc);
             if (producer_cfg.type == .document_extraction) {
-                document_extraction_view = try buildDocumentExtractionCatalogView(alloc, db, artifact_name);
+                if (precompute_mode != .direct) {
+                    document_extraction_view = try buildDocumentExtractionCatalogView(alloc, db, artifact_name);
+                } else {
+                    var pinned = try S.ownerField(db, "core").*.index_manager.acquireWritePlanSnapshot();
+                    defer pinned.release();
+                    if (pinned.plan().completion_plan) |*plan| for (plan.nodes) |node| {
+                        if (node.kind == .unit_children and std.mem.eql(u8, node.upstream, artifact_name)) {
+                            document_extraction_view.children_pending = true;
+                            pending_child_work.* = true;
+                            break;
+                        }
+                    };
+                }
             }
 
             const text_indexes: []const []const u8 = request.consumer_indexes;
@@ -6944,14 +6965,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
                 if (producer_cfg.type == .document_extraction) {
                     try appendDocumentExtractionDeleteKeys(alloc, db, &document_extraction_view, request.doc_key, artifact_name, key, artifact_delete_keys);
-                    try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .skipped);
+                    try appendPrecomputedArtifactCoverageOutcomesForStages(db, alloc, coverage_outcomes, request, .skipped, !document_extraction_view.children_pending);
                     return;
                 }
                 try appendOwnedKey(alloc, artifact_delete_keys, key);
                 const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
                 errdefer alloc.free(state_key);
                 try artifact_delete_keys.append(alloc, state_key);
-                try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .skipped);
+                try appendPrecomputedArtifactCoverageOutcomesForStages(db, alloc, coverage_outcomes, request, .skipped, !document_extraction_view.children_pending);
                 return;
             }
             defer alloc.free(source_text.?);
@@ -6989,7 +7010,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (selected_manifest orelse retained_manifest) |manifest| {
                     const failed = try documentExtractionManifestHasLastError(alloc, manifest) or
                         try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(alloc, manifest);
-                    try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, if (failed) .terminal_failed else .produced);
+                    if (failed and precompute_mode == .direct) return error.CommitRequirementFailed;
+                    try appendPrecomputedArtifactCoverageOutcomesForStages(db, alloc, coverage_outcomes, request, if (failed) .terminal_failed else .produced, !document_extraction_view.children_pending);
                 }
                 return;
             }
@@ -7017,10 +7039,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const existing_asset = try S.ownerField(db, "core").*.getStoreValue(alloc, key);
                     defer if (existing_asset) |value| alloc.free(value);
                     if (existing_asset) |value| {
-                        try artifact_writes.append(alloc, .{
-                            .key = try alloc.dupe(u8, key),
-                            .value = try alloc.dupe(u8, value),
-                        });
+                        try appendPreparedArtifactCopy(alloc, artifact_writes, key, value);
                         try appendInlineFullTextDocument(alloc, documents, key, value, text_indexes);
                         try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .produced);
                         return;
@@ -7062,33 +7081,34 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const value = if (producer_cfg.type == .copy) source_text.? else blk: {
                 const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingAssetProducer;
-                const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
-                break :blk try producer.produce(alloc, .{
+                var producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+                if (requestContext(artifact_writes)) |context| producer = producer.withInvocationContext(@import("enrichment/asset_producer.zig").InvocationContext.fromRequestContext(context));
+                const input: asset_producer_mod.Request = .{
                     .producer_type = producer_cfg.type,
                     .config_json = producer_cfg.config_json,
                     .source_text = source_text.?,
                     .source_parts_json = source_parts_json,
                     .content_type = request.content_type,
-                });
+                };
+                if (requestContext(artifact_writes)) |context| {
+                    try context.check();
+                    if (!try producer.foregroundBoundedForRequests(alloc, &.{input})) return error.UnboundedEnrichmentProvider;
+                    try context.check();
+                }
+                break :blk try producer.produce(alloc, input);
             };
             defer if (producer_cfg.type != .copy) alloc.free(value);
             const privacy_output = try @import("../../privacy/materialize.zig").output(alloc, source_text.?, request.producer_json, value);
             defer if (privacy_output) |output| alloc.free(output);
             const validated = privacy_output orelse value;
 
-            try artifact_writes.append(alloc, .{
-                .key = try alloc.dupe(u8, key),
-                .value = try alloc.dupe(u8, validated),
-            });
+            try appendPreparedArtifactCopy(alloc, artifact_writes, key, validated);
             try appendInlineFullTextDocument(alloc, documents, key, validated, text_indexes);
 
             try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .produced);
 
             if (producer_cfg.type != .copy) {
-                try artifact_writes.append(alloc, .{
-                    .key = try alloc.dupe(u8, state_key.?),
-                    .value = try alloc.dupe(u8, state_value.?),
-                });
+                try appendPreparedArtifactCopy(alloc, artifact_writes, state_key.?, state_value.?);
             }
         }
 
@@ -7097,8 +7117,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             db: anytype,
             doc_value: []const u8,
             request: enrichment_types.GeneratedEnrichmentRequest,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-            artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+            artifact_writes: anytype,
+            artifact_delete_keys: anytype,
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
         ) !void {
@@ -7164,7 +7184,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             db: anytype,
             runtime: *enrichment_runtime_mod.EnrichmentRuntime,
             request: enrichment_types.GeneratedEnrichmentRequest,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             pending_deletes: *const std.StringHashMapUnmanaged(void),
             dense_embeddings: anytype,
             skip_unchanged_artifacts: bool,
@@ -7235,7 +7255,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             db: anytype,
             doc_value: []const u8,
             request: enrichment_types.GeneratedEnrichmentRequest,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             pending_deletes: *const std.StringHashMapUnmanaged(void),
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
             cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
@@ -7251,7 +7271,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             db: anytype,
             doc_value: []const u8,
             request: enrichment_types.GeneratedEnrichmentRequest,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             pending_deletes: *const std.StringHashMapUnmanaged(void),
             dense_embeddings: anytype,
             cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
@@ -7272,7 +7292,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             };
             const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingDenseEmbedder;
-            const dense_embedder = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
+            const dense_embedder = (runtime.config.dense_embedder orelse return error.MissingDenseEmbedder).withRequestContext(requestContext(artifact_writes));
 
             const embedding_name = requestEmbeddingName(request);
             const consumer_indexes: []const []const u8 = request.consumer_indexes;
@@ -7472,8 +7492,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             existing_manifest: ?[]const u8,
             manifest_key: []const u8,
             generation: u64,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-            artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+            artifact_writes: anytype,
+            artifact_delete_keys: anytype,
         ) !bool {
             const state = existing_state orelse return false;
             const manifest = existing_manifest orelse return false;
@@ -7485,7 +7505,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             if (has_error) return false;
             try appendDocumentExtractionNavigationBackfill(alloc, db, doc_key, artifact_name, fingerprint, state, generation, artifact_writes, artifact_delete_keys);
-            try artifact_writes.append(alloc, .{ .key = try alloc.dupe(u8, manifest_key), .value = try alloc.dupe(u8, manifest) });
+            try appendPreparedArtifactCopy(alloc, artifact_writes, manifest_key, manifest);
             return true;
         }
 
@@ -7498,8 +7518,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             request: enrichment_types.GeneratedEnrichmentRequest,
             config_json: []const u8,
             manifest_key: []const u8,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-            artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+            artifact_writes: anytype,
+            artifact_delete_keys: anytype,
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
@@ -7571,9 +7591,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // digest, if any, did not already prove this extraction
             // unnecessary.
             std.log.info("document extraction fetching source: doc_key={s} artifact={s}", .{ request.doc_key, artifact_name });
+            var source_control = remoteRenderConfig(db, null);
+            if (preparation_memo.context) |context| {
+                source_control.io = context.io;
+                source_control.deadline_ns = context.deadline_ns;
+                if (comptime @hasField(@TypeOf(source_control), "cancellation")) {
+                    source_control.cancellation = .{ .ptr = &preparation_memo.context.?, .is_cancelled_fn = struct {
+                        fn check(ptr: *const anyopaque) bool {
+                            const control: *const @import("antfly_inference_execution_context").RequestContext = @ptrCast(@alignCast(ptr));
+                            control.check() catch return true;
+                            return false;
+                        }
+                    }.check };
+                }
+                try context.check();
+            }
             const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
                 extraction_alloc,
-                remoteRenderConfig(db, null),
+                source_control,
                 source_url,
                 if (config.credentials.len > 0) config.credentials else null,
             ) catch |raw_err| {
@@ -7641,7 +7676,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 extraction_config.pdf_decode_limits.max_decoded_stream_bytes = @min(extraction_config.pdf_decode_limits.max_decoded_stream_bytes, pdf_inspection_bytes);
             }
             var extraction_failure: runtime_failure_abi.FailureIdentity = .{};
-            var extraction = extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure) catch |raw_err| {
+            var extraction = extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure, preparation_memo.context) catch |raw_err| {
                 const err = if (raw_err != error.OutOfMemory)
                     raw_err
                 else if (pdf_inspection_reservation.limit_exceeded)
@@ -7717,8 +7752,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return error.InvalidDocumentExtractionState;
             const navigation_block_count = hierarchyNavigationBlockCount(navigation_unit_count);
 
-            const new_state = try documentExtractionStateValueAlloc(
+            const new_state = try documentExtractionStateValueForStagesAlloc(
                 alloc,
+                view.children_pending,
                 source_fingerprint,
                 desired_unit_keys.items,
                 desired_unit_descriptors,
@@ -7743,10 +7779,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 {
                     if (existing_manifest) |value| {
                         if (!(try documentExtractionManifestHasLastError(alloc, value))) {
-                            try artifact_writes.append(alloc, .{
-                                .key = try alloc.dupe(u8, manifest_key),
-                                .value = try alloc.dupe(u8, value),
-                            });
+                            try appendPreparedArtifactCopy(alloc, artifact_writes, manifest_key, value);
                             return;
                         }
                     }
@@ -7778,10 +7811,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 navigation_block_count,
             );
             defer alloc.free(navigation_summary);
-            try artifact_writes.append(alloc, .{
-                .key = try alloc.dupe(u8, navigation_summary_key),
-                .value = try alloc.dupe(u8, navigation_summary),
-            });
+            try appendPreparedArtifactCopy(alloc, artifact_writes, navigation_summary_key, navigation_summary);
             var navigation_block_index: u32 = 0;
             while (navigation_block_index < navigation_block_count) : (navigation_block_index += 1) {
                 const start = @as(usize, navigation_block_index) * hierarchy_navigation_block_size;
@@ -7799,15 +7829,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     desired_unit_descriptors[start..end],
                 );
                 defer alloc.free(block_value);
-                try artifact_writes.append(alloc, .{
-                    .key = try alloc.dupe(u8, block_key),
-                    .value = try alloc.dupe(u8, block_value),
-                });
+                try appendPreparedArtifactCopy(alloc, artifact_writes, block_key, block_value);
             }
             var obsolete_navigation_block = navigation_block_count;
             while (obsolete_navigation_block < previous_state.navigation_block_count) : (obsolete_navigation_block += 1) {
-                try artifact_delete_keys.append(
+                try appendPreparedOwnedDelete(
                     alloc,
+                    artifact_delete_keys,
                     try internal_keys.documentUnitNavigationBlockKeyAlloc(
                         alloc,
                         request.doc_key,
@@ -7834,10 +7862,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (force_reprocess) {
                         const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, unit_descriptor.fingerprint, source_url, extraction.content_type, unit_route);
                         defer alloc.free(payload);
-                        try artifact_writes.append(alloc, .{
-                            .key = try alloc.dupe(u8, unit_key),
-                            .value = try alloc.dupe(u8, payload),
-                        });
+                        try appendPreparedArtifactCopy(alloc, artifact_writes, unit_key, payload);
                         if (text_indexes.len > 0) {
                             const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
                             errdefer {
@@ -7865,10 +7890,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, unit_descriptor.fingerprint, source_url, extraction.content_type, unit_route);
                 defer alloc.free(payload);
-                try artifact_writes.append(alloc, .{
-                    .key = try alloc.dupe(u8, unit_key),
-                    .value = try alloc.dupe(u8, payload),
-                });
+                try appendPreparedArtifactCopy(alloc, artifact_writes, unit_key, payload);
                 if (text_indexes.len > 0) {
                     const targets = try alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
                     errdefer {
@@ -7912,14 +7934,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 "converged",
             );
             defer alloc.free(manifest);
-            try artifact_writes.append(alloc, .{
-                .key = try alloc.dupe(u8, manifest_key),
-                .value = try alloc.dupe(u8, manifest),
-            });
-            try artifact_writes.append(alloc, .{
-                .key = try alloc.dupe(u8, state_key),
-                .value = try alloc.dupe(u8, new_state),
-            });
+            try appendPreparedArtifactCopy(alloc, artifact_writes, manifest_key, manifest);
+            try appendPreparedArtifactCopy(alloc, artifact_writes, state_key, new_state);
         }
 
         pub fn computeSparseMaterializedChunkRequest(
@@ -7927,7 +7943,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             db: anytype,
             runtime: *enrichment_runtime_mod.EnrichmentRuntime,
             request: enrichment_types.GeneratedEnrichmentRequest,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             pending_deletes: *const std.StringHashMapUnmanaged(void),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
             sparse_embedder: embedder_mod.SparseEmbedder,
@@ -7995,7 +8011,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             db: anytype,
             doc_value: []const u8,
             request: enrichment_types.GeneratedEnrichmentRequest,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             pending_deletes: *const std.StringHashMapUnmanaged(void),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
             cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
@@ -8015,7 +8031,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             };
             const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingSparseEmbedder;
-            const sparse_embedder = runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder;
+            var sparse_embedder = (runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder).withRequestContext(requestContext(artifact_writes));
+            const generation = if (memo) |cache_memo| try cache_memo.sparseGeneration(sparse_embedder, requestEmbeddingName(request)) else try sparse_embedder.captureGeneration(alloc, requestEmbeddingName(request));
+            sparse_embedder = sparse_embedder.withGeneration(generation);
 
             const embedding_name = requestEmbeddingName(request);
             const revision = if (memo) |cache_memo| try cache_memo.sparseRevision(sparse_embedder, embedding_name) else try sparse_embedder.captureRevision(alloc, embedding_name);
@@ -8977,6 +8995,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, state, .{}) catch return false;
             defer parsed.deinit();
             if (parsed.value != .object) return false;
+            if (parsed.value.object.get("children_pending")) |pending|
+                if (pending != .bool or pending.bool) return false;
             const version = parsed.value.object.get("chunk_unit_fingerprint_version") orelse return false;
             return document_unit_fingerprint.stateVersionIsCurrent(version);
         }
@@ -9078,8 +9098,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             navigation_block_count: u32,
             chunk_unit_fingerprints: bool,
         ) ![]u8 {
+            return documentExtractionStateValueForStagesAlloc(alloc, false, fingerprint, unit_keys, unit_descriptors, chunk_keys, navigation_digest, navigation_block_count, chunk_unit_fingerprints);
+        }
+
+        fn documentExtractionStateValueForStagesAlloc(
+            alloc: Allocator,
+            children_pending: bool,
+            fingerprint: []const u8,
+            unit_keys: []const []const u8,
+            unit_descriptors: []const DocumentExtractionUnitDescriptor,
+            chunk_keys: []const []const u8,
+            navigation_digest: []const u8,
+            navigation_block_count: u32,
+            chunk_unit_fingerprints: bool,
+        ) ![]u8 {
             return try std.json.Stringify.valueAlloc(alloc, .{
                 .kind = "document_extraction_state_v1",
+                .children_pending = children_pending,
                 .fingerprint = fingerprint,
                 .unit_keys = unit_keys,
                 .unit_descriptors = unit_descriptors,
@@ -9087,7 +9122,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .navigation_digest = navigation_digest,
                 .navigation_block_count = navigation_block_count,
                 .navigation_block_size = hierarchy_navigation_block_size,
-                .chunk_unit_fingerprint_version = if (chunk_unit_fingerprints) document_unit_fingerprint.current_state_version else @as(u8, 0),
+                .chunk_unit_fingerprint_version = if (chunk_unit_fingerprints and !children_pending) document_unit_fingerprint.current_state_version else @as(u8, 0),
             }, .{});
         }
 
@@ -9538,10 +9573,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             config_json: []const u8,
             raw_document_json: []const u8,
             out_failure: *runtime_failure_abi.FailureIdentity,
+            context: ?@import("antfly_inference_execution_context").RequestContext,
         ) !document_extraction_mod.Result {
             out_failure.* = .{};
             if (comptime !builtin.is_test and build_options.linked_storage) {
-                return document_extraction_client.extractDownloadedAllocWithLimitsWithFailure(
+                return document_extraction_client.extractDownloadedControlledAlloc(
                     alloc,
                     downloaded,
                     source_url,
@@ -9549,8 +9585,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     raw_document_json,
                     config.pdf_decode_limits,
                     out_failure,
+                    context,
                 );
             }
+            if (context) |control| try control.check();
             return document_extraction_mod.extractDownloadedAlloc(alloc, downloaded, source_url, config);
         }
 
@@ -9818,7 +9856,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dense_embedder: embedder_mod.DenseEmbedder,
             doc_key: []const u8,
             pending: *PendingDocumentUnitDenseChunkEmbedding,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
         ) !void {
             if (pending.chunk_texts.items.len == 0) return;
@@ -9855,7 +9893,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             runtime: *enrichment_runtime_mod.EnrichmentRuntime,
             sparse_embedder: embedder_mod.SparseEmbedder,
             pending: *PendingDocumentUnitSparseChunkEmbedding,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
         ) !void {
             if (pending.chunk_texts.items.len == 0) return;
@@ -9887,7 +9925,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             alloc: Allocator,
             db: anytype,
             items: *std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
         ) !void {
@@ -9895,13 +9933,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer clearPrecomputeAssetProducerBatchItems(alloc, items);
 
             const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingAssetProducer;
-            const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+            var producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+            if (requestContext(artifact_writes)) |context| producer = producer.withInvocationContext(@import("enrichment/asset_producer.zig").InvocationContext.fromRequestContext(context));
+            if (comptime @hasField(@TypeOf(artifact_writes.*), "budget")) if (artifact_writes.budget) |budget| {
+                var context = producer.invocation_context;
+                const remaining = @import("commit_requirements.zig").max_output_bytes - budget.bytes;
+                context.max_response_bytes = @min(context.max_response_bytes orelse remaining, remaining);
+                producer = producer.withInvocationContext(context);
+            };
             const requests = try alloc.alloc(asset_producer_mod.Request, items.items.len);
             defer alloc.free(requests);
             for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
+            if (requestContext(artifact_writes)) |context| {
+                try context.check();
+                if (!try producer.foregroundBoundedForRequests(alloc, requests)) return error.UnboundedEnrichmentProvider;
+                try context.check();
+            }
 
             const can_batch = producer.canProduceBatch(alloc, requests) catch |err| {
-                if (err == error.OutOfMemory) return err;
+                if (err == error.OutOfMemory or err == error.InferenceResultTooLarge) return err;
                 if (isRetryableAssetProducerError(err)) return err;
                 return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
             };
@@ -9909,7 +9959,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
 
             var produced = producer.produceBatch(alloc, requests) catch |err| {
-                if (err == error.OutOfMemory) return err;
+                if (err == error.OutOfMemory or err == error.InferenceResultTooLarge) return err;
                 if (isRetryableAssetProducerError(err)) return err;
                 return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
             };
@@ -9932,7 +9982,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 applyPrecomputeAssetProducerOutput(alloc, db, item, output, artifact_writes, documents, coverage_outcomes) catch |err| {
                     alloc.free(output);
                     produced[idx] = "";
-                    if (err == error.OutOfMemory) return err;
+                    if (err == error.OutOfMemory or err == error.InferenceResultTooLarge) return err;
                     if (isRetryableAssetProducerError(err)) return err;
                     return err;
                 };
@@ -9946,19 +9996,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             producer: asset_producer_mod.Producer,
             items: []const PrecomputeAssetProducerBatchItem,
             db: anytype,
-            artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+            artifact_writes: anytype,
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
         ) !void {
             for (items) |item| {
-                const produced = producer.produce(alloc, item.asRequest()) catch |err| {
-                    if (err == error.OutOfMemory) return err;
+                if (requestContext(artifact_writes)) |context| try context.check();
+                var item_producer = producer;
+                if (comptime @hasField(@TypeOf(artifact_writes.*), "budget")) if (artifact_writes.budget) |budget| {
+                    var context = producer.invocation_context;
+                    const remaining = @import("commit_requirements.zig").max_output_bytes - budget.bytes;
+                    context.max_response_bytes = @min(context.max_response_bytes orelse remaining, remaining);
+                    item_producer = producer.withInvocationContext(context);
+                };
+                const produced = item_producer.produce(alloc, item.asRequest()) catch |err| {
+                    if (err == error.OutOfMemory or err == error.InferenceResultTooLarge) return err;
                     if (isRetryableAssetProducerError(err)) return err;
                     return err;
                 };
                 defer alloc.free(produced);
                 applyPrecomputeAssetProducerOutput(alloc, db, item, produced, artifact_writes, documents, coverage_outcomes) catch |err| {
-                    if (err == error.OutOfMemory) return err;
+                    if (err == error.OutOfMemory or err == error.InferenceResultTooLarge) return err;
                     if (isRetryableAssetProducerError(err)) return err;
                     return err;
                 };
@@ -10044,8 +10102,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             defer alloc.free(source_text.?);
 
+            const context = if (@hasField(@TypeOf(db.*), "preparation_context")) db.preparation_context else null;
+            if (context) |control| try control.check();
             const chunks = if (request.chunker_json.len > 0)
-                try chunker_mod.chunkTextWithConfigJson(alloc, source_text.?, request.chunker_json)
+                try chunker_mod.chunkTextWithConfigJsonControlled(alloc, source_text.?, request.chunker_json, context)
             else
                 try chunker_mod.chunkText(alloc, source_text.?, request.chunk_size, request.chunk_overlap);
             errdefer chunker_mod.freeChunks(alloc, chunks);

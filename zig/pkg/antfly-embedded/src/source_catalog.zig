@@ -911,6 +911,8 @@ pub const storage_source_value_identity = @import("storage/source_value_identity
 
 pub const storage_db_mutation_commit_disposition_test = @import("storage/db/mutation_commit_disposition_test.zig");
 
+pub const storage_db_commit_requirements = @import("storage/db/commit_requirements.zig");
+pub const storage_db_prepared_producer_acceptance = @import("storage/db/prepared_producer_acceptance.zig");
 pub const storage_db_mutation_plan = @import("storage/db/mutation_plan.zig");
 
 pub const storage_db_transform_read_plan = @import("storage/db/transform_read_plan.zig");

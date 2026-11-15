@@ -201,6 +201,7 @@ from .cohere_embedder_config_provider import CohereEmbedderConfigProvider
 from .cohere_embedder_config_truncate import CohereEmbedderConfigTruncate
 from .cohere_reranker_config import CohereRerankerConfig
 from .cohere_reranker_config_provider import CohereRerankerConfigProvider
+from .commit_requires import CommitRequires
 from .committed_mutation_outcome import CommittedMutationOutcome
 from .committed_mutation_outcome_status import CommittedMutationOutcomeStatus
 from .composed_query_source import ComposedQuerySource
@@ -987,6 +988,10 @@ from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
+from .index_alias import IndexAlias
+from .index_alias_request import IndexAliasRequest
+from .index_alias_request_require import IndexAliasRequestRequire
+from .index_alias_require import IndexAliasRequire
 from .index_execution_config import IndexExecutionConfig
 from .index_maintenance_owner_proof import IndexMaintenanceOwnerProof
 from .index_maintenance_request import IndexMaintenanceRequest
@@ -2898,6 +2903,7 @@ __all__ = (
     "CohereEmbedderConfigTruncate",
     "CohereRerankerConfig",
     "CohereRerankerConfigProvider",
+    "CommitRequires",
     "CommittedMutationOutcome",
     "CommittedMutationOutcomeStatus",
     "ComposedQuerySource",
@@ -3676,6 +3682,10 @@ __all__ = (
     "ImageURLContentPartType",
     "IncompleteDetails",
     "IncompleteDetailsReason",
+    "IndexAlias",
+    "IndexAliasRequest",
+    "IndexAliasRequestRequire",
+    "IndexAliasRequire",
     "IndexExecutionConfig",
     "IndexMaintenanceOwnerProof",
     "IndexMaintenanceRequest",

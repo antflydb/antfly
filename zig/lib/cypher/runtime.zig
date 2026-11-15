@@ -48,6 +48,7 @@ pub const Result = struct {
     graph_incarnation: u64,
     graph_revision: u64,
     complete: bool = true,
+    resolved_indexes: ?[]const []const u8 = null,
     statement_byte_pool: ?*v.BytePool = null,
     pub fn jsonStringify(self: Result, writer: anytype) !void {
         try writer.beginObject();
@@ -59,6 +60,10 @@ pub const Result = struct {
         return .{ .result = self, .commit = receipt };
     }
     fn jsonStringifyFields(self: Result, writer: anytype) !void {
+        if (self.resolved_indexes) |names| {
+            try writer.objectField("resolved_indexes");
+            try writer.write(names);
+        }
         try writer.objectField("wire_version");
         try writer.write(@import("wire.zig").version);
         try writer.objectField("columns");
@@ -1800,8 +1805,17 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     const columns = try engine.a.alloc([]const u8, engine.columns.len);
     for (engine.columns, columns) |name, *out| out.* = try engine.a.dupe(u8, name);
     const stages = try engine.stages.toOwnedSlice(engine.a);
+    var selected_indexes: std.ArrayList([]const u8) = .empty;
+    try selected_indexes.appendSlice(engine.a, try @import("dependencies.zig").selectedIndexes(engine.a, compiled.query, graph));
+    if (backend.index_attribution) |attribution| for (try attribution.snapshot(attribution.ptr, engine.a)) |name| {
+        const duplicate = for (selected_indexes.items) |prior| {
+            if (std.mem.eql(u8, prior, name)) break true;
+        } else false;
+        if (!duplicate) try selected_indexes.append(engine.a, name);
+    };
+    const resolved_indexes = selected_indexes.items;
     engine.stats.memory_bytes = budget.peak;
-    var result: Result = .{ .arena = arena, .budget = budget, .columns = columns, .rows = output, .stages = stages, .stats = engine.stats, .read_only = !writes, .graph_incarnation = graph.incarnation, .graph_revision = graph.revision, .statement_byte_pool = engine.statement_byte_pool };
+    var result: Result = .{ .arena = arena, .budget = budget, .columns = columns, .rows = output, .stages = stages, .stats = engine.stats, .read_only = !writes, .graph_incarnation = graph.incarnation, .graph_revision = graph.revision, .resolved_indexes = if (resolved_indexes.len == 0) null else resolved_indexes, .statement_byte_pool = engine.statement_byte_pool };
     var checkpoint_backend = backend;
     // Reserve room for the host's durable receipt. Count escaped wire bytes
     // before a write decision, so an oversized RETURN rolls back the overlay.

@@ -139,7 +139,7 @@ fn attemptWithTransport(request: c.Request, callbacks: *Callbacks, io: std.Io, t
     var handle = artifact_reads.store();
     const physical_started = probeNow();
     defer probeStage("physical_ns", physical_started);
-    return @import("lake_execution_build_impl.zig").buildWithReuse(a, &handle, request.table, &source, store.identity, context, request.cancellation, .{ .ptr = callbacks, .now_ms = Callbacks.now }, .{ .ptr = callbacks, .snapshot = Callbacks.snapshot, .save_checkpoint = Callbacks.save, .discard_checkpoint = Callbacks.discard }, embedding_options, .{ .store = &store, .table_id = request.table.table_id, .recipe = local.metadata_lake_index_catalog.desiredFingerprint(request.table), .context = context }, request.policy) catch |err| {
+    return @import("lake_execution_build_impl.zig").buildWithReuse(a, &handle, request.table, &source, store.identity, context, request.cancellation, .{ .ptr = callbacks, .now_ms = Callbacks.now }, .{ .ptr = callbacks, .snapshot = Callbacks.snapshot, .save_checkpoint = Callbacks.save, .discard_checkpoint = Callbacks.discard }, embedding_options, .{ .store = &store, .table_id = request.table.table_id, .recipe = try local.metadata_lake_index_catalog.desiredFingerprint(a, request.table), .context = context }, request.policy) catch |err| {
         if (artifact_reads.cause()) |artifact_error| cause.* = .fromError(artifact_error);
         return err;
     };

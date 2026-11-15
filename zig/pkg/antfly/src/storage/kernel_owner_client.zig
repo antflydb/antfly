@@ -434,6 +434,19 @@ pub const Owner = struct {
         return result;
     }
 
+    pub fn prepareEnrichments(self: *Owner, table_name: []const u8, request_json: []const u8, deadline: ?u64, cancellation: @import("antfly_cancellation").CancellationToken) !Response {
+        const Callback = struct {
+            fn canceled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
+        var token = cancellation;
+        var response = Response{};
+        try statusToError(abi.antfly_storage_owner_prepare_enrichments(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(request_json), .execution_deadline_ns = deadline orelse 0, .has_execution_deadline = @intFromBool(deadline != null), .cancellation_ctx = &token, .cancellation_fn = Callback.canceled }, &response.buffer));
+        return response;
+    }
+
     pub fn preflightWriteAdmission(self: *Owner, table_name: []const u8) !void {
         _ = try self.preflightWriteAdmissionJson(table_name, "");
     }

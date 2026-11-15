@@ -4912,3 +4912,24 @@ test "metadata.lake index owner projection read negotiates older peers without w
     executor.body = "NotLeader";
     try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
 }
+
+test "index alias definition conflicts remain definite across metadata forwarding" {
+    const Executor = struct {
+        calls: usize = 0,
+        body: []const u8 = "IndexReferencedByAlias",
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{ .status = 409, .body = try a.dupe(u8, self.body) };
+        }
+    };
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    for ([_][]const u8{ "IndexReferencedByAlias", "IndexAliasGraphConflict" }) |body| {
+        executor.body = body;
+        const before = executor.calls;
+        try std.testing.expectError(error.TableGenerationChanged, client.replaceTableDefinition("http://metadata.invalid", "docs", "{}"));
+        try std.testing.expectError(error.TableGenerationChanged, client.replaceTableDefinitionStamped("http://metadata.invalid", "docs", "{}"));
+        try std.testing.expectEqual(before + 2, executor.calls);
+    }
+}
