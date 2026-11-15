@@ -345,6 +345,64 @@ test "lite allocator v4 clean certificate carries checked ownership across proce
     }
 }
 
+// perf/lwa-peer-cert: every other certificate test in this file builds its
+// `NativeFile` with `createWithIo`/`CreateOptions`, which never attaches a
+// redo log (`self.redo` stays null) unless `createWithRedoLog`/
+// `enableRedoLog` is called explicitly -- so `stageAllocatorCertificate`'s
+// `self.redo == null or self.redo.?.checkpointing` check was always true
+// for them, and the certificate it sealed always matched the real
+// publish's unconditional slot flip. The redo log is the *default* one
+// layer up (`docstore.zig`'s `opts.use_redo_log orelse true`), so a real
+// writer's own `certifyAllocator()` call almost always has `self.redo`
+// active and not mid-checkpoint -- the one case none of those tests ever
+// exercised. There, the real commit diverts into an in-place redo-log
+// append (`publishCheckpoint`'s ride-along/fresh-append branches: `self
+// .header.checkpoints[self.header.active_checkpoint]` is overwritten,
+// `active_checkpoint` never moves), while `stageAllocatorCertificate`
+// still fingerprinted a header that assumed the v8/v9 flip -- sealing the
+// certificate against a slot arrangement the real publish never produced,
+// so every later `inheritAllocatorCertificate` replay of the identical
+// formula disagreed with it.
+test "lite native allocator certificate seals against the slot a redo-diverted commit actually publishes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-certificate-inherit.aflite");
+    defer a.free(path);
+    const active_before_seal, const sequence_before_seal = blk: {
+        var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+        defer file.close();
+        try file.beginTransaction();
+        try file.putCatalogRecord("seed", "value");
+        try file.commitTransaction();
+        try std.testing.expect(file.free_pages_verified);
+        // Exactly the common, previously-untested case: an active redo
+        // log, not mid-checkpoint, so the imminent certifying commit
+        // below diverts into an in-place append rather than a real
+        // v8/v9 slot write.
+        try std.testing.expect(file.redo != null and !file.redo.?.checkpointing);
+        const before = file.activeCheckpoint();
+        try std.testing.expect(try file.certifyAllocator());
+        const after = file.activeCheckpoint();
+        // Confirms the divert actually happened as expected: the commit
+        // advanced but never flipped which physical slot is active.
+        try std.testing.expect(after.commit_sequence != before.commit_sequence);
+        break :blk .{ file.header.active_checkpoint, after.commit_sequence };
+    };
+    // A fresh handle on the same file -- recovers the redo log from disk,
+    // exactly like a peer process (or, within one process, a post-refresh
+    // reopen) opening after a certifying peer closed. Before this fix,
+    // the certificate `certifyAllocator` just sealed disagreed with this
+    // handle's own, correctly-recovered header, and this returned `false`.
+    var peer = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer peer.close();
+    try std.testing.expectEqual(active_before_seal, peer.header.active_checkpoint);
+    try std.testing.expectEqual(sequence_before_seal, peer.activeCheckpoint().commit_sequence);
+    try std.testing.expect(!peer.free_pages_verified);
+    try std.testing.expect(try peer.inheritAllocatorCertificate());
+    try std.testing.expect(peer.free_pages_verified);
+}
+
 test "lite allocator v4 live certificates share the caller transaction and reject unchecked writers" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5013,15 +5071,20 @@ pub const PathWriterLock = struct {
     }
 
     /// Like `othersWaiting`, but true only for a waiter in a genuinely
-    /// different *process* -- see `Region.othersWaitingAcrossProcesses`.
-    /// Unlike `othersWaiting`, this process's own background maintenance
-    /// worker (or any other same-process caller that reaches the region
-    /// through a path other than the one holding this lease) never
-    /// counts, since its own ticket is tagged with this same process's
-    /// id. Callers that would otherwise treat their own maintenance work
-    /// as a hostile waiter -- starving it by never releasing, since it
-    /// only ever shows up as "someone is queued" and never actually goes
-    /// away on its own -- use this instead.
+    /// different *process*, or a different in-process `Owner` (a
+    /// distinct `Region.open`, so a distinct `own_liveness_slot`) -- see
+    /// `Region.othersWaitingAcrossProcesses`. Unlike `othersWaiting`,
+    /// this process's own maintenance worker reusing *this exact*
+    /// handoff-shared lease/region never counts, since its ticket is
+    /// tagged with this same opener's pid and liveness slot both.
+    /// Callers that would otherwise treat their own maintenance work as
+    /// a hostile waiter -- starving it by never releasing, since it
+    /// only ever shows up as "someone is queued" and never actually
+    /// goes away on its own -- use this instead. A genuinely separate
+    /// `Owner` in this process (its own `Region.open`, its own liveness
+    /// slot) still counts as foreign here, exactly as a cross-process
+    /// waiter would: it cannot make the same zero-cost same-process
+    /// progress a handoff caller can, so it needs the same bounded wait.
     pub fn othersWaitingAcrossProcesses(self: *const PathWriterLock, own_pid: u32) bool {
         if (self.region) |region| return region.othersWaitingAcrossProcesses(own_pid);
         return true;
@@ -9034,6 +9097,52 @@ pub const NativeFile = struct {
     fn refreshIfWriterBaseStale(self: *NativeFile) !void {
         const entry = self.inode_lock_ref.load(.acquire) orelse return;
         const latest = inode_lock.committedSequence(entry);
+        // perf/lwa-grouped-stall: `base` below (the checkpoint's own
+        // `commit_sequence`) and `redo.writer.last_sequence` (this
+        // instance's redo-log continuity counter, independently checked
+        // by `redo_log.Writer.append`) are two different pieces of state
+        // that can desync even when `base` itself already matches
+        // `latest` -- confirmed live: `base == latest == 57` while
+        // `redo.writer.last_sequence` was still 55 on a maintenance
+        // owner's repeatedly-reopened `NativeFile` instance, so every
+        // later append computed `commit_sequence = base + 1 = 58`,
+        // which failed `58 != 55 + 1` (`error.SequenceOutOfOrder`,
+        // surfacing as the far less specific `error.OutcomeUnknown`)
+        // forever -- nothing ever advanced the redo writer's own counter
+        // to match, because the full refresh below only runs when `base`
+        // itself is stale, and the `base >= latest` early return skipped
+        // past this instance's own now-separately-stale redo counter.
+        // Sync it unconditionally and first. The logical overlay for this
+        // inode is already shared and current across every same-process
+        // instance (`inode_lock.Entry`'s one `redo.shared`, per
+        // `recoverRedoLog`'s own doc comment -- "there is nothing to
+        // replay here, only this instance's own bookkeeping to catch
+        // up"), so no second populate of it is needed; but `redo.writer`
+        // is NOT shared -- its `tail` is this instance's own physical
+        // append cursor, and bumping only `last_sequence`/`durable_sequence`
+        // without it left `tail` pointing right after this instance's own
+        // last-seen record, so its next append wrote over bytes a
+        // different, more current instance had already physically
+        // written for the sequences in between (`error.NativeRedoLogCorrupt`
+        // on replay, caught live the first time this fix tried the
+        // `last_sequence`-only version). A no-op-callback replay of the
+        // valid prefix recomputes the real `tail`/`last_sequence` the
+        // same way a cold `recoverRedoLog` open would, without re-applying
+        // any record content (already shared and current).
+        if (self.redo) |*redo| {
+            const current = redo.writer.last_sequence orelse 0;
+            if (latest > current) {
+                const io = self.runtime();
+                const Noop = struct {
+                    fn onRecord(_: ?*anyopaque, _: redo_log.RecordView) anyerror!void {}
+                };
+                const outcome = try redo_log.replay(self.allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, redo.checkpoint_sequence, Noop.onRecord, null);
+                if (outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
+                redo.writer.tail = outcome.valid_bytes;
+                redo.writer.last_sequence = outcome.last_sequence;
+                if (latest > redo.durable_sequence) redo.durable_sequence = latest;
+            }
+        }
         const base = self.activeCheckpoint().commit_sequence;
         if (base >= latest) return;
         const io = self.runtime();
@@ -9616,6 +9725,20 @@ pub const NativeFile = struct {
         // commitTransaction retains the fence if publication becomes uncertain.
         try self.beginTransaction();
         errdefer self.abortTransaction();
+        // `beginTransaction` can itself call `refreshIfWriterBaseStale`
+        // (perf/lwa-grouped-stall) when this instance's writer base is
+        // behind the inode registry's latest committed sequence. That
+        // resync adopts the newer on-disk header
+        // (`adoptIndexPublicationHeader`), which unconditionally clears
+        // `free_pages_verified` -- invalidating the precondition this
+        // function already checked above, between that check and
+        // `stageAllocatorCertificate`'s own assertion of it. Re-check
+        // after beginning the transaction and abort cleanly (certifying
+        // nothing, same as the pre-check above) instead of asserting.
+        if (!self.header.indexed_reclamation or !self.free_pages_verified) {
+            self.abortTransaction();
+            return false;
+        }
         try self.stageAllocatorCertificate(.metadata);
         try self.commitTransaction();
         return true;
@@ -9664,7 +9787,32 @@ pub const NativeFile = struct {
         next.page_count = pages.next_page_id;
         try self.persistAllocator(&pages, &next);
         var published = original;
-        published.active_checkpoint = 1 - original.active_checkpoint;
+        // perf/lwa-peer-cert: the `self.commitTransaction()` call this
+        // function's own caller (`certifyAllocator`) makes right after it
+        // returns only flips `active_checkpoint` to the *other* physical
+        // slot when that commit reaches the real v8/v9 slot write
+        // (`self.redo == null`, a checkpointing fold, or a last-second
+        // log-full fallback `publishCheckpoint` itself discovers) -- the
+        // same "will this be a real, physically-written checkpoint"
+        // condition `redo_folded_through` above already has to predict,
+        // for the identical reason (see that stamp's comment just
+        // above). Otherwise -- by far the common case, since the redo
+        // log is the default and this commit has nothing forcing a fold
+        // -- the real publish diverts into an in-place redo-log append:
+        // `self.header.checkpoints[self.header.active_checkpoint]` is
+        // simply overwritten with `next` and `active_checkpoint` never
+        // moves (`publishCheckpoint`'s own ride-along/fresh-append
+        // branches). `fingerprintHeader` hashes both slots in fixed
+        // physical-index order, independent of which one is active (its
+        // own doc comment), so which physical slot ends up holding
+        // `next`'s content is exactly what `published` must predict
+        // correctly: unconditionally flipping here fingerprinted a
+        // header the real diverted commit never produces, so every
+        // later `inheritAllocatorCertificate` byte-for-byte replay of
+        // this formula disagreed with what was actually on disk/in
+        // `self.header`, for a reason that has nothing to do with the
+        // ownership the certificate exists to attest.
+        if (self.redo == null or self.redo.?.checkpointing) published.active_checkpoint = 1 - original.active_checkpoint;
         published.checkpoints[published.active_checkpoint] = next;
         var certificate: [allocator_certificate_size]u8 = undefined;
         @memcpy(certificate[0..8], if (root == .index) allocator_certificate_live_magic else allocator_certificate_magic);
@@ -11148,19 +11296,45 @@ pub const NativeFile = struct {
                 //
                 // Logical debt gets exactly the same treatment as a
                 // staged page here, not a more eager one: an unbudgeted
-                // caller must stay deferred (several tests -- "artifact
-                // leases defer allocator proof until an authored write,"
-                // "ride-along passes force no sync" -- assert exactly
-                // that: a read-driven or idle maintenance pass must not
-                // unilaterally force the proof/fold a caller never asked
-                // for). Skipping this pass's own ledger work entirely
-                // when unbudgeted is always safe for the same reason
-                // skipping it for a staged page is: `redo.checkpoint_sequence`
-                // (and the real checkpoint slot) simply stay exactly
-                // where they were, so nothing here can ever make the
-                // "superseded" boundary used on the next reopen worse
-                // than it already is.
-                if (self.reserve_retirement_capacity and self.max_file_bytes != null) {
+                // *ride-along* caller must stay deferred (several tests --
+                // "artifact leases defer allocator proof until an
+                // authored write," "ride-along passes force no sync" --
+                // assert exactly that: a read-driven or idle maintenance
+                // pass must not unilaterally force the proof/fold a
+                // caller never asked for). Skipping this pass's own
+                // ledger work entirely when unbudgeted is always safe for
+                // the same reason skipping it for a staged page is:
+                // `redo.checkpoint_sequence` (and the real checkpoint
+                // slot) simply stay exactly where they were, so nothing
+                // here can ever make the "superseded" boundary used on
+                // the next reopen worse than it already is.
+                //
+                // perf/lwa-peer-cert: `require_reuse_proof` is exactly
+                // the opposite posture, though -- it marks a caller that
+                // already *asked* for real reclamation, synchronously,
+                // right now (`reclaimPagesWithCancel`/`reclaimPages`;
+                // `reclaimRetirementPressure`'s own doc comment: "a
+                // sustained writer must contribute reclamation before
+                // filling the bounded retirement queue"). Deferring for
+                // such a caller just because no `max_file_bytes` budget
+                // happens to be configured silently turned every explicit
+                // reclaim request into a guaranteed no-op whenever any
+                // logical overlay debt was outstanding, with nothing else
+                // in the system ever unblocking it on its own -- found
+                // live via `reclaimRetirementPressure`'s own foreground
+                // admission loop (`capi.db_test`'s "coalesces allocator
+                // proof outside publication gates": `reclaimPages` calls
+                // retired nothing without a budget, so `reusable_pages`
+                // never moved) and matching `reclaimRetirementPressure`'s
+                // own 16-iteration loop, which would otherwise spin to
+                // `error.FileBusy` with zero progress once pending debt
+                // crossed half the queue limit on any unbudgeted store.
+                // `durable` is always `true` for every existing
+                // `require_reuse_proof = true` caller (`reclaimPagesWithCancel`
+                // hard-codes both), so folding here is exactly as durable
+                // as the rest of this explicit path already is -- never a
+                // surprise ride-along sync.
+                if (require_reuse_proof or (self.reserve_retirement_capacity and self.max_file_bytes != null)) {
                     self.checkpointRedoLog() catch {};
                 }
                 // Whether or not folding ran (skipped above, or
@@ -19458,7 +19632,17 @@ pub const NativeFile = struct {
         for (previous.checkpoints) |slot| if (slot.free_map_root_page == next.free_map_root_page) return;
         const state = try self.loadLedgerForDigest(next, self.allocator_cancel_token, true);
         var published = previous;
-        published.active_checkpoint = 1 - previous.active_checkpoint;
+        // perf/lwa-peer-cert: same prediction `stageAllocatorCertificate`
+        // makes for the identical reason (see its own doc comment) --
+        // this caller's own `next.redo_folded_through` stamp just above
+        // already uses this exact condition to decide whether the
+        // imminent publish is a real physical slot write (flips
+        // `active_checkpoint`) or an in-place redo-log append (does
+        // not); `published` must predict the same outcome, or this
+        // fingerprint disagrees with the real `self.header` on every
+        // later `inheritAllocatorCertificate` replay whenever the commit
+        // diverts.
+        if (self.redo == null or self.redo.?.checkpointing) published.active_checkpoint = 1 - previous.active_checkpoint;
         published.checkpoints[published.active_checkpoint] = next;
         var root: [192]u8 = @splat(0);
         allocator_v4.State.encodeRoot(state.root, root[0..128]);
@@ -30394,6 +30578,95 @@ test "lite sustained writers reclaim bounded retirement pressure before admissio
     try std.testing.expect((try file.check()).valid);
 }
 
+// perf/lwa-peer-cert: reclaimPagesImpl's redo-overlay gate (perf/lwa-reuse-loss,
+// ec28c12c66/2b6ee404e8) deferred its ledger-only body whenever unfolded
+// logical/page-shaped overlay content existed and no `max_file_bytes`
+// budget was configured -- correct for an unbudgeted *ride-along*
+// maintenance pass (`reclaimPagesForMaintenanceWithCancel`, `require_reuse_proof
+// = false`; see the test right after this one), but the same unconditional
+// check also covered `reclaimPagesWithCancel`/`reclaimPages` (`require_reuse_proof
+// = true`), an explicit, synchronous caller that already asked for real
+// reclamation right now and has no ride-along to fall back on
+// (`reclaimRetirementPressure`'s own doc comment: "a sustained writer must
+// contribute reclamation before filling the bounded retirement queue").
+// Silently returning 0 on every call turned every such explicit request
+// into a permanent no-op whenever any logical overlay debt was
+// outstanding and no budget happened to be configured -- found live via
+// `capi.db_test`'s "coalesces allocator proof outside publication gates":
+// an unbudgeted file's `reclaimPages(4096)` loop retired nothing, so
+// `allocatorStats().reusable_pages` never moved, and (unrelated to a
+// budget at all) `reclaimRetirementPressure`'s own foreground admission
+// loop would have spun to `error.FileBusy` with zero progress on any
+// unbudgeted store once pending debt crossed half the queue limit.
+test "lite native reclaimPages folds unfolded redo overlay debt for an explicit caller even without a configured storage budget" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reclaim-explicit-no-budget.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+    defer file.close();
+    // No `max_file_bytes` configured anywhere -- the exact unbudgeted
+    // condition the old gate silently starved an explicit caller under.
+    try std.testing.expect(file.max_file_bytes == null);
+    const large: [32768]u8 = @splat('v');
+    var keys: [16][16]u8 = undefined;
+    var batch: [16]CatalogMutation = undefined;
+    for (&batch, &keys, 0..) |*mutation, *key, i| mutation.* = .{ .key = try std.fmt.bufPrint(key, "doomed-{d}", .{i}), .value = &large };
+    try file.putCatalogBatch(&batch);
+    for (&batch) |*mutation| mutation.* = .{ .key = mutation.key, .is_delete = true };
+    try file.putCatalogBatch(&batch);
+    // Exactly the previously-unexercised case: an active redo log, not
+    // mid-checkpoint, with real unfolded overlay debt from the puts and
+    // deletes above.
+    try std.testing.expect(file.redo != null and !file.redo.?.checkpointing);
+    var reclaimed: usize = 0;
+    for (0..8) |_| reclaimed += try file.reclaimPages(4096);
+    try std.testing.expect(reclaimed > 0);
+    try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 64);
+    try std.testing.expect((try file.check()).valid);
+}
+
+// Companion to the test above: the *ride-along*, non-explicit caller
+// (`require_reuse_proof = false`) must still stay deferred without a
+// budget -- the fix above is scoped to `require_reuse_proof`, not a
+// blanket removal of the gate. Matches docstore.zig's "lite reclamation
+// ride-along passes force no sync before the next durable write" at the
+// `Store` layer; this is the same property one level down, directly on
+// `NativeFile.reclaimPagesForMaintenanceWithCancel`. Checked via
+// `test_sync_calls`/`redo.checkpoint_sequence`, not `reusable_pages`: a
+// diverting commit's own external-value pages are retired through a
+// separate mechanism independent of this gate (`PageWriteBatch`'s own
+// `direct_value_pages` handling), so some incidental free-map movement
+// is expected even while the gated ledger-only fold body itself never
+// runs -- the actual property this gate protects is that no *fold*
+// (a real, syncing commit) happens, not that the free map never moves
+// at all.
+test "lite native reclaimPagesForMaintenanceWithCancel still defers the gated ledger fold without a configured storage budget" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reclaim-ride-along-no-budget.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+    defer file.close();
+    try std.testing.expect(file.max_file_bytes == null);
+    const large: [32768]u8 = @splat('v');
+    var keys: [16][16]u8 = undefined;
+    var batch: [16]CatalogMutation = undefined;
+    for (&batch, &keys, 0..) |*mutation, *key, i| mutation.* = .{ .key = try std.fmt.bufPrint(key, "doomed-{d}", .{i}), .value = &large };
+    try file.putCatalogBatch(&batch);
+    for (&batch) |*mutation| mutation.* = .{ .key = mutation.key, .is_delete = true };
+    try file.putCatalogBatch(&batch);
+    try std.testing.expect(file.redo != null and !file.redo.?.checkpointing);
+    const folded_before = file.redo.?.checkpoint_sequence;
+    const syncs_before = file.test_sync_calls.load(.monotonic);
+    for (0..8) |_| _ = try file.reclaimPagesForMaintenanceWithCancel(4096, null, false);
+    try std.testing.expectEqual(folded_before, file.redo.?.checkpoint_sequence);
+    try std.testing.expectEqual(syncs_before, file.test_sync_calls.load(.monotonic));
+    try std.testing.expect((try file.check()).valid);
+}
+
 test "lite raw value leases retain replacement bytes and account retired pins" {
     const a = std.testing.allocator;
     var cache = PageCache{};
@@ -33204,6 +33477,86 @@ test "lite redo log a second writer-mode handle refreshes to the registry's logi
     try writer.beginTransaction();
     try writer.putDocument("w-after", "v-after");
     try writer.commitTransaction();
+}
+
+// Regression for the grouped-source background-maintenance stall: unlike
+// the sibling test above (`base < latest`, both of `redo.durable_sequence`/
+// `redo.writer.last_sequence` bumped together by the existing refresh),
+// this forces the specific desync that refresh used to miss entirely --
+// `base`/`durable_sequence` already agree with the registry's `latest`,
+// but `redo.writer.last_sequence` (the counter `redo_log.Writer.append`'s
+// own continuity check actually reads) was never told, because the old
+// `base >= latest` early return skipped straight past it. Confirmed live
+// under a repeatedly-reopened `NativeFile` driving Lite's background
+// maintenance owner: `base == latest == 57`, `writer.last_sequence == 55`,
+// so every append after that point computed `commit_sequence = base + 1`,
+// failed the writer's own `commit_sequence == last_sequence + 1` check
+// forever (`error.SequenceOutOfOrder`, surfacing as the far less specific
+// `error.OutcomeUnknown`), and the catch-up loop never advanced its
+// applied sequence.
+test "lite redo log in-process base refresh also resyncs the redo writer's own continuity counter" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-stale-writer-counter.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    try writer.beginTransaction();
+    try writer.putDocument("w0", "v0");
+    try writer.commitTransaction();
+
+    var second = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    try std.testing.expect(second.redo != null);
+
+    var key_buf: [16]u8 = undefined;
+    for (0..5) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "w{d}", .{i + 1});
+        try writer.beginTransaction();
+        try writer.putDocument(key, "v");
+        try writer.commitTransaction();
+    }
+    try std.testing.expectEqual(@as(u64, 6), writer.activeCheckpoint().commit_sequence);
+
+    // Force exactly the desync described above: `base` and
+    // `durable_sequence` already match the registry's `latest` (6), but
+    // this instance's own redo-log continuity counter was never told.
+    second.header.checkpoints[second.header.active_checkpoint].commit_sequence = 6;
+    second.redo.?.durable_sequence = 6;
+    second.redo.?.writer.last_sequence = 4;
+
+    // `beginTransaction` calls `refreshIfWriterBaseStale` internally.
+    // `base (6) >= latest (6)` alone must no longer be enough to skip the
+    // redo writer's own resync.
+    try second.beginTransaction();
+    try std.testing.expectEqual(@as(u64, 6), second.redo.?.writer.last_sequence);
+
+    // The real regression: this commit used to compute
+    // `commit_sequence = base + 1 = 7` against a writer whose own
+    // continuity counter was still 4, failing `error.SequenceOutOfOrder`
+    // on every retry, forever.
+    try second.putDocument("second-doc", "second-value");
+    try second.commitTransaction();
+    try std.testing.expectEqual(@as(u64, 7), second.activeCheckpoint().commit_sequence);
+
+    const value = (try second.getDocumentAlloc(a, "second-doc")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("second-value", value);
+
+    // A fix that only bumped the logical counter without recomputing the
+    // writer's own physical `tail` left the physical cursor wrong instead
+    // -- it wrote "second-doc" over bytes a different, more current
+    // instance had already physically appended, surfacing later as
+    // `error.NativeRedoLogCorrupt`. Close both handles and reopen fresh to
+    // confirm the log is still structurally valid and the write is
+    // actually durable.
+    second.close();
+    writer.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    const confirmed = (try reopened.getDocumentAlloc(a, "second-doc")).?;
+    defer a.free(confirmed);
+    try std.testing.expectEqualStrings("second-value", confirmed);
 }
 
 test "lite redo log checkpointer defers log reclaim while a cross-process reader is pinned behind it" {

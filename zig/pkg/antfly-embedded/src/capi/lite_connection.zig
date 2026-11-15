@@ -1884,7 +1884,19 @@ pub const Owner = struct {
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
             }
-            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and
+            // `sequence_unchanged` exists to catch a redo-only commit that
+            // the header/metadata comparisons below cannot see on their own
+            // (the comment above). Without a redo log, the physical
+            // checkpoint *is* the only commit record: every commit,
+            // including a lease-only one, bumps `committedSequence()` by
+            // bumping the checkpoint's own `commit_sequence`, so requiring
+            // it unchanged here would force a full reopen for exactly the
+            // lease bookkeeping this fast path exists to adopt cheaply.
+            // `runtimeMetadataUnchanged`/`loadedIndexInputsUnchanged` already
+            // prove no primary/index root moved; that is sufficient on a
+            // non-redo file, which has no logical watermark separate from
+            // the physical one for `sequence_unchanged` to protect.
+            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
                 try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
             {
                 // Lease bookkeeping and unpublished shadow files do not change
@@ -2214,10 +2226,40 @@ pub const Owner = struct {
         return demand;
     }
 
+    /// `registeredDemand()` can only read the catalog off an established
+    /// `self.current`; with none yet (the opportunistic lock attempt in
+    /// `open()`'s `!create` path lost its race and deferred establishing
+    /// one -- "initialize this runtime lazily", that call site's own doc
+    /// comment), it answers `.none`. That is a true "unknown", not a true
+    /// "nothing to do": a foreground call still establishes `self.current`
+    /// the first time it needs one (`Connection.refresh()`/`Owner.refresh()`),
+    /// but does so without ever calling `notifyMutation()`/`notifyDemand()`,
+    /// so nothing wakes a maintenance loop that already decided "no demand,
+    /// park indefinitely" from this same unknown state. Both of
+    /// `maintenanceLoop`'s own scheduling decisions (the initial wait and
+    /// `maintenanceWaitMillis`'s idle-turn fallback) must treat an
+    /// unestablished `self.current` as "recheck soon", never as "nothing
+    /// registered, wait forever" -- the next bounded wait's own
+    /// `maintenanceTurn()` call establishes `self.current` via its own
+    /// `self.refresh()` and learns the real answer.
+    fn registeredDemandOrUnknown(self: *Owner) bool {
+        return self.current == null or self.registeredDemand().any();
+    }
+
     fn tableDemand(database: *h.db_mod.DB) Demand {
         return .{
             .index = database.core.hasManagedIndexes(),
-            .enrichment = database.core.index_manager.enrichments.items.len != 0,
+            // `index_manager.enrichments` only ever holds a *standalone*
+            // enrichment (chunk/asset, or one listed for symmetry). A
+            // dense/sparse index's own embedded `generator` config carries
+            // no entry there at all (see `liteEnrichmentCatalogEntryJsonAlloc`'s
+            // own doc comment on `capi/db.zig`) -- `hasGeneratedEnrichmentTargets()`
+            // is the one check that already walks every index kind for
+            // either shape (`computeGeneratedEnrichmentTargetCacheExcluding`),
+            // so without it a durable embedding backlog on a plain
+            // `dense_vector`/`sparse_vector` index never registers any
+            // demand at all.
+            .enrichment = database.core.index_manager.enrichments.items.len != 0 or database.core.hasGeneratedEnrichmentTargets(),
             .group_source = database.core.index_manager.hasGroupSources(),
             .ttl = database.ttl_runtime != null,
             .resolver = database.core.index_manager.resolvers.items.len != 0,
@@ -2390,6 +2432,21 @@ pub const Owner = struct {
             },
             else => return err,
         };
+        // perf/lwa-grouped-stall: same drain the handoff branches above
+        // perform before handing their lease to maintenance (see
+        // `ensureDurableForReuse`'s own doc comment: its two callers are
+        // this function and `tryWriterLeaseAssumeLocked`, handing the
+        // lease to a *different*, detached `NativeFile` instance than the
+        // one any ride-along work queued against). A fresh kernel
+        // acquisition still hands the same detached instance a lease
+        // next, so it needs the same drain; this branch was the one case
+        // that skipped it, confirmed live alongside
+        // `refreshIfWriterBaseStale`'s own fix (storage/lite/native.zig)
+        // as part of the grouped-source background-maintenance stall --
+        // handoff never actually fires under this owner's own polling
+        // cadence, so this fresh path is not the rare fallback its name
+        // implies here, it is the *common* one.
+        if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
         errdefer held.close();
         stats.recordAcquired(if (held.contended) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
         wal_trace.recordOp(.maintenance_lease_acquired);
@@ -2434,6 +2491,13 @@ pub const Owner = struct {
             break :blk held;
         } else blk: {
             const held = try native.tryFairWriterLockWithIo(alloc, h.handleLockIo(), self.path);
+            // Same drain as the handoff branches above, and
+            // `acquireMaintenancePathLeaseAssumeLocked`'s own fresh-kernel
+            // branch: a fresh acquisition still hands this lease to the
+            // same detached `self.current` instance next, which needs any
+            // still-queued ride-along work on the file physically written
+            // first so its own next commit's sequence check sees it.
+            if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
             stats.recordAcquired(.uncontended, 0);
             break :blk held;
         };
@@ -2918,6 +2982,18 @@ pub const Owner = struct {
         // sources and publish lease metadata, so yield before even capturing
         // a runtime. The gate protects this flag through the capture boundary.
         if (self.allocator_verification_active) return true;
+        // A turn reached with no established `self.current` yet (the
+        // opportunistic lock attempt in `open()`'s `!create` path lost its
+        // race -- "initialize this runtime lazily", that call site's own
+        // doc comment -- and `registeredDemandOrUnknown()` now schedules a
+        // prompt recheck instead of parking the loop forever on that
+        // unknown state) must establish one before touching it: every
+        // step below, starting with `acquireMaintenancePathLeaseAssumeLocked`'s
+        // own `self.current.?`, assumes it already exists. `self.gate.mutex`
+        // is already held here (`acquireMaintenanceCapture` above), the
+        // same precondition the later, ordinary `self.refresh()` call
+        // below relies on.
+        if (self.current == null) _ = try self.refresh();
         var lease = try self.acquireMaintenancePathLeaseAssumeLocked();
         const turn_held_from = nowNs();
         var clock: StepClock = .{ .last = turn_held_from };
@@ -3387,7 +3463,7 @@ pub const Owner = struct {
         // No durable consumer is known yet at spawn, so start parked; the
         // first notifyMutation()/notifyDemand() with a non-zero mask (or an
         // explicit stop) wakes this immediately.
-        var next_wait_ms: i64 = if (self.registeredDemand().any()) 1000 else no_scheduled_wait;
+        var next_wait_ms: i64 = if (self.registeredDemandOrUnknown()) 1000 else no_scheduled_wait;
         var earliest_turn_ns: i96 = 0;
         while (!self.stopping.load(.acquire)) {
             // Bound the wait while `WriterLane.checkin` still has a lease
@@ -3449,7 +3525,9 @@ pub const Owner = struct {
         // at all, a fixed-interval poll could only ever rediscover the same
         // "nothing to do" answer that a future notifyDemand() wake already
         // delivers, so idle turns stop polling instead of repeating every second.
-        return if (self.registeredDemand().any()) 1000 else no_scheduled_wait;
+        // (`registeredDemandOrUnknown`'s own doc comment: an unestablished
+        // `self.current` must recheck soon, never park indefinitely.)
+        return if (self.registeredDemandOrUnknown()) 1000 else no_scheduled_wait;
     }
 
     pub fn maintenanceWaitMillisForTest(self: *Owner, pending: bool) i64 {
@@ -3636,6 +3714,22 @@ pub const Owner = struct {
                         continue;
                     }
                     try file.sync();
+                    // `sync()` can itself force a durability-barrier commit,
+                    // which (perf/lwa-grouped-stall's `refreshIfWriterBaseStale`)
+                    // may discover this instance's own writer base is behind
+                    // the inode registry's latest committed sequence and
+                    // adopt the newer on-disk header -- invalidating
+                    // `free_pages_verified` as part of that adoption
+                    // (`adoptIndexPublicationHeader`'s own doc comment).
+                    // The check above is no longer valid once that happens:
+                    // `certifyAllocator`'s own precondition would otherwise
+                    // panic on a verification this exact call just undid.
+                    // Treat it the same as never having been verified.
+                    if (!file.free_pages_verified) {
+                        if (self.current == root and !needsOutcomeReconciliation(root) and
+                            file.transaction_header == null and file.durable_header == null) can_prove_current = true;
+                        continue;
+                    }
                     _ = try file.certifyAllocator();
                     return;
                 }
@@ -6975,6 +7069,191 @@ test "capi native owner refresh observes a redo-diverted commit from a genuinely
     child_reaped = true;
 }
 
+// Regression for py/packages/embedded's
+// test_cross_process_writers_do_not_lose_each_others_rows: two genuinely
+// separate OS processes, each holding the cross-process writer lease for a
+// handful of commits in turn, must never lose a sibling's committed rows --
+// no SEGFAULT, no InvalidBatchRequest, no FileBusy once each writer's own
+// lease wait succeeds. Forked (not simulated in-process) for the same
+// reason as the redo-observation test above: a same-process sibling shares
+// this process's one `SharedRedoOverlay`/allocator state per inode, which
+// would hide a bug that only a genuinely different process's independent
+// open can expose.
+test "capi native two genuinely separate writer processes do not lose each other's rows" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("xproc-two-writers");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+
+    const writers_per_child = 8;
+    const Child = struct {
+        // `lockWriterPathWithIo` is a single non-blocking try (WouldBlock on
+        // contention, never a wait): poll it the way every real caller must
+        // under genuine cross-process contention from the sibling writer
+        // below, bounded the same as the Python repro's busy_timeout=10.
+        fn acquireWithRetry(child_io: std.Io, child_path: []const u8) native.PathWriterLock {
+            const deadline_ns = std.Io.Clock.awake.now(child_io).nanoseconds + 10 * std.time.ns_per_s;
+            while (true) {
+                if (native.lockWriterPathWithIo(alloc, child_io, child_path)) |lease| return lease else |err| switch (err) {
+                    error.WouldBlock, error.FileBusy => {
+                        if (std.Io.Clock.awake.now(child_io).nanoseconds >= deadline_ns) xprocParkForever();
+                        var no_fds: [0]std.c.pollfd = .{};
+                        _ = std.c.poll(&no_fds, 0, 2);
+                    },
+                    else => xprocParkForever(),
+                }
+            }
+        }
+        fn run(child_path: []const u8, writer_id: u8, result_fd: std.c.fd_t) noreturn {
+            const child_io = h.handleLockIo();
+            var key_buffer: [8]u8 = undefined;
+            var i: u8 = 0;
+            while (i < writers_per_child) : (i += 1) {
+                var lease = acquireWithRetry(child_io, child_path);
+                var writer = native.NativeFile.openWithIo(alloc, child_io, child_path, .{ .externally_locked = true, .no_sync = true }) catch xprocParkForever();
+                const key = std.fmt.bufPrint(&key_buffer, "{d}:{d}", .{ writer_id, i }) catch xprocParkForever();
+                var value_buffer: [64]u8 = undefined;
+                const value = std.fmt.bufPrint(&value_buffer, "{{\"body\":\"writer {d} item {d}\"}}", .{ writer_id, i }) catch xprocParkForever();
+                writer.putDocument(key, value) catch xprocParkForever();
+                writer.close();
+                lease.close();
+            }
+            const report: [1]u8 = .{1};
+            _ = std.c.write(result_fd, &report, report.len);
+            xprocParkForever();
+        }
+    };
+
+    var result_fds: [2][2]std.c.fd_t = undefined;
+    for (&result_fds) |*fds| try std.testing.expectEqual(0, std.c.pipe(fds));
+
+    var child_pids: [2]std.c.pid_t = undefined;
+    for (0..2) |writer_id| {
+        const pid = std.c.fork();
+        if (pid == 0) {
+            for (0..2) |other| {
+                if (other != writer_id) _ = std.posix.system.close(result_fds[other][1]);
+            }
+            _ = std.posix.system.close(result_fds[writer_id][0]);
+            Child.run(path, @intCast(writer_id), result_fds[writer_id][1]);
+        }
+        try std.testing.expect(pid > 0);
+        child_pids[writer_id] = pid;
+    }
+    for (&result_fds) |*fds| _ = std.posix.system.close(fds[1]);
+    var children_reaped = false;
+    defer if (!children_reaped) for (child_pids) |pid| {
+        _ = std.c.kill(pid, std.c.SIG.KILL);
+        _ = std.c.waitpid(pid, null, 0);
+    };
+    defer for (&result_fds) |*fds| {
+        _ = std.posix.system.close(fds[0]);
+    };
+
+    for (&result_fds) |*fds| {
+        var report: [1]u8 = undefined;
+        try xprocReadBounded(fds[0], &report, xproc_fork_read_timeout_ms);
+        try std.testing.expectEqual(@as(u8, 1), report[0]);
+    }
+
+    var lease = try connection.acquire();
+    defer {
+        lease.close();
+        connection.gate.mutex.unlock(io);
+    }
+    const after = try owner.refresh();
+    const file = &after.owned_lite_backend.?.native_docstore.?.file;
+    for (0..2) |writer_id| {
+        var i: u8 = 0;
+        while (i < writers_per_child) : (i += 1) {
+            var key_buffer: [8]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "{d}:{d}", .{ writer_id, i });
+            const value = try file.getDocumentAlloc(a, key);
+            defer if (value) |bytes| a.free(bytes);
+            try std.testing.expect(value != null);
+            var expected_buffer: [64]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&expected_buffer, "{{\"body\":\"writer {d} item {d}\"}}", .{ writer_id, i });
+            try std.testing.expectEqualStrings(expected, value.?);
+        }
+    }
+
+    for (child_pids) |pid| _ = std.c.kill(pid, std.c.SIG.KILL);
+    for (child_pids) |pid| try xprocReapBounded(pid, xproc_fork_reap_timeout_ms);
+    children_reaped = true;
+}
+
+// perf/lwa-xproc-writers item 4: a cold-opened writer whose opportunistic
+// lock attempt in `open()`'s `!create` path loses its race leaves
+// `self.current` null when `Owner.maintenanceLoop` spawns. Before this fix,
+// `registeredDemand()`'s `self.current orelse return .none` made that
+// unknown state look like "nothing registered", parking the loop's own
+// wake `Io.Event` forever (`no_scheduled_wait`) with nothing left to ever
+// wake it -- not even the durable dense-index generator backlog seeded
+// below. No foreground call on `wrapper`/`connection` ever runs here: the
+// background loop alone must discover and drain it.
+test "capi native cold-opened owner drains durable enrichment backlog with no foreground call" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("cold-owner-enrichment-drain");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+
+    // Seed durable state and close cleanly: an index with an embedded
+    // generator and one document needing it, committed, with no owner
+    // left registered on this path afterward -- the same durable shape a
+    // genuinely separate process (perf/lwa-xproc-writers's own motivating
+    // scenario) leaves behind once it exits.
+    {
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+        const id = try api.publishHandle(wrapper);
+        defer api.antfly_db_close(id);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(
+            "{\"name\":\"semantic\",\"kind\":\"dense_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"dims\\\":3,\\\"metric\\\":\\\"l2_squared\\\",\\\"generator\\\":{\\\"kind\\\":\\\"dense_embedding\\\",\\\"source_field\\\":\\\"body\\\",\\\"embedding_name\\\":\\\"dense_v1\\\"}}\"}",
+        )));
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(
+            "{\"inserts\":{\"doc\":{\"body\":\"durable generated work\"}},\"sync_level\":\"write\"}",
+        ), &out));
+    }
+
+    // Cold reopen: a brand new Owner/maintenanceLoop. No foreground call
+    // on this connection follows -- only the background thread can make
+    // the enrichment runtime's `applied_sequence` reach `target_sequence`.
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+    defer h.closeHandle(wrapper);
+    const owner = wrapper.lite_connection.?.owner;
+
+    const deadline_ns = std.Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
+    while (true) {
+        const applied = blk: {
+            const root = owner.current orelse break :blk 0;
+            const runtime = root.db.enrichment_runtime orelse break :blk 0;
+            break :blk runtime.stats().applied_sequence;
+        };
+        if (applied >= 1) break;
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline_ns) return error.EnrichmentNeverDrained;
+        var no_fds: [0]std.c.pollfd = .{};
+        _ = std.c.poll(&no_fds, 0, 20);
+    }
+}
+
 test "capi native recovery agenda clean opens avoid unrelated table runtimes" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("recovery-agenda-discovery", 5000, .sql);
@@ -7543,13 +7822,26 @@ test "capi native parked writer lease releases for a foreign waiter within the f
         fn run(self: *@This()) void {
             const wio = h.handleLockIo();
             const deadline = std.Io.Clock.now(.awake, wio).addDuration(.fromSeconds(2));
-            self.acquired = self.region.acquireWriterFairBounded(wio, self.pid, deadline, null) catch false;
-            if (self.acquired) self.region.releaseWriter();
+            // `acquireWriterFairBounded`'s own return value says whether
+            // *this particular* acquisition was contended (it took a real
+            // ticket) versus winning the uncontended ticketless fast path
+            // -- not whether it succeeded at all, which is exactly
+            // "didn't error" (see its own doc comment). Discarding the
+            // bool here and keying `acquired` off the absence of an error
+            // is deliberate: both outcomes mean the foreign waiter got
+            // served, and which one happens is itself a race between this
+            // task's own scheduling delay and `maintainParkedLease`'s
+            // release (see this test's own comment below for why that
+            // race is exactly what made the bug below only ever surface
+            // under `io.concurrent`, never under `std.Thread.spawn`).
+            _ = self.region.acquireWriterFairBounded(wio, self.pid, deadline, null) catch return;
+            self.acquired = true;
+            self.region.releaseWriter();
         }
     };
     // `started` precedes spawning the foreign waiter: by the time it
     // calls `acquireWriterFairBounded`, test setup overhead (opening a
-    // second `Region` mapping, thread spawn) may already exceed
+    // second `Region` mapping, task spawn) may already exceed
     // `foreign_fairness_quantum_ns` on its own, so `maintainParkedLease`
     // can release the instant the foreign ticket is claimed -- the
     // claim-then-release round trip can finish faster than any poll
@@ -7557,25 +7849,24 @@ test "capi native parked writer lease releases for a foreign waiter within the f
     // The bound below is what actually matters: the lease is released
     // and the waiter served promptly, not on the much longer idle window.
     //
-    // Deliberately `std.Thread.spawn`, not `io.concurrent`: tried converting
-    // this to `io.concurrent` (both on a dedicated `std.Io.Threaded` and on
-    // `std.testing.io`) and measured genuine, reproducible flakiness --
-    // `foreign.acquired` false roughly 1 run in 3, meaning the spawned
-    // task's own bounded `acquireWriterFairBounded` call (a generous 2s
-    // deadline) sometimes never succeeded at all, not just slower timing.
-    // `h.handleLockIo()` ("the process-wide threaded Io, whose waits block
-    // the calling OS thread") is explicitly for blocking waits from
-    // arbitrary foreign threads; `io.concurrent` on it fails outright
-    // (`ConcurrencyUnavailable`/`OutOfMemory`), and routing the spawn
-    // through a different `Io` while the waiter's own blocking call still
-    // goes through `handleLockIo()` did not resolve the flakiness within
-    // the time available to root-cause it. A real OS thread remains the
-    // reliable way to simulate a genuinely concurrent, independent waiter
-    // here; revisit if `io.concurrent`'s interaction with `handleLockIo()`
-    // from a pool-spawned task is understood and fixed.
+    // This test was briefly flaky (~1/3 of runs) when first converted from
+    // `std.Thread.spawn` to `io.concurrent`, with `foreign.acquired` false
+    // despite `acquireWriterFairBounded` never actually erroring. Root
+    // cause: the bug above was already latent under `std.Thread.spawn` too
+    // -- `self.acquired = ... catch false` conflated "did this error" with
+    // "did this take the contended ticket path" -- but real OS thread
+    // creation happened to always take longer than `maintainParkedLease`'s
+    // own release, so the foreign call always lost the race to
+    // `tryAcquireWriter`'s own uncontended CAS and took a ticket (`true`),
+    // masking the bug. `io.concurrent`'s task dispatch has no such
+    // consistent floor: sometimes the foreign task's first
+    // `tryAcquireWriter` attempt runs *after* the parked lease is already
+    // released, winning the fast, uncontended path (a legitimate, even
+    // faster, success that the old assertion wrongly treated as a
+    // failure).
     const started = std.Io.Clock.awake.now(io).nanoseconds;
     var foreign: Foreign = .{ .region = &foreign_region, .pid = foreign_pid };
-    const thread = try std.Thread.spawn(.{}, Foreign.run, .{&foreign});
+    var foreign_task = try std.testing.io.concurrent(Foreign.run, .{&foreign});
 
     const deadline_ns = started + 3 * std.time.ns_per_s;
     while (owner.writer_lane.parked != null) {
@@ -7583,7 +7874,7 @@ test "capi native parked writer lease releases for a foreign waiter within the f
         io.sleep(.fromMilliseconds(5), .awake) catch {};
     }
     try std.testing.expect(owner.writer_lane.parked == null);
-    thread.join();
+    foreign_task.await(std.testing.io);
     try std.testing.expect(foreign.acquired);
     const elapsed_ns = std.Io.Clock.awake.now(io).nanoseconds - started;
     // Served well within the fairness quantum plus this loop's own poll
