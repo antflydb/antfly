@@ -810,7 +810,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (jobs.items.len == 0) return;
             defer clearGeneratedSparseMemoJobs(memo.alloc, jobs);
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
-            const embedder = (runtime.config.sparse_embedder orelse return).withRequestContext(memo.context);
+            var embedder = (runtime.config.sparse_embedder orelse return).withRequestContext(memo.context);
+            embedder = embedder.withGeneration(try memo.sparseGeneration(embedder, requestEmbeddingName(jobs.items[0].request)));
             const texts = try memo.alloc.alloc([]const u8, jobs.items.len);
             defer memo.alloc.free(texts);
             for (jobs.items, texts) |job, *text| text.* = job.text;
@@ -1513,7 +1514,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (precompute_mode == .direct) {
                         const revision = switch (request.kind) {
                             .dense_embedding => if (preparation_memo.generations.get(requestEmbeddingName(request))) |generation| generation.revision else null,
-                            .sparse_embedding => preparation_memo.sparse_revisions.get(requestEmbeddingName(request)) orelse null,
+                            .sparse_embedding => if (preparation_memo.sparse_generations.get(requestEmbeddingName(request))) |generation| generation.revision else null,
                             else => null,
                         };
                         const document = try alloc.dupe(u8, request.doc_key);

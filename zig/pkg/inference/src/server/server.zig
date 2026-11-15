@@ -5427,6 +5427,17 @@ pub const Node = struct {
         texts: []const []const u8,
         supplied_control: InferenceExecutionControl,
     ) ![]DirectSparseEmbedding {
+        return self.embedSparseTextsDirectWithControlAndRevision(allocator, model_name, texts, supplied_control, null);
+    }
+
+    pub fn embedSparseTextsDirectWithControlAndRevision(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        texts: []const []const u8,
+        supplied_control: InferenceExecutionControl,
+        expected_revision: ?[32]u8,
+    ) ![]DirectSparseEmbedding {
         var control = self.bindExecutionControl(null, supplied_control);
         try control.check();
         if (texts.len == 0) return try allocator.alloc(DirectSparseEmbedding, 0);
@@ -5455,9 +5466,11 @@ pub const Node = struct {
             control: InferenceExecutionControl,
             vectors: ?[]DirectSparseEmbedding = null,
             node: *Node,
+            expected_revision: ?[32]u8,
 
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
+                try requireLoadedEmbeddingRevision(attempt.expected_revision, model.resolution_revision);
                 if (!model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 const input_tokens = try maxTokenizerTextTokens(
                     attempt.allocator,
@@ -5496,6 +5509,7 @@ pub const Node = struct {
             .executor_contract = executor_contract,
             .control = control,
             .node = self,
+            .expected_revision = expected_revision,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{ .execution_control = control }, &attempt, Attempt.run);
         return attempt.vectors.?;

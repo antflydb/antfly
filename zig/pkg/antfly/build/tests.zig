@@ -5847,6 +5847,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const inference_host_tests = b.addTest(.{
         .root_module = test_imports.runtime.inference_host,
         .filters = &.{
+            "commit requirements sparse host operation preserves execution revision",
             "local generate message conversion preserves tool history and admission",
             "local generate message conversion gives video its own field and rejects mixed media",
             "local generate video reaches a Gemma 4 model through the linked provider",

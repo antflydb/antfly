@@ -154604,3 +154604,53 @@ test "db commit requirements preserve provider batches across bounded planning w
     const last = (try db.get(a, "doc-39")) orelse return error.TestUnexpectedResult;
     defer a.free(last);
 }
+
+test "db commit requirements relational preparation retries a source race" {
+    const Producer = struct {
+        db: ?*DB = null,
+        calls: usize = 0,
+        fn produce(ptr: *anyopaque, a: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) try self.db.?.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"intervening source\"}" }}, .commit_requires = .none, .sync_level = .write });
+            return a.dupe(u8, "prepared result");
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-relational-source-race");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "source-race", .asset_producer = .{ .ptr = &producer, .vtable = &.{ .produce = Producer.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } } } });
+    defer db.close();
+    producer.db = &db;
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"summary\"}}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"requested source\"}" }}, .commit_requires = .direct_enrichments, .sync_level = .write });
+    try std.testing.expectEqual(@as(usize, 2), producer.calls);
+    const source = (try db.get(a, "doc")) orelse return error.TestUnexpectedResult;
+    defer a.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "requested source") != null);
+}
+
+test "db commit requirements coverage candidates share pinned configuration across windows" {
+    const a = std.testing.allocator;
+    const config = try a.alloc(u8, 64 * 1024);
+    defer a.free(config);
+    @memset(config, ' ');
+    var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 128 * 1024);
+    defer quota.deinit();
+    const alloc = quota.allocator();
+    var candidates: std.ArrayListUnmanaged(PrecomputedCoverageCandidate) = .empty;
+    defer {
+        for (candidates.items) |candidate| candidate.deinit(alloc);
+        candidates.deinit(alloc);
+    }
+    var consumers = [_][]u8{@constCast("dense")};
+    for (0..128) |_| try appendPrecomputedCoverageCandidate(alloc, &candidates, .{ .kind = .dense_embedding, .doc_key = "doc", .index_name = "dense", .source_field = "body", .producer_json = config, .source_template = config, .consumer_indexes = &consumers }, true);
+    for (candidates.items) |candidate| {
+        try std.testing.expectEqual(config.ptr, candidate.request.producer_json.ptr);
+        try std.testing.expectEqual(config.ptr, candidate.request.source_template.ptr);
+        try std.testing.expect(candidate.request.consumer_indexes.ptr != consumers[0..].ptr);
+    }
+}

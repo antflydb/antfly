@@ -1415,7 +1415,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // only tracks schema/enrichment catalog changes, not per-document
             // data changes. use_preprepared_document_generated already forced a
             // retry on a stale catalog; this call does the same for a stale key.
-            if (use_preprepared_document_generated) try self.validateGeneratedWriteReadSnapshot(preparation.generated_snapshot);
+            try self.validateGeneratedWriteReadSnapshot(preparation.generated_snapshot);
 
             if (effective_req.predicates.len > 0) {
                 const predicates_start_ns = monotonicTimeNs();

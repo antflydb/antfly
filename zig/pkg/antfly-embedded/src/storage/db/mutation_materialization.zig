@@ -2693,9 +2693,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             request: enrichment_types.GeneratedEnrichmentRequest,
             produced: bool,
         ) !void {
-            const cloned = try enrichment_types.cloneGeneratedRequest(alloc, request);
-            errdefer enrichment_types.freeGeneratedRequest(alloc, cloned);
-            try out.append(alloc, .{ .request = cloned, .produced = produced });
+            var retained = request;
+            retained.consumer_indexes = try alloc.dupe([]u8, request.consumer_indexes);
+            errdefer alloc.free(retained.consumer_indexes);
+            try out.append(alloc, .{ .request = retained, .produced = produced });
         }
 
         pub fn appendPrecomputedCoverageOutcomeMutations(
@@ -6971,7 +6972,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             };
             const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingSparseEmbedder;
-            const sparse_embedder = (runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder).withRequestContext(requestContext(artifact_writes));
+            var sparse_embedder = (runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder).withRequestContext(requestContext(artifact_writes));
+            const generation = if (memo) |cache_memo| try cache_memo.sparseGeneration(sparse_embedder, requestEmbeddingName(request)) else try sparse_embedder.captureGeneration(alloc, requestEmbeddingName(request));
+            sparse_embedder = sparse_embedder.withGeneration(generation);
 
             const embedding_name = requestEmbeddingName(request);
             const revision = if (memo) |cache_memo| try cache_memo.sparseRevision(sparse_embedder, embedding_name) else try sparse_embedder.captureRevision(alloc, embedding_name);

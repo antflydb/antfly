@@ -150,7 +150,9 @@ also strengthens retained implicit tables; a later `none` cannot erase a prior
 direct floor. Trusted persistence uses the versioned
 `commit-requirements-request-v1` envelope so older readers reject this state
 rather than silently discarding its provenance. Public JSON remains unchanged.
-Single-shard fast paths and grouped forwarding preserve the optional field.
+Single-shard fast paths and grouped forwarding preserve the optional field. Linear merge does not yet expose
+this prerequisite contract and rejects explicit `commit_requires` fields in both
+ordinary and scoped requests before mutations.
 Requests with explicit requirements bypass the local write coalescer so each
 request retains its own preparation and source fences.
 
@@ -188,13 +190,26 @@ revisions. It references each immutable catalog definition instead of repeating
 provider configuration for every document. Binary artifact values round-trip
 without UTF-8 conversion. Capture has no primary side effects. Receivers validate
 the complete eligible producer set and its physical output scopes without model
-calls. Native owner ABI 94, storage engine ABI 41 and media compute ABI 5
+calls. Native owner ABI 94, storage engine ABI 42, inference host ABI 36 and media compute ABI 5
 fence the added interfaces. Request deadlines and cancellation cross the native
 owner and extraction boundaries into request-owned provider calls. Acceptance
 shares one immutable source image and digest across producers for each document,
 and validates its source/TTL bytes once inside the commit. Sparse revision
 discovery uses the same controlled provider boundary as foreground inference;
 legacy synchronous discovery is rejected when request controls are present.
+Sparse preparation also captures an immutable execution generation, partitions
+against its batch ceiling, and carries its lease through native and HTTP calls.
+The native sparse operation transmits the expected revision and checks the loaded
+model before tokenization or broker dispatch. A revision-observing provider that
+cannot consume a captured generation fails closed; unversioned providers never
+acquire invented revision provenance. Final generation checks use fresh discovery,
+so a captured lease cannot validate itself. An alias A → B → A cannot mix B output
+into an A-labelled result.
+
+Relational and document preparation both recheck captured source revisions under
+the apply lock before consuming speculative effects. Coverage candidates borrow
+the pinned producer definition and source envelope, retaining only their filtered
+consumer list across windows; configuration JSON is never copied per document.
 
 Raft leaders prepare before acquiring routed admission or the proposal lock.
 The all-member durable protocol-30 barrier precedes prepared-effect entries;

@@ -1725,12 +1725,14 @@ pub const PrecomputedCoverageOutcome = struct {
     }
 };
 
+/// Definitions and document keys borrow the preparation's pinned catalog and
+/// source envelope. Only the filtered consumer slice outlives its window plan.
 pub const PrecomputedCoverageCandidate = struct {
     request: enrichment_types.GeneratedEnrichmentRequest,
     produced: bool,
 
     pub fn deinit(self: @This(), alloc: Allocator) void {
-        enrichment_types.freeGeneratedRequest(alloc, self.request);
+        alloc.free(self.request.consumer_indexes);
     }
 };
 
@@ -1780,7 +1782,7 @@ pub const GeneratedEmbeddingMemo = struct {
     dense: std.AutoHashMapUnmanaged(Key, []f32) = .empty,
     generations: std.StringHashMapUnmanaged(embedder_mod.DenseEmbedder.TextGeneration) = .empty,
     sparse: std.AutoHashMapUnmanaged(Key, SparseValue) = .empty,
-    sparse_revisions: std.StringHashMapUnmanaged(?[32]u8) = .empty,
+    sparse_generations: std.StringHashMapUnmanaged(embedder_mod.SparseEmbedder.Generation) = .empty,
 
     pub fn init(alloc: Allocator) GeneratedEmbeddingMemo {
         return .{ .alloc = alloc };
@@ -1790,9 +1792,9 @@ pub const GeneratedEmbeddingMemo = struct {
         var names = self.generations.keyIterator();
         while (names.next()) |name| self.alloc.free(name.*);
         self.generations.deinit(self.alloc);
-        var sparse_names = self.sparse_revisions.keyIterator();
+        var sparse_names = self.sparse_generations.keyIterator();
         while (sparse_names.next()) |name| self.alloc.free(name.*);
-        self.sparse_revisions.deinit(self.alloc);
+        self.sparse_generations.deinit(self.alloc);
         var dense_values = self.dense.valueIterator();
         while (dense_values.next()) |vector| self.alloc.free(vector.*);
         self.dense.deinit(self.alloc);
@@ -1878,13 +1880,17 @@ pub const GeneratedEmbeddingMemo = struct {
         return captured;
     }
 
-    pub fn sparseRevision(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !?[32]u8 {
-        if (self.sparse_revisions.get(name)) |revision| return revision;
-        const revision = try provider.withRequestContext(self.context).captureRevision(self.alloc, name);
+    pub fn sparseGeneration(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !embedder_mod.SparseEmbedder.Generation {
+        if (self.sparse_generations.get(name)) |captured| return captured;
+        const captured = try provider.withRequestContext(self.context).captureGeneration(self.alloc, name);
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
-        try self.sparse_revisions.put(self.alloc, owned, revision);
-        return revision;
+        try self.sparse_generations.put(self.alloc, owned, captured);
+        return captured;
+    }
+
+    pub fn sparseRevision(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !?[32]u8 {
+        return (try self.sparseGeneration(provider, name)).revision;
     }
 
     /// One final check after every producer has finished, before preparation
@@ -1896,10 +1902,10 @@ pub const GeneratedEmbeddingMemo = struct {
             const provider = dense_provider orelse return error.MissingDenseEmbedder;
             try provider.withRequestContext(self.context).requireTextGeneration(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
         }
-        var sparse_generations = self.sparse_revisions.iterator();
+        var sparse_generations = self.sparse_generations.iterator();
         while (sparse_generations.next()) |entry| {
             const provider = sparse_provider orelse return error.MissingSparseEmbedder;
-            try provider.withRequestContext(self.context).requireRevision(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+            try provider.withRequestContext(self.context).requireRevision(self.alloc, entry.key_ptr.*, entry.value_ptr.revision);
         }
     }
 

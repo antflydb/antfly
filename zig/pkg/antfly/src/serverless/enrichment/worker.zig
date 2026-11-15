@@ -259,8 +259,9 @@ pub const SparseEnricher = struct {
         }
         if (self.sparse_embedder) |provider| {
             const controlled = provider.withRequestContext(context);
-            self.sparse_embedder = controlled;
-            self.prepared_sparse_revision = try controlled.captureRevision(self.alloc, self.sparse_embedding_name.?);
+            const generation = try controlled.captureGeneration(self.alloc, self.sparse_embedding_name.?);
+            self.sparse_embedder = controlled.withGeneration(generation);
+            self.prepared_sparse_revision = generation.revision;
         }
     }
 

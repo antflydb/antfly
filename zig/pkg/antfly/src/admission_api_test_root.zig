@@ -20,6 +20,7 @@ test {
     _ = @import("api/public_table_http.zig");
     _ = @import("api/http_server.zig");
     _ = @import("api/transactions.zig");
+    _ = @import("api/linear_merge.zig");
     _ = @import("api/table_contract.zig");
     _ = @import("serverless/api/http_handler.zig");
 }
