@@ -2516,6 +2516,7 @@ pub const KernelModule = struct {
     kv_write_suffix_turboquant_f32: driver_mod.CUfunction = null,
     deberta_attention_f32: driver_mod.CUfunction = null,
     deberta_attention_fused_f32: driver_mod.CUfunction = null,
+    deberta_attention_stream_f32: driver_mod.CUfunction = null,
     deberta_attention_stream_f16: driver_mod.CUfunction = null,
     /// Generated tensor-core DeBERTa prefill schedule. It consumes graph
     /// layout F32 directly and owns a 16-query x 32-key tile per CTA.
@@ -3726,6 +3727,7 @@ pub const KernelModule = struct {
         var deberta_attention_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&deberta_attention_f32, module, "termite_deberta_attention_f32"));
         const deberta_attention_fused_f32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_fused_f32");
+        const deberta_attention_stream_f32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_stream_f32");
         const deberta_attention_stream_f16 = loadOptionalFunction(ctx, module, "termite_deberta_attention_stream_f16");
         const deberta_attention_tc_f16_m16n32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_tc_f16_m16n32");
         const deberta_attention_tc_f16_m32n16 = loadOptionalFunction(ctx, module, "termite_deberta_attention_tc_f16_m32n16");
@@ -4187,6 +4189,7 @@ pub const KernelModule = struct {
             .kv_write_suffix_turboquant_f32 = kv_write_suffix_turboquant_f32,
             .deberta_attention_f32 = deberta_attention_f32,
             .deberta_attention_fused_f32 = deberta_attention_fused_f32,
+            .deberta_attention_stream_f32 = deberta_attention_stream_f32,
             .deberta_attention_stream_f16 = deberta_attention_stream_f16,
             .deberta_attention_tc_f16_m16n32 = deberta_attention_tc_f16_m16n32,
             .deberta_attention_tc_f16_m32n16 = deberta_attention_tc_f16_m32n16,
@@ -4654,6 +4657,7 @@ pub const KernelModule = struct {
             self.kv_write_suffix_turboquant_f32 = null;
             self.deberta_attention_f32 = null;
             self.deberta_attention_fused_f32 = null;
+            self.deberta_attention_stream_f32 = null;
             self.deberta_attention_stream_f16 = null;
             self.deberta_attention_tc_f16_m16n32 = null;
             self.deberta_attention_tc_f16_m32n16 = null;
@@ -13661,6 +13665,64 @@ pub const KernelModule = struct {
             @ptrCast(&head_dim_u32),
         };
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), seq_len);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
+    /// Eight FP32 query warps per block, with no additional scratch allocation.
+    pub fn launchDebertaAttentionStreamF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_attention_stream_f32 orelse return false;
+        if (seq_len == 0 or seq_len > 512 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkBytes(q_r, rel_count);
+        try checkBytes(k_r, rel_count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&q_r_ptr),
+            @ptrCast(&k_r_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), (seq_len + 7) / 8);
         try launchBlocks(function, ctx, blocks, 256, &params);
         return true;
     }

@@ -31,6 +31,7 @@ class SQLResponse:
             rows (list[list[Any]]):
             rows_affected (int): Number of rows affected by a mutation, or zero for a read-only statement.
             command_tag (str): SQL command completion tag.
+            resolved_indexes (list[str] | Unset): Concrete graph index names selected from the statement catalog cut.
             sql_nulls (list[list[bool]] | Unset): Null flags aligned exactly with rows and their columns. True denotes
                 SQL NULL; false denotes a value, including the JSON literal null.
                 When omitted, null cells have the legacy SQL NULL interpretation.
@@ -56,6 +57,7 @@ class SQLResponse:
     rows: list[list[Any]]
     rows_affected: int
     command_tag: str
+    resolved_indexes: list[str] | Unset = UNSET
     sql_nulls: list[list[bool]] | Unset = UNSET
     mutation_outcome: SQLMutationOutcome | Unset = UNSET
     ddl_receipt: SQLDDLReceipt | Unset = UNSET
@@ -78,6 +80,10 @@ class SQLResponse:
         rows_affected = self.rows_affected
 
         command_tag = self.command_tag
+
+        resolved_indexes: list[str] | Unset = UNSET
+        if not isinstance(self.resolved_indexes, Unset):
+            resolved_indexes = self.resolved_indexes
 
         sql_nulls: list[list[bool]] | Unset = UNSET
         if not isinstance(self.sql_nulls, Unset):
@@ -113,6 +119,8 @@ class SQLResponse:
                 "command_tag": command_tag,
             }
         )
+        if resolved_indexes is not UNSET:
+            field_dict["resolved_indexes"] = resolved_indexes
         if sql_nulls is not UNSET:
             field_dict["sql_nulls"] = sql_nulls
         if mutation_outcome is not UNSET:
@@ -151,6 +159,8 @@ class SQLResponse:
         rows_affected = d.pop("rows_affected")
 
         command_tag = d.pop("command_tag")
+
+        resolved_indexes = cast(list[str], d.pop("resolved_indexes", UNSET))
 
         _sql_nulls = d.pop("sql_nulls", UNSET)
         sql_nulls: list[list[bool]] | Unset = UNSET
@@ -191,6 +201,7 @@ class SQLResponse:
             rows=rows,
             rows_affected=rows_affected,
             command_tag=command_tag,
+            resolved_indexes=resolved_indexes,
             sql_nulls=sql_nulls,
             mutation_outcome=mutation_outcome,
             ddl_receipt=ddl_receipt,

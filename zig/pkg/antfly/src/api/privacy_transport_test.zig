@@ -331,9 +331,9 @@ test "privacy remote mutations preserve preconditions and never replay ambiguous
 test "privacy checkpoint job commands require the same coordinated decoder as catalog attachment" {
     const service = @import("../metadata/service.zig");
     const protocol = @import("../metadata/topology_protocol.zig");
-    try std.testing.expectEqual(protocol.privacy_version, service.transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_set_job_state = .{ .key = "privacy/m/checkpoint", .expected_hash = "", .value = "{}" } }));
-    try std.testing.expectEqual(protocol.privacy_version, service.transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_set_job_state = .{ .key = "privacy/c/checkpoint", .expected_hash = "", .value = "Vchunk" } }));
-    try std.testing.expectEqual(protocol.job_state_version, service.transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_set_job_state = .{ .key = "documents/run", .expected_hash = "", .value = "{}" } }));
+    try std.testing.expectEqual(protocol.privacy_version, (try service.transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_set_job_state = .{ .key = "privacy/m/checkpoint", .expected_hash = "", .value = "{}" } })));
+    try std.testing.expectEqual(protocol.privacy_version, (try service.transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_set_job_state = .{ .key = "privacy/c/checkpoint", .expected_hash = "", .value = "Vchunk" } })));
+    try std.testing.expectEqual(protocol.job_state_version, (try service.transitionRequiredCoordinatedDecoderVersion(std.testing.allocator, .{ .compare_and_set_job_state = .{ .key = "documents/run", .expected_hash = "", .value = "{}" } })));
 }
 
 test "privacy scratch preserves both outer and inner invocation limits" {

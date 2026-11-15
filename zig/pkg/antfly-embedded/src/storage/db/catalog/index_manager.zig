@@ -6664,6 +6664,18 @@ pub const IndexManager = struct {
             doc_key: []const u8,
             extracted: mapper.ExtractedWrite,
         ) !BorrowedGeneratedRowPlan {
+            return self.planGeneratedEnrichmentsForRowBounded(alloc, doc_key, extracted, null, null);
+        }
+
+        pub fn planGeneratedEnrichmentsForRowBounded(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            extracted: mapper.ExtractedWrite,
+            budget: ?*@import("../commit_requirements.zig").OutputBudget,
+            context: ?@import("antfly_inference_execution_context").RequestContext,
+        ) !BorrowedGeneratedRowPlan {
+            if (context) |control| try control.check();
             var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
             errdefer {
                 for (requests.items) |request| {
@@ -6674,7 +6686,12 @@ pub const IndexManager = struct {
                 requests.deinit(alloc);
             }
             for (self.generated_templates, 0..) |template, template_index| {
+                if (context) |control| try control.check();
                 if (!self.generatedTemplateRequired(extracted, template_index) or !enrichment_types.appliesToDocument(template, doc_key)) continue;
+                // Charge request/coverage/pending bookkeeping before any
+                // descriptor or consumer-list allocation, including deferred
+                // producers whose work still has to be represented in replay.
+                if (budget) |account| try account.reserve(doc_key.len + template.index_name.len + template.artifact_name.len + template.embedding_name.len + 128, 1);
                 var request = template;
                 request.doc_key = doc_key;
                 if (request.kind == .dense_embedding or request.kind == .sparse_embedding) {
@@ -6683,7 +6700,9 @@ pub const IndexManager = struct {
                         var consumers = std.ArrayListUnmanaged([]u8).empty;
                         errdefer consumers.deinit(alloc);
                         for (template.consumer_indexes) |consumer| {
+                            if (context) |control| try control.check();
                             if (generatedConsumerSatisfied(extracted, request.kind, consumer)) continue;
+                            if (budget) |account| try account.reserve(consumer.len + 64, 1);
                             try consumers.append(alloc, consumer);
                         }
                         request.consumer_indexes = try consumers.toOwnedSlice(alloc);

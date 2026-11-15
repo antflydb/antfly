@@ -8958,9 +8958,52 @@ pub const NativeFile = struct {
         header.checkpoints = loadCheckpointSlots(self.file, io, header.page_size, file_size);
         const recovered = try recoverActiveCheckpoint(self.file, io, header, file_size, false);
         header.active_checkpoint = recovered.index;
+        // perf/lwa-stale-base: for a redo-log file, the on-disk checkpoint
+        // slot's own `commit_sequence` just read above is only the last
+        // real *fold* boundary (`recoverRedoLog`'s own `folded_through`) --
+        // every ordinary redo-diverted commit since then only ever
+        // advanced the logical tip inside the shared, in-process overlay
+        // (`inode_lock.Entry.redo_overlay`) and this inode's registry
+        // (`inode_lock.committedSequence`, this call's own `latest`),
+        // never the physical slot. Trusting the raw on-disk value here
+        // regresses this instance's base *below* where it already
+        // correctly was -- confirmed live via the debug log two lines
+        // down firing with `old_base=90 new_base=1 registry_latest=91`:
+        // this same instance's own prior commits had already kept
+        // `self.header` at the correct logical 90, and this "refresh",
+        // meant to fix a one-commit-behind staleness, instead clobbered
+        // it with the ancient fold boundary -- so the very next commit's
+        // `publishCheckpoint` backstop panicked against a base this call
+        // itself had just regressed. Bump the recovered slot's own
+        // `commit_sequence` up to `latest` instead -- exactly the
+        // "provisional, no real pages touched" bump an ordinary redo
+        // commit already applies to its own writer (`publishCheckpoint`'s
+        // redo branch) and `refreshCrossProcessRedoOverlay`'s own
+        // cross-process counterpart applies after replaying the overlay.
+        // The shared overlay this instance's own `self.redo.shared`
+        // already points at (same `inode_lock.Entry`, same process) is
+        // already current -- there is nothing to replay here, only this
+        // instance's own bookkeeping to catch up.
+        if (header.redo_log_capacity != 0 and header.checkpoints[header.active_checkpoint].commit_sequence < latest) {
+            header.checkpoints[header.active_checkpoint].commit_sequence = latest;
+        }
         const new_sequence = header.checkpoints[header.active_checkpoint].commit_sequence;
         std.log.debug("lite: NativeFile instance refreshed a stale writer base (path={s} ptr={*} old_base={d} new_base={d} registry_latest={d})", .{ self.path, self, base, new_sequence, latest });
         try self.adoptIndexPublicationHeader(header);
+        if (self.redo) |*redo| {
+            // Mirror `refreshCrossProcessRedoOverlay`'s own bookkeeping:
+            // the fold boundary just read from disk is this process's own
+            // correct, authoritative one going forward, and `durable_sequence`/
+            // `writer.last_sequence` must agree with the bumped logical tip
+            // above so the next append's continuity check expects
+            // `latest + 1`, not a value already behind what the shared
+            // overlay carries.
+            redo.checkpoint_sequence = header.checkpoints[header.active_checkpoint].redo_folded_through;
+            if (latest > redo.durable_sequence) {
+                redo.durable_sequence = latest;
+                redo.writer.last_sequence = latest;
+            }
+        }
     }
 
     /// Carry pending lineage across identical runtime generations, or inherit
@@ -32779,6 +32822,93 @@ test "lite redo log cross-process refresh still sees a pinned reader's own write
     const beta = (try reader.getDocumentAlloc(a, "beta")).?;
     defer a.free(beta);
     try std.testing.expectEqualStrings("two", beta);
+}
+
+// perf/lwa-stale-base: a second in-process writer-mode handle on the same
+// inode (`.externally_locked = true`, standing in for a borrowed index
+// writer or any other second `NativeFile` instance on this inode --
+// `refreshIfWriterBaseStale`'s own doc comment) opens while the log's tip
+// is still at `commit_sequence=1`, then sits idle while the real `writer`
+// commits several more ordinary (never-folded) redo-log transactions.
+// `second.header` is never touched by any of those -- only `writer`'s own
+// and the shared `inode_lock` registry (`committedSequence`) advance --
+// so by the time `second.beginTransaction()` notices its own base is
+// behind and calls `refreshIfWriterBaseStale`, the on-disk checkpoint
+// slot it re-reads is still at the stale fold boundary (`commit_sequence
+// == 1`): exactly the raw value the buggy refresh used to adopt
+// verbatim, discarding the registry's own, already-correct logical tip.
+// `second`'s very next commit then reached `publishCheckpoint` with that
+// stale base, panicking "stale writer base reached publishCheckpoint" --
+// reproduced live via the Python graph-edge-readiness concurrent
+// promotion test (`old_base=90 new_base=1 registry_latest=91`). The fix
+// bumps the refreshed slot's `commit_sequence` up to the registry's
+// `latest` instead of trusting the raw on-disk fold boundary; this test
+// reproduces the staleness directly against two in-process `NativeFile`
+// handles, no Python, no second process or thread required.
+test "lite redo log a second writer-mode handle refreshes to the registry's logical tip, not the on-disk fold boundary" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-stale-writer-base.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("w0", "v0");
+    try writer.commitTransaction();
+    try std.testing.expectEqual(@as(u64, 1), writer.activeCheckpoint().commit_sequence);
+
+    // Opens right after the first commit, while its own stale-fold-boundary
+    // view (commit_sequence == 1) still matches reality -- the staleness
+    // this test exercises is entirely what happens *after* this open.
+    var second = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    defer second.close();
+    try std.testing.expect(second.redo != null);
+    try std.testing.expectEqual(@as(u64, 1), second.activeCheckpoint().commit_sequence);
+
+    // Five more ordinary (never-folded) commits through `writer` alone --
+    // `second.header` never changes, but the shared in-process registry
+    // does.
+    var key_buf: [16]u8 = undefined;
+    for (0..5) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "w{d}", .{i + 1});
+        try writer.beginTransaction();
+        try writer.putDocument(key, "v");
+        try writer.commitTransaction();
+    }
+    try std.testing.expectEqual(@as(u64, 6), writer.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 1), second.activeCheckpoint().commit_sequence);
+
+    const entry = second.inode_lock_ref.load(.acquire).?;
+    try std.testing.expectEqual(@as(u64, 6), inode_lock.committedSequence(entry));
+
+    // `beginTransaction` calls `refreshIfWriterBaseStale` internally
+    // (base=1 < latest=6): before the fix this adopted the raw on-disk
+    // slot's own stale `commit_sequence` (still 1, no fold ever ran)
+    // verbatim, so the base stayed exactly as stale as before. After the
+    // fix it is bumped to the registry's own `latest`.
+    try second.beginTransaction();
+    try std.testing.expectEqual(@as(u64, 6), second.activeCheckpoint().commit_sequence);
+
+    // The real regression: this commit used to reach `publishCheckpoint`
+    // with `base=1 latest=6` and hit the "stale writer base reached
+    // publishCheckpoint" panic. It must now succeed cleanly, continuing
+    // the sequence from the registry's own tip.
+    try second.putDocument("second-doc", "second-value");
+    try second.commitTransaction();
+    try std.testing.expectEqual(@as(u64, 7), second.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 7), inode_lock.committedSequence(entry));
+
+    const value = (try second.getDocumentAlloc(a, "second-doc")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("second-value", value);
+
+    // `writer` itself must still be able to commit afterward, confirming
+    // this isn't just `second`'s own view that got patched up.
+    try writer.beginTransaction();
+    try writer.putDocument("w-after", "v-after");
+    try writer.commitTransaction();
 }
 
 test "lite redo log checkpointer defers log reclaim while a cross-process reader is pinned behind it" {

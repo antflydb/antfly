@@ -2551,6 +2551,56 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/index-aliases/{aliasName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        /** Inspect an index alias */
+        get: operations["getTableIndexAlias"];
+        /**
+         * Atomically create or swap an index alias
+         * @description Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
+         */
+        put: operations["putTableIndexAlias"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        /** Inspect an index alias */
+        get: operations["getNamespaceTableIndexAlias"];
+        /**
+         * Atomically create or swap an index alias
+         * @description Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
+         */
+        put: operations["putNamespaceTableIndexAlias"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/indexes": {
         parameters: {
             query?: never;
@@ -7777,6 +7827,8 @@ export interface components {
          *     descriptor in the corresponding SQLColumn. They are not JSON columns.
          */
         SQLResponse: {
+            /** @description Concrete graph index names selected from the statement catalog cut. */
+            resolved_indexes?: string[];
             columns: components["schemas"]["SQLColumn"][];
             rows: unknown[][];
             /**
@@ -9908,14 +9960,40 @@ export interface components {
         };
         ByteRange: string[];
         /**
-         * @description Synchronization level for batch operations:
+         * @description Admission prerequisite independent of sync_level. Explicit none commits the
+         *     source without precomputing enrichments. direct_enrichments requires eligible
+         *     document-local producers to succeed, committing their outputs and coverage
+         *     atomically with the source; producer failure rejects the whole batch.
+         *     Artifact-source stages, committed graph/neighbor context, grouped producers,
+         *     protected producers and PDF page-image embeddings remain asynchronous.
+         *     Configured producers with no eligible request reject the requirement.
+         *     Direct admission has an 8 MiB and 16384-row budget for the complete mutation,
+         *     including source keys/values, artifact effects, deletions, coverage, revisions,
+         *     counters and replay payload. Both the submitted source envelope and final
+         *     physical effect set must fit; this is not an artifact-only allowance.
+         *     Supported by embedded batches, server/Raft writes and distributed transactions.
+         *     Raft prepares on the leader and replays immutable effects without inference.
+         *     Transactions reserve the complete envelope before voting prepared; their
+         *     conservative reservation can reject a batch below the final physical limit.
+         *     Serverless supports source-local pipeline stages through conditional atomic
+         *     WAL batches (at most 1024 mutations and 8 MiB including WAL framing).
+         *     Backends without that capability reject before source admission.
+         *     Omission retains legacy embedded precomputation for enrichments/full_index
+         *     during the compatibility window; other surfaces retain their existing waits.
+         * @enum {string}
+         */
+        CommitRequires: "none" | "direct_enrichments";
+        /**
+         * @description Response acknowledgment/publication barrier, independent of commit_requires:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
-         *     - "write": Wait for the write to be durably applied to the local key-value store
+         *     - "write": Wait for durable application to the local key-value store
          *     - "full_text": Wait for full-text index WAL write
-         *     - "enrichments": Precompute enrichments before committing the document. A synchronous
-         *       producer failure rejects the write; post-commit worker failures retain the document
-         *       and may return `committed_repair_required`.
-         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+         *     - "enrichments": Wait for this write's enrichment publication
+         *     - "full_index": Wait for full-text, enrichment and vector-index publication
+         *     A post-commit wait failure never rolls back the source. Terminal background
+         *     failures may return committed_repair_required. During the embedded migration
+         *     window, omitting commit_requires retains legacy precomputation for enrichments
+         *     and full_index; explicit none disables that implicit admission prerequisite.
          * @default propose
          * @enum {string}
          */
@@ -11320,6 +11398,7 @@ export interface components {
              *     ]
              */
             transforms?: components["schemas"]["Transform"][];
+            commit_requires?: components["schemas"]["CommitRequires"];
             sync_level?: components["schemas"]["SyncLevel"];
         };
         BatchResponse: {
@@ -11379,6 +11458,12 @@ export interface components {
          *     or maintaining referential integrity across tables.
          */
         MultiBatchRequest: {
+            /**
+             * @description Default admission prerequisite for tables without an explicit commit_requires.
+             *     A table-level value overrides this default. Staged transaction statements
+             *     retain the strongest prerequisite selected for each table.
+             */
+            commit_requires?: components["schemas"]["CommitRequires"];
             /**
              * @description Map of table names to batch operations for that table.
              *     Each entry follows the same format as a single-table BatchRequest.
@@ -11448,6 +11533,12 @@ export interface components {
          *     its own read set and submits the full transaction in one request.
          */
         TransactionCommitRequest: {
+            /**
+             * @description Default admission prerequisite for tables without an explicit commit_requires.
+             *     A table-level value overrides this default. Staged transaction statements
+             *     retain the strongest prerequisite selected for each table.
+             */
+            commit_requires?: components["schemas"]["CommitRequires"];
             /**
              * @description Set of keys that were read during the transaction, with their observed versions.
              *     The server verifies these versions still match before committing writes.
@@ -14222,6 +14313,8 @@ export interface components {
             limits?: components["schemas"]["GraphQueryLimits"];
         };
         GraphQueryResult: {
+            /** @description Concrete graph index names selected from the statement catalog cut. */
+            resolved_indexes?: string[];
             /** @enum {integer} */
             wire_version: 1;
             columns: string[];
@@ -15171,6 +15264,8 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /** @description Concrete index names selected for this query before embedding and execution. */
+            resolved_indexes?: string[];
             /**
              * @description Ranking contract for a composed result.
              * @enum {string}
@@ -23757,6 +23852,26 @@ export interface components {
             context?: Record<string, never>[];
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
+        };
+        IndexAlias: {
+            index: string;
+            previous_index?: string | null;
+            /** Format: int64 */
+            swapped_at_ms: number;
+            /** @enum {string} */
+            require: "queryable" | "complete";
+            idempotency_key: string;
+            readiness: components["schemas"]["IndexReadinessStatus"];
+        };
+        IndexAliasRequest: {
+            index: string;
+            expected_index?: string;
+            /**
+             * @default complete
+             * @enum {string}
+             */
+            require?: "queryable" | "complete";
+            idempotency_key: string;
         };
         IndexMaintenanceOwnerProof: {
             group_id: string;
@@ -37405,6 +37520,164 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    putTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexAliasRequest"];
+            };
+        };
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description This index kind or runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    putNamespaceTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexAliasRequest"];
+            };
+        };
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description This index kind or runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listIndexes: {

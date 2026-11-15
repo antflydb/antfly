@@ -129,6 +129,10 @@ pub const Context = struct {
 };
 
 pub const QueryPlanningContext = struct {
+    /// Borrowed from the coordinator's immutable query catalog cut. Carrying
+    /// the selected producer config avoids another metadata read after alias
+    /// resolution and excludes control-state receipts from embedder parsing.
+    indexes_json: ?[]const u8 = null,
     ptr: *anyopaque,
     admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
     free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
@@ -222,11 +226,10 @@ pub fn planSemanticQuery(
     const embedding_deadline_ns = effectiveQueryEmbeddingDeadlineNs(planning.query_embedding_deadline_ns, now_ns);
     if (embedding_deadline_ns <= now_ns) return error.Timeout;
 
-    var snapshot = try planning.adminSnapshot();
-    defer planning.freeAdminSnapshot(&snapshot);
-
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-    var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, table.indexes_json, .{
+    var snapshot: ?metadata_api.AdminSnapshot = if (planning.indexes_json == null) try planning.adminSnapshot() else null;
+    defer if (snapshot) |*value| planning.freeAdminSnapshot(value);
+    const indexes_json = planning.indexes_json orelse (tables_api.findTableByName(&snapshot.?, table_name) orelse return error.TableNotFound).indexes_json;
+    var runtime = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, .{
         .antfly_provider = planning.antfly_provider,
         .io = planning.io,
         .deadline_ns = embedding_deadline_ns,

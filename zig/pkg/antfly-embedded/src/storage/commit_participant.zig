@@ -261,6 +261,9 @@ pub const View = struct {
 
 pub const Participant = struct {
     ptr: *anyopaque,
+    /// Fallible accounting covers physical mutations, including stamps staged
+    /// by the host and private metadata staged by this participant.
+    charge: ?*const fn (*anyopaque, []const u8, ?[]const u8) anyerror!void = null,
     /// Called on attachment to a fresh writer attempt, before any mutation.
     reset: *const fn (*anyopaque) void,
     observe: *const fn (*anyopaque, []const u8, ?[]const u8) void,

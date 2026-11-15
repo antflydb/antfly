@@ -61,6 +61,9 @@ pub const BootstrapConfig = struct {
     wal_document_index: bool = false,
     wal_packed_pages: bool = false,
     wal_deferred_indexes: bool = false,
+    /// Explicit layout-v3 activation on a new/migrated prefix. All readers and
+    /// metadata writers must support catalog intents before this is selected.
+    wal_catalog_fences: bool = false,
     point_read_blocks: bool = false,
     /// Managed reader contract and physical collection, new WAL prefixes only.
     wal_gc: bool = false,
@@ -516,7 +519,7 @@ pub const OwnedStack = struct {
         } else try wal_object_store.ObjectStore.initRemoteUriWithS3Options(alloc, cfg.wal_uri, cfg.s3_options[2]);
         self.wal = self.wal_impl.walStore();
         // Establish unwind ownership before configuration can perform I/O.
-        if (cfg.indexed_wal) self.wal_impl.enableIndexed(.{ .read_state = cfg.native_read_state, .document_index = cfg.wal_document_index, .packed_pages = cfg.wal_packed_pages, .deferred_indexes = cfg.wal_deferred_indexes, .managed_collection = cfg.wal_gc }) catch |err| {
+        if (cfg.indexed_wal) self.wal_impl.enableIndexed(.{ .catalog_fences = cfg.wal_catalog_fences, .read_state = cfg.native_read_state, .document_index = cfg.wal_document_index, .packed_pages = cfg.wal_packed_pages, .deferred_indexes = cfg.wal_deferred_indexes, .managed_collection = cfg.wal_gc }) catch |err| {
             self.wal.deinit();
             return err;
         };
@@ -794,7 +797,7 @@ fn workLeaseOwnerIdAlloc(alloc: Allocator, io: std.Io) ![]u8 {
 }
 
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
-    if ((cfg.resident_points or cfg.native_read_state or cfg.wal_document_index or cfg.wal_gc or cfg.wal_packed_pages or cfg.wal_deferred_indexes) and !cfg.indexed_wal) return error.IndexedWalRequired;
+    if ((cfg.resident_points or cfg.native_read_state or cfg.wal_document_index or cfg.wal_gc or cfg.wal_packed_pages or cfg.wal_deferred_indexes or cfg.wal_catalog_fences) and !cfg.indexed_wal) return error.IndexedWalRequired;
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;

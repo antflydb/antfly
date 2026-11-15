@@ -1916,6 +1916,10 @@ pub const AuthenticatedRequest = struct {
 };
 
 pub const SemanticStatusResolver = struct {
+    server: ?*ApiHttpServer = null,
+    catalog_resolver: ?*ApiHttpServer.CatalogQueryResolver = null,
+    pinned_indexes_json: ?[]const u8 = null,
+    statement_indexes_json: ?[]const u8 = null,
     source: StatusSource,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     io: ?std.Io = null,
@@ -1935,9 +1939,47 @@ pub const SemanticStatusResolver = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .bind_index_aliases = bindIndexAliases,
                 .resolve_dense_query = resolveDenseQuery,
             },
         };
+    }
+
+    fn bindIndexAliases(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, body: []const u8) !?query_contract.BoundIndexAliases {
+        const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
+        self.pinned_indexes_json = null;
+        const server = self.server orelse return null;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const owner = if (self.catalog_resolver) |resolver| resolver.arena else alloc;
+        const indexes_json = self.statement_indexes_json orelse table_indexes: {
+            const table = (try server.queryTableDefinition(if (self.catalog_resolver) |resolver| resolver.arena else a, self.catalog_resolver, table_name, .{
+                .deadline_ns = self.query_embedding_deadline_ns,
+                .cancellation = self.query_cancellation orelse .none,
+            })) orelse return null;
+            break :table_indexes table.indexes_json;
+        };
+        const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+        if (std.mem.indexOf(u8, indexes_json, "_index_aliases") == null and std.mem.indexOfScalar(u8, indexes_json, '\\') == null) return null;
+        const compact = try server.index_alias_cache.project(server.alloc, owner, indexes_json);
+        const owned_compact = self.catalog_resolver == null;
+        errdefer if (owned_compact) alloc.free(compact);
+        const catalog = try std.json.parseFromSliceLeaky(std.json.Value, a, compact, .{});
+        if (!catalog.object.contains(aliases.key)) {
+            if (owned_compact) alloc.free(compact);
+            return null;
+        }
+        self.pinned_indexes_json = compact;
+        var query = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .allocate = .alloc_always });
+        try aliases.bindQuery(a, catalog, &query);
+        if (query.object.getPtr("_index_alias_fences")) |fences| for (fences.array.items) |*fence| {
+            if (fence.object.get("incarnation").?.integer != 0) continue;
+            const name = fence.object.get("name").?.string;
+            const identity = (try indexes_api.indexRuntimeIdentity(a, name, catalog.object.get(name) orelse return error.InvalidTableIndexMetadata)) orelse return error.InvalidTableIndexMetadata;
+            try fence.object.put(a, "incarnation", .{ .integer = @intCast(identity.incarnation) });
+        };
+        return .{ .body = try std.json.Stringify.valueAlloc(alloc, query, .{}), .indexes_json = if (owned_compact) compact else null };
     }
 
     fn resolveDenseQuery(
@@ -1952,6 +1994,7 @@ pub const SemanticStatusResolver = struct {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
         try ensureRequestActive(self.query_cancellation);
         const planned = try internal_query_operations.planSemanticQuery(.{
+            .indexes_json = self.pinned_indexes_json,
             .ptr = self.source.ptr,
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return error.UnsupportedQueryRequest,
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
@@ -2003,6 +2046,15 @@ pub const AuthenticatedIdentity = struct {
     row_filter: []usermgr.RowFilterEntry = &.{},
     metadata_json: []u8 = &.{},
     roles: [][]u8 = &.{},
+
+    /// Resolve one storage binding before matching logical policy scopes. Keep
+    /// this single-hop: a logical table name may itself resemble a storage ID.
+    pub fn logicalTableName(self: AuthenticatedIdentity, name: []const u8) []const u8 {
+        for (self.catalog_aliases) |alias| {
+            if (std.mem.eql(u8, alias.physical, name)) return alias.logical;
+        }
+        return name;
+    }
 
     pub fn deinit(self: *AuthenticatedIdentity, alloc: std.mem.Allocator) void {
         for (self.catalog_aliases) |alias| {
@@ -4047,6 +4099,7 @@ pub const ApiHttpServer = struct {
     }
 
     object_tables: @import("object_table_runtime.zig").Manager = .{},
+    index_alias_cache: @import("index_alias_cache.zig").Cache = .{},
     retained_read_runtime: ?*@import("retained_read_owner.zig").Runtime = null,
     retained_read_runtime_mutex: std.Io.Mutex = .init,
     table_definition_cache: tables_api.DefinitionCache = .{},
@@ -4695,6 +4748,18 @@ pub const ApiHttpServer = struct {
             return error.ArtifactIndexSourcesTemporarilyUnavailable;
     }
 
+    pub fn ensureIndexAliasAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
+        if (self.cfg.deployment_mode != .distributed) return;
+        var snapshot = (try self.source.linearizableSnapshot(request)) orelse return error.IndexAliasProtocolUpgradeRequired;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        for (snapshot.stores) |store| {
+            if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
+            if (!metadata_table_manager.indexAliasesProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.IndexAliasProtocolUpgradeRequired;
+        }
+        // Empty data fleets are valid for object tables. The durable alias
+        // admission and subsequent store admission enforce the protocol floor.
+    }
+
     pub fn ensurePrivacyAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
         const reads = self.table_reads orelse return error.PrivacyProtectiveInstallationRequired;
         if (reads.vtable.privacy_policy_version == null or self.cfg.deployment_mode == .serverless) return error.PrivacyProtectiveInstallationRequired;
@@ -5052,6 +5117,7 @@ pub const ApiHttpServer = struct {
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
         self.sql_schema_cache.deinit();
+        self.index_alias_cache.deinit(self.alloc);
         self.lake_recent_vector_jobs.deinit();
         self.lake_retained_payloads.deinit();
         self.lake_recent_text.deinit();
@@ -5205,6 +5271,7 @@ pub const ApiHttpServer = struct {
         security_scope: []const u8,
     ) SemanticStatusResolver {
         return .{
+            .server = self,
             .source = self.source,
             .antfly_provider = self.antfly_provider,
             .io = self.inferenceIo(),
@@ -5930,7 +5997,7 @@ pub const ApiHttpServer = struct {
                     for (filters) |*filter| filter.deinit(manager.alloc);
                     manager.alloc.free(filters);
                 }
-                if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
+                if (usermgr.hasRowFilters(filters)) return error.MemoryRowPolicyUnsupported;
                 context.admin = permissionsAllow(permissions, .table, logical, .admin);
                 context.curator = permissionsAllow(permissions, .table, logical, .curator);
             }
@@ -9707,7 +9774,7 @@ pub const ApiHttpServer = struct {
                     return error.Forbidden;
                 // Root discovery probes the physical reverse index, which
                 // cannot yet distinguish parents hidden by a row filter.
-                if (discovers_tree_roots and effectiveRowFilterJson(identity, table_name) != null)
+                if (discovers_tree_roots and hasEffectiveRowFilter(identity, table_name))
                     return error.Forbidden;
             }
 
@@ -9771,7 +9838,7 @@ pub const ApiHttpServer = struct {
                 if (catalog_identity) |identity| {
                     if (!permissionsAllow(identity.permissions, .table, table_name, .read))
                         return error.Forbidden;
-                    if (effectiveRowFilterJson(identity, table_name) != null)
+                    if (hasEffectiveRowFilter(identity, table_name))
                         return error.Forbidden;
                 }
                 return try runner.server.probeRetrievalIncomingEdges(
@@ -10921,6 +10988,20 @@ pub const ApiHttpServer = struct {
         index_name: []const u8,
         keys: []const []const u8,
     ) ![]bool {
+        var alias_arena = std.heap.ArenaAllocator.init(alloc);
+        defer alias_arena.deinit();
+        const scratch = alias_arena.allocator();
+        var concrete_index = index_name;
+        var selected_identity: ?distributed_graph.GraphIndexIdentity = null;
+        if (try self.queryTableDefinition(scratch, null, table_name, .{})) |table| {
+            const compact = try self.index_alias_cache.project(self.alloc, scratch, table.indexes_json);
+            const alias_catalog = try std.json.parseFromSliceLeaky(std.json.Value, scratch, compact, .{});
+            concrete_index = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(alias_catalog, index_name);
+            if (!std.mem.eql(u8, concrete_index, index_name)) {
+                const identity = (try indexes_api.indexRuntimeIdentity(scratch, concrete_index, alias_catalog.object.get(concrete_index).?)) orelse return error.IndexNotFound;
+                selected_identity = .{ .incarnation = identity.incarnation, .config_hash = identity.config_hash };
+            }
+        }
         const SourceWorker = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
@@ -11005,16 +11086,17 @@ pub const ApiHttpServer = struct {
             .server = self,
             .source = source,
         };
-        return try distributed_graph.probeIncomingEdgesForKeys(
+        return try distributed_graph.probeIncomingEdgesForKeysWithOptions(
             alloc,
             catalog,
             worker.iface(),
             table_name,
             topology_epoch,
             null,
-            index_name,
+            concrete_index,
             keys,
             .read_index,
+            .{ .index_identity = selected_identity },
         );
     }
 
@@ -11170,6 +11252,25 @@ pub const ApiHttpServer = struct {
                 .graph => {
                     try self.appendQueryBuilderGraphIndexMetadata(&graph_metadata, entry.key_ptr.*, entry.value_ptr.*);
                 },
+            }
+        }
+
+        if (object.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |aliases| {
+            if (aliases != .object) return error.InvalidTableIndexMetadata;
+            var names = aliases.object.iterator();
+            while (names.next()) |entry| {
+                const target = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(parsed.value, entry.key_ptr.*);
+                const config = object.get(target) orelse return error.InvalidTableIndexMetadata;
+                const kind = queryBuilderIndexContextType(target, config) orelse continue;
+                switch (kind) {
+                    .full_text => try self.appendQueryBuilderFullTextIndexMetadata(&full_text_metadata, entry.key_ptr.*, config),
+                    .embeddings => {
+                        const metadata = try self.queryBuilderEmbeddingIndexMetadata(entry.key_ptr.*, config);
+                        errdefer freeQueryBuilderEmbeddingIndexMetadataItem(self.alloc, metadata);
+                        try embedding_metadata.append(self.alloc, metadata);
+                    },
+                    .graph => try self.appendQueryBuilderGraphIndexMetadata(&graph_metadata, entry.key_ptr.*, config),
+                }
             }
         }
 
@@ -14788,6 +14889,7 @@ pub const ApiHttpServer = struct {
         const txn_writes: []const db_mod.types.TransactionWrite = @ptrCast(req.writes);
         const tables = [_]distributed_txn.TableCommitRequest{.{
             .table_name = table_name,
+            .commit_requires = req.commit_requires,
             .writes = txn_writes,
             .deletes = req.deletes,
             .transforms = req.transforms,
@@ -14806,6 +14908,9 @@ pub const ApiHttpServer = struct {
         var retained_preparation: ?@import("antfly_local_sources").api_relational_integrity_commit.Prepared = null;
         defer if (retained_preparation) |*prepared| prepared.deinit();
         const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request, &retained_preparation) catch |err| switch (err) {
+            error.UnsupportedCommitRequirement => return error.UnsupportedCommitRequirement,
+            error.CommitRequirementUnavailable => return error.Unavailable,
+            error.CommitRequirementTooLarge, error.CommitRequirementFailed => return error.InvalidBatchRequest,
             error.RelationalIndexKeyTooLarge => return error.RelationalIndexKeyTooLarge,
             error.UniqueConstraintViolation => return error.UniqueConstraintViolation,
             error.RelationalCheckViolation => return error.RelationalCheckViolation,
@@ -16116,6 +16221,7 @@ pub const ApiHttpServer = struct {
         defer resolver.native_capture_token = null;
         try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
+        semantic_resolver.catalog_resolver = resolver;
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
         semantic_resolver.query_cancellation = cancellation;
         var query_req = query_api.parsePublicQueryRequestWithDeadline(
@@ -16601,6 +16707,7 @@ pub const ApiHttpServer = struct {
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
         defer alloc.free(query_body);
         var semantic_resolver = self.semanticStatusResolver(.internal, "");
+        semantic_resolver.catalog_resolver = resolver;
         semantic_resolver.query_embedding_deadline_ns = execution_deadline_ns;
         semantic_resolver.query_cancellation = cancellation;
         var owned = try query_api.parsePublicQueryRequestWithDeadline(
@@ -17007,6 +17114,22 @@ pub const ApiHttpServer = struct {
         return result;
     }
 
+    pub fn indexAliasTargetResource(self: *ApiHttpServer, alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index: []const u8, request: api_operation.RequestContext) ![]u8 {
+        if (table.storage.engine == .object) {
+            var schema = try schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
+            defer schema.deinit(alloc);
+            if (schema.external_base_source == null) {
+                const suffix = try std.fmt.allocPrint(alloc, "indexes/{s}", .{index});
+                defer alloc.free(suffix);
+                var response = (try self.tryObjectTableRequestWithOptions(table.name, .get, suffix, "", null, request, .{ .incarnation = .{ .table_id = table.table_id, .generation = table.object_storage_generation } })) orelse return error.UnsupportedOperation;
+                defer response.deinit(self.alloc);
+                if (response.status != 200) return error.IndexAliasTargetNotReady;
+                return alloc.dupe(u8, response.body);
+            }
+        }
+        return getIndexResourceWithExpected(self, alloc, table.name, index, request, table);
+    }
+
     fn executePublicTableGetIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -17014,11 +17137,23 @@ pub const ApiHttpServer = struct {
         index_name: []const u8,
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
+        return getIndexResourceWithExpected(ptr, alloc, table_name, index_name, request, null);
+    }
+
+    fn getIndexResourceWithExpected(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        request: api_operation.RequestContext,
+        expected: ?metadata_table_manager.TableRecord,
+    ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
+        if (expected) |record| if (!metadata_table_manager.tableDefinitionsEqual(record, table.*)) return error.Conflict;
         if (table.schema_json.len != 0) {
             var parsed = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
             defer parsed.deinit(alloc);
@@ -17940,6 +18075,7 @@ pub const ApiHttpServer = struct {
         // through consensus and used as the projection expectation, making the
         // operation idempotent across retries and leadership changes.
         const assembled_indexes_json = indexes_api.addIndexToTableIndexesJsonWithIo(alloc, self.inferenceIo(), table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
+            error.IndexAliasNameConflict, error.IndexReferencedByAlias => return error.Conflict,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
@@ -18029,7 +18165,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -18303,7 +18439,7 @@ pub const ApiHttpServer = struct {
         };
         for (try self.logicalTableNamesInArena(arena.allocator(), .{}, names)) |name| {
             if (!permissionsAllow(permissions, .table, name, .admin)) return error.StoredDestinationAuthorizationRevoked;
-            for (restrictions) |entry| if (system_catalog.tableResourceMatches(entry.table, name)) return error.StoredDestinationAuthorizationRevoked;
+            if (usermgr.hasRowFilterForTable(restrictions, name)) return error.StoredDestinationAuthorizationRevoked;
         }
     }
 
@@ -18417,7 +18553,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject, error.UnsupportedOperation => return error.MethodNotAllowed,
             else => return if (metadata_authority.isRetryableError(err)) error.NotLeader else error.InternalFailure,
         };
@@ -18452,7 +18588,7 @@ pub const ApiHttpServer = struct {
                 external_table = schema.external_base_source != null;
             }
             if (@import("relational_index_mutation.zig").drop(alloc, before, index_name) catch |err| switch (err) {
-                error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+                error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
                 else => return error.InternalFailure,
             }) |replacement| {
                 defer metadata_table_manager.freeTable(alloc, replacement);
@@ -18474,7 +18610,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidEnrichmentConfig,
@@ -18667,7 +18803,7 @@ pub const ApiHttpServer = struct {
         self.source.replaceTableDefinition(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
@@ -18729,7 +18865,7 @@ pub const ApiHttpServer = struct {
         self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidEnrichmentConfig,
@@ -22478,7 +22614,7 @@ pub const ApiHttpServer = struct {
                     for (filters) |*filter| filter.deinit(manager.alloc);
                     manager.alloc.free(filters);
                 }
-                if (filters.len > 0) return .{ .state = .denied };
+                if (usermgr.hasRowFilters(filters)) return .{ .state = .denied };
                 identity = try cloneCatalogIdentity(server.alloc, .{ .username = @constCast(self.executor), .permissions = permissions, .live_user_manager = manager, .credential_principal = @constCast(self.executor) });
             }
             if (server.cfg.auth_enabled and identity == null) return .{ .state = .denied };
@@ -22559,7 +22695,7 @@ pub const ApiHttpServer = struct {
                 for (filters) |*filter| filter.deinit(manager.alloc);
                 manager.alloc.free(filters);
             }
-            if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
+            if (usermgr.hasRowFilters(filters)) return error.MemoryRowPolicyUnsupported;
         }
     };
 
@@ -23327,6 +23463,10 @@ pub const ApiHttpServer = struct {
             if (hint.storage.engine != .object or hint.table_id != expected.table_id or hint.object_storage_generation != expected.generation) return error.TableGenerationChanged;
         }
         if (hint.storage.engine != .object) return null;
+        // Public controls must be rejected before a trusted alias envelope is
+        // produced or an object runtime can consume it. Native requests retain
+        // their normal parser admission and never bind during this engine probe.
+        if (std.mem.eql(u8, suffix, "query")) try @import("public_graph_query.zig").rejectInternalDocIdentityFields(self.alloc, body);
         var snapshot = (try self.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableGenerationChanged;
@@ -23338,7 +23478,7 @@ pub const ApiHttpServer = struct {
         if (method == .get and std.mem.eql(u8, suffix, "lookup") and options.lookup_consistency != .stale)
             return try contextual_operations.textAlloc(self.alloc, 400, "object document lookup supports only consistency=stale (published generations); use sync_level=full_index on writes to wait for publication");
 
-        if (identity) |user| if (user.row_filter.len != 0) return try contextual_operations.textAlloc(self.alloc, 409, "object-backed document tables do not support credential row filters");
+        if (identity) |user| if (usermgr.hasRowFilters(user.row_filter)) return try contextual_operations.textAlloc(self.alloc, 409, "object-backed document tables do not support credential row filters");
         // Policy enforcement belongs to native storage owners. Check the
         // durable publication before bypassing those owners for object data.
         var policy_context = context;
@@ -23369,6 +23509,13 @@ pub const ApiHttpServer = struct {
             const current = tables_api.findTableByName(&admitted, table_name) orelse return error.TableNotFound;
             if (!metadata_table_manager.tableDefinitionsEqual(current.*, bound)) return error.TableGenerationChanged;
         }
+        var alias_resolver = self.semanticStatusResolver(.internal, "");
+        alias_resolver.catalog_resolver = options.resolver;
+        alias_resolver.statement_indexes_json = hint.indexes_json;
+        alias_resolver.query_embedding_deadline_ns = context.deadline_ns;
+        alias_resolver.query_cancellation = context.cancellation;
+        const alias_body = if (std.mem.eql(u8, suffix, "query")) try SemanticStatusResolver.bindIndexAliases(&alias_resolver, self.alloc, table_name, body) else null;
+        defer if (alias_body) |value| value.deinit(self.alloc);
         var response = self.object_tables.handle(self.owner_alloc, self.embedding_provider_runtime.io, bound, .{
             .config = self.cfg.node_config,
             .secrets = self.cfg.secret_store,
@@ -23376,7 +23523,7 @@ pub const ApiHttpServer = struct {
             .local_base_dir = self.cfg.native_lake_artifact_base_dir,
             .graph_execution_limits = self.cfg.graph_execution_limits,
             .remote_content = self.cfg.remote_content,
-        }, method, suffix, body, context) catch |err| switch (err) {
+        }, method, suffix, if (alias_body) |value| value.body else body, context) catch |err| switch (err) {
             error.ObjectTableStorageBindingChanged => return try contextual_operations.textAlloc(self.alloc, 409, "object table storage binding differs from its durable catalog binding"),
             error.ObjectTableDefinitionConflict => return try contextual_operations.textAlloc(self.alloc, 409, "object table definition is immutable; use a new table and explicit migration"),
             error.ObjectTableRuntimeCapacityExceeded => return try contextual_operations.textAlloc(self.alloc, 503, "object table runtime capacity exhausted"),
@@ -23722,7 +23869,7 @@ pub const ApiHttpServer = struct {
         return switch (err) {
             error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
-            error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
+            error.PreparedGenerationChanged, error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
             error.InvalidComposedGraphIdentity, error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
                 try contextualUnsupportedExactSortResponse(self.alloc)
@@ -29721,6 +29868,13 @@ test "httpx inference gateway authorization tells disabled public inference apar
     }
 }
 
+test "api http commit requirements require a coordinator source" {
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    try std.testing.expectError(error.NotFound, ApiHttpServer.executePublicTableBatch(&server, std.testing.allocator, "docs", .{ .commit_requires = .direct_enrichments }, .{}));
+    try std.testing.expectError(error.NotFound, ApiHttpServer.executePublicTableBatch(&server, std.testing.allocator, "docs", .{ .commit_requires = .none }, .{}));
+}
+
 test "api http server validates dedicated internal service runtime credentials" {
     try std.testing.expectError(
         error.InternalServiceSecretMissing,
@@ -31472,20 +31626,9 @@ pub fn authSubjectsToResponse(
     return out;
 }
 
-pub fn effectiveRowFilterJson(identity: ?AuthenticatedIdentity, table_name: []const u8) ?[]const u8 {
-    const row_filters = if (identity) |value| value.row_filter else return null;
-    var selected: ?[]const u8 = null;
-    var rank: u8 = 0;
-    for (row_filters) |entry| {
-        if (!system_catalog.tableResourceMatches(entry.table, table_name)) continue;
-        const candidate_rank: u8 = if (std.mem.eql(u8, entry.table, "*")) 1 else if (std.mem.startsWith(u8, entry.table, system_catalog.target_key_prefix) and (system_catalog.TableScope.fromKey(entry.table) catch continue).table == null) 2 else 3;
-        if (candidate_rank > rank) {
-            selected = entry.filter;
-            rank = candidate_rank;
-        }
-    }
-    if (selected) |filter| if (!std.mem.eql(u8, filter, "null")) return filter;
-    return null;
+pub fn hasEffectiveRowFilter(identity: ?AuthenticatedIdentity, table_name: []const u8) bool {
+    const active_identity = identity orelse return false;
+    return usermgr.hasRowFilterForTable(active_identity.row_filter, active_identity.logicalTableName(table_name));
 }
 
 pub fn resolveEffectiveRowFilterJson(
@@ -31493,54 +31636,116 @@ pub fn resolveEffectiveRowFilterJson(
     identity: ?AuthenticatedIdentity,
     table_name: []const u8,
 ) !?[]u8 {
-    const raw = effectiveRowFilterJson(identity, table_name) orelse return null;
-    const active_identity = identity orelse return try alloc.dupe(u8, raw);
-    return try resolveAuthRowFilterJson(alloc, active_identity, raw);
+    const active = identity orelse return null;
+    var matching = usermgr.matchingRowFilters(active.row_filter, active.logicalTableName(table_name));
+    const first = matching.next() orelse return null;
+    var lookahead = matching;
+    if (lookahead.next() == null) return try resolveAuthRowFilterJson(alloc, active, first);
+    return try resolveAuthRowFilterComponents(alloc, active, first, matching);
 }
+
+fn parseAuthRowFilter(alloc: std.mem.Allocator, json: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidQueryRequest,
+    };
+}
+
+/// Metadata is loaded at most once, only when a visited component needs it.
+/// Expansion authority is shared even though components have separate limits.
+const AuthRowFilterResolver = struct {
+    alloc: std.mem.Allocator,
+    identity: AuthenticatedIdentity,
+    metadata: ?std.json.Parsed(std.json.Value) = null,
+    remaining_expansion_nodes: usize = auth_filter_max_tree_nodes,
+
+    fn deinit(self: *AuthRowFilterResolver) void {
+        if (self.metadata) |*metadata| metadata.deinit();
+    }
+
+    fn resolve(self: *AuthRowFilterResolver, alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+        if (self.metadata == null and authFilterUsesMetadataReference(value)) {
+            self.metadata = std.json.parseFromSlice(
+                std.json.Value,
+                self.alloc,
+                if (self.identity.metadata_json.len > 0) self.identity.metadata_json else "{}",
+                .{},
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.AuthRowFilterNoMatch,
+            };
+        }
+        var remaining: usize = auth_filter_max_tree_nodes;
+        return resolveAuthRowFilterValue(alloc, .{
+            .identity = self.identity,
+            .metadata = if (self.metadata) |metadata| metadata.value else null,
+            .remaining_expansion_nodes = &self.remaining_expansion_nodes,
+        }, value, .filter, &remaining);
+    }
+};
 
 pub fn resolveAuthRowFilterJson(
     alloc: std.mem.Allocator,
     identity: AuthenticatedIdentity,
     filter_json: []const u8,
 ) ![]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{}) catch return error.InvalidQueryRequest;
+    var parsed = try parseAuthRowFilter(alloc, filter_json);
     defer parsed.deinit();
     try validateAuthRowFilterValue(parsed.value);
-    var remaining_nodes: usize = auth_filter_max_tree_nodes;
-
-    var parsed_metadata: ?std.json.Parsed(std.json.Value) = null;
-    defer if (parsed_metadata) |*metadata| metadata.deinit();
-    if (authFilterUsesMetadataReference(parsed.value)) {
-        parsed_metadata = std.json.parseFromSlice(
-            std.json.Value,
-            alloc,
-            if (identity.metadata_json.len > 0) identity.metadata_json else "{}",
-            .{},
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return try alloc.dupe(u8, "{\"match_none\":{}}"),
-        };
-    }
-    const context = AuthRowFilterResolveContext{
-        .identity = identity,
-        .metadata = if (parsed_metadata) |metadata| metadata.value else null,
-    };
-    var resolved = resolveAuthRowFilterValue(
-        alloc,
-        context,
-        parsed.value,
-        .filter,
-        &remaining_nodes,
-    ) catch |err| switch (err) {
-        // Identity metadata is allowed to vary independently of policy
-        // admission. Missing or type-incompatible values must deny the whole
-        // policy, never turn a protected read into a server error or weaken a
-        // negative branch.
+    var resolver = AuthRowFilterResolver{ .alloc = alloc, .identity = identity };
+    defer resolver.deinit();
+    var resolved = resolver.resolve(alloc, parsed.value) catch |err| switch (err) {
         error.AuthRowFilterNoMatch => return try alloc.dupe(u8, "{\"match_none\":{}}"),
         else => return err,
     };
     defer json_helpers.deinitJsonValue(alloc, &resolved);
-    return try json_helpers.stringifyJsonValueAlloc(alloc, resolved);
+    return json_helpers.stringifyJsonValueAlloc(alloc, resolved);
+}
+
+fn resolveAuthRowFilterComponents(
+    alloc: std.mem.Allocator,
+    identity: AuthenticatedIdentity,
+    first: []const u8,
+    remaining_filters: usermgr.RowFilterIterator,
+) ![]u8 {
+    var resolver = AuthRowFilterResolver{ .alloc = alloc, .identity = identity };
+    defer resolver.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var parse_arena = std.heap.ArenaAllocator.init(alloc);
+    defer parse_arena.deinit();
+    var values = std.json.Array.init(scratch);
+    var remaining_input_nodes: usize = auth_filter_max_composed_nodes - 2;
+    var remaining_output_nodes: usize = auth_filter_max_composed_nodes - 2;
+    var matching = remaining_filters;
+    var next: ?[]const u8 = first;
+    while (next) |json| : (next = matching.next()) {
+        // Every executable filter needs at least its object and body. Deny
+        // before parsing another component once either budget is exhausted.
+        if (remaining_input_nodes < 2 or remaining_output_nodes < 2) return error.Forbidden;
+        // Reuse the template workspace even when the request allocator is an
+        // arena whose free() cannot reclaim intermediate parser allocations.
+        if (!parse_arena.reset(.retain_capacity)) return error.OutOfMemory;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, parse_arena.allocator(), json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidQueryRequest,
+        };
+        const used = try authRowFilterNodeCount(parsed);
+        if (used > remaining_input_nodes) return error.Forbidden;
+        remaining_input_nodes -= used;
+        const value = resolver.resolve(scratch, parsed) catch |err| switch (err) {
+            error.AuthRowFilterNoMatch => return try alloc.dupe(u8, "{\"match_none\":{}}"),
+            else => return err,
+        };
+        consumeAuthContextJsonBudget(value, 0, &remaining_output_nodes) catch return error.Forbidden;
+        try values.append(value);
+        // Only the bounded resolved prefix survives the next workspace
+        // reset. No combined input or unvisited tail is materialized.
+    }
+    var object = std.json.ObjectMap.empty;
+    try object.put(scratch, "conjuncts", .{ .array = values });
+    return json_helpers.stringifyJsonValueAlloc(alloc, .{ .object = object });
 }
 
 pub fn validateAuthRowFilterJson(
@@ -31722,6 +31927,11 @@ fn materializeAuthFilterTemplateValue(
 
 const auth_filter_max_tree_depth: u8 = 64;
 const auth_filter_max_tree_nodes: usize = 16_384;
+// Every compiled filter node occupies at least two JSON values (its object
+// and body). This aggregate cap fits the storage compiler's 16,384-node
+// budget, including our conjunction. Each component still has depth <64;
+// the synthetic object/array add two JSON levels, not policy recursion.
+const auth_filter_max_composed_nodes: usize = 2 * auth_filter_max_tree_nodes;
 
 fn authFilterUsesMetadataReference(value: std.json.Value) bool {
     return switch (value) {
@@ -31749,8 +31959,13 @@ fn authFilterUsesMetadataReference(value: std.json.Value) bool {
 }
 
 fn validateAuthRowFilterValue(value: std.json.Value) !void {
+    _ = try authRowFilterNodeCount(value);
+}
+
+fn authRowFilterNodeCount(value: std.json.Value) !usize {
     var remaining_nodes: usize = auth_filter_max_tree_nodes;
-    return try validateAuthRowFilterValueBounded(value, 0, &remaining_nodes);
+    try validateAuthRowFilterValueBounded(value, 0, &remaining_nodes);
+    return auth_filter_max_tree_nodes - remaining_nodes;
 }
 
 fn validateAuthRowFilterValueBounded(
@@ -31796,6 +32011,7 @@ fn validateAuthRowFilterValueBounded(
 const AuthRowFilterResolveContext = struct {
     identity: AuthenticatedIdentity,
     metadata: ?std.json.Value,
+    remaining_expansion_nodes: ?*usize = null,
 };
 
 fn resolveAuthRowFilterValue(
@@ -31825,7 +32041,7 @@ fn resolveAuthRowFilterValue(
                     alloc,
                     context,
                     path,
-                    remaining_nodes.*,
+                    if (context.remaining_expansion_nodes) |remaining| @min(remaining_nodes.*, remaining.*) else remaining_nodes.*,
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.AuthRowFilterNoMatch,
@@ -31836,6 +32052,7 @@ fn resolveAuthRowFilterValue(
                     return error.AuthRowFilterNoMatch;
                 }
                 remaining_nodes.* -= auth_value.node_count;
+                if (context.remaining_expansion_nodes) |remaining| remaining.* -= auth_value.node_count;
                 break :blk resolved;
             }
             if (remaining_nodes.* == 0) return error.AuthRowFilterNoMatch;
@@ -32346,7 +32563,7 @@ test "auth row filter validator rejects malformed auth node" {
     );
 }
 
-test "effective resolved row filter prefers table filter before wildcard" {
+test "effective resolved row filter combines table and wildcard" {
     const alloc = std.testing.allocator;
     var row_filters = [_]usermgr.RowFilterEntry{
         try usermgr.RowFilterEntry.initOwned(alloc, "*", "{\"term\":{\"visibility\":\"public\"}}"),
@@ -32364,7 +32581,7 @@ test "effective resolved row filter prefers table filter before wildcard" {
     const resolved = (try resolveEffectiveRowFilterJson(alloc, identity, "docs")) orelse return error.TestExpectedEqual;
     defer alloc.free(resolved);
 
-    try std.testing.expectEqualStrings("{\"term\":{\"owner\":\"bob\"}}", resolved);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"visibility\":\"public\"}},{\"term\":{\"owner\":\"bob\"}}]}", resolved);
 }
 
 test "artifact operations apply source document row filter visibility" {
@@ -59304,23 +59521,62 @@ test "query builder dependency 503 responses preserve public retry contract" {
 }
 
 pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
-    try appendCatalogAlias(alloc, identity, logical, physical);
-    const permission_count = identity.permissions.len;
-    for (0..permission_count) |i| {
-        const original = identity.permissions[i];
-        if (original.resource_type != .table or !system_catalog_routes.tableResourceMatches(original.resource, logical)) continue;
-        var permission = try usermgr.Permission.initOwned(alloc, .table, physical, original.type);
-        permission.deny_mutation = original.deny_mutation;
-        errdefer permission.deinit(alloc);
-        identity.permissions = try alloc.realloc(identity.permissions, identity.permissions.len + 1);
-        identity.permissions[identity.permissions.len - 1] = permission;
+    // A relation can bind the same target through qualified and unqualified
+    // names. Never append its predicates twice or alter retained policy JSON.
+    for (identity.catalog_aliases) |alias| {
+        if (!std.mem.eql(u8, alias.physical, physical)) continue;
+        const existing = try system_catalog.Target.parse(alias.logical);
+        const target = try system_catalog.Target.parse(logical);
+        if (!std.mem.eql(u8, existing.database, target.database) or
+            !std.mem.eql(u8, existing.namespace, target.namespace) or
+            !std.mem.eql(u8, existing.table, target.table)) return error.CatalogGenerationChanged;
+        return;
     }
-    if (effectiveRowFilterJson(identity.*, logical)) |raw| {
-        var filter = try usermgr.RowFilterEntry.initOwned(alloc, physical, raw);
-        errdefer filter.deinit(alloc);
-        identity.row_filter = try alloc.realloc(identity.row_filter, identity.row_filter.len + 1);
-        identity.row_filter[identity.row_filter.len - 1] = filter;
+
+    var permission_count: usize = 0;
+    for (identity.permissions) |permission| {
+        if (permission.resource_type == .table and
+            system_catalog_routes.tableResourceMatches(permission.resource, logical) and
+            !system_catalog_routes.tableResourceMatches(permission.resource, physical)) permission_count += 1;
     }
+    // Row policies remain immutable logical scopes. Resolving through aliases
+    // avoids treating opaque storage names as tables in default.public, and
+    // avoids copying every policy for every relation in a page arena.
+    // Build any new grants before publishing the alias so failures are atomic.
+    var replacement_permissions: ?[]usermgr.Permission = null;
+    var permission_filled = identity.permissions.len;
+    errdefer if (replacement_permissions) |permissions| {
+        for (permissions[identity.permissions.len..permission_filled]) |*entry| entry.deinit(alloc);
+        alloc.free(permissions);
+    };
+    if (permission_count > 0) {
+        const permissions = try alloc.alloc(usermgr.Permission, identity.permissions.len + permission_count);
+        replacement_permissions = permissions;
+        @memcpy(permissions[0..identity.permissions.len], identity.permissions);
+        for (identity.permissions) |original| {
+            if (original.resource_type != .table or
+                !system_catalog_routes.tableResourceMatches(original.resource, logical) or
+                system_catalog_routes.tableResourceMatches(original.resource, physical)) continue;
+            permissions[permission_filled] = try usermgr.Permission.initOwned(alloc, .table, physical, original.type);
+            permissions[permission_filled].deny_mutation = original.deny_mutation;
+            permission_filled += 1;
+        }
+    }
+
+    const logical_copy = try alloc.dupe(u8, logical);
+    errdefer alloc.free(logical_copy);
+    const physical_copy = try alloc.dupe(u8, physical);
+    errdefer alloc.free(physical_copy);
+    const aliases = try alloc.alloc(AuthenticatedIdentity.CatalogAlias, identity.catalog_aliases.len + 1);
+    @memcpy(aliases[0..identity.catalog_aliases.len], identity.catalog_aliases);
+    aliases[identity.catalog_aliases.len] = .{ .logical = logical_copy, .physical = physical_copy };
+
+    if (replacement_permissions) |permissions| {
+        alloc.free(identity.permissions);
+        identity.permissions = permissions;
+    }
+    alloc.free(identity.catalog_aliases);
+    identity.catalog_aliases = aliases;
 }
 
 fn appendCatalogAlias(alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
@@ -59494,9 +59750,10 @@ test "system catalog projects only matching permission and row-filter scopes" {
     try projectCatalogIdentity(alloc, &identity, "\x00catalog:9:analytics6:public6:events", "table:immutable");
     try std.testing.expect(permissionsAllow(identity.permissions, .table, "table:immutable", .read));
     try std.testing.expect(!permissionsAllow(identity.permissions, .table, "table:immutable", .write));
-    try std.testing.expectEqual(@as(usize, 3), identity.row_filter.len);
-    try std.testing.expectEqualStrings("table:immutable", identity.row_filter[2].table);
-    try std.testing.expectEqualStrings(filters[0].filter, identity.row_filter[2].filter);
+    try std.testing.expectEqual(@as(usize, 2), identity.row_filter.len);
+    const resolved = (try resolveEffectiveRowFilterJson(alloc, identity, "table:immutable")).?;
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings(filters[0].filter, resolved);
 }
 
 fn projectCatalogStatusAlloc(alloc: std.mem.Allocator, body: []const u8, logical_name: []const u8) ![]u8 {
@@ -63336,4 +63593,413 @@ test "system catalog graph physical endpoints recheck logical grants and binding
     try std.testing.expectEqual(@as(usize, 1), fake.forward_reads);
     fake.revision += 1;
     try std.testing.expectError(error.CatalogGenerationChanged, ApiHttpServer.CatalogGraphReadContext.authorize(&context, a, "table:another"));
+}
+
+test "index alias production resolver owns its producer cut without a catalog resolver" {
+    const alias_catalog = @import("antfly_local_sources").api_index_metadata.aliases;
+    const Fake = struct {
+        table: metadata_table_manager.TableRecord,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 0 };
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = @as(*[1]metadata_table_manager.TableRecord, @ptrCast(&self.table)), .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"complete\":true}", .{});
+    const base = "{\"a\":{\"type\":\"embeddings\",\"_index_incarnation\":41},\"b\":{\"type\":\"embeddings\",\"_index_incarnation\":42}}";
+    const first = try alias_catalog.put(scratch, base, "live", .{ .index = "a", .idempotency_key = "1" }, ready, 1);
+    const second = try alias_catalog.put(scratch, first, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "2" }, ready, 2);
+    var fake: Fake = .{ .table = .{ .table_id = 1, .name = "docs", .indexes_json = first } };
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } }, null, null);
+    defer server.deinit();
+    var resolver = server.semanticStatusResolver(.internal, "");
+    const iface = resolver.iface();
+    const bound = (try iface.vtable.bind_index_aliases.?(iface.ptr, a, "docs", "{\"indexes\":[\"live\"],\"semantic_search\":\"hello\"}")).?;
+    defer bound.deinit(a);
+    fake.table.indexes_json = second;
+    var document = try std.json.parseFromSlice(std.json.Value, a, bound.body, .{});
+    defer document.deinit();
+    try std.testing.expectEqualStrings("a", document.value.object.get("indexes").?.array.items[0].string);
+    try std.testing.expectEqual(@as(i64, 41), document.value.object.get("_index_alias_fences").?.array.items[0].object.get("incarnation").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, resolver.pinned_indexes_json.?, "\"index\":\"a\"") != null);
+}
+
+test "system catalog row filter scopes preserve tenant restriction and resolve auth references" {
+    const alloc = std.testing.allocator;
+    var filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(alloc, "*", "{\"term\":{\"tenant_id\":{\"$auth\":\"metadata.tenant_id\"}}}"),
+        try usermgr.RowFilterEntry.initOwned(alloc, "calls", "{\"term\":{\"status\":\"open\"}}"),
+        try usermgr.RowFilterEntry.initOwned(alloc, "calls", "null"),
+    };
+    defer for (&filters) |*filter| filter.deinit(alloc);
+    const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = &filters, .metadata_json = @constCast("{\"tenant_id\":\"a\"}") };
+    const resolved = (try resolveEffectiveRowFilterJson(alloc, identity, "calls")).?;
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant_id\":\"a\"}},{\"term\":{\"status\":\"open\"}}]}", resolved);
+    try std.testing.expect(hasEffectiveRowFilter(identity, "calls"));
+    var projected = (try cloneCatalogIdentity(alloc, identity)).?;
+    defer projected.deinit(alloc);
+    try projectCatalogIdentity(alloc, &projected, "calls", "table:immutable");
+    const physical = (try resolveEffectiveRowFilterJson(alloc, projected, "table:immutable")).?;
+    defer alloc.free(physical);
+    try std.testing.expectEqualStrings(resolved, physical);
+}
+
+test "system catalog projection is idempotent and failure atomic" {
+    const Fixture = struct {
+        fn check(failing: std.mem.Allocator) !void {
+            const a = std.testing.allocator;
+            var permission = try usermgr.Permission.initOwned(a, .table, "docs", .read);
+            defer permission.deinit(a);
+            var restriction = try usermgr.RowFilterEntry.initOwned(a, "docs", "{\"term\":{\"tenant\":\"a\"}}");
+            defer restriction.deinit(a);
+            var permissions = [_]usermgr.Permission{permission};
+            var restrictions = [_]usermgr.RowFilterEntry{restriction};
+            var identity = (try cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &restrictions })).?;
+            defer identity.deinit(a);
+            projectCatalogIdentity(failing, &identity, "docs", "table:immutable") catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), identity.catalog_aliases.len);
+                try std.testing.expectEqual(@as(usize, 1), identity.permissions.len);
+                try std.testing.expectEqual(@as(usize, 1), identity.row_filter.len);
+                // A failed attempt must not leave an alias that suppresses retry.
+                try projectCatalogIdentity(a, &identity, "docs", "table:immutable");
+                return err;
+            };
+            const permission_count = identity.permissions.len;
+            const filter_count = identity.row_filter.len;
+            // Equivalent qualification must be a no-allocation no-op.
+            try projectCatalogIdentity(std.testing.failing_allocator, &identity, "\x00catalog:7:default6:public4:docs", "table:immutable");
+            try std.testing.expectEqual(permission_count, identity.permissions.len);
+            try std.testing.expectEqual(filter_count, identity.row_filter.len);
+            try std.testing.expectEqual(@as(usize, 1), identity.catalog_aliases.len);
+            try std.testing.expectError(error.CatalogGenerationChanged, projectCatalogIdentity(std.testing.failing_allocator, &identity, "other", "table:immutable"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "system catalog signed trusted principal combines all filter scopes" {
+    const a = std.testing.allocator;
+    const secret = "scoped-trusted-principal-test-secret";
+    const payload = "{\"iss\":\"trusted-upstream\",\"sub\":\"reader\",\"tables\":[\"*\"],\"operations\":[\"read\"],\"metadata\":{\"tenant\":\"a\"},\"row_filter\":{\"*\":{\"term\":{\"tenant\":{\"$auth\":\"metadata.tenant\"}}},\"\\u0000catalog:7:default6:public*\":{\"term\":{\"region\":\"us\"}},\"docs\":{\"term\":{\"status\":\"open\"}},\"\\u0000catalog:7:default6:public4:docs\":null},\"exp\":4102444800}";
+    const token = try encodeTrustedPrincipalToken(a, secret, payload);
+    defer a.free(token);
+    // Credential decoding borrows only configuration and an allocator. Keep
+    // unrelated serving capabilities poisoned rather than starting a runtime.
+    var server: ApiHttpServer = undefined;
+    server.alloc = a;
+    server.cfg = .{ .trusted_principal_secret = secret, .trusted_principal_issuer = "trusted-upstream" };
+    var identity = try server.authenticateRequest(.{ .trusted_principal = token });
+    defer identity.deinit(a);
+    const logical = "\x00catalog:7:default6:public4:docs";
+    const resolved = (try resolveEffectiveRowFilterJson(a, identity, logical)).?;
+    defer a.free(resolved);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant\":\"a\"}},{\"term\":{\"region\":\"us\"}},{\"term\":{\"status\":\"open\"}}]}", resolved);
+    try projectCatalogIdentity(a, &identity, logical, "table:immutable");
+    const projected = (try resolveEffectiveRowFilterJson(a, identity, "table:immutable")).?;
+    defer a.free(projected);
+    try std.testing.expectEqualStrings(resolved, projected);
+}
+
+test "system catalog row filter scopes remain isolated across physical aliases" {
+    const a = std.testing.allocator;
+    const tenant_table = "\x00catalog:6:tenant7:allowed6:events";
+    var permission = try usermgr.Permission.initOwned(a, .table, "*", .read);
+    defer permission.deinit(a);
+    var permissions = [_]usermgr.Permission{permission};
+    var filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(a, "*", "{\"term\":{\"tenant\":\"a\"}}"),
+        try usermgr.RowFilterEntry.initOwned(a, "\x00catalog:7:default6:public*", "{\"term\":{\"visibility\":\"public\"}}"),
+        try usermgr.RowFilterEntry.initOwned(a, "\x00catalog:6:tenant7:allowed*", "{\"term\":{\"region\":\"us\"}}"),
+        try usermgr.RowFilterEntry.initOwned(a, tenant_table, "{\"term\":{\"status\":\"open\"}}"),
+    };
+    defer for (&filters) |*entry| entry.deinit(a);
+    var identity = (try cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &filters })).?;
+    defer identity.deinit(a);
+    const logical = (try resolveEffectiveRowFilterJson(a, identity, tenant_table)).?;
+    defer a.free(logical);
+    try projectCatalogIdentity(a, &identity, tenant_table, "table:tenant");
+    try projectCatalogIdentity(a, &identity, "docs", "table:default");
+    const physical = (try resolveEffectiveRowFilterJson(a, identity, "table:tenant")).?;
+    defer a.free(physical);
+    try std.testing.expectEqualStrings(logical, physical);
+    const public = (try resolveEffectiveRowFilterJson(a, identity, "table:default")).?;
+    defer a.free(public);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant\":\"a\"}},{\"term\":{\"visibility\":\"public\"}}]}", public);
+
+    var unrelated = (try cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = filters[1..2] })).?;
+    defer unrelated.deinit(a);
+    try projectCatalogIdentity(a, &unrelated, tenant_table, "table:tenant");
+    try std.testing.expect(!hasEffectiveRowFilter(unrelated, "table:tenant"));
+    const absent = try resolveEffectiveRowFilterJson(a, unrelated, "table:tenant");
+    defer if (absent) |bytes| a.free(bytes);
+    try std.testing.expect(absent == null);
+}
+
+test "system catalog row filter logical names cannot collide with physical aliases" {
+    const a = std.testing.allocator;
+    var filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(a, "calls", "{\"term\":{\"kind\":\"calls\"}}"),
+        try usermgr.RowFilterEntry.initOwned(a, "table:shared", "{\"term\":{\"kind\":\"logical\"}}"),
+    };
+    defer for (&filters) |*entry| entry.deinit(a);
+    var identity = (try cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .row_filter = &filters })).?;
+    defer identity.deinit(a);
+    const named_like_storage = try (system_catalog.Target{ .table = "table:shared" }).resourceNameAlloc(a);
+    defer a.free(named_like_storage);
+    try projectCatalogIdentity(a, &identity, "calls", "table:shared");
+    try projectCatalogIdentity(a, &identity, named_like_storage, "table:second");
+    const calls = (try resolveEffectiveRowFilterJson(a, identity, "table:shared")).?;
+    defer a.free(calls);
+    const second = (try resolveEffectiveRowFilterJson(a, identity, "table:second")).?;
+    defer a.free(second);
+    try std.testing.expectEqualStrings(filters[0].filter, calls);
+    try std.testing.expectEqualStrings(filters[1].filter, second);
+}
+
+test "system catalog projection preserves immutable policy arrays with bounded allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const filter_count = 1024;
+    const filters = try a.alloc(usermgr.RowFilterEntry, filter_count);
+    for (filters, 0..) |*entry, i| entry.* = try usermgr.RowFilterEntry.initOwned(a, try std.fmt.allocPrint(a, "unrelated-{d}", .{i}), "{\"match_all\":{}}");
+    const permissions = try a.alloc(usermgr.Permission, 1);
+    permissions[0] = try usermgr.Permission.initOwned(a, .table, "*", .read);
+    var identity = AuthenticatedIdentity{ .username = try a.dupe(u8, "reader"), .permissions = permissions, .row_filter = filters };
+    defer identity.deinit(a);
+    var measured = std.testing.FailingAllocator.init(a, .{});
+    for (0..32) |i| {
+        const logical = try (system_catalog.Target{ .database = "tenant", .namespace = "allowed", .table = try std.fmt.allocPrint(a, "events-{d}", .{i}) }).resourceNameAlloc(a);
+        const physical = try std.fmt.allocPrint(a, "table:opaque-{d}", .{i});
+        try projectCatalogIdentity(measured.allocator(), &identity, logical, physical);
+    }
+    // Only aliases grow. Copying the unrelated policy vector per table would
+    // retain over 1 MiB in this page arena instead of this small alias budget.
+    try std.testing.expect(measured.allocated_bytes < 64 * 1024);
+    try std.testing.expect(identity.row_filter.ptr == filters.ptr);
+    try std.testing.expect(identity.permissions.ptr == permissions.ptr);
+    try std.testing.expectEqual(@as(usize, filter_count), identity.row_filter.len);
+    try std.testing.expectEqual(@as(usize, 32), identity.catalog_aliases.len);
+}
+
+test "system catalog row filter composition preserves admitted node budgets" {
+    const a = std.testing.allocator;
+    var policy = std.ArrayListUnmanaged(u8).empty;
+    defer policy.deinit(a);
+    try policy.appendSlice(a, "{\"terms\":{\"tenant\":[");
+    for (0..9000) |i| try policy.appendSlice(a, if (i == 0) "\"a\"" else ",\"a\"");
+    try policy.appendSlice(a, "]}}");
+    try validateAuthRowFilterJson(a, policy.items);
+    const filters = [_]usermgr.RowFilterEntry{
+        .{ .table = @constCast("*"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = policy.items },
+    };
+    const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(&filters) };
+    const result = (try resolveEffectiveRowFilterJson(a, identity, "docs")).?;
+    defer a.free(result);
+    var prepared = try search_pattern_filter.PreparedPatternFilter.init(a, result);
+    defer prepared.deinit();
+    try std.testing.expect(try search_pattern_filter.storedDocMatchesPatternFilter(a, "one", "{\"tenant\":\"a\"}", result));
+    try std.testing.expect(!try search_pattern_filter.storedDocMatchesPatternFilter(a, "two", "{\"tenant\":\"b\"}", result));
+    // Aggregate allowance must not relax single-policy admission.
+    try std.testing.expectError(error.InvalidQueryRequest, validateAuthRowFilterJson(a, result));
+}
+
+test "system catalog row filter composition preserves admitted depth budgets" {
+    const a = std.testing.allocator;
+    var policy = std.ArrayListUnmanaged(u8).empty;
+    defer policy.deinit(a);
+    for (0..30) |_| try policy.appendSlice(a, "{\"conjuncts\":[");
+    try policy.appendSlice(a, "{\"term\":{\"tenant\":\"a\"}}");
+    for (0..30) |_| try policy.appendSlice(a, "]}");
+    try validateAuthRowFilterJson(a, policy.items);
+    const filters = [_]usermgr.RowFilterEntry{
+        .{ .table = @constCast("*"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = @constCast("{\"match_all\":{}}") },
+    };
+    const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(&filters) };
+    const result = (try resolveEffectiveRowFilterJson(a, identity, "docs")).?;
+    defer a.free(result);
+    try std.testing.expect(try search_pattern_filter.storedDocMatchesPatternFilter(a, "one", "{\"tenant\":\"a\"}", result));
+    try std.testing.expect(!try search_pattern_filter.storedDocMatchesPatternFilter(a, "two", "{\"tenant\":\"b\"}", result));
+    try std.testing.expectError(error.InvalidQueryRequest, validateAuthRowFilterJson(a, result));
+}
+
+test "system catalog row filter composition bounds aggregate execution work" {
+    const a = std.testing.allocator;
+    var policy = std.ArrayListUnmanaged(u8).empty;
+    defer policy.deinit(a);
+    try policy.appendSlice(a, "{\"conjuncts\":[");
+    for (0..8190) |i| try policy.appendSlice(a, if (i == 0) "{\"match_all\":{}}" else ",{\"match_all\":{}}");
+    try policy.appendSlice(a, "]}");
+    try validateAuthRowFilterJson(a, policy.items);
+    const filters = [_]usermgr.RowFilterEntry{
+        .{ .table = @constCast("*"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = @constCast("{\"match_all\":{}}") },
+        .{ .table = @constCast("docs"), .filter = policy.items },
+    };
+    var identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(filters[0..3]) };
+    const result = (try resolveEffectiveRowFilterJson(a, identity, "docs")).?;
+    defer a.free(result);
+    // Exactly 32,768 JSON values and 16,384 compiled nodes.
+    var prepared = try search_pattern_filter.PreparedPatternFilter.init(a, result);
+    defer prepared.deinit();
+    identity.row_filter = @constCast(&filters);
+    try std.testing.expectError(error.Forbidden, resolveEffectiveRowFilterJson(a, identity, "docs"));
+}
+
+test "system catalog row filter composition shares identity expansion budget" {
+    const a = std.testing.allocator;
+    var metadata = std.ArrayListUnmanaged(u8).empty;
+    defer metadata.deinit(a);
+    try metadata.appendSlice(a, "{\"groups\":[");
+    for (0..9000) |i| try metadata.appendSlice(a, if (i == 0) "\"a\"" else ",\"a\"");
+    try metadata.appendSlice(a, "]}");
+    const filters = [_]usermgr.RowFilterEntry{
+        .{ .table = @constCast("*"), .filter = @constCast("{\"terms\":{\"tenant\":{\"$auth\":\"metadata.groups\"}}}") },
+        .{ .table = @constCast("docs"), .filter = @constCast("{\"terms\":{\"tenant\":{\"$auth\":\"metadata.groups\"}}}") },
+    };
+    const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(&filters), .metadata_json = metadata.items };
+    const result = (try resolveEffectiveRowFilterJson(a, identity, "docs")).?;
+    defer a.free(result);
+    try std.testing.expectEqualStrings("{\"match_none\":{}}", result);
+}
+
+test "system catalog row filter composition bounds expanded aggregate" {
+    const a = std.testing.allocator;
+    var policy = std.ArrayListUnmanaged(u8).empty;
+    defer policy.deinit(a);
+    try policy.appendSlice(a, "{\"conjuncts\":[{\"terms\":{\"status\":[");
+    for (0..6000) |i| try policy.appendSlice(a, if (i == 0) "\"open\"" else ",\"open\"");
+    try policy.appendSlice(a, "]}},{\"terms\":{\"tenant\":{\"$auth\":\"metadata.groups\"}}}]}");
+    try validateAuthRowFilterJson(a, policy.items);
+    var metadata = std.ArrayListUnmanaged(u8).empty;
+    defer metadata.deinit(a);
+    try metadata.appendSlice(a, "{\"groups\":[");
+    for (0..5000) |i| try metadata.appendSlice(a, if (i == 0) "\"a\"" else ",\"a\"");
+    try metadata.appendSlice(a, "]}");
+    const filters = [_]usermgr.RowFilterEntry{
+        .{ .table = @constCast("*"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = policy.items },
+    };
+    const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(&filters), .metadata_json = metadata.items };
+    try std.testing.expectError(error.Forbidden, resolveEffectiveRowFilterJson(a, identity, "docs"));
+}
+
+test "system catalog row filter composition releases partial allocations" {
+    const Fixture = struct {
+        fn check(a: std.mem.Allocator) !void {
+            const filters = [_]usermgr.RowFilterEntry{
+                .{ .table = @constCast("*"), .filter = @constCast("{\"terms\":{\"tenant\":{\"$auth\":\"metadata.groups\"}}}") },
+                .{ .table = @constCast("docs"), .filter = @constCast("{\"term\":{\"tier\":\"gold\"}}") },
+            };
+            const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(&filters), .metadata_json = @constCast("{\"groups\":[\"a\",\"b\"]}") };
+            const result = (try resolveEffectiveRowFilterJson(a, identity, "docs")).?;
+            defer a.free(result);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "index alias object engine admission rejects private controls before storage and skips native binding" {
+    const Fake = struct {
+        engine: @import("antfly_local_sources").common_table_storage.Engine = .local,
+        reads: usize = 0,
+        aliases: bool = true,
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (call != .query_definition) return error.UnexpectedCatalogRead;
+            self.reads += 1;
+            return std.json.Stringify.valueAlloc(a, system_catalog.QueryDefinition{ .storage_engine = self.engine, .table_id = 7, .schema_json = "{}", .read_schema_json = "", .indexes_json = if (self.aliases) "{\"text\":{\"type\":\"full_text\",\"_index_incarnation\":41},\"_index_aliases\":{\"live\":{\"index\":\"text\"}}}" else "{\"text\":{\"type\":\"full_text\",\"_index_incarnation\":41}}" }, .{});
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = .{};
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.catalog, .supports_query_definitions = true, .supports_object_tables = true } }, null, null);
+    defer server.deinit();
+    try std.testing.expect((try server.tryObjectTableQuery("docs", "{\"indexes\":[\"live\"]}", null, null, null, null, null, .{ .primary_foreign = false, .context = .{} })) == null);
+    try std.testing.expectEqual(@as(usize, 1), fake.reads);
+    try std.testing.expectEqual(@as(usize, 0), server.index_alias_cache.retained_bytes);
+    fake.engine = .object;
+    for ([_]bool{ false, true }) |has_aliases| {
+        fake.aliases = has_aliases;
+        for ([_][]const u8{
+            "{\"_index_alias_fences\":1}",
+            "{\"_index_alias_fences\":[{}]}",
+            "{\"_index_alias_fences\":[{\"name\":\"text\",\"incarnation\":41}]}",
+            "{\"\\u005findex_alias_fences\":[]}",
+        }) |body| {
+            try std.testing.expectError(error.InvalidQueryRequest, server.tryObjectTableQuery("docs", body, null, null, null, null, null, .{ .primary_foreign = false, .context = .{} }));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.index_alias_cache.retained_bytes);
+}
+
+test "system catalog row filter composition rejects oversized tails with bounded allocation" {
+    const a = std.testing.allocator;
+    var policy = std.ArrayListUnmanaged(u8).empty;
+    defer policy.deinit(a);
+    try policy.appendSlice(a, "{\"terms\":{\"tenant\":[");
+    for (0..9000) |i| try policy.appendSlice(a, if (i == 0) "\"a\"" else ",\"a\"");
+    try policy.appendSlice(a, "]}}");
+    try validateAuthRowFilterJson(a, policy.items);
+    const filters = try a.alloc(usermgr.RowFilterEntry, 1000);
+    defer a.free(filters);
+    for (filters) |*entry| entry.* = .{ .table = @constCast("docs"), .filter = policy.items };
+    const buffer = try a.alloc(u8, 16 * 1024 * 1024);
+    defer a.free(buffer);
+    var prefix_allocation: ?usize = null;
+    for ([_]usize{ 100, 1000 }) |count| {
+        var bounded = std.heap.FixedBufferAllocator.init(buffer);
+        var measured = std.testing.FailingAllocator.init(bounded.allocator(), .{});
+        const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = filters[0..count] };
+        // The 1,000-policy input would require a 36 MB combined JSON buffer
+        // before parsing. Serving must deny within this fixed 16 MiB budget.
+        try std.testing.expectError(error.Forbidden, resolveEffectiveRowFilterJson(measured.allocator(), identity, "docs"));
+        if (prefix_allocation) |expected| {
+            // The unvisited tail must not affect composition allocations.
+            try std.testing.expectEqual(expected, measured.allocated_bytes);
+        } else prefix_allocation = measured.allocated_bytes;
+    }
+}
+
+test "index alias admission accepts empty object fleets and fences incompatible live data stores" {
+    const Fake = struct {
+        stores: []metadata_table_manager.StoreRecord = &.{},
+        frees: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 0 };
+        }
+        fn snapshot(ptr: *anyopaque, _: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &.{}, .ranges = &.{}, .stores = self.stores, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(ptr: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.frees += 1;
+        }
+    };
+    var fake: Fake = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .deployment_mode = .distributed }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .linearizable_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } }, null, null);
+    defer server.deinit();
+    try server.ensureIndexAliasAdmission(.{});
+    var stores = [_]metadata_table_manager.StoreRecord{.{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .artifact_sources_protocol_version = 2 }};
+    fake.stores = &stores;
+    try std.testing.expectError(error.IndexAliasProtocolUpgradeRequired, server.ensureIndexAliasAdmission(.{}));
+    stores[0].role = "metadata";
+    try server.ensureIndexAliasAdmission(.{});
+    stores[0].role = "data";
+    stores[0].artifact_sources_protocol_version = 3;
+    try server.ensureIndexAliasAdmission(.{});
+    try std.testing.expectEqual(@as(usize, 4), fake.frees);
 }

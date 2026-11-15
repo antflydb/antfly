@@ -316,7 +316,11 @@ pub const CatalogService = struct {
         indexes_json: []const u8,
     ) !bool {
         try @import("storage_capabilities.zig").requireDefinition(self.alloc, schema_json, read_schema_json, indexes_json);
-        return try self.store.setTableDefinition(table_name, schema_json, read_schema_json, indexes_json);
+        if (!self.wal.supportsCatalogFences()) return try self.store.setTableDefinition(table_name, schema_json, read_schema_json, indexes_json);
+        const namespace = self.store.resolveNamespaceAlloc(self.alloc, table_name) catch |err| if (err == error.NamespaceNotFound) return false else return err;
+        defer self.alloc.free(namespace);
+        try self.publishCatalogUpdate(namespace, .{ .definition = .{ .table = table_name, .schema = schema_json, .read_schema = read_schema_json, .indexes = indexes_json } });
+        return true;
     }
 
     pub fn freeNamespaces(self: *CatalogService, alloc: Allocator, records: []catalog_types.NamespaceRecord) void {
@@ -1318,12 +1322,62 @@ pub const CatalogService = struct {
         return false;
     }
 
+    /// Finish a durable catalog intent after crashes or ambiguous writes. Each
+    /// metadata store rejects older epochs, so delayed recoverers cannot undo
+    /// a newer definition, including an ABA back to an earlier configuration.
+    pub fn recoverCatalogUpdate(self: *CatalogService, namespace: []const u8) !void {
+        if (!self.wal.supportsCatalogFences()) return;
+        if (self.store.vtable.apply_catalog_update == null) return error.AtomicCatalogAdmissionUnsupported;
+        for (0..8) |_| {
+            var current = try self.wal.catalogFence(namespace);
+            defer current.deinit(self.wal.allocator);
+            const payload = current.payload orelse return;
+            var mutation = try api_codec.decodeMutationAlloc(self.alloc, payload);
+            defer mutation.deinit(self.alloc);
+            if (mutation.kind != .catalog) return error.InvalidWal;
+            var parsed = try std.json.parseFromSlice(catalog_types.CatalogUpdate, self.alloc, mutation.body orelse return error.InvalidWal, .{});
+            defer parsed.deinit();
+            self.store.applyCatalogUpdate(namespace, current.fence.epoch, parsed.value) catch |err| switch (err) {
+                error.PreconditionFailed => continue,
+                else => return err,
+            };
+            try self.wal.completeCatalogUpdate(namespace, current.fence.epoch);
+        }
+        return error.CatalogUpdateInProgress;
+    }
+
+    pub fn directCatalogFence(self: *CatalogService, namespace: []const u8) !wal_mod.types.CatalogFence {
+        if (!self.wal.supportsCatalogFences()) return error.AtomicCatalogAdmissionUnsupported;
+        try self.recoverCatalogUpdate(namespace);
+        var current = try self.wal.catalogFence(namespace);
+        defer current.deinit(self.wal.allocator);
+        if (current.fence.pending_lsn != null) return error.CatalogUpdateInProgress;
+        return current.fence;
+    }
+
+    fn publishCatalogUpdate(self: *CatalogService, namespace: []const u8, update: catalog_types.CatalogUpdate) !void {
+        if (self.store.vtable.apply_catalog_update == null) return error.AtomicCatalogAdmissionUnsupported;
+        try self.recoverCatalogUpdate(namespace);
+        var current = try self.wal.catalogFence(namespace);
+        defer current.deinit(self.wal.allocator);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, update, .{});
+        defer self.alloc.free(body);
+        const payload = try api_codec.encodeMutationAlloc(self.alloc, .{ .kind = .catalog, .doc_id = "", .body = body });
+        defer self.alloc.free(payload);
+        _ = try self.wal.beginCatalogUpdate(namespace, payload, current.fence.epoch);
+        try self.recoverCatalogUpdate(namespace);
+    }
+
     pub fn getPolicy(self: *CatalogService, namespace: []const u8) !catalog_types.NamespacePolicy {
+        try self.recoverCatalogUpdate(namespace);
         return try self.store.getPolicy(namespace);
     }
 
     pub fn setPolicy(self: *CatalogService, namespace: []const u8, policy: catalog_types.NamespacePolicy) !catalog_types.NamespacePolicy {
-        return try self.store.setPolicy(namespace, policy);
+        if (!self.wal.supportsCatalogFences()) return try self.store.setPolicy(namespace, policy);
+        _ = try self.store.getPolicy(namespace);
+        try self.publishCatalogUpdate(namespace, .{ .policy = policy });
+        return try self.store.getPolicy(namespace);
     }
 };
 
@@ -5886,4 +5940,81 @@ fn findNamedArtifactAction(
         if (std.mem.eql(u8, action.name, name)) return action.action;
     }
     return null;
+}
+
+test "commit requirements catalog intent recovers and old recoverers cannot undo newer definitions" {
+    try testDirectCatalogRecovery(false);
+    try testDirectCatalogRecovery(true);
+}
+
+fn testDirectCatalogRecovery(comptime object_backed: bool) !void {
+    const a = std.testing.allocator;
+    var root_buf: [256]u8 = undefined;
+    const root = tmpPath(&root_buf, "direct-catalog-recovery");
+    defer cleanupTmp(root);
+    const uri = try std.fmt.allocPrint(a, "file://{s}/objects", .{std.mem.span(root)});
+    defer a.free(uri);
+    var backend = if (object_backed)
+        try @import("object_store.zig").ObjectStore.initFileUri(a, uri)
+    else
+        try @import("fs_store.zig").FsStore.init(a, std.mem.span(root));
+    var metadata = backend.catalogStore();
+    defer metadata.deinit();
+    try std.testing.expect(try metadata.ensureTable("docs", "docs", 1, .{}, "", "", "{}"));
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var indexed = try wal_mod.IndexedObjectStore.init(a, client, "db", "catalog-recovery");
+    defer indexed.deinit();
+    indexed.catalog_fences_enabled = true;
+    var wal = indexed.walStore();
+    var service: CatalogService = .{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = &wal, .builder = undefined, .store = &metadata };
+    const update: catalog_types.CatalogUpdate = .{ .definition = .{ .table = "docs", .schema = "", .read_schema = "", .indexes = "{\"old\":{}}" } };
+    const body = try std.json.Stringify.valueAlloc(a, update, .{});
+    defer a.free(body);
+    const payload = try api_codec.encodeMutationAlloc(a, .{ .kind = .catalog, .doc_id = "", .body = body });
+    defer a.free(payload);
+    // Crash after publishing the durable intent, before touching metadata.
+    const old_epoch = try wal.beginCatalogUpdate("docs", payload, 0);
+    const admitted = try service.directCatalogFence("docs");
+    try std.testing.expectEqual(old_epoch, admitted.epoch);
+    try std.testing.expect(admitted.pending_lsn == null);
+    try std.testing.expect(try service.setTableDefinition("docs", "", "", "{\"new\":{}}"));
+    // Delayed recovery is a no-op after a newer catalog epoch.
+    try metadata.applyCatalogUpdate("docs", old_epoch, update);
+    var table = (try metadata.getTableAlloc(a, "docs")).?;
+    defer table.deinit(a);
+    try std.testing.expectEqualStrings("{\"new\":{}}", table.indexes_json);
+    _ = try service.setPolicy("docs", .{ .chunk_preview_enabled = true });
+    var policy_fence = try wal.catalogFence("docs");
+    defer policy_fence.deinit(a);
+    _ = try service.setPolicy("docs", .{ .chunk_preview_enabled = false });
+    try metadata.applyCatalogUpdate("docs", policy_fence.fence.epoch, .{ .policy = .{ .chunk_preview_enabled = true } });
+    try std.testing.expect(!(try metadata.getPolicy("docs")).chunk_preview_enabled);
+    try std.testing.expectError(error.CatalogFenceRequired, metadata.setPolicy("docs", .{}));
+}
+
+test "commit requirements ordinary catalog changes preserve an unactivated WAL" {
+    const a = std.testing.allocator;
+    var root_buf: [256]u8 = undefined;
+    const root = tmpPath(&root_buf, "legacy-catalog-compatibility");
+    defer cleanupTmp(root);
+    var fs = try @import("fs_store.zig").FsStore.init(a, std.mem.span(root));
+    var metadata = fs.catalogStore();
+    defer metadata.deinit();
+    try std.testing.expect(try metadata.ensureTable("docs", "docs", 1, .{}, "", "", "{}"));
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var backing = try @import("../wal/object_store.zig").ObjectStore.initWithClient(a, client, "db", "legacy-catalog");
+    defer backing.deinit();
+    try backing.enableIndexed(.{});
+    var wal = backing.walStore();
+    var service: CatalogService = .{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = &wal, .builder = undefined, .store = &metadata };
+    try std.testing.expect(try service.setTableDefinition("docs", "", "", "{\"new\":{}}"));
+    _ = try service.setPolicy("docs", .{ .chunk_preview_enabled = true });
+    try std.testing.expectEqual(@as(u64, 0), try wal.latestLsn("docs"));
+    try std.testing.expectError(error.AtomicCatalogAdmissionUnsupported, service.directCatalogFence("docs"));
 }

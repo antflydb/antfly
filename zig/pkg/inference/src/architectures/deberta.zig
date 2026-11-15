@@ -27,6 +27,7 @@ const ComputeBackend = ops.ComputeBackend;
 const deberta_config = @import("../models/deberta.zig");
 
 pub const Config = deberta_config.Config;
+const decide_metal_policy = @import("../models/gliner_decide_qualification.zig").MetalExecutionPolicy{};
 
 pub const EncoderProfile = struct {
     embeddings_ns: u64 = 0,
@@ -280,7 +281,10 @@ pub fn metalFastPathReservationBytes(config: Config, prefer_weight_mirrors: bool
     }
     return .{
         .persistent_bytes = persistent_bytes,
-        .scratch_bytes = metalDebertaMpsAttentionScratchMaxBytes(),
+        .scratch_bytes = if (config.metal_decide_execution_policy)
+            decide_metal_policy.attention_scratch_bytes
+        else
+            metalDebertaMpsAttentionScratchMaxBytes(),
     };
 }
 
@@ -524,6 +528,14 @@ pub fn preplanMetalDebertaEncoderFrame(
         .max_position_embeddings = @intCast(config.max_position_embeddings),
         .norm_eps = config.layer_norm_eps,
         .layers = layers,
+        .packed_qkv_cache_bytes = if (config.metal_decide_execution_policy)
+            decide_metal_policy.packed_qkv_cache_bytes
+        else
+            null,
+        .attention_scratch_bytes = if (config.metal_decide_execution_policy)
+            decide_metal_policy.attention_scratch_bytes
+        else
+            null,
     });
     return true;
 }

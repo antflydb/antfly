@@ -23,6 +23,7 @@ from antfly.client_generated.models import (
     ChunkEmbeddingContext,
     ChunkEmbeddingObject,
     ChunkEmbeddingResponse,
+    CommitRequires,
     CreateAlgebraicIndexRequest,
     CreatedAlgebraicIndex,
     CreatedEmbeddingsIndex,
@@ -1895,6 +1896,7 @@ class AntflyClient:
         deletes: list[str] | None = None,
         *,
         sync_level: str | SyncLevel | None = None,
+        commit_requires: str | CommitRequires | None = None,
         transforms: list[Mapping[str, Any]] | None = None,
     ) -> BatchResponse:
         """
@@ -1905,6 +1907,7 @@ class AntflyClient:
             inserts: Dictionary of key-value pairs to insert
             deletes: List of keys to delete
             sync_level: Requested durable/index visibility boundary.
+            commit_requires: Required precommit work; unsupported engines reject it.
             transforms: Atomic document transformations, including upserts.
 
         Returns:
@@ -1918,6 +1921,7 @@ class AntflyClient:
             inserts=batch_inserts,
             deletes=deletes or [],
             sync_level=SyncLevel(sync_level) if sync_level is not None else UNSET,
+            commit_requires=CommitRequires(commit_requires) if commit_requires is not None else UNSET,
             transforms=[Transform.from_dict(item) for item in transforms] if transforms is not None else UNSET,
         )
         encoded = self._encode_write_request("Batch", request.to_dict())

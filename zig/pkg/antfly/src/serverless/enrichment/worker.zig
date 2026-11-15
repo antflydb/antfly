@@ -175,6 +175,26 @@ const MediaGenerationSnapshot = struct {
     }
 };
 
+/// Admission and publication share the same typed projection contract. A
+/// preserved source field must never create an unreadable durable postimage.
+pub fn validateDirectBody(a: Allocator, body: []const u8) !void {
+    var projection = document_projection.parseAlloc(a, body) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDocumentBody,
+    };
+    projection.deinit(a);
+}
+
+pub const DirectWindowCache = struct {
+    arena: std.heap.ArenaAllocator,
+    dense: std.StringHashMapUnmanaged([]const f32) = .empty,
+    sparse: std.StringHashMapUnmanaged(embedder_mod.SparseEmbedding) = .empty,
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const SparseEnricher = struct {
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
@@ -194,6 +214,13 @@ pub const SparseEnricher = struct {
     media_checkpoint_interval_ms: u64 = 1000,
     generation_snapshot: ?*MediaGenerationSnapshot = null,
     checkpoint_context: ?media_checkpoint.Context = null,
+    prepared_catalog: ?[32]u8 = null,
+    direct_output_limit: usize = 8 * 1024 * 1024,
+    direct_retained_bytes: ?usize = null,
+    direct_cache: ?*DirectWindowCache = null,
+    execution_context: ?@import("antfly_inference_execution_context").RequestContext = null,
+    prepared_dense_generation: ?embedder_mod.DenseEmbedder.TextGeneration = null,
+    prepared_sparse_revision: ?[32]u8 = null,
 
     pub fn init(
         alloc: Allocator,
@@ -218,6 +245,200 @@ pub const SparseEnricher = struct {
         if (self.chunk_embedding_name) |name| self.alloc.free(name);
         self.clearModelChunker();
         self.* = undefined;
+    }
+
+    /// Resolve once for the entire admission attempt. All bounded partitions
+    /// and documents execute against the same immutable provider generation.
+    pub fn captureDirectProviders(self: *SparseEnricher, context: @import("antfly_inference_execution_context").RequestContext) !void {
+        self.execution_context = context;
+        if (self.chunk_embedder) |provider| {
+            const controlled = provider.withRequestContext(context);
+            const generation = try controlled.captureTextGeneration(self.alloc, self.chunk_embedding_name.?);
+            self.prepared_dense_generation = generation;
+            self.chunk_embedder = controlled.withTextGeneration(generation);
+        }
+        if (self.sparse_embedder) |provider| {
+            const controlled = provider.withRequestContext(context);
+            const generation = try controlled.captureGeneration(self.alloc, self.sparse_embedding_name.?);
+            self.sparse_embedder = controlled.withGeneration(generation);
+            self.prepared_sparse_revision = generation.revision;
+        }
+    }
+
+    /// Execute only source-local stages against an uncommitted postimage.
+    /// This request-owned enricher never appends WAL or publishes artifacts.
+    pub fn prepareDirectBody(self: *SparseEnricher, body: []const u8, policy: catalog_mod.NamespacePolicy, exclude_model_sources: bool) ![]u8 {
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(self.alloc, 64 * 1024 * 1024);
+        defer quota.deinit();
+        var scoped = self.*;
+        scoped.alloc = quota.allocator();
+        const prepared = scoped.prepareDirectBodyBounded(body, policy, exclude_model_sources) catch |err| {
+            // Model adapters may classify transport errors. Request control
+            // remains authoritative even when inference wrapped its failure.
+            if (self.execution_context) |context| try context.check();
+            if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
+            return err;
+        };
+        defer scoped.alloc.free(prepared);
+        if (prepared.len > self.direct_output_limit) return error.CommitRequirementTooLarge;
+        validateDirectBody(scoped.alloc, prepared) catch |err| {
+            if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
+            return err;
+        };
+        return self.alloc.dupe(u8, prepared);
+    }
+
+    fn prepareDirectBodyBounded(self: *SparseEnricher, body: []const u8, policy: catalog_mod.NamespacePolicy, exclude_model_sources: bool) ![]u8 {
+        const pipeline = @import("pipeline.zig").builtinPipelineForPolicy(policy);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        if (parsed.value != .object) {
+            if (pipeline.len == 0) return self.alloc.dupe(u8, body);
+            return error.UnsupportedCommitRequirement;
+        }
+        // Completion metadata is private; public source fields are not. Keep
+        // the complete source postimage and overlay only stage-owned outputs.
+        _ = parsed.value.object.swapRemove("_enrichment");
+        var current = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
+        errdefer self.alloc.free(current);
+        if (pipeline.len == 0) return current;
+        // Active producers own replacement, including terminal no-output.
+        // Keep unowned source fields, but never retain an old owned result.
+        for (pipeline.slice()) |spec| {
+            if (exclude_model_sources and spec.stage == .chunk_embeddings) continue;
+            _ = parsed.value.object.swapRemove(directStageOutput(spec.stage));
+            if (spec.stage == .chunk_embeddings) _ = parsed.value.object.swapRemove("chunk_preview");
+        }
+        const cleaned_current = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
+        self.alloc.free(current);
+        current = cleaned_current;
+        // Preserve valid authored inputs too (for example sparse weights when
+        // lexical generation is disabled). Active outputs were removed above;
+        // only freshly produced results can satisfy a stage dependency.
+        const text = text: {
+            if (parsed.value.object.get("text")) |value| if (value == .string) break :text value.string;
+            if (parsed.value.object.get("body")) |value| if (value == .string) break :text value.string;
+            break :text current;
+        };
+        // Pin fallback text before intermediate metadata grows the projection.
+        try parsed.value.object.put(parsed.arena.allocator(), "text", .{ .string = text });
+        var source = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
+        defer self.alloc.free(source);
+        try validateDirectBody(self.alloc, source);
+        var eligible: usize = 0;
+        for (pipeline.slice()) |spec| {
+            if (self.execution_context) |context| try context.check();
+            if (exclude_model_sources and spec.stage == .chunk_embeddings) continue;
+            eligible += 1;
+            const preference: catalog_mod.EnrichmentModelPreference = if (spec.model_preference != .deterministic_only and ((spec.stage == .lexical_sparse and self.sparse_embedder != null) or (spec.stage == .chunk_embeddings and self.chunk_embedder != null))) .require_model else spec.model_preference;
+            if (self.prepared_catalog != null and spec.stage == .chunk_embeddings)
+                self.direct_retained_bytes = try directRetainedBytes(self.alloc, current);
+            const result = try buildDerivedBodyAlloc(self, spec.stage, source, spec.pipeline_version, preference);
+            if (result.body) |next| {
+                defer self.alloc.free(next);
+                const intermediate = try mergeDirectStageAlloc(self.alloc, source, next, spec.stage);
+                self.alloc.free(source);
+                source = intermediate;
+                const merged = try mergeDirectStageAlloc(self.alloc, current, next, spec.stage);
+                self.alloc.free(current);
+                current = merged;
+            }
+            if (current.len > self.direct_output_limit) return error.CommitRequirementTooLarge;
+        }
+        if (pipeline.len != 0 and eligible == 0) return error.UnsupportedCommitRequirement;
+        if (self.prepared_catalog) |digest| {
+            var marked = try std.json.parseFromSlice(std.json.Value, self.alloc, current, .{ .parse_numbers = false });
+            defer marked.deinit();
+            const owned = marked.arena.allocator();
+            var state = marked.value.object.get("_enrichment") orelse std.json.Value{ .object = .empty };
+            if (state != .object) return error.InvalidEnrichmentStageProgress;
+            const hex = std.fmt.bytesToHex(digest, .lower);
+            try state.object.put(owned, "commit_catalog", .{ .string = try owned.dupe(u8, &hex) });
+            if (self.prepared_dense_generation) |generation| if (generation.revision) |revision| {
+                const encoded = std.fmt.bytesToHex(revision, .lower);
+                try state.object.put(owned, "commit_dense_revision", .{ .string = try owned.dupe(u8, &encoded) });
+            };
+            if (self.prepared_sparse_revision) |revision| {
+                const encoded = std.fmt.bytesToHex(revision, .lower);
+                try state.object.put(owned, "commit_sparse_revision", .{ .string = try owned.dupe(u8, &encoded) });
+            }
+            try marked.value.object.put(owned, "_enrichment", state);
+            const next = try std.json.Stringify.valueAlloc(self.alloc, marked.value, .{});
+            self.alloc.free(current);
+            current = next;
+        }
+        return current;
+    }
+
+    /// Prewarm one request-owned window. Provider results are reused only by
+    /// this attempt, whose provider generations were pinned before dispatch.
+    pub fn prewarmDirectWindow(self: *SparseEnricher, backing: Allocator, bodies: []const []const u8, policy: catalog_mod.NamespacePolicy, exclude_model_sources: bool) !DirectWindowCache {
+        var cache: DirectWindowCache = .{ .arena = std.heap.ArenaAllocator.init(backing) };
+        errdefer cache.deinit();
+        const a = cache.arena.allocator();
+        var sparse_texts: std.ArrayList([]const u8) = .empty;
+        var dense_texts: std.ArrayList([]const u8) = .empty;
+        var sparse_seen: std.StringHashMapUnmanaged(void) = .empty;
+        var dense_seen: std.StringHashMapUnmanaged(void) = .empty;
+        const sparse_model = policy.enrichment_enabled and policy.lexical_sparse_model_preference != .deterministic_only and self.sparse_embedder != null;
+        const dense_model = policy.chunk_embeddings_enabled and !exclude_model_sources and policy.chunk_embeddings_model_preference != .deterministic_only and self.chunk_embedder != null;
+        if (!sparse_model and !dense_model) return cache;
+        var minimum: usize = 0;
+        for (bodies) |body| {
+            if (self.execution_context) |context| try context.check();
+            const text = try directSourceTextAlloc(a, body, policy, exclude_model_sources);
+            if (sparse_model and !(try sparse_seen.getOrPut(a, text)).found_existing) try sparse_texts.append(a, text);
+            if (dense_model) {
+                const normalized = try query_reader.normalizeAlloc(a, text);
+                const chunks = if (normalized.len == 0) &.{} else try buildChunkPreviewAlloc(a, normalized, 8);
+                minimum = std.math.add(usize, minimum, try directRetainedBytes(a, body)) catch return error.CommitRequirementTooLarge;
+                for (chunks) |chunk| {
+                    const size = std.math.mul(usize, self.chunk_embedding_dims, 2) catch return error.CommitRequirementTooLarge;
+                    minimum = std.math.add(usize, minimum, size + chunk.len + 64) catch return error.CommitRequirementTooLarge;
+                    if (minimum > self.direct_output_limit) return error.CommitRequirementTooLarge;
+                    if (!(try dense_seen.getOrPut(a, chunk)).found_existing) try dense_texts.append(a, chunk);
+                }
+            }
+        }
+        // Bound both provider batch count and bytes, independent of the number
+        // of chunks a source produces. The backing quota bounds all responses.
+        var start: usize = 0;
+        while (start < sparse_texts.items.len) {
+            const end = directTextWindowEnd(sparse_texts.items, start);
+            if (self.execution_context) |context| try context.check();
+            const vectors = try self.sparse_embedder.?.embedSparseBatch(a, self.sparse_embedding_name.?, sparse_texts.items[start..end]);
+            if (vectors.len != end - start) return error.InvalidDocumentBody;
+            for (sparse_texts.items[start..end], vectors) |text, vector| {
+                if (vector.indices.len != vector.values.len) return error.InvalidDocumentBody;
+                for (vector.values) |value| if (!std.math.isFinite(value)) return error.InvalidDocumentBody;
+                try cache.sparse.put(a, text, vector);
+            }
+            start = end;
+        }
+        start = 0;
+        while (start < dense_texts.items.len) {
+            const end = directTextWindowEnd(dense_texts.items, start);
+            if (self.execution_context) |context| try context.check();
+            const vectors = try self.chunk_embedder.?.embedDenseBatch(a, self.chunk_embedding_name.?, dense_texts.items[start..end], self.chunk_embedding_dims);
+            if (vectors.len != end - start) return error.ChunkEmbeddingBatchMismatch;
+            for (dense_texts.items[start..end], vectors) |text, vector| {
+                if (vector.len != self.chunk_embedding_dims) return error.ChunkEmbeddingBatchMismatch;
+                for (vector) |value| if (!std.math.isFinite(value)) return error.ChunkEmbeddingBatchMismatch;
+                try cache.dense.put(a, text, vector);
+            }
+            start = end;
+        }
+        if (self.execution_context) |context| try context.check();
+        return cache;
+    }
+
+    fn directSparse(self: *SparseEnricher, a: Allocator, provider: embedder_mod.SparseEmbedder, name: []const u8, text: []const u8) !embedder_mod.SparseEmbedding {
+        if (self.direct_cache) |cache| if (cache.sparse.get(text)) |value| {
+            const indices = try a.dupe(u32, value.indices);
+            errdefer a.free(indices);
+            return .{ .indices = indices, .values = try a.dupe(f32, value.values) };
+        };
+        return provider.embedSparse(a, name, text);
     }
 
     pub fn configureModelChunkerFromIndexes(self: *SparseEnricher, indexes: std.json.Value, index_name: []const u8, options: @import("antfly_local_sources").inference_managed_embedder.InitOptions) !void {
@@ -696,19 +917,119 @@ fn buildDerivedBodyAlloc(
     pipeline_version: u32,
     model_preference: catalog_mod.EnrichmentModelPreference,
 ) !DerivedBodyResult {
+    var normalized: ?[]u8 = null;
+    defer if (normalized) |bytes| self.alloc.free(bytes);
+    if (self.prepared_catalog) |expected| if (std.mem.indexOf(u8, body, "commit_catalog") != null) {
+        var projected = try document_projection.parseAlloc(self.alloc, body);
+        defer projected.deinit(self.alloc);
+        if (projected.prepared_catalog) |digest| if (!std.mem.eql(u8, &digest, &expected)) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{});
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                _ = parsed.value.object.swapRemove("_enrichment");
+                normalized = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
+            }
+        };
+    };
+    const input = normalized orelse body;
     var result = if (stage == .chunk_embeddings and self.model_chunker != null and model_preference != .deterministic_only)
-        try buildModelAwareChunkBodyAlloc(self, body, pipeline_version)
+        try buildModelAwareChunkBodyAlloc(self, input, pipeline_version)
     else switch (stage) {
-        .lexical_sparse => try buildDerivedSparseBodyAlloc(self, body, pipeline_version, model_preference),
-        .chunk_preview => DerivedBodyResult{ .body = try buildDerivedChunkPreviewBodyAlloc(self.alloc, body, pipeline_version) },
-        .chunk_embeddings => try buildDerivedChunkEmbeddingsBodyAlloc(self, body, pipeline_version, model_preference),
-        .rerank_terms => DerivedBodyResult{ .body = try buildDerivedRerankTermsBodyAlloc(self.alloc, body, pipeline_version) },
+        .lexical_sparse => try buildDerivedSparseBodyAlloc(self, input, pipeline_version, model_preference),
+        .chunk_preview => DerivedBodyResult{ .body = try buildDerivedChunkPreviewBodyAlloc(self.alloc, input, pipeline_version) },
+        .chunk_embeddings => try buildDerivedChunkEmbeddingsBodyAlloc(self, input, pipeline_version, model_preference),
+        .rerank_terms => DerivedBodyResult{ .body = try buildDerivedRerankTermsBodyAlloc(self.alloc, input, pipeline_version) },
     };
     if (result.body) |produced| {
         defer self.alloc.free(produced);
-        result.body = try preserveOtherEnrichmentOutputsAlloc(self.alloc, body, produced, stage);
+        result.body = try preserveOtherEnrichmentOutputsAlloc(self.alloc, input, produced, stage);
     }
     return result;
+}
+
+fn directTextWindowEnd(texts: []const []const u8, start: usize) usize {
+    var end = start;
+    var bytes: usize = 0;
+    while (end < texts.len and end - start < 32) {
+        if (end != start and texts[end].len > 256 * 1024 -| bytes) break;
+        bytes +|= texts[end].len;
+        end += 1;
+    }
+    return end;
+}
+
+fn directSourceTextAlloc(a: Allocator, body: []const u8, policy: catalog_mod.NamespacePolicy, exclude: bool) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.UnsupportedCommitRequirement;
+    _ = parsed.value.object.swapRemove("_enrichment");
+    const pipeline = @import("pipeline.zig").builtinPipelineForPolicy(policy);
+    for (pipeline.slice()) |spec| {
+        if (exclude and spec.stage == .chunk_embeddings) continue;
+        _ = parsed.value.object.swapRemove(directStageOutput(spec.stage));
+        if (spec.stage == .chunk_embeddings) _ = parsed.value.object.swapRemove("chunk_preview");
+    }
+    const logical = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(logical);
+    try validateDirectBody(a, logical);
+    if (parsed.value.object.get("text")) |value| if (value == .string) return a.dupe(u8, value.string);
+    if (parsed.value.object.get("body")) |value| if (value == .string) return a.dupe(u8, value.string);
+    return a.dupe(u8, logical);
+}
+
+// Vector preflight counts the retained source postimage. Subtract only
+// replaceable values, keeping their framing as a conservative allowance.
+fn directRetainedBytes(a: Allocator, body: []const u8) !usize {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDocumentBody;
+    var bytes = body.len;
+    for ([_][]const u8{ "chunk_embeddings", "chunk_preview" }) |name| if (parsed.value.object.get(name)) |value| {
+        const encoded = try std.json.Stringify.valueAlloc(a, value, .{});
+        defer a.free(encoded);
+        bytes -|= encoded.len;
+    };
+    return bytes;
+}
+
+fn directStageOutput(stage: catalog_mod.EnrichmentStage) []const u8 {
+    return switch (stage) {
+        .lexical_sparse => "sparse_embedding",
+        .chunk_preview => "chunk_preview",
+        .chunk_embeddings => "chunk_embeddings",
+        .rerank_terms => "rerank_terms",
+    };
+}
+
+fn mergeDirectStageAlloc(a: Allocator, original: []const u8, produced: []const u8, stage: catalog_mod.EnrichmentStage) ![]u8 {
+    var before = try std.json.parseFromSlice(std.json.Value, a, original, .{ .parse_numbers = false });
+    defer before.deinit();
+    var after = try std.json.parseFromSlice(std.json.Value, a, produced, .{ .parse_numbers = false });
+    defer after.deinit();
+    if (before.value != .object or after.value != .object) return error.InvalidDocumentBody;
+    const arena = before.arena.allocator();
+    const name = directStageOutput(stage);
+    if (after.value.object.get(name)) |value| try before.value.object.put(arena, name, value);
+    // Chunk embeddings also own their freshly computed preview, but no media
+    // or transcript fields: those belong to separate producers/source inputs.
+    if (stage == .chunk_embeddings) if (after.value.object.get("chunk_preview")) |value| try before.value.object.put(arena, "chunk_preview", value);
+    var state = before.value.object.get("_enrichment") orelse std.json.Value{ .object = .empty };
+    if (state != .object) return error.InvalidEnrichmentStageProgress;
+    if (after.value.object.get("_enrichment")) |next| {
+        if (next != .object) return error.InvalidEnrichmentStageProgress;
+        const prefix = switch (stage) {
+            .lexical_sparse => "lexical_sparse",
+            .chunk_preview => "chunk_preview",
+            .chunk_embeddings => "chunk_embeddings",
+            .rerank_terms => "rerank_terms",
+        };
+        var it = next.object.iterator();
+        while (it.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
+            try state.object.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+        };
+    }
+    try before.value.object.put(arena, "_enrichment", state);
+    return std.json.Stringify.valueAlloc(a, before.value, .{});
 }
 
 fn preserveOtherEnrichmentOutputsAlloc(a: Allocator, original: []const u8, produced: []const u8, stage: catalog_mod.EnrichmentStage) ![]u8 {
@@ -748,6 +1069,17 @@ fn preserveOtherEnrichmentOutputsAlloc(a: Allocator, original: []const u8, produ
     return std.json.Stringify.valueAlloc(a, after.value, .{});
 }
 
+fn isExecutionControlError(err: anyerror) bool {
+    return switch (err) {
+        error.Canceled, error.Cancelled, error.Timeout, error.DeadlineExceeded => true,
+        else => false,
+    };
+}
+
+fn modelFailure(err: anyerror, classified: anyerror) anyerror {
+    return if (isExecutionControlError(err) or err == error.OutOfMemory) err else classified;
+}
+
 fn buildDerivedSparseBodyAlloc(
     self: *SparseEnricher,
     body: []const u8,
@@ -762,7 +1094,7 @@ fn buildDerivedSparseBodyAlloc(
     }
 
     var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
+    defer out.deinit(alloc);
     try appendJSONString(alloc, &out, "{");
     var wrote_field = false;
     try appendPreservedDocumentFieldsJSON(alloc, &out, body, &wrote_field);
@@ -784,7 +1116,7 @@ fn buildDerivedSparseBodyAlloc(
             .prefer_model => {
                 if (self.sparse_embedder) |embedder| {
                     const embedding_name = self.sparse_embedding_name orelse return EnrichmentError.MissingSparseEmbeddingName;
-                    const sparse = embedder.embedSparse(alloc, embedding_name, projection.text) catch null;
+                    const sparse = self.directSparse(alloc, embedder, embedding_name, projection.text) catch |err| if (isExecutionControlError(err) or err == error.OutOfMemory) return err else null;
                     if (sparse) |value| {
                         var owned_sparse = value;
                         defer owned_sparse.deinit(alloc);
@@ -811,7 +1143,7 @@ fn buildDerivedSparseBodyAlloc(
             .require_model => {
                 const embedder = self.sparse_embedder orelse return EnrichmentError.RequiredSparseModelUnavailable;
                 const embedding_name = self.sparse_embedding_name orelse return EnrichmentError.MissingSparseEmbeddingName;
-                var sparse = embedder.embedSparse(alloc, embedding_name, projection.text) catch return EnrichmentError.SparseEmbeddingModelFailed;
+                var sparse = self.directSparse(alloc, embedder, embedding_name, projection.text) catch |err| return modelFailure(err, EnrichmentError.SparseEmbeddingModelFailed);
                 defer sparse.deinit(alloc);
                 used_model = true;
                 try appendJSONString(alloc, &out, ",\"sparse_embedding\":{");
@@ -1420,6 +1752,14 @@ fn buildDerivedChunkEmbeddingsBodyAlloc(
         alloc.free(value);
     };
     if (chunks.len == 0) return .{};
+    if (self.prepared_catalog != null) {
+        var minimum: usize = self.direct_retained_bytes orelse body.len;
+        for (chunks) |chunk| {
+            minimum = std.math.add(usize, minimum, std.math.mul(usize, self.chunk_embedding_dims, 2) catch return error.CommitRequirementTooLarge) catch return error.CommitRequirementTooLarge;
+            minimum = std.math.add(usize, minimum, chunk.len + 64) catch return error.CommitRequirementTooLarge;
+            if (minimum > self.direct_output_limit) return error.CommitRequirementTooLarge;
+        }
+    }
 
     const chunk_embedding_result = try buildChunkEmbeddingsAlloc(
         self,
@@ -1528,11 +1868,11 @@ fn buildDerivedRerankTermsBodyAlloc(alloc: Allocator, body: []const u8, pipeline
         try appendJSONString(alloc, &out, ",\"chunk_embeddings\":");
         try appendChunkEmbeddingsJSON(alloc, &out, chunk_embeddings);
     }
-    try appendJSONString(alloc, &out, ",\"rerank_terms\":[");
+    try appendJSONString(alloc, &out, ",\"rerank_terms\":");
     try appendStringSliceArrayJSON(alloc, &out, rerank_terms);
     const version = try std.fmt.allocPrint(alloc, "{d}", .{pipeline_version});
     defer alloc.free(version);
-    try appendJSONString(alloc, &out, "],\"_enrichment\":{\"rerank_terms\":true,\"rerank_terms_version\":");
+    try appendJSONString(alloc, &out, ",\"_enrichment\":{\"rerank_terms\":true,\"rerank_terms_version\":");
     try appendJSONString(alloc, &out, version);
     if (projection.lexical_sparse_version) |lexical_version| {
         const lexical = try std.fmt.allocPrint(alloc, "{d}", .{lexical_version});
@@ -1600,6 +1940,22 @@ fn buildChunkEmbeddingsAlloc(
     errdefer {
         for (out[0..initialized]) |*chunk_embedding| chunk_embedding.deinit(alloc);
     }
+    if (self.direct_cache) |cache| {
+        var complete = true;
+        for (chunks) |chunk| if (!cache.dense.contains(chunk)) {
+            complete = false;
+            break;
+        };
+        if (complete) {
+            for (chunks, out) |chunk, *item| {
+                const owned_chunk = try alloc.dupe(u8, chunk);
+                errdefer alloc.free(owned_chunk);
+                item.* = .{ .chunk = owned_chunk, .embedding = try alloc.dupe(f32, cache.dense.get(chunk).?) };
+                initialized += 1;
+            }
+            return .{ .embeddings = out, .used_model = true, .used_fallback = false };
+        }
+    }
     // Remote providers can embed a bounded chunk window in one invocation.
     // Keep the legacy per-chunk path for providers without a batch contract.
     if (model_preference == .require_model) if (self.chunk_embedder) |embedder| if (embedder.dense_embed_batch_fn != null) {
@@ -1666,7 +2022,7 @@ fn buildDenseEmbeddingAlloc(
         .prefer_model => {
             if (self.chunk_embedder) |embedder| {
                 const embedding_name = self.chunk_embedding_name orelse return EnrichmentError.MissingChunkEmbeddingName;
-                const model_result = embedder.embedDense(alloc, embedding_name, text, @intCast(dims)) catch null;
+                const model_result = embedder.embedDense(alloc, embedding_name, text, @intCast(dims)) catch |err| if (isExecutionControlError(err) or err == error.OutOfMemory) return err else null;
                 if (model_result) |result| {
                     return .{ .embedding = result, .used_model = true, .used_fallback = false };
                 }
@@ -1685,7 +2041,7 @@ fn buildDenseEmbeddingAlloc(
         .require_model => {
             const embedder = self.chunk_embedder orelse return EnrichmentError.RequiredChunkEmbeddingModelUnavailable;
             const embedding_name = self.chunk_embedding_name orelse return EnrichmentError.MissingChunkEmbeddingName;
-            const result = embedder.embedDense(alloc, embedding_name, text, @intCast(dims)) catch return EnrichmentError.ChunkEmbeddingModelFailed;
+            const result = embedder.embedDense(alloc, embedding_name, text, @intCast(dims)) catch |err| return modelFailure(err, EnrichmentError.ChunkEmbeddingModelFailed);
             return .{ .embedding = result, .used_model = true, .used_fallback = false };
         },
     }
@@ -4544,4 +4900,298 @@ test "model aware media serverless completed input accounting survives output gr
         };
     }
     try std.testing.expect(rejected);
+}
+
+test "commit requirements serverless direct preparation rejects models and ignores forged completion" {
+    const a = std.testing.allocator;
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    try enricher.setSparseEmbedder(FailingSparseEmbedder.interface(), "sparse");
+    try std.testing.expectError(error.SparseEmbeddingModelFailed, enricher.prepareDirectBody("{\"text\":\"source\",\"sparse_embedding\":{\"1\":1},\"_enrichment\":{\"lexical_sparse_version\":999}}", .{ .enrichment_enabled = true }, false));
+    enricher.clearSparseEmbedder();
+    const body = try enricher.prepareDirectBody("{\"text\":\"source document\"}", .{ .chunk_preview_enabled = true }, false);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.contains("chunk_preview"));
+    // A model/media-only plan cannot silently become an empty gate.
+    try std.testing.expectError(error.UnsupportedCommitRequirement, enricher.prepareDirectBody("{\"text\":\"source\"}", .{ .chunk_embeddings_enabled = true }, true));
+}
+
+test "commit requirements serverless catalog changes reopen prepared coverage" {
+    const a = std.testing.allocator;
+    const facts_builder = @import("../build/document_facts_builder.zig");
+    const policy: catalog_mod.NamespacePolicy = .{ .enrichment_enabled = true, .lexical_sparse_model_preference = .deterministic_only };
+    const old_indexes = "{\"sparse\":{\"type\":\"embeddings\",\"sparse\":true,\"embedder\":{\"model\":\"first\"}}}";
+    const new_indexes = "{\"sparse\":{\"type\":\"embeddings\",\"sparse\":true,\"embedder\":{\"model\":\"second\"}}}";
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    enricher.prepared_catalog = try facts_builder.fingerprint(a, policy, old_indexes);
+    const body = try enricher.prepareDirectBody("{\"text\":\"source document\"}", policy, false);
+    defer a.free(body);
+    const document: @import("../query/materializer.zig").Document = .{ .doc_id = @constCast("doc"), .body = body, .last_lsn = 1, .last_timestamp_ns = 1 };
+    try std.testing.expectEqual(@as(u4, 0), (try facts_builder.flagsForDocumentAlloc(a, document, policy, old_indexes)).pending);
+    try std.testing.expect((try facts_builder.flagsForDocumentAlloc(a, document, policy, new_indexes)).pending & 1 != 0);
+    enricher.prepared_catalog = try facts_builder.fingerprint(a, policy, new_indexes);
+    const replacement = try buildDerivedBodyAlloc(&enricher, .lexical_sparse, body, policy.enrichment_pipeline_version, .deterministic_only);
+    const next = replacement.body orelse return error.TestUnexpectedResult;
+    defer a.free(next);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, next, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.get("_enrichment").?.object.contains("commit_catalog"));
+}
+
+test "commit requirements serverless direct transforms cannot reuse old chunk inputs" {
+    const a = std.testing.allocator;
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    const body = try enricher.prepareDirectBody("{\"text\":\"new words\",\"chunk_preview\":[\"old words\"],\"chunk_embeddings\":[],\"_enrichment\":{\"chunk_embeddings_version\":999}}", .{ .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .deterministic_only }, false);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const chunks = parsed.value.object.get("chunk_embeddings").?.array.items;
+    try std.testing.expect(chunks.len != 0);
+    try std.testing.expectEqualStrings("new words", chunks[0].object.get("chunk").?.string);
+}
+
+test "commit requirements serverless rejects predictable vector amplification before inference" {
+    const a = std.testing.allocator;
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    enricher.prepared_catalog = @splat(1);
+    enricher.chunk_embedding_dims = 8192;
+    enricher.direct_output_limit = 1024;
+    try std.testing.expectError(error.CommitRequirementTooLarge, enricher.prepareDirectBody("{\"text\":\"some source words\"}", .{ .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .require_model }, false));
+    // Unmanaged source data remains in the committed postimage even though
+    // the provider sees only a small text projection.
+    enricher.chunk_embedding_dims = 32;
+    const body = try std.fmt.allocPrint(a, "{{\"text\":\"source words\",\"payload\":\"{s}\"}}", .{&@as([900]u8, @splat('x'))});
+    defer a.free(body);
+    try std.testing.expectError(error.CommitRequirementTooLarge, enricher.prepareDirectBody(body, .{ .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .require_model }, false));
+}
+
+test "commit requirements serverless model cancellation survives error classification" {
+    const Probe = struct {
+        canceled: std.atomic.Value(bool) = .init(false),
+        fn embed(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            return error.UnexpectedLegacyInference;
+        }
+        fn controlled(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, context: @import("antfly_inference_execution_context").RequestContext) !embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            self.canceled.store(true, .release);
+            return error.ProviderTransportFailure;
+        }
+    };
+    var probe = Probe{};
+    const context: @import("antfly_inference_execution_context").RequestContext = .{ .io = std.testing.io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&probe.canceled) };
+    var enricher = SparseEnricher.init(std.testing.allocator, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    enricher.execution_context = context;
+    try enricher.setSparseEmbedder((embedder_mod.SparseEmbedder{ .ptr = &probe, .sparse_embed_fn = Probe.embed, .sparse_embed_with_context_fn = Probe.controlled }).withRequestContext(context), "model");
+    try std.testing.expectError(error.Cancelled, enricher.prepareDirectBody("{\"text\":\"must cancel during inference\"}", .{ .enrichment_enabled = true, .lexical_sparse_model_preference = .require_model }, false));
+    probe.canceled.store(false, .release);
+    enricher.execution_context = .{ .io = std.testing.io, .deadline_ns = 0 };
+    try std.testing.expectError(error.Timeout, enricher.prepareDirectBody("{\"text\":\"expired\"}", .{ .enrichment_enabled = true }, false));
+}
+
+test "serverless managed runtime commit requirements pin one dense generation across documents and partitions" {
+    const work = @import("antfly_inference_work");
+    const Context = @import("antfly_inference_execution_context").RequestContext;
+    const Probe = struct {
+        revision: u8 = 1,
+        resolutions: usize = 0,
+        calls: usize = 0,
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedUnpinnedInference;
+        }
+        fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8, _: u32) ![]const []const f32 {
+            return error.UnexpectedUnpinnedInference;
+        }
+        fn resolve(ptr: *anyopaque, _: Allocator, _: []const u8, context: ?Context) !work.CapabilityLease {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.resolutions += 1;
+            return .{ .capabilities = .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .batch = .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, .model_revision = @as([32]u8, @splat(self.revision)) } };
+        }
+        fn planned(ptr: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8, dims: u32, context: ?Context, lease: work.CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(texts.len <= 2);
+            try std.testing.expectEqual(@as(u8, 1), lease.capabilities.?.model_revision.?[0]);
+            const vectors = try a.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| a.free(vector);
+                a.free(vectors);
+            }
+            for (vectors) |*vector| {
+                const values = try a.alloc(f32, dims);
+                @memset(values, 1);
+                vector.* = values;
+                initialized += 1;
+            }
+            self.revision = 2;
+            return vectors;
+        }
+    };
+    const a = std.testing.allocator;
+    var probe = Probe{};
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    try enricher.setChunkEmbedder(.{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch, .dense_embed_batch_planned_fn = Probe.planned, .resolve_part_lease_fn = Probe.resolve }, "dense", 2);
+    try enricher.captureDirectProviders(.{ .io = std.testing.io, .deadline_ns = null });
+    const policy: catalog_mod.NamespacePolicy = .{ .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .require_model };
+    for (0..2) |_| {
+        const body = try enricher.prepareDirectBody("{\"text\":\"one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone twentytwo twentythree twentyfour\"}", policy, false);
+        defer a.free(body);
+    }
+    try std.testing.expect(probe.calls >= 4);
+    try std.testing.expectEqual(@as(usize, 1), probe.resolutions);
+    const provider = enricher.chunk_embedder.?;
+    try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(a, "dense", enricher.prepared_dense_generation.?));
+    // A -> B -> A cannot admit mixed vectors: both bodies used the A lease.
+    probe.revision = 1;
+    try provider.requireTextGeneration(a, "dense", enricher.prepared_dense_generation.?);
+}
+
+test "commit requirements direct stages preserve source fields outside producer ownership" {
+    const a = std.testing.allocator;
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    const source = "{\"text\":\"new source words\",\"title\":\"keep me\",\"metadata\":{\"tenant\":7,\"exact\":9223372036854775809,\"decimal\":9007199254740993.0},\"transcript\":\"user transcript\",\"transcript_spans\":[1],\"media_outputs\":[2],\"sparse_embedding\":{\"custom\":3},\"chunk_preview\":[\"user preview\"],\"chunk_embeddings\":[{\"chunk\":\"user chunk\",\"embedding\":[1,0]}],\"rerank_terms\":[\"user term\"]}";
+    const policies = [_]catalog_mod.NamespacePolicy{
+        .{},
+        .{ .chunk_preview_enabled = true },
+        .{ .enrichment_enabled = true, .lexical_sparse_model_preference = .deterministic_only },
+        .{ .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .deterministic_only },
+    };
+    for (policies) |policy| {
+        const body = try enricher.prepareDirectBody(source, policy, false);
+        defer a.free(body);
+        var before = try std.json.parseFromSlice(std.json.Value, a, source, .{ .parse_numbers = false });
+        defer before.deinit();
+        var after = try std.json.parseFromSlice(std.json.Value, a, body, .{ .parse_numbers = false });
+        defer after.deinit();
+        var fields = before.value.object.iterator();
+        while (fields.next()) |field| {
+            const name = field.key_ptr.*;
+            if ((policy.chunk_preview_enabled or policy.chunk_embeddings_enabled) and std.mem.eql(u8, name, "chunk_preview")) continue;
+            if (policy.chunk_embeddings_enabled and std.mem.eql(u8, name, "chunk_embeddings")) continue;
+            if (policy.enrichment_enabled and std.mem.eql(u8, name, "sparse_embedding")) continue;
+            const expected = try std.json.Stringify.valueAlloc(a, field.value_ptr.*, .{});
+            defer a.free(expected);
+            const actual = try std.json.Stringify.valueAlloc(a, after.value.object.get(name) orelse return error.TestUnexpectedResult, .{});
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(expected, actual);
+        }
+    }
+    const scalar = try enricher.prepareDirectBody("\"plain source\"", .{}, false);
+    defer a.free(scalar);
+    try std.testing.expectEqualStrings("\"plain source\"", scalar);
+}
+
+test "commit requirements direct no-output retires owned results and preserves fresh dependencies" {
+    const a = std.testing.allocator;
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    const policy: catalog_mod.NamespacePolicy = .{ .enrichment_enabled = true, .lexical_sparse_model_preference = .deterministic_only, .chunk_preview_enabled = true, .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .deterministic_only, .rerank_terms_enabled = true };
+    const body = try enricher.prepareDirectBody("{\"text\":\"   \",\"title\":\"keep\",\"sparse_embedding\":{\"stale\":1},\"chunk_preview\":[\"stale\"],\"chunk_embeddings\":[4],\"rerank_terms\":[\"stale\"]}", policy, false);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    for ([_][]const u8{ "sparse_embedding", "chunk_preview", "chunk_embeddings", "rerank_terms" }) |name| try std.testing.expect(!parsed.value.object.contains(name));
+    try std.testing.expectEqualStrings("keep", parsed.value.object.get("title").?.string);
+    try std.testing.expectError(error.InvalidDocumentBody, enricher.prepareDirectBody("{\"text\":\"source\",\"chunk_embeddings\":[4]}", .{}, false));
+    const authored = try enricher.prepareDirectBody("{\"text\":\"source words\",\"sparse_embedding\":{\"authored\":9}}", .{ .rerank_terms_enabled = true }, false);
+    defer a.free(authored);
+    var projection = try document_projection.parseAlloc(a, authored);
+    defer projection.deinit(a);
+    try std.testing.expectEqualStrings("authored", projection.rerank_terms.?[0]);
+}
+
+test "commit requirements direct windows batch providers and reuse fresh sparse rerank dependencies" {
+    const Probe = struct {
+        dense_calls: usize = 0,
+        sparse_calls: usize = 0,
+        dense_items: usize = 0,
+        sparse_items: usize = 0,
+        fn dense(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedScalarInference;
+        }
+        fn sparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            return error.UnexpectedScalarInference;
+        }
+        fn controlledDense(ptr: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: @import("antfly_inference_execution_context").RequestContext) ![][]f32 {
+            try context.check();
+            return denseBatch(ptr, a, name, texts, dims);
+        }
+        fn controlledSparse(ptr: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, context: @import("antfly_inference_execution_context").RequestContext) ![]embedder_mod.SparseEmbedding {
+            try context.check();
+            return sparseBatch(ptr, a, name, texts);
+        }
+        fn denseBatch(ptr: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8, dims: u32) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(texts.len > 1 and texts.len <= 32);
+            self.dense_calls += 1;
+            self.dense_items += texts.len;
+            const out = try a.alloc([]f32, texts.len);
+            for (out) |*vector| {
+                vector.* = try a.alloc(f32, dims);
+                @memset(vector.*, 0.5);
+            }
+            return out;
+        }
+        fn sparseBatch(ptr: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8) ![]embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(texts.len > 1 and texts.len <= 32);
+            self.sparse_calls += 1;
+            self.sparse_items += texts.len;
+            const out = try a.alloc(embedder_mod.SparseEmbedding, texts.len);
+            for (out) |*vector| vector.* = .{ .indices = try a.dupe(u32, &.{7}), .values = try a.dupe(f32, &.{9}) };
+            return out;
+        }
+    };
+    const a = std.testing.allocator;
+    var probe: Probe = .{};
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    try enricher.setSparseEmbedder(.{ .ptr = &probe, .sparse_embed_fn = Probe.sparse, .sparse_embed_batch_fn = Probe.sparseBatch, .sparse_embed_batch_with_context_fn = Probe.controlledSparse }, "sparse");
+    try enricher.setChunkEmbedder(.{ .ptr = &probe, .dense_embed_fn = Probe.dense, .dense_embed_batch_fn = Probe.denseBatch, .dense_embed_batch_with_context_fn = Probe.controlledDense }, "dense", 2);
+    const context: @import("antfly_inference_execution_context").RequestContext = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) };
+    enricher.execution_context = context;
+    enricher.sparse_embedder = enricher.sparse_embedder.?.withRequestContext(context);
+    enricher.chunk_embedder = enricher.chunk_embedder.?.withRequestContext(context);
+    enricher.prepared_catalog = @splat(1);
+    const policy: catalog_mod.NamespacePolicy = .{ .enrichment_enabled = true, .lexical_sparse_model_preference = .require_model, .chunk_preview_enabled = true, .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .require_model, .rerank_terms_enabled = true };
+    var bodies: [40][]const u8 = undefined;
+    for (&bodies, 0..) |*body, i| body.* = try std.fmt.allocPrint(a, "{{\"text\":\"document{d} common tail\"}}", .{i});
+    defer for (bodies) |body| a.free(body);
+    var start: usize = 0;
+    while (start < bodies.len) {
+        const end = @min(start + 32, bodies.len);
+        var cache = try enricher.prewarmDirectWindow(a, bodies[start..end], policy, false);
+        defer cache.deinit();
+        enricher.direct_cache = &cache;
+        defer enricher.direct_cache = null;
+        for (bodies[start..end]) |source| {
+            const body = try enricher.prepareDirectBody(source, policy, false);
+            defer a.free(body);
+            var projected = try document_projection.parseAlloc(a, body);
+            defer projected.deinit(a);
+            try std.testing.expectEqualStrings("f7", projected.rerank_terms.?[0]);
+            try std.testing.expectEqual(@as(usize, 1), projected.chunk_embeddings.?.len);
+        }
+        start = end;
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.dense_calls);
+    try std.testing.expectEqual(@as(usize, 2), probe.sparse_calls);
+    try std.testing.expectEqual(@as(usize, 40), probe.dense_items);
+    try std.testing.expectEqual(@as(usize, 40), probe.sparse_items);
+    enricher.chunk_embedding_dims = 1024 * 1024;
+    enricher.direct_output_limit = 1024;
+    try std.testing.expectError(error.CommitRequirementTooLarge, enricher.prewarmDirectWindow(a, bodies[0..1], policy, false));
+    try std.testing.expectEqual(@as(usize, 2), probe.dense_calls);
+    try std.testing.expectEqual(@as(usize, 2), probe.sparse_calls);
 }
