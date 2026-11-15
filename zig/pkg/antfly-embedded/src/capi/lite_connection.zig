@@ -1232,7 +1232,7 @@ pub const WriterLane = struct {
                 // parked lifetime.
                 connection.gate.mutex.lockUncancelable(io);
                 var lease: ?native.PathWriterLock = parked;
-                const root = connection.refresh(&lease, intent) catch |err| {
+                const root = connection.refresh(&lease, intent, true) catch |err| {
                     connection.gate.mutex.unlock(io);
                     if (lease) |*held| held.close();
                     self.mutex.lockUncancelable(io);
@@ -1269,7 +1269,7 @@ pub const WriterLane = struct {
                     self.mutex.unlock(io);
                     return err;
                 };
-                const root = connection.refresh(&lease, intent) catch |err| {
+                const root = connection.refresh(&lease, intent, true) catch |err| {
                     if (lease) |*held| held.close();
                     connection.gate.mutex.unlock(io);
                     self.mutex.lockUncancelable(io);
@@ -2936,7 +2936,7 @@ pub const Owner = struct {
             var proof_lease: ?native.PathWriterLock = lease;
             lease_held = false;
             defer if (proof_lease) |*held| held.close();
-            try self.verifyAllocatorAssumeLocked(&proof_lease, null);
+            try self.verifyAllocatorAssumeLocked(&proof_lease, null, false);
             return true;
         }
         try @import("sql_commit.zig").recover(foreground);
@@ -3468,7 +3468,14 @@ pub const Owner = struct {
     /// the gate held on every path; proof teardown releases the path lease.
     /// Runtime pins keep the reader's borrowed allocator/executor alive while
     /// the graph walk runs with both publication locks released.
-    fn verifyAllocatorAssumeLocked(self: *Owner, lease: *?native.PathWriterLock, connection: ?*Connection) !void {
+    /// `skip_lane_wait`: forwarded to the writer-lease reacquisition below
+    /// (see `Connection.refresh`'s own doc comment on its identically
+    /// named parameter) -- `true` only when `connection` is the same
+    /// `Connection` whose own `WriterLane.checkout` is still on the stack
+    /// above this call, `false` for every other caller (background
+    /// maintenance, or a direct `connection.acquire()`-based caller that
+    /// never touched the lane at all).
+    fn verifyAllocatorAssumeLocked(self: *Owner, lease: *?native.PathWriterLock, connection: ?*Connection, skip_lane_wait: bool) !void {
         const io = h.handleLockIo();
         if (!try self.retainMaintenanceTurnAssumeLocked()) return error.FileBusy;
         defer self.releaseMaintenanceTurnAssumeLocked();
@@ -3556,7 +3563,7 @@ pub const Owner = struct {
         // its connection-local busy policy when another process wins the
         // writer lease during the detached proof. Background turns stay
         // nonblocking and yield to that writer instead of consuming its budget.
-        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked(false) else self.withReadRegistrationBatch(try self.tryWriterLeaseAssumeLocked());
+        lease.* = if (connection) |caller| try caller.acquirePathLeaseAssumeLocked(skip_lane_wait) else self.withReadRegistrationBatch(try self.tryWriterLeaseAssumeLocked());
         var probe = try native.NativeFile.openWithIo(alloc, io, self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         if (self.current) |current| {
@@ -3639,7 +3646,7 @@ pub const Owner = struct {
             self.verification_cancel.requested.store(false, .release);
             self.allocator_proof_mutex.lockUncancelable(io);
             defer self.allocator_proof_mutex.unlock(io);
-            try self.verifyAllocatorAssumeLocked(&lease, null);
+            try self.verifyAllocatorAssumeLocked(&lease, null, false);
             if (lease == null) lease = try self.tryWriterLeaseAssumeLocked();
         }
     }
@@ -3967,7 +3974,25 @@ pub const Connection = struct {
     /// keep the append-first path, reads do not demand reuse proof, and bounded
     /// owners still require capacity proof.
     /// No SQL request has started, so admission never replays partial work.
-    pub fn refresh(self: *Connection, lease: *?native.PathWriterLock, intent: api.StorageIntent) !*h.Handle {
+    ///
+    /// `skip_lane_wait`: `true` only from `WriterLane.checkout`'s own two
+    /// call sites, which have already marked `writer_lane.checked_out =
+    /// true` for *this* checkout before calling this function -- exactly
+    /// the condition `Connection.acquireForOwnCheckout`'s own doc comment
+    /// describes for its initial lease. A capacity/reuse admission retry
+    /// below reacquires the lease a *second* time (after a detached
+    /// allocator proof closes and reopens it); without threading this
+    /// through to that reacquisition too, it would call
+    /// `WriterLane.waitParkedForStore`, which waits on `writer_lane.
+    /// parked` -- a flag only *this* call's own eventual return (back up
+    /// through `checkout`'s own `checkin`) can ever set, so the wait can
+    /// never resolve except by timing out the entire busy budget (observed
+    /// live: `verifyAllocatorAssumeLocked`'s reacquire burning the whole
+    /// `busy_timeout_ms` on an otherwise-uncontended lease). Every other
+    /// caller (plain reads, non-lane-eligible writes, and every direct
+    /// test call to this function) passes `false`, preserving the
+    /// original wait behavior where it is not self-referential.
+    pub fn refresh(self: *Connection, lease: *?native.PathWriterLock, intent: api.StorageIntent, skip_lane_wait: bool) !*h.Handle {
         var root = try self.owner.refresh();
         if (self.options.profile == .native and self.options.open_mode == .writer and
             (usesCapacityAdmission(root) or (intent == .mutation and try self.needsReuseAdmission(root))))
@@ -3997,7 +4022,7 @@ pub const Connection = struct {
             }
             defer self.owner.allocator_proof_mutex.unlock(io);
             if (waited) {
-                lease.* = try self.acquirePathLeaseAssumeLocked(false);
+                lease.* = try self.acquirePathLeaseAssumeLocked(skip_lane_wait);
                 root = try self.owner.refresh();
             }
             if (try needsCapacityProof(root) or (intent == .mutation and try self.needsReuseAdmission(root))) {
@@ -4005,8 +4030,8 @@ pub const Connection = struct {
                 // between the detached proof and reacquiring the writer lease.
                 if (!try self.owner.retainMaintenanceTurnAssumeLocked()) return error.FileBusy;
                 defer self.owner.releaseMaintenanceTurnAssumeLocked();
-                try self.owner.verifyAllocatorAssumeLocked(lease, self);
-                if (lease.* == null) lease.* = try self.acquirePathLeaseAssumeLocked(false);
+                try self.owner.verifyAllocatorAssumeLocked(lease, self, skip_lane_wait);
+                if (lease.* == null) lease.* = try self.acquirePathLeaseAssumeLocked(skip_lane_wait);
                 root = try self.owner.refresh();
                 // Another process may move the tip during the detached walk.
                 // Do not repeat whole-file proofs while holding this
@@ -4404,7 +4429,7 @@ test "capi native unbounded writer admits reusable pool before a large request" 
                 if (lease) |*held| held.close();
                 connection.gate.mutex.unlock(io);
             }
-            const root = try connection.refresh(&lease, .read_only);
+            const root = try connection.refresh(&lease, .read_only, false);
             try std.testing.expect(!root.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
             try std.testing.expect(!owner.allocator_verification_started);
         }
@@ -4500,7 +4525,7 @@ test "capi native unbounded writer admits reusable pool before a large request" 
                 // reconciles from durable state before admitting the request.
                 const poisoned = owner.current.?;
                 poisoned.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain = true;
-                const reconciled = try connection.refresh(&lease, .mutation);
+                const reconciled = try connection.refresh(&lease, .mutation, false);
                 try std.testing.expect(reconciled != poisoned);
                 try std.testing.expect(!reconciled.owned_lite_backend.?.native_docstore.?.file.checkpoint_publication_uncertain);
                 try std.testing.expect(!owner.allocator_verification_active);
@@ -4508,13 +4533,13 @@ test "capi native unbounded writer admits reusable pool before a large request" 
             }
             if (scenario == .uncertain_during) {
                 owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.capture };
-                try std.testing.expectError(error.OutcomeReconciliationRequired, connection.refresh(&lease, .mutation));
+                try std.testing.expectError(error.OutcomeReconciliationRequired, connection.refresh(&lease, .mutation, false));
                 try std.testing.expectEqual(@as(usize, 1), probe.captures);
                 try std.testing.expect(!owner.allocator_verification_active);
                 try std.testing.expect(!owner.verification_cancel.requested.load(.acquire));
                 continue;
             }
-            const root = try connection.refresh(&lease, .mutation);
+            const root = try connection.refresh(&lease, .mutation, false);
             const file = &root.owned_lite_backend.?.native_docstore.?.file;
             if (scenario == .empty) {
                 try std.testing.expect(!owner.allocator_verification_started);
@@ -4731,7 +4756,7 @@ test "capi native allocator proof reacquisition honors per-connection busy admis
             if (lease) |*held| held.close();
             connection.gate.mutex.unlock(io);
         }
-        const result = owner.verifyAllocatorAssumeLocked(&lease, if (scenario == .background) null else connection);
+        const result = owner.verifyAllocatorAssumeLocked(&lease, if (scenario == .background) null else connection, false);
         if (probe.failure) |err| return err;
         switch (scenario) {
             .foreground => {
@@ -4755,7 +4780,7 @@ test "capi native allocator proof reacquisition honors per-connection busy admis
             owner.test_after_allocator_capture = null;
             if (lease == null) lease = try owner.tryWriterLeaseAssumeLocked();
             const walks = owner.publication_stats.allocator_proof_walks;
-            try owner.verifyAllocatorAssumeLocked(&lease, if (scenario == .background) null else connection);
+            try owner.verifyAllocatorAssumeLocked(&lease, if (scenario == .background) null else connection, false);
             try std.testing.expectEqual(walks, owner.publication_stats.allocator_proof_walks);
             try std.testing.expectEqual(@as(u64, 1), owner.publication_stats.allocator_proof_receipt_reuses);
             try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
@@ -4939,7 +4964,7 @@ test "capi native allocator proof survives close and foreground runtime replacem
                     if (lease) |*held| held.close();
                     connection.gate.mutex.unlock(io);
                 }
-                const root = try connection.refresh(&lease, .mutation);
+                const root = try connection.refresh(&lease, .mutation, false);
                 const file = &root.owned_lite_backend.?.native_docstore.?.file;
                 if (!file.free_pages_verified) return error.CompletedProofLostAcrossReplacement;
                 const before = (try file.allocatorStats()).?.reused_pages;
@@ -5090,7 +5115,7 @@ test "capi native short lived writers carry reuse across clean closes without a 
                 if (lease) |*held| held.close();
                 connection.gate.mutex.unlock(io);
             }
-            const root = try connection.refresh(&lease, .mutation);
+            const root = try connection.refresh(&lease, .mutation, false);
             const file = &root.owned_lite_backend.?.native_docstore.?.file;
             if (!file.free_pages_verified) return error.ShortLivedWriterPoolUnverified;
             const before = (try file.allocatorStats()).?.reused_pages;
@@ -5257,7 +5282,7 @@ test "capi native allocator proof refuses admission on a moving tip" {
     owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
     const proof_walks_before = owner.publication_stats.allocator_proof_walks;
     const proof_failures_before = owner.publication_stats.allocator_proof_failures;
-    const result = connection.refresh(&lease, .mutation);
+    const result = connection.refresh(&lease, .mutation, false);
     if (probe.failure) |err| return err;
     try std.testing.expectError(error.FileBusy, result);
     try std.testing.expectEqual(@as(usize, 1), probe.captures);
@@ -5268,7 +5293,7 @@ test "capi native allocator proof refuses admission on a moving tip" {
     // The refusal occurs before a transaction starts. A later, stable request
     // can obtain a new proof and proceed using the same connection.
     owner.test_after_allocator_capture = null;
-    const root = try connection.refresh(&lease, .mutation);
+    const root = try connection.refresh(&lease, .mutation, false);
     try std.testing.expect(root.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
 }
 
@@ -5493,7 +5518,7 @@ test "capi native allocator proof peer close certificate survives runtime refres
             connection.gate.mutex.unlock(io);
         }
         owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
-        try owner.verifyAllocatorAssumeLocked(&lease, connection);
+        try owner.verifyAllocatorAssumeLocked(&lease, connection, false);
         try std.testing.expect(owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
     }
     const key = "certificate-document";
@@ -6956,7 +6981,7 @@ test "capi native recovery agenda readonly sweeps become clean across eight and 
             if (lease) |*held| held.close();
             connection.gate.mutex.unlock(h.handleLockIo());
         };
-        const root = try connection.refresh(&lease, .read_only);
+        const root = try connection.refresh(&lease, .read_only, false);
         for (0..4) |_| try ddl.recover(root);
         try std.testing.expect(!root.sql_ddl_recovery_needed);
         const scans = root.sql_ddl_recovery_scans;
@@ -6981,7 +7006,7 @@ test "capi native recovery agenda readonly sweeps become clean across eight and 
         }
         lease = try connection.acquire();
         gate_held = true;
-        const refreshed = try connection.refresh(&lease, .read_only);
+        const refreshed = try connection.refresh(&lease, .read_only, false);
         try std.testing.expectEqualSlices(u8, &metadata, &refreshed.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().logical.metadata);
         try std.testing.expect(!refreshed.sql_ddl_recovery_needed);
         try @import("sql_ddl.zig").recover(refreshed);
@@ -7005,7 +7030,7 @@ test "capi native recovery agenda readonly sweeps become clean across eight and 
         }
         lease = try connection.acquire();
         gate_held = true;
-        const changed = try connection.refresh(&lease, .read_only);
+        const changed = try connection.refresh(&lease, .read_only, false);
         try @import("sql_ddl.zig").recover(changed);
         try std.testing.expect(changed.sql_ddl_recovery_needed);
         try std.testing.expectError(error.SqlStatementReadUnavailable, @import("tables.zig").get(changed, "namespace-0"));
@@ -7044,7 +7069,7 @@ test "capi native recovery agenda fences an affected namespace beyond the curren
         if (lease) |*held| held.close();
         connection.gate.mutex.unlock(h.handleLockIo());
     }
-    const root = try connection.refresh(&lease, .read_only);
+    const root = try connection.refresh(&lease, .read_only, false);
     for (0..20) |_| {
         try @import("sql_ddl.zig").recover(root);
         try std.testing.expectError(error.SqlStatementReadUnavailable, @import("tables.zig").get(root, "namespace-7"));
@@ -7110,7 +7135,7 @@ test "capi native recovery agenda interrupted readonly namespace cannot certify 
         if (lease) |*held| held.close();
         connection.gate.mutex.unlock(h.handleLockIo());
     }
-    const root = try connection.refresh(&lease, .read_only);
+    const root = try connection.refresh(&lease, .read_only, false);
     try @import("tables.zig").loadCatalog(root);
     const original = root.alloc;
     var failing = std.testing.FailingAllocator.init(original, .{ .fail_index = 2 });
@@ -7156,7 +7181,7 @@ test "capi native recovery agenda repeated compaction invalidates a clean metada
         if (lease) |*held| held.close();
         connection.gate.mutex.unlock(h.handleLockIo());
     };
-    const root = try connection.refresh(&lease, .read_only);
+    const root = try connection.refresh(&lease, .read_only, false);
     try @import("sql_ddl.zig").recover(root);
     try std.testing.expect(!root.sql_ddl_recovery_needed);
     const clean = root.sql_ddl_recovery_generation;
@@ -7179,7 +7204,7 @@ test "capi native recovery agenda repeated compaction invalidates a clean metada
     }
     lease = try connection.acquire();
     gate_held = true;
-    const refreshed = try connection.refresh(&lease, .read_only);
+    const refreshed = try connection.refresh(&lease, .read_only, false);
     try std.testing.expect(!std.mem.eql(u8, &clean, &refreshed.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().logical.metadata));
     for (0..20) |_| {
         try @import("sql_ddl.zig").recover(refreshed);
@@ -7373,7 +7398,7 @@ test "capi native parked writer lease releases for a foreign waiter within the f
         fn run(self: *@This()) void {
             const wio = h.handleLockIo();
             const deadline = std.Io.Clock.now(.awake, wio).addDuration(.fromSeconds(2));
-            self.acquired = self.region.acquireWriterFairBounded(wio, self.pid, deadline) catch false;
+            self.acquired = self.region.acquireWriterFairBounded(wio, self.pid, deadline, null) catch false;
             if (self.acquired) self.region.releaseWriter();
         }
     };
@@ -7386,6 +7411,23 @@ test "capi native parked writer lease releases for a foreign waiter within the f
     // interval could reliably observe the intermediate "queued" state.
     // The bound below is what actually matters: the lease is released
     // and the waiter served promptly, not on the much longer idle window.
+    //
+    // Deliberately `std.Thread.spawn`, not `io.concurrent`: tried converting
+    // this to `io.concurrent` (both on a dedicated `std.Io.Threaded` and on
+    // `std.testing.io`) and measured genuine, reproducible flakiness --
+    // `foreign.acquired` false roughly 1 run in 3, meaning the spawned
+    // task's own bounded `acquireWriterFairBounded` call (a generous 2s
+    // deadline) sometimes never succeeded at all, not just slower timing.
+    // `h.handleLockIo()` ("the process-wide threaded Io, whose waits block
+    // the calling OS thread") is explicitly for blocking waits from
+    // arbitrary foreign threads; `io.concurrent` on it fails outright
+    // (`ConcurrencyUnavailable`/`OutOfMemory`), and routing the spawn
+    // through a different `Io` while the waiter's own blocking call still
+    // goes through `handleLockIo()` did not resolve the flakiness within
+    // the time available to root-cause it. A real OS thread remains the
+    // reliable way to simulate a genuinely concurrent, independent waiter
+    // here; revisit if `io.concurrent`'s interaction with `handleLockIo()`
+    // from a pool-spawned task is understood and fixed.
     const started = std.Io.Clock.awake.now(io).nanoseconds;
     var foreign: Foreign = .{ .region = &foreign_region, .pid = foreign_pid };
     const thread = try std.Thread.spawn(.{}, Foreign.run, .{&foreign});
