@@ -6,6 +6,11 @@ const httpx = @import("httpx");
 const types = @import("types.zig");
 
 /// --- Extractors (framework-agnostic) ---
+/// Parse the JSON request body for accessInternalChangefeedState.
+pub fn parseAccessInternalChangefeedStateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.InternalChangefeedStateRequest) {
+    return std.json.parseFromSlice(types.InternalChangefeedStateRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Submit a native retention control or recover its exact result
 pub const ControlNativeRetainedHistoryPathParams = struct {
     group_id: []const u8,
@@ -66,6 +71,7 @@ pub const Route = struct {
 };
 
 pub const routes = [_]Route{
+    .{ .method = "POST", .path = "/catalog/changefeed-state-v1", .operation_id = "accessInternalChangefeedState", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/control-v1", .operation_id = "controlNativeRetainedHistory", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/grant-v1", .operation_id = "observeNativeRetainedHistoryGrant", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/page-v1", .operation_id = "readNativeRetainedHistoryPage", .request_body = .buffered, .streaming_response = true },
@@ -86,6 +92,7 @@ pub const routes = [_]Route{
 ///   try router.register(&server);
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
+        if (!@hasDecl(Impl, "accessInternalChangefeedState")) @compileError("ServerRouter: Impl missing required method 'accessInternalChangefeedState'");
         if (!@hasDecl(Impl, "controlNativeRetainedHistory")) @compileError("ServerRouter: Impl missing required method 'controlNativeRetainedHistory'");
         if (!@hasDecl(Impl, "observeNativeRetainedHistoryGrant")) @compileError("ServerRouter: Impl missing required method 'observeNativeRetainedHistoryGrant'");
         if (!@hasDecl(Impl, "readNativeRetainedHistoryPage")) @compileError("ServerRouter: Impl missing required method 'readNativeRetainedHistoryPage'");
@@ -104,6 +111,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
+            try server.post("/catalog/changefeed-state-v1", httpx.Handler.bind(self.impl, accessInternalChangefeedState));
             try server.post("/groups/:group_id/tables/:table_name/history/control-v1", httpx.Handler.bind(self.impl, controlNativeRetainedHistory));
             try server.post("/groups/:group_id/tables/:table_name/history/grant-v1", httpx.Handler.bind(self.impl, observeNativeRetainedHistoryGrant));
             try server.post("/groups/:group_id/tables/:table_name/history/page-v1", httpx.Handler.bind(self.impl, readNativeRetainedHistoryPage));
@@ -111,6 +119,12 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/standby/replication/slots", httpx.Handler.bind(self.impl, createHAReplicationStreamingSlot));
             try server.post("/standby/replication/start", httpx.Handler.bind(self.impl, startHAReplication));
             try server.post("/standby/replication/status", httpx.Handler.bind(self.impl, updateHAStandbyStatus));
+        }
+
+        /// Read or mutate durable private changefeed ownership state
+        /// POST /catalog/changefeed-state-v1
+        fn accessInternalChangefeedState(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.accessInternalChangefeedState(ctx);
         }
 
         /// Submit a native retention control or recover its exact result
@@ -165,6 +179,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 
 // Handler interface. Implement these methods on your Impl struct:
 //
+//   fn accessInternalChangefeedState(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn controlNativeRetainedHistory(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn observeNativeRetainedHistoryGrant(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn readNativeRetainedHistoryPage(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response

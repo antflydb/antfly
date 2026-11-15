@@ -22,6 +22,58 @@ const control = @import("../metadata/changefeed_control.zig");
 const local = @import("antfly_local_sources");
 const Context = local.api_operation.RequestContext;
 const A = std.mem.Allocator;
+pub const path = "/internal/v1/catalog/changefeed-state-v1";
+pub const max_wire_bytes = control.max_state_bytes * 6 + 4096;
+pub const Action = enum { read, authority, mutate };
+pub const Request = struct {
+    version: u16 = 1,
+    action: Action,
+    metadata_group_id: u64,
+    metadata_incarnation: [32]u8,
+    id: ?control.Id = null,
+    write: ?[]const u8 = null,
+    pub fn validate(self: Request) !void {
+        if (self.version != 1 or self.metadata_group_id == 0 or std.mem.allEqual(u8, &self.metadata_incarnation, 0)) return error.InvalidChangefeed;
+        switch (self.action) {
+            .read => if (self.id == null or self.write != null) return error.InvalidChangefeed,
+            .authority => if (self.id != null or self.write != null) return error.InvalidChangefeed,
+            .mutate => if (self.id != null or self.write == null or self.write.?.len == 0 or self.write.?.len > control.max_state_bytes) return error.InvalidChangefeed,
+        }
+    }
+};
+pub const Reply = struct {
+    version: u16 = 1,
+    action: Action,
+    metadata_group_id: u64,
+    metadata_incarnation: [32]u8,
+    id: ?control.Id = null,
+    state: ?[]const u8 = null,
+    authority: ?control.Stamp = null,
+    pub fn validate(self: Reply, a: A, request: Request) !void {
+        try request.validate();
+        if (self.version != 1 or self.action != request.action or self.metadata_group_id != request.metadata_group_id or !std.mem.eql(u8, &self.metadata_incarnation, &request.metadata_incarnation)) return error.ChangefeedCorrupt;
+        switch (self.action) {
+            .read => {
+                if (self.id == null or !std.mem.eql(u8, &self.id.?, &request.id.?) or self.state == null or self.authority != null) return error.ChangefeedCorrupt;
+                var parsed = try control.parse(a, self.state.?);
+                defer parsed.deinit();
+                if (parsed.value.phase != .empty and !std.mem.eql(u8, &parsed.value.id, &request.id.?)) return error.ChangefeedCorrupt;
+            },
+            .authority => {
+                if (self.id != null or self.state != null) return error.ChangefeedCorrupt;
+                if (self.authority) |stamp| if (stamp.sequence == 0 or std.mem.allEqual(u8, &stamp.incarnation, 0)) return error.ChangefeedCorrupt;
+            },
+            .mutate => if (self.id != null or self.state != null or self.authority != null) return error.ChangefeedCorrupt,
+        }
+    }
+};
+pub fn parseRequest(a: A, bytes: []const u8) !std.json.Parsed(Request) {
+    if (bytes.len == 0 or bytes.len > max_wire_bytes) return error.InvalidChangefeed;
+    var parsed = try std.json.parseFromSlice(Request, a, bytes, .{ .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    try parsed.value.validate();
+    return parsed;
+}
 pub const Port = struct {
     ptr: *anyopaque,
     read_fn: *const fn (*anyopaque, A, control.Id, Context) anyerror![]u8,
@@ -105,9 +157,9 @@ pub const test_support = if (@import("builtin").is_test) struct {
         const a = std.testing.allocator;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/feed-metadata-port", .{tmp.sub_path});
-        defer a.free(path);
-        var store = try Store.init(a, .{ .root_dir = path });
+        const store_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/feed-metadata-port", .{tmp.sub_path});
+        defer a.free(store_path);
+        var store = try Store.init(a, .{ .root_dir = store_path });
         defer store.deinit();
         var svc: fixture.Service = .{ .store = &store, .id = @splat(4) };
         const port = Port.fromService(&svc);
@@ -124,7 +176,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, control.mutateOnService(&client, a, write, authorized));
         svc.lose_ack = false;
         store.deinit();
-        store = try Store.init(a, .{ .root_dir = path });
+        store = try Store.init(a, .{ .root_dir = store_path });
         const bytes = try control.readOnService(&client, a, svc.id, authorized);
         defer a.free(bytes);
         var parsed = try control.parse(a, bytes);

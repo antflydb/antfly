@@ -490,6 +490,52 @@ pub const MetadataHttpClient = struct {
         };
     }
 
+    pub fn accessChangefeedState(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../api/changefeed_metadata.zig").Request, request: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("../api/changefeed_metadata.zig").Reply) {
+        const feeds = @import("../api/changefeed_metadata.zig");
+        try request.ensureActive();
+        try input.validate();
+        const bytes = try std.json.Stringify.valueAlloc(self.alloc, input, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(bytes);
+        if (bytes.len > feeds.max_wire_bytes) return error.InvalidChangefeed;
+        const uri = try join(self.alloc, base_uri, feeds.path);
+        defer self.alloc.free(uri);
+        const timeout = @min(@as(u32, 5000), (try request.remainingTimeoutMs()) orelse 5000);
+        var encoded_budget: [20]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{.{ .name = routes.routing_remaining_ms_header, .value = try std.fmt.bufPrint(&encoded_budget, "{d}", .{timeout}) }};
+        var signal = http_common.RequestCancellation.fromToken(request.cancellation);
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        delivery.markNotSent();
+        // Translate the remaining budget once into the executor's platform
+        // clock. The request's absolute deadline may use a borrowed test clock.
+        const transport_budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() +| @as(u64, timeout) * std.time.ns_per_ms, .cancellation = &signal };
+        var response = self.executeWithRetryPolicy(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .headers = &headers, .timeout_ms = timeout, .max_response_bytes = feeds.max_wire_bytes, .cancellation = &signal, .delivery_tracker = &delivery }, transport_budget, .at_most_once) catch |err| {
+            if (input.action == .mutate and delivery.load() != .not_sent) return error.MetadataMutationOutcomeUnknown;
+            return err;
+        };
+        defer response.deinit(self.alloc);
+        var outcome_count: usize = 0;
+        var outcome: []const u8 = "";
+        for (response.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_outcome_header)) {
+                outcome_count += 1;
+                outcome = header.value;
+            }
+        }
+        const committed = outcome_count == 1 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed);
+        const not_proposed = outcome_count == 1 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed);
+        if (input.action == .mutate and !committed) {
+            if (not_proposed and response.status == 400) return error.InvalidChangefeed;
+            if (not_proposed and response.status == 403) return error.Forbidden;
+            return error.MetadataMutationOutcomeUnknown;
+        }
+        if (response.status != 200) return error.StorageReadTemporarilyUnavailable;
+        var parsed = std.json.parseFromSlice(feeds.Reply, self.alloc, response.body, .{ .allocate = .alloc_always }) catch |err| return if (input.action == .mutate) error.MetadataMutationOutcomeUnknown else err;
+        errdefer parsed.deinit();
+        parsed.value.validate(self.alloc, input) catch |err| return if (input.action == .mutate) error.MetadataMutationOutcomeUnknown else err;
+        request.ensureActive() catch |err| return if (input.action == .mutate) error.MetadataMutationOutcomeUnknown else err;
+        return parsed;
+    }
+
     pub fn fetchPrivacyPolicyBinding(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.PrivacyPolicyBinding) {
         const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogTableRoutingSnapshotRequest{ .table_name = table_name }, .{});
         defer self.alloc.free(body);
@@ -4881,6 +4927,46 @@ test "SQL pgwire native metadata RPC preserves explicit submission evidence" {
     const response = try client.forwardSystemCatalogObserved("http://owner", input, forwarding, false, &submitted);
     defer a.free(response);
     try std.testing.expect(submitted);
+}
+
+test "metadata changefeed state transport validates replies and never replays uncertain writes" {
+    const a = std.testing.allocator;
+    const feeds = @import("../api/changefeed_metadata.zig");
+    const Executor = struct {
+        calls: usize = 0,
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_committed,
+        body: []const u8 = "{\"version\":1,\"action\":\"mutate\",\"metadata_group_id\":77,\"metadata_incarnation\":\"11111111111111111111111111111111\"}",
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, feeds.path));
+            try std.testing.expectEqual(feeds.max_wire_bytes, request.max_response_bytes.?);
+            try std.testing.expect(request.header(routes.routing_remaining_ms_header) != null);
+            var parsed = try feeds.parseRequest(alloc, request.body);
+            defer parsed.deinit();
+            const headers = try alloc.alloc(http_common.Header, 1);
+            headers[0] = .{ .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header), .value = try alloc.dupe(u8, self.outcome) };
+            return .{ .status = 200, .headers = headers, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const input: feeds.Request = .{ .action = .mutate, .write = "{}", .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".* };
+    var reply = try client.accessChangefeedState("http://metadata.invalid", input, .{});
+    reply.deinit();
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessChangefeedState("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    executor.outcome = routes.Routes.raft_mutation_outcome_committed;
+    executor.body = "{\"version\":1,\"action\":\"authority\",\"metadata_group_id\":77,\"metadata_incarnation\":\"11111111111111111111111111111111\"}";
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessChangefeedState("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 3), executor.calls);
+    var authority = try client.accessChangefeedState("http://metadata.invalid", .{ .action = .authority, .metadata_group_id = input.metadata_group_id, .metadata_incarnation = input.metadata_incarnation }, .{});
+    defer authority.deinit();
+    try std.testing.expect(authority.value.authority == null);
+    try std.testing.expectError(error.InvalidChangefeed, client.accessChangefeedState("http://metadata.invalid", .{ .action = .authority, .id = @splat(1), .metadata_group_id = input.metadata_group_id, .metadata_incarnation = input.metadata_incarnation }, .{}));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
 }
 
 test "metadata.lake index owner projection read negotiates older peers without weakening grants" {

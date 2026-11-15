@@ -1884,6 +1884,30 @@ retained-history RPC qualification completed successfully (exit 0), including
 27 control-entry tests and 13 HTTP contracts, in
 `feed-metadata-port-final-test.log`.
 
+## In progress: private feed metadata HTTP transport
+
+The internal OpenAPI contract now defines POST
+`/internal/v1/catalog/changefeed-state-v1` for bounded state reads, authority
+reads, and exact revision-fenced writes. API generation completed. Every action
+names the immutable metadata group/incarnation; the handler checks that identity
+before invoking the capability. Tokenless migration calls are rejected. Local
+metadata HTTP sources register the same strong state port as embedded sources.
+
+The signed client uses at-most-once mutation transport and one shared time
+budget. A delegated mutation failure, malformed/mismatched reply, or ambiguous
+outcome header remains unknown. Strong state reconciliation is required before
+another mutation decision. Handler tests cover unsigned rejection, wrong-cluster
+rejection before authority access, and positive authority binding. Client tests
+cover exact dispatch counts and reply/action validation. Six explicitly
+discovered tests passed in `feed-metadata-handler-test.log`; the final stricter
+outcome/deadline qualification is in `feed-metadata-transport-final-test.log`.
+
+The data runtime's remote metadata source still needs to register a routed port
+and preserve the full original request budget across peer selection. These
+private operations are not public feed management, a consumer scheduler, or a
+coherent bootstrap implementation. The broader completion requirements remain
+open.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

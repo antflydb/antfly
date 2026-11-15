@@ -3,6 +3,113 @@
 
 const std = @import("std");
 
+pub const InternalChangefeedStateReply = struct {
+    version: i64,
+    action: []const u8,
+    metadata_group_id: i64,
+    metadata_incarnation: []const u8,
+    id: ?[]const i64 = null,
+    /// Exact validated state envelope, present only for read
+    state: ?[]const u8 = null,
+    /// Present only for authority; omitted before first feed mutation
+    authority: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "action", "action", false },
+        .{ "metadata_group_id", "metadata_group_id", false },
+        .{ "metadata_incarnation", "metadata_incarnation", false },
+        .{ "id", "id", true },
+        .{ "state", "state", true },
+        .{ "authority", "authority", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("metadata_group_id");
+        try jw.write(self.metadata_group_id);
+        try jw.objectField("metadata_incarnation");
+        try jw.write(self.metadata_incarnation);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.state) |value| {
+            try jw.objectField("state");
+            try jw.write(value);
+        }
+        if (self.authority) |value| {
+            try jw.objectField("authority");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InternalChangefeedStateRequest = struct {
+    version: i64,
+    action: []const u8,
+    metadata_group_id: i64,
+    /// Expected immutable metadata cluster identity; checked before dispatch
+    metadata_incarnation: []const u8,
+    /// Required only for read; immutable feed ID
+    id: ?[]const i64 = null,
+    /// Required only for mutate; exact encoded private revision-fenced write
+    write: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "action", "action", false },
+        .{ "metadata_group_id", "metadata_group_id", false },
+        .{ "metadata_incarnation", "metadata_incarnation", false },
+        .{ "id", "id", true },
+        .{ "write", "write", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("metadata_group_id");
+        try jw.write(self.metadata_group_id);
+        try jw.objectField("metadata_incarnation");
+        try jw.write(self.metadata_incarnation);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.write) |value| {
+            try jw.objectField("write");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const NativeHistoryAcknowledge = struct {
     reference: NativeHistoryReference,
     previous: u64,

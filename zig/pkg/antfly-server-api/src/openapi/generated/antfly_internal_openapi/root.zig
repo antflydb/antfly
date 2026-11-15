@@ -5,6 +5,8 @@ pub const types = @import("types.zig");
 pub const server = @import("server.zig");
 pub const ServerRouter = server.ServerRouter;
 
+pub const InternalChangefeedStateReply = types.InternalChangefeedStateReply;
+pub const InternalChangefeedStateRequest = types.InternalChangefeedStateRequest;
 pub const NativeHistoryAcknowledge = types.NativeHistoryAcknowledge;
 pub const NativeHistoryApplied = types.NativeHistoryApplied;
 pub const NativeHistoryCollect = types.NativeHistoryCollect;

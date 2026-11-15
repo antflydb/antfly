@@ -500,6 +500,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const history_control_entry_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{ "history control entry", "history root control outcome", "history root control driver", "history root control observation", "history root discovery", "history feed metadata port", "raft batch", "raft protocol barrier", "ordered artifact merge adoption" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const run_history_control_entry_tests = b.addRunArtifact(history_control_entry_tests);
     b.step("history-control-entry-test", "Verify bounded fail-closed ordered retention envelopes").dependOn(&run_history_control_entry_tests.step);
+    const feed_metadata_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{ "metadata changefeed state transport", "metadata linearizable head uses the fenced source operation" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_feed_metadata_transport_tests = b.addRunArtifact(feed_metadata_transport_tests);
+    b.step("changefeed-metadata-transport-test", "Verify private metadata feed state transport and uncertain mutation boundaries").dependOn(&run_feed_metadata_transport_tests.step);
 
     const changefeed_storage_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "metadata changefeed control", "metadata raft apply store snapshot key registry covers every durable projection class" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const run_changefeed_storage_tests = b.addRunArtifact(changefeed_storage_tests);

@@ -205,6 +205,7 @@ test "store-root readiness returns only an exact durable v17 activation" {
 pub const AdminSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    changefeeds: ?@import("../api/changefeed_metadata.zig").Port = null,
 
     pub const VTable = struct {
         catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
@@ -642,6 +643,7 @@ pub const AdminSource = struct {
     pub fn fromMetadataService(svc: *service.MetadataService) AdminSource {
         return .{
             .ptr = svc,
+            .changefeeds = @import("../api/changefeed_metadata.zig").Port.fromService(svc),
             .vtable = &.{
                 .system_catalog = comptime systemCatalogServiceCall(service.MetadataService),
                 .catalog_identity = comptime systemCatalogIdentityCall(service.MetadataService),
@@ -714,6 +716,7 @@ pub const AdminSource = struct {
     pub fn fromMetadataHttpService(svc: *service.MetadataHttpService) AdminSource {
         return .{
             .ptr = svc,
+            .changefeeds = @import("../api/changefeed_metadata.zig").Port.fromService(svc),
             .vtable = &.{
                 .system_catalog = comptime systemCatalogServiceCall(service.MetadataHttpService),
                 .catalog_identity = comptime systemCatalogIdentityCall(service.MetadataHttpService),
@@ -2037,6 +2040,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_routing_token, httpx.Handler.bind(self, metadataRoutingToken));
         try server.post(routes.Routes.internal_owner_readiness, httpx.Handler.bind(self, metadataOwnerReadiness));
         try server.post(routes.Routes.internal_privacy_policy_binding, httpx.Handler.bind(self, metadataPrivacyPolicyBinding));
+        try server.postWithBodyLimit(@import("../api/changefeed_metadata.zig").path, @import("../api/changefeed_metadata.zig").max_wire_bytes, httpx.Handler.bind(self, metadataChangefeedState));
         try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_await_route, httpx.Handler.bind(self, metadataAwaitRoute));
@@ -2621,6 +2625,49 @@ pub const MetadataHttpServer = struct {
         const result = capture(self.source.ptr, parsed.value, request) catch |err| return metadataReadError(ctx, err);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return ctx.json(result);
+    }
+
+    fn metadataChangefeedState(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const feeds = @import("../api/changefeed_metadata.zig");
+        const control = @import("changefeed_control.zig");
+        // The host verifies supplied credentials even in migration mode. The
+        // tokenless migration exception must never expose private feed state.
+        if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null) return ctx.status(403).text("authenticated service required");
+        if (ctx.header(routes.routing_remaining_ms_header) == null) return ctx.status(400).text("shared budget required");
+        try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        var parsed = feeds.parseRequest(ctx.allocator, (try ctx.body()) orelse "") catch return ctx.status(400).text("invalid changefeed state request");
+        defer parsed.deinit();
+        const identity_fn = self.source.vtable.catalog_identity orelse return ctx.status(503).text("metadata identity unavailable");
+        const identity = identity_fn(self.source.ptr) catch |err| return metadataReadError(ctx, err);
+        if (identity.metadata_group_id != parsed.value.metadata_group_id or !std.mem.eql(u8, &identity.metadata_incarnation, &parsed.value.metadata_incarnation)) return ctx.status(409).text("metadata identity mismatch");
+        const port = self.source.changefeeds orelse return ctx.status(503).text("changefeed authority unavailable");
+        var request = requestContext(ctx);
+        request.principal = .{ .kind = .internal, .subject = "changefeed-maintenance" };
+        var reply: feeds.Reply = .{ .action = parsed.value.action, .metadata_group_id = identity.metadata_group_id, .metadata_incarnation = identity.metadata_incarnation };
+        switch (parsed.value.action) {
+            .read => {
+                const bytes = port.read(ctx.allocator, parsed.value.id.?, request) catch |err| return metadataReadError(ctx, err);
+                defer ctx.allocator.free(bytes);
+                reply.id = parsed.value.id;
+                reply.state = bytes;
+                return ctx.json(reply);
+            },
+            .authority => {
+                reply.authority = port.authority(ctx.allocator, request) catch |err| return metadataReadError(ctx, err);
+                return ctx.json(reply);
+            },
+            .mutate => {
+                var write = control.parseWrite(ctx.allocator, parsed.value.write.?) catch return ctx.status(400).text("invalid changefeed write");
+                defer write.deinit();
+                // Once delegated, every failure may follow a committed proposal.
+                // Do not downgrade a failed observation into non-admission.
+                try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
+                port.mutate(ctx.allocator, write.value, request) catch return ctx.status(503).text("changefeed mutation outcome unknown");
+                try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_committed);
+                return ctx.json(reply);
+            },
+        }
     }
 
     fn metadataPrivacyPolicyBinding(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -7178,6 +7225,77 @@ test "restore staging authority capture is fenced compact and former-owner scope
     fake.allowed = true;
     fake.term_changes = true;
     try std.testing.expectError(error.NotLeader, AdminSource.captureRestoreStagingAuthority(Fake, &fake, std.testing.allocator, .{}, input));
+}
+
+test "metadata changefeed state transport rejects unsigned migration requests" {
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var marker: u8 = 0;
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &marker, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } });
+    var response = try server.executeTypedHandlerWithBodyForTest(.POST, @import("../api/changefeed_metadata.zig").path, &.{}, "{\"version\":1,\"action\":\"authority\"}", MetadataHttpServer.metadataChangefeedState);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 403), response.status.code);
+}
+
+test "metadata changefeed state transport fences cluster identity before authority access" {
+    const feeds = @import("../api/changefeed_metadata.zig");
+    const control = @import("changefeed_control.zig");
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        fn identity(_: *anyopaque) !metadata_api.CatalogIdentity {
+            return .{ .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".* };
+        }
+        fn authority(raw: *anyopaque, _: std.mem.Allocator, request: operation.RequestContext) !?control.Stamp {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try request.ensureActive();
+            try std.testing.expectEqualStrings("changefeed-maintenance", request.principal.?.subject);
+            self.calls += 1;
+            return .{ .incarnation = @splat(9), .sequence = 42 };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var fake: Fake = .{};
+    var server = MetadataHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .catalog_identity = Fake.identity, .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free }, .changefeeds = .{ .ptr = &fake, .read_fn = undefined, .mutate_fn = undefined, .authority_fn = Fake.authority } });
+    for ([_]u64{ 78, 77 }) |group_id| {
+        const input: feeds.Request = .{ .action = .authority, .metadata_group_id = group_id, .metadata_incarnation = "11111111111111111111111111111111".* };
+        const body = try std.json.Stringify.valueAlloc(a, input, .{});
+        defer a.free(body);
+        var request = try httpx.Request.init(a, .POST, feeds.path);
+        defer request.deinit();
+        try request.setBody(body);
+        // Direct handler fixture: token verification belongs to host middleware.
+        try request.setHeader(@import("../api/internal_service_auth.zig").header_name, "verified-by-host-fixture");
+        try request.setHeader(routes.routing_remaining_ms_header, "1000");
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try server.metadataChangefeedState(&ctx);
+        defer response.deinit();
+        if (group_id == 78) {
+            try std.testing.expectEqual(@as(u16, 409), response.status.code);
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+        } else {
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            var reply = try std.json.parseFromSlice(feeds.Reply, a, response.body.?, .{});
+            defer reply.deinit();
+            try reply.value.validate(a, input);
+            try std.testing.expectEqual(@as(u64, 42), reply.value.authority.?.sequence);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        }
+    }
 }
 
 test "metadata linearizable head uses the fenced source operation" {

@@ -19,6 +19,50 @@ tags:
     x-displayName: Hot Standby Replication
     description: Runtime-to-runtime hot-standby replication protocol.
 paths:
+  /catalog/changefeed-state-v1:
+    post:
+      tags: [retained-history]
+      operationId: accessInternalChangefeedState
+      summary: Read or mutate durable private changefeed ownership state
+      description: |
+        Signed service-only metadata capability, including during migration.
+        Never expose this operation as a public feed API. Reads and authority
+        discovery establish a linearizable metadata barrier. Mutations preserve
+        the state machine's revision, owner epoch and authority fences and are
+        attempted at most once. An uncertain response cannot certify non-commit;
+        reconcile by reading durable state before making another decision.
+        The routing remaining-time header carries one shared relative budget.
+        Bodies are limited to 50335744 bytes to accommodate JSON escaping of an
+        encoded state or write of at most 8388608 bytes. Unknown fields, mixed
+        action fields and unsupported wire versions are rejected before dispatch.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - in: header
+          name: X-Antfly-Routing-Remaining-Ms
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 5000}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/InternalChangefeedStateRequest'}
+      responses:
+        '200':
+          description: Action-bound result; a mutation reply confirms durable success
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/InternalChangefeedStateReply'}
+        '400': {description: Invalid bounded request}
+        '403': {description: Authenticated service required}
+        '409': {description: Known revision or authority conflict}
+        '413': {description: Request exceeds wire bounds}
+        '503':
+          description: Unavailable or uncertain mutation; inspect the outcome header
+          headers:
+            X-Antfly-Raft-Mutation-Outcome:
+              schema: {type: string, enum: [not-proposed-v1, not-applied-v1, unknown-v1, committed-v1]}
+        '504': {description: Shared deadline exhausted; mutation may have committed}
   /groups/{group_id}/tables/{table_name}/history/grant-v1:
     post:
       tags: [retained-history]
@@ -336,6 +380,59 @@ components:
           schema:
             type: string
   schemas:
+    InternalChangefeedStateRequest:
+      type: object
+      additionalProperties: false
+      required: [version, action, metadata_group_id, metadata_incarnation]
+      properties:
+        version: {type: integer, enum: [1]}
+        action: {type: string, enum: [read, authority, mutate]}
+        metadata_group_id: {type: integer, minimum: 1}
+        metadata_incarnation:
+          type: string
+          minLength: 32
+          maxLength: 32
+          description: Expected immutable metadata cluster identity; checked before dispatch
+        id:
+          type: array
+          minItems: 16
+          maxItems: 16
+          items: {type: integer, minimum: 0, maximum: 255}
+          description: Required only for read; immutable feed ID
+        write:
+          type: string
+          maxLength: 8388608
+          description: Required only for mutate; exact encoded private revision-fenced write
+    InternalChangefeedStateReply:
+      type: object
+      additionalProperties: false
+      required: [version, action, metadata_group_id, metadata_incarnation]
+      properties:
+        version: {type: integer, enum: [1]}
+        action: {type: string, enum: [read, authority, mutate]}
+        metadata_group_id: {type: integer, minimum: 1}
+        metadata_incarnation: {type: string, minLength: 32, maxLength: 32}
+        id:
+          type: array
+          minItems: 16
+          maxItems: 16
+          items: {type: integer, minimum: 0, maximum: 255}
+        state:
+          type: string
+          maxLength: 8388608
+          description: Exact validated state envelope, present only for read
+        authority:
+          type: object
+          additionalProperties: false
+          required: [incarnation, sequence]
+          description: Present only for authority; omitted before first feed mutation
+          properties:
+            incarnation:
+              type: array
+              minItems: 32
+              maxItems: 32
+              items: {type: integer, minimum: 0, maximum: 255}
+            sequence: {type: integer, minimum: 1}
     NativeHistoryGrantIdentity:
       {"type":"object","additionalProperties":false,"properties":{"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"authority":{"$ref":"#/components/schemas/NativeHistoryDigest"},"consumer":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"definition":{"$ref":"#/components/schemas/NativeHistoryDigest"},"sequence":{"type":"integer","format":"uint64","minimum":1},"policy_revision":{"type":"integer","format":"uint64","minimum":1}},"required":["namespace","authority","consumer","definition","sequence","policy_revision"]}
     NativeHistoryGrantActive:
