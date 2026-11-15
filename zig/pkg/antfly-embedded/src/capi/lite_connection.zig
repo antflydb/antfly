@@ -1884,7 +1884,19 @@ pub const Owner = struct {
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
             }
-            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and
+            // `sequence_unchanged` exists to catch a redo-only commit that
+            // the header/metadata comparisons below cannot see on their own
+            // (the comment above). Without a redo log, the physical
+            // checkpoint *is* the only commit record: every commit,
+            // including a lease-only one, bumps `committedSequence()` by
+            // bumping the checkpoint's own `commit_sequence`, so requiring
+            // it unchanged here would force a full reopen for exactly the
+            // lease bookkeeping this fast path exists to adopt cheaply.
+            // `runtimeMetadataUnchanged`/`loadedIndexInputsUnchanged` already
+            // prove no primary/index root moved; that is sufficient on a
+            // non-redo file, which has no logical watermark separate from
+            // the physical one for `sequence_unchanged` to protect.
+            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
                 try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
             {
                 // Lease bookkeeping and unpublished shadow files do not change
@@ -3658,6 +3670,22 @@ pub const Owner = struct {
                         continue;
                     }
                     try file.sync();
+                    // `sync()` can itself force a durability-barrier commit,
+                    // which (perf/lwa-grouped-stall's `refreshIfWriterBaseStale`)
+                    // may discover this instance's own writer base is behind
+                    // the inode registry's latest committed sequence and
+                    // adopt the newer on-disk header -- invalidating
+                    // `free_pages_verified` as part of that adoption
+                    // (`adoptIndexPublicationHeader`'s own doc comment).
+                    // The check above is no longer valid once that happens:
+                    // `certifyAllocator`'s own precondition would otherwise
+                    // panic on a verification this exact call just undid.
+                    // Treat it the same as never having been verified.
+                    if (!file.free_pages_verified) {
+                        if (self.current == root and !needsOutcomeReconciliation(root) and
+                            file.transaction_header == null and file.durable_header == null) can_prove_current = true;
+                        continue;
+                    }
                     _ = try file.certifyAllocator();
                     return;
                 }
@@ -6995,6 +7023,132 @@ test "capi native owner refresh observes a redo-diverted commit from a genuinely
     _ = std.c.kill(child_pid, std.c.SIG.KILL);
     try xprocReapBounded(child_pid, xproc_fork_reap_timeout_ms);
     child_reaped = true;
+}
+
+// Regression for py/packages/embedded's
+// test_cross_process_writers_do_not_lose_each_others_rows: two genuinely
+// separate OS processes, each holding the cross-process writer lease for a
+// handful of commits in turn, must never lose a sibling's committed rows --
+// no SEGFAULT, no InvalidBatchRequest, no FileBusy once each writer's own
+// lease wait succeeds. Forked (not simulated in-process) for the same
+// reason as the redo-observation test above: a same-process sibling shares
+// this process's one `SharedRedoOverlay`/allocator state per inode, which
+// would hide a bug that only a genuinely different process's independent
+// open can expose.
+test "capi native two genuinely separate writer processes do not lose each other's rows" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("xproc-two-writers");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+
+    const writers_per_child = 8;
+    const Child = struct {
+        // `lockWriterPathWithIo` is a single non-blocking try (WouldBlock on
+        // contention, never a wait): poll it the way every real caller must
+        // under genuine cross-process contention from the sibling writer
+        // below, bounded the same as the Python repro's busy_timeout=10.
+        fn acquireWithRetry(child_io: std.Io, child_path: []const u8) native.PathWriterLock {
+            const deadline_ns = std.Io.Clock.awake.now(child_io).nanoseconds + 10 * std.time.ns_per_s;
+            while (true) {
+                if (native.lockWriterPathWithIo(alloc, child_io, child_path)) |lease| return lease else |err| switch (err) {
+                    error.WouldBlock, error.FileBusy => {
+                        if (std.Io.Clock.awake.now(child_io).nanoseconds >= deadline_ns) xprocParkForever();
+                        var no_fds: [0]std.c.pollfd = .{};
+                        _ = std.c.poll(&no_fds, 0, 2);
+                    },
+                    else => xprocParkForever(),
+                }
+            }
+        }
+        fn run(child_path: []const u8, writer_id: u8, result_fd: std.c.fd_t) noreturn {
+            const child_io = h.handleLockIo();
+            var key_buffer: [8]u8 = undefined;
+            var i: u8 = 0;
+            while (i < writers_per_child) : (i += 1) {
+                var lease = acquireWithRetry(child_io, child_path);
+                var writer = native.NativeFile.openWithIo(alloc, child_io, child_path, .{ .externally_locked = true, .no_sync = true }) catch xprocParkForever();
+                const key = std.fmt.bufPrint(&key_buffer, "{d}:{d}", .{ writer_id, i }) catch xprocParkForever();
+                var value_buffer: [64]u8 = undefined;
+                const value = std.fmt.bufPrint(&value_buffer, "{{\"body\":\"writer {d} item {d}\"}}", .{ writer_id, i }) catch xprocParkForever();
+                writer.putDocument(key, value) catch xprocParkForever();
+                writer.close();
+                lease.close();
+            }
+            const report: [1]u8 = .{1};
+            _ = std.c.write(result_fd, &report, report.len);
+            xprocParkForever();
+        }
+    };
+
+    var result_fds: [2][2]std.c.fd_t = undefined;
+    for (&result_fds) |*fds| try std.testing.expectEqual(0, std.c.pipe(fds));
+
+    var child_pids: [2]std.c.pid_t = undefined;
+    for (0..2) |writer_id| {
+        const pid = std.c.fork();
+        if (pid == 0) {
+            for (0..2) |other| {
+                if (other != writer_id) _ = std.posix.system.close(result_fds[other][1]);
+            }
+            _ = std.posix.system.close(result_fds[writer_id][0]);
+            Child.run(path, @intCast(writer_id), result_fds[writer_id][1]);
+        }
+        try std.testing.expect(pid > 0);
+        child_pids[writer_id] = pid;
+    }
+    for (&result_fds) |*fds| _ = std.posix.system.close(fds[1]);
+    var children_reaped = false;
+    defer if (!children_reaped) for (child_pids) |pid| {
+        _ = std.c.kill(pid, std.c.SIG.KILL);
+        _ = std.c.waitpid(pid, null, 0);
+    };
+    defer for (&result_fds) |*fds| {
+        _ = std.posix.system.close(fds[0]);
+    };
+
+    for (&result_fds) |*fds| {
+        var report: [1]u8 = undefined;
+        try xprocReadBounded(fds[0], &report, xproc_fork_read_timeout_ms);
+        try std.testing.expectEqual(@as(u8, 1), report[0]);
+    }
+
+    var lease = try connection.acquire();
+    defer {
+        lease.close();
+        connection.gate.mutex.unlock(io);
+    }
+    const after = try owner.refresh();
+    const file = &after.owned_lite_backend.?.native_docstore.?.file;
+    for (0..2) |writer_id| {
+        var i: u8 = 0;
+        while (i < writers_per_child) : (i += 1) {
+            var key_buffer: [8]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "{d}:{d}", .{ writer_id, i });
+            const value = try file.getDocumentAlloc(a, key);
+            defer if (value) |bytes| a.free(bytes);
+            try std.testing.expect(value != null);
+            var expected_buffer: [64]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&expected_buffer, "{{\"body\":\"writer {d} item {d}\"}}", .{ writer_id, i });
+            try std.testing.expectEqualStrings(expected, value.?);
+        }
+    }
+
+    for (child_pids) |pid| _ = std.c.kill(pid, std.c.SIG.KILL);
+    for (child_pids) |pid| try xprocReapBounded(pid, xproc_fork_reap_timeout_ms);
+    children_reaped = true;
 }
 
 test "capi native recovery agenda clean opens avoid unrelated table runtimes" {

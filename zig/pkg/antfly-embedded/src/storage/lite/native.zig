@@ -9639,6 +9639,20 @@ pub const NativeFile = struct {
         // commitTransaction retains the fence if publication becomes uncertain.
         try self.beginTransaction();
         errdefer self.abortTransaction();
+        // `beginTransaction` can itself call `refreshIfWriterBaseStale`
+        // (perf/lwa-grouped-stall) when this instance's writer base is
+        // behind the inode registry's latest committed sequence. That
+        // resync adopts the newer on-disk header
+        // (`adoptIndexPublicationHeader`), which unconditionally clears
+        // `free_pages_verified` -- invalidating the precondition this
+        // function already checked above, between that check and
+        // `stageAllocatorCertificate`'s own assertion of it. Re-check
+        // after beginning the transaction and abort cleanly (certifying
+        // nothing, same as the pre-check above) instead of asserting.
+        if (!self.header.indexed_reclamation or !self.free_pages_verified) {
+            self.abortTransaction();
+            return false;
+        }
         try self.stageAllocatorCertificate(.metadata);
         try self.commitTransaction();
         return true;
