@@ -39089,13 +39089,32 @@ pub const DB = struct {
                 break :blk settled;
             };
             if (ready) return producer_sequence;
-            _ = try self.runGroupSourceSlice();
             if (self.local_execution.optional_runtime_workers_enabled) {
-                // Wake the owner without waiting for a global cursor that
-                // may be blocked on an independent, later request. The
-                // durable source debt above is the completion authority.
+                // A resident `group_source_owner.Owner`, registered by
+                // `startResidentBackgroundWorkersIfNeeded`, already drives
+                // this exact (possibly borrowed/shared -- `open_table`
+                // points every table's `GroupSourceMaintenanceState` at the
+                // connection-wide `lite_connection.Owner`'s own map, keyed by
+                // table id) state on its own scheduler turn, serialized with
+                // itself through `state.slice_mutex`. Driving the identical
+                // `runGroupSourceSlice` a second time from here, on this
+                // call's own stack, raced that owner's commit through the
+                // same table's writer-base bookkeeping: a benign-looking
+                // `EnrichmentSourceChanged` (the two slices' fan-in reads of
+                // the same partition disagreeing) that, once this loop
+                // retried instead of surfacing it, escalated into a `stale
+                // writer base reached publishCheckpoint` panic. Wake the
+                // owner and the enrichment runtime without waiting for a
+                // global cursor that may be blocked on an independent,
+                // later request -- the durable source debt above is the
+                // completion authority -- instead of duplicating either's
+                // work inline.
+                self.backend_runtime.wakeMaintenance(&self.group_source_owner);
                 if (self.enrichment_runtime) |runtime| runtime.notifySequence(producer_sequence);
-            } else try self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
+            } else {
+                _ = try self.runGroupSourceSlice();
+                try self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
+            }
             try wait.check();
             try io.sleep(.fromMilliseconds(5), .awake);
         }
