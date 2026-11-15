@@ -10042,6 +10042,38 @@ pub fn getGlinerDecideMetalExecutionPolicy(session: Session) ?gliner_decide_qual
     return gliner_decide_qualification.metalExecutionPolicy(identity);
 }
 
+pub fn getGlinerDecideExecutionBatchPolicy(session: Session) ?gliner_decide_qualification.ExecutionBatchPolicy {
+    const backend: gliner_decide_qualification.Backend = switch (session.backend()) {
+        .cuda => .cuda,
+        .metal => .metal,
+        else => return null,
+    };
+    const identity = getGlinerDecisionIdentity(session) catch return null;
+    return gliner_decide_qualification.executionBatchPolicy(identity, backend);
+}
+
+test "Decide CUDA execution batches require a sealed session identity" {
+    for ([_]gliner_decide_qualification.Identity{ gliner_decide_qualification.pinned_legacy_fp32_identity, gliner_decide_qualification.pinned_legacy_q8_identity }) |identity| {
+        var arch = ArchSession{
+            .allocator = std.testing.allocator,
+            .arch_config = .{ .deberta = .{} },
+            .task = .extractor,
+            .gliner_decision_identity = identity,
+            .backend_type = .cuda,
+            .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } },
+        };
+        const session = Session{ .ptr = &arch, .vtable = &arch_vtable };
+        try std.testing.expect(getGlinerDecideExecutionBatchPolicy(session) == null);
+        try sealGlinerDecisionTokenizerDigest(session, identity.sidecars.tokenizer);
+        try std.testing.expectEqual(@as(usize, 8), getGlinerDecideExecutionBatchPolicy(session).?.batch_items);
+        arch.backend_type = .native;
+        try std.testing.expect(getGlinerDecideExecutionBatchPolicy(session) == null);
+        arch.backend_type = .cuda;
+        arch.gliner_decision_identity.?.weight.sha256[0] ^= 1;
+        try std.testing.expect(getGlinerDecideExecutionBatchPolicy(session) == null);
+    }
+}
+
 pub const GlinerMetalRuntimeStats = struct {
     allocated_bytes: u64,
     dense_f32_weight_bytes: u64,
