@@ -1440,8 +1440,9 @@ unsupported profiles, known rejections, lost confirmations with original receipt
 invalid callback results, and temporary storage failures. Production runtime
 qualification extends the real Raft/native-owner test through this operation
 boundary. Signed service authority is required even in legacy migration
-mode; unsigned requests fail before invoking the owner. The five focused HTTP
-checks and four real Raft/native-owner checks pass without leaks. Full
+mode; unsigned requests fail before invoking the owner. The six focused HTTP
+checks (including a mounted loopback route in migration mode) and four real
+Raft/native-owner checks pass without leaks. Full
 `make generate` also passed. This does not yet register a production feed root, route controls remotely,
 implement a remote retained-page API, or satisfy the public feed/client contracts.
 

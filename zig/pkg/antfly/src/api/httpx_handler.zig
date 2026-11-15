@@ -455,6 +455,34 @@ test "history control ingress HTTP preserves recovery receipts and unknown failu
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
 }
 
+test "history control ingress mounted route rejects unsigned migration traffic" {
+    const a = std.testing.allocator;
+    var source: AuthStatusSource = .{};
+    const secret = "history-control-mounted-test-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api_server);
+    defer server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(a, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/history/control-v1", .{base});
+    defer a.free(url);
+    var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+    defer unsigned.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unsigned.status.code);
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token } };
+    var authenticated = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &headers, 20);
+    defer authenticated.deinit();
+    try std.testing.expectEqual(@as(u16, 400), authenticated.status.code);
+}
+
 test "internal capabilities advertise only the serving history apply profile" {
     const a = std.testing.allocator;
     var request = try httpx.Request.init(a, .GET, "http://127.0.0.1/internal/v1/capabilities");
