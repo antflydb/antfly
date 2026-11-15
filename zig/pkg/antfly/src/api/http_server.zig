@@ -29896,13 +29896,14 @@ pub fn resourcePermissionsCurrentlyAllowed(alloc: std.mem.Allocator, authenticat
     for (checks) |check| if (!permissionsAllow(identity.permissions, check.resource_type, check.resource, check.permission_type)) return false;
     const manager = identity.live_user_manager orelse return true;
     const logical = try alloc.dupe(usermgr.UserManager.PermissionCheck, checks);
+    defer alloc.free(logical);
     for (logical) |*check| if (check.resource_type == .table) {
         for (identity.catalog_aliases) |alias| if (std.mem.eql(u8, alias.physical, check.resource)) {
             check.resource = alias.logical;
             break;
         };
     };
-    return manager.permissionsCurrentlyAllowed(identity.username, identity.credential_principal, logical);
+    return manager.permissionsCurrentlyAllowedWithUserInstance(identity.username, identity.credential_principal, logical, identity.user_instance_id);
 }
 
 pub fn tablePermissionCurrentlyAllowed(identity: ?AuthenticatedIdentity, table_name: []const u8, permission_type: usermgr.PermissionType) !bool {
@@ -29928,22 +29929,7 @@ pub fn resourcePermissionCurrentlyAllowed(
         break :logical table_name;
     };
 
-    if (std.mem.startsWith(u8, identity.credential_principal, "api-key:")) {
-        const key_id = identity.credential_principal["api-key:".len..];
-        const current = manager.effectiveApiKeyPermissions(key_id) catch |err| switch (err) {
-            error.ApiKeyNotFound, error.ApiKeyExpired, error.UserNotFound => return false,
-            else => return err,
-        };
-        defer freePermissions(manager.alloc, current);
-        return permissionsAllow(current, resource_type, logical_name, permission_type);
-    }
-
-    return try manager.permissionCurrentlyAllowed(
-        identity.username,
-        resource_type,
-        logical_name,
-        permission_type,
-    );
+    return manager.permissionsCurrentlyAllowedWithUserInstance(identity.username, identity.credential_principal, &.{.{ .resource_type = resource_type, .resource = logical_name, .permission_type = permission_type }}, identity.user_instance_id);
 }
 
 fn storedDestinationAllowedForIdentity(
@@ -59452,6 +59438,7 @@ pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedId
     const value = identity orelse return null;
     var owned = try cloneAuthenticatedIdentity(alloc, value.username, value.credential_principal, value.permissions, value.row_filter, value.metadata_json, value.roles);
     errdefer owned.deinit(alloc);
+    owned.user_instance_id = value.user_instance_id;
     owned.is_internal_service = value.is_internal_service;
     owned.mcp_creation_discovery = value.mcp_creation_discovery;
     owned.live_user_manager = value.live_user_manager;

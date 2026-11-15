@@ -936,6 +936,36 @@ existing PostgreSQL CDC client. Production relational capture, coherent cuts,
 credential lineage, namespace registration, public endpoints, inbound/destination
 and lifecycle integration, and existing-client qualification remain outstanding.
 
+## In progress: production credential incarnation fencing
+
+Production Basic pgwire credentials now retain the persisted UserManager user
+instance ID. Validation checks that incarnation and the existing credential MAC
+under the same mutation lock, preserving the MAC format used by existing
+destination grants. Catalog identity copies preserve the ID, including physical
+table projections. Live single-resource and bulk permission checks intersect the
+admitted grants with current permissions and the admitted incarnation under one
+lock. The bulk helper also releases its temporary logical-name mapping.
+
+Trusted credential renewal requires the same optional user incarnation as the
+existing session. Locally backed trusted identities recheck that incarnation
+before returning a cloned identity. External trusted principals retain their
+existing issuer authority contract.
+
+The pgwire regression deletes and recreates a username, then reinstalls the exact
+old password verifier. Although its legacy credential MAC matches, the retained
+credential and both projected permission paths must reject the old incarnation;
+a fresh login belongs to the new incarnation. This is a prerequisite for the
+production feed owner, not registration of the replication session factory.
+Qualification: SQL/catalog DDL and row-filter suites pass, as do UserManager
+storage/persistence tests. The independent archive-boundary test checks the
+identity-aware MAC and permission methods across separate error domains,
+including zero IDs and username recreation. Its deterministic random fixture
+now emits distinct identities across calls. Logs:
+`zig/identity-lineage-qualification.log`,
+`zig/identity-lineage-final-qualification.log` (the archive fixture failure
+before that correction), and `zig/identity-lineage-abi-qualification.log`
+(corrected archive tests pass).
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

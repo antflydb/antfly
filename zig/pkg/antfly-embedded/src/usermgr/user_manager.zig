@@ -948,11 +948,20 @@ pub const UserManager = struct {
     /// One immutable live ACL snapshot for a complete graph operation. The
     /// caller separately intersects every check with its admitted ACL snapshot.
     pub fn permissionsCurrentlyAllowed(self: *UserManager, username: []const u8, credential: []const u8, checks: []const PermissionCheck) !bool {
+        return self.permissionsCurrentlyAllowedWithUserInstance(username, credential, checks, null);
+    }
+    /// Intersect an admitted identity with current permissions atomically. A
+    /// recreated username cannot inherit a prior identity's retained readers.
+    pub fn permissionsCurrentlyAllowedWithUserInstance(self: *UserManager, username: []const u8, credential: []const u8, checks: []const PermissionCheck, expected_instance: ?[16]u8) !bool {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
         defer self.mutation_mutex.unlock(io);
         if (!self.users.contains(username)) return false;
+        if (expected_instance) |expected| {
+            const current = self.user_instances.get(username) orelse return false;
+            if (std.mem.allEqual(u8, &expected, 0) or !std.mem.eql(u8, &current, &expected)) return false;
+        }
         const permissions = if (std.mem.startsWith(u8, credential, "api-key:")) blk: {
             const id = credential["api-key:".len..];
             const record = self.api_keys.get(id) orelse return false;
@@ -1514,6 +1523,35 @@ pub const UserManager = struct {
         principal: []const u8,
         payload: []const u8,
     ) ![std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 {
+        return self.destinationGrantMacWithInstance(principal, payload, null);
+    }
+
+    /// Check the persisted user incarnation and credential under one lock.
+    /// Username reuse must not revive a long-lived capture/feed credential,
+    /// even if an operator reinstalls exactly the same password verifier.
+    pub fn destinationGrantMacForUserInstance(
+        self: *const UserManager,
+        principal: []const u8,
+        payload: []const u8,
+        expected_instance: [16]u8,
+    ) ![std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 {
+        if (std.mem.allEqual(u8, &expected_instance, 0)) return error.UserNotFound;
+        return self.destinationGrantMacWithInstance(principal, payload, expected_instance);
+    }
+
+    fn requireUserInstanceUnlocked(self: *const UserManager, username: []const u8, expected: ?[16]u8) !void {
+        if (expected) |instance| {
+            const current = self.user_instances.get(username) orelse return error.UserNotFound;
+            if (!std.mem.eql(u8, &current, &instance)) return error.UserNotFound;
+        }
+    }
+
+    fn destinationGrantMacWithInstance(
+        self: *const UserManager,
+        principal: []const u8,
+        payload: []const u8,
+        expected_instance: ?[16]u8,
+    ) ![std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         const mutable: *UserManager = @constCast(self);
@@ -1522,11 +1560,13 @@ pub const UserManager = struct {
         const key = if (std.mem.startsWith(u8, principal, "basic:")) blk: {
             const username = principal["basic:".len..];
             if (username.len == 0) return error.InvalidDestinationGrantPrincipal;
+            try self.requireUserInstanceUnlocked(username, expected_instance);
             break :blk self.users.get(username) orelse return error.UserNotFound;
         } else if (std.mem.startsWith(u8, principal, "api-key:")) blk: {
             const key_id = principal["api-key:".len..];
             if (key_id.len == 0) return error.InvalidDestinationGrantPrincipal;
             const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
+            try self.requireUserInstanceUnlocked(record.key.username, expected_instance);
             if (record.key.expires_at_ns) |expires_at_ns| {
                 if (nowNs(io) > expires_at_ns) return error.ApiKeyExpired;
             }

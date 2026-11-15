@@ -61,3 +61,20 @@ test "usermgr archive boundary preserves replication grants and current revocati
     defer revoked.deinit(manager.alloc);
     try std.testing.expectEqual(@as(usize, 0), revoked.permissions.len);
 }
+
+test "usermgr archive boundary fences credential and permission checks by user incarnation" {
+    const manager = usermgr_abi_create() orelse return error.TestSetupFailed;
+    defer usermgr_abi_destroy(manager);
+    var user = try manager.getUser("alice");
+    defer user.deinit(manager.alloc);
+    const legacy = try manager.destinationGrantMac("basic:alice", "replication-owner");
+    try std.testing.expectEqual(legacy, try manager.destinationGrantMacForUserInstance("basic:alice", "replication-owner", user.instance_id));
+    try std.testing.expectError(error.UserNotFound, manager.destinationGrantMacForUserInstance("basic:alice", "replication-owner", @splat(0)));
+    try std.testing.expect(try manager.permissionsCurrentlyAllowedWithUserInstance("alice", "basic:alice", &.{}, user.instance_id));
+    try manager.deleteUser("alice");
+    var replacement = try manager.createUser("alice", "password", &.{});
+    defer replacement.deinit(manager.alloc);
+    try std.testing.expectError(error.UserNotFound, manager.destinationGrantMacForUserInstance("basic:alice", "replication-owner", user.instance_id));
+    try std.testing.expect(!try manager.permissionsCurrentlyAllowedWithUserInstance("alice", "basic:alice", &.{}, user.instance_id));
+    try std.testing.expect(try manager.permissionsCurrentlyAllowedWithUserInstance("alice", "basic:alice", &.{}, replacement.instance_id));
+}

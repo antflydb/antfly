@@ -256,7 +256,7 @@ pub const Adapter = struct {
         const next = try Credential.authenticateTrusted(alloc, self.server, self.server.cfg.user_manager, token);
         defer Credential.release(next, alloc);
         // Renewal never changes the owner of prepared statements or transactions.
-        if (!std.mem.eql(u8, current.principal, next.principal) or !std.mem.eql(u8, current.username, next.username)) return error.Unauthorized;
+        if (!std.mem.eql(u8, current.principal, next.principal) or !std.mem.eql(u8, current.username, next.username) or !std.meta.eql(current.user_instance_id, next.user_instance_id)) return error.Unauthorized;
         std.mem.swap(?http.AuthenticatedIdentity, &current.trusted_identity, &next.trusted_identity);
         std.mem.swap(?[]u8, &current.trusted_issuer, &next.trusted_issuer);
         current.verifier_mac = next.verifier_mac;
@@ -757,6 +757,7 @@ const Credential = struct {
     trusted_issuer: ?[]u8 = null,
     trusted_expires: i64 = 0,
     session_cleanup_complete: bool = true,
+    user_instance_id: ?[16]u8 = null,
 
     fn sessionPrincipal(self: *const Credential) []const u8 {
         // Durable Basic SQL sessions use the username across mixed-version
@@ -770,6 +771,7 @@ const Credential = struct {
         var user = snapshotUser(manager, username) catch return error.Unauthorized;
         defer user.deinit(manager.alloc);
         try usermgr.verifyPassword(user.password_hash, password);
+        if (std.mem.allEqual(u8, &user.instance_id, 0)) return error.Unauthorized;
         const self = try alloc.create(Credential);
         errdefer alloc.destroy(self);
         const name = try alloc.dupe(u8, username);
@@ -778,7 +780,7 @@ const Credential = struct {
         errdefer alloc.free(principal);
         var verifier_mac: [Mac.mac_length]u8 = undefined;
         Mac.create(&verifier_mac, credential_domain, user.password_hash);
-        self.* = .{ .manager = manager, .username = name, .principal = principal, .verifier_mac = verifier_mac };
+        self.* = .{ .manager = manager, .username = name, .principal = principal, .verifier_mac = verifier_mac, .user_instance_id = user.instance_id };
         // Detect rotation/deletion between snapshot, expensive verification,
         // and session publication without retaining either password or hash.
         try self.validate();
@@ -812,7 +814,7 @@ const Credential = struct {
         errdefer alloc.free(issuer);
         var fingerprint: [Mac.mac_length]u8 = undefined;
         Mac.create(&fingerprint, credential_domain, server.cfg.trusted_principal_secret orelse return error.Unauthorized);
-        self.* = .{ .manager = manager, .username = username, .principal = principal, .verifier_mac = fingerprint, .trusted_server = server, .trusted_identity = owned_identity, .trusted_issuer = issuer, .trusted_expires = exp.integer };
+        self.* = .{ .manager = manager, .username = username, .principal = principal, .verifier_mac = fingerprint, .trusted_server = server, .trusted_identity = owned_identity, .trusted_issuer = issuer, .trusted_expires = exp.integer, .user_instance_id = admitted.user_instance_id };
         return self;
     }
 
@@ -828,7 +830,10 @@ const Credential = struct {
             if (!std.crypto.timing_safe.eql([Mac.mac_length]u8, current, self.verifier_mac)) return error.Unauthorized;
             return;
         }
-        const current = self.manager.?.destinationGrantMac(self.principal, credential_domain) catch return error.Unauthorized;
+        const current = if (self.user_instance_id) |instance|
+            self.manager.?.destinationGrantMacForUserInstance(self.principal, credential_domain, instance) catch return error.Unauthorized
+        else
+            self.manager.?.destinationGrantMac(self.principal, credential_domain) catch return error.Unauthorized;
         if (!std.crypto.timing_safe.eql([Mac.mac_length]u8, current, self.verifier_mac)) return error.Unauthorized;
     }
 
@@ -844,7 +849,12 @@ const Credential = struct {
 
     fn identity(self: *Credential, alloc: std.mem.Allocator) !http.AuthenticatedIdentity {
         try self.validate();
-        if (self.trusted_identity) |cached| return (try http.cloneCatalogIdentity(alloc, cached)).?;
+        if (self.trusted_identity) |cached| {
+            if (cached.user_instance_id != null) if (cached.live_user_manager) |manager| {
+                if (!try manager.permissionsCurrentlyAllowedWithUserInstance(cached.username, cached.credential_principal, &.{}, cached.user_instance_id)) return error.Unauthorized;
+            };
+            return (try http.cloneCatalogIdentity(alloc, cached)).?;
+        }
         var lease = try self.manager.?.acquireSnapshotLease();
         // Copy credentials and policies under one lease without recursively
         // acquiring the user-manager mutex or retaining a login-time grant.
@@ -852,6 +862,9 @@ const Credential = struct {
             defer lease.release();
             var user = try lease.getUser(self.username);
             defer user.deinit(self.manager.?.alloc);
+            if (self.user_instance_id) |expected| {
+                if (!std.mem.eql(u8, &expected, &user.instance_id)) return error.Unauthorized;
+            }
             const permissions = try self.manager.?.getPermissionsForUser(self.username);
             defer http.freePermissions(self.manager.?.alloc, permissions);
             const filters = try self.manager.?.getRowFilters(self.username);
@@ -862,6 +875,7 @@ const Credential = struct {
                 self.manager.?.alloc.free(roles);
             }
             break :blk (try http.cloneCatalogIdentity(alloc, .{
+                .user_instance_id = user.instance_id,
                 .username = user.username,
                 .credential_principal = self.principal,
                 .permissions = permissions,
@@ -1742,6 +1756,8 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     defer Credential.release(credential, alloc);
     var admitted = try credential.identity(alloc);
     defer admitted.deinit(alloc);
+    try std.testing.expectEqual(user.instance_id, admitted.user_instance_id.?);
+    try std.testing.expectEqual(user.instance_id, credential.user_instance_id.?);
     try std.testing.expect(try http.tablePermissionCurrentlyAllowed(admitted, "docs", .read));
     var projected = (try http.cloneCatalogIdentity(alloc, admitted)).?;
     defer projected.deinit(alloc);
@@ -2198,4 +2214,48 @@ test "system catalog SQL pgwire retained policies keep namespace scopes isolated
     defer fresh.deinit(a);
     try OwnedRead.validatePolicies(a, &fresh, admitted, &retained);
     try OwnedRead.validatePolicies(a, &fresh, admitted, &retained);
+}
+
+test "SQL pgwire credential identity rejects username reuse with an identical password verifier" {
+    const a = std.testing.allocator;
+    const casbin = @import("antfly_casbin");
+    var store = usermgr.MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try usermgr.UserManager.init(a, store.iface(), try usermgr.initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    var read = try usermgr.Permission.initOwned(a, .table, "docs", .read);
+    defer read.deinit(a);
+    var original = try manager.createUser("alice", "secret", &.{read});
+    defer original.deinit(a);
+    const credential = try Credential.authenticate(a, &manager, "alice", "secret");
+    defer Credential.release(credential, a);
+    var identity = try credential.identity(a);
+    defer identity.deinit(a);
+    var projected = (try http.cloneCatalogIdentity(a, identity)).?;
+    defer projected.deinit(a);
+    try http.projectCatalogIdentity(a, &projected, "docs", "private-table-17");
+    try std.testing.expectEqual(original.instance_id, projected.user_instance_id.?);
+    try manager.deleteUser("alice");
+    var replacement = try manager.createUser("alice", "different-secret", &.{read});
+    defer replacement.deinit(a);
+    try std.testing.expect(!std.mem.eql(u8, &original.instance_id, &replacement.instance_id));
+    // Model an operator reinstalling the exact persisted verifier. The old
+    // MAC then matches, so only the immutable incarnation can fence reuse.
+    const hash = try a.dupe(u8, original.password_hash);
+    const current = manager.users.getPtr("alice").?;
+    a.free(current.*);
+    current.* = hash;
+    try std.testing.expectEqual(credential.verifier_mac, try manager.destinationGrantMac(credential.principal, credential_domain));
+    try std.testing.expectError(error.Unauthorized, credential.validate());
+    try std.testing.expectError(error.Unauthorized, credential.identity(a));
+    try std.testing.expect(!try http.tablePermissionCurrentlyAllowed(projected, "private-table-17", .read));
+    try std.testing.expect(!try http.resourcePermissionsCurrentlyAllowed(a, projected, &.{.{ .resource_type = .table, .resource = "private-table-17", .permission_type = .read }}));
+    const renewed = try Credential.authenticate(a, &manager, "alice", "secret");
+    defer Credential.release(renewed, a);
+    var renewed_identity = try renewed.identity(a);
+    defer renewed_identity.deinit(a);
+    try std.testing.expectEqual(replacement.instance_id, renewed_identity.user_instance_id.?);
+    try std.testing.expect(try http.tablePermissionCurrentlyAllowed(renewed_identity, "docs", .read));
 }
