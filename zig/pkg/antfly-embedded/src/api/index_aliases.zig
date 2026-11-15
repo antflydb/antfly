@@ -37,6 +37,51 @@ pub fn uses(a: A, bytes: []const u8) A.Error!bool {
     return parsed.value == .object and (parsed.value.object.contains(key) or parsed.value.object.contains(receipts_key) or parsed.value.object.contains("_index_alias_epoch"));
 }
 
+/// Minimum store capability for the actual persisted alias representation.
+/// Legacy bindings/receipts are readable by v3; only lifecycle state needs v4.
+pub fn requiredStoreProtocol(a: A, bytes: []const u8) A.Error!u16 {
+    if (std.mem.indexOfScalar(u8, bytes, '\\') == null and std.mem.indexOf(u8, bytes, "_index_alias") == null) return 0;
+    var parsed = std.json.parseFromSlice(V, a, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return 4,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+    if (parsed.value.object.contains("_index_alias_epoch")) return 4;
+    return if (parsed.value.object.contains(key) or parsed.value.object.contains(receipts_key)) 3 else 0;
+}
+
+pub fn requiredEnvelopeStoreProtocol(a: A, bytes: []const u8) A.Error!u16 {
+    var parsed = std.json.parseFromSlice(V, a, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return 4,
+    };
+    defer parsed.deinit();
+    return envelopeProtocol(a, parsed.value);
+}
+fn envelopeProtocol(a: A, value: V) A.Error!u16 {
+    var required: u16 = 0;
+    switch (value) {
+        .object => |object| {
+            if (object.contains("_index_alias_epoch")) return 4;
+            if (object.contains(key) or object.contains(receipts_key)) required = 3;
+            var entries = object.iterator();
+            while (entries.next()) |entry| {
+                const next = if (std.mem.eql(u8, entry.key_ptr.*, "indexes_json") and entry.value_ptr.* == .string)
+                    try requiredStoreProtocol(a, entry.value_ptr.string)
+                else
+                    try envelopeProtocol(a, entry.value_ptr.*);
+                required = @max(required, next);
+            }
+        },
+        .array => |items| for (items.items) |item| {
+            required = @max(required, try envelopeProtocol(a, item));
+        },
+        else => {},
+    }
+    return required;
+}
+
 /// Transition envelopes contain TableRecord.indexes_json as an escaped string.
 /// Inspect that structural field, never arbitrary prompt/document strings.
 pub fn usesEnvelope(a: A, bytes: []const u8) A.Error!bool {
@@ -76,7 +121,8 @@ pub fn physicalProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
     if (root != .object) return error.InvalidTableIndexMetadata;
     const removed_aliases = root.object.orderedRemove(key);
     const removed_receipts = root.object.orderedRemove(receipts_key);
-    if (!removed_aliases and !removed_receipts) return null;
+    const removed_epoch = root.object.orderedRemove("_index_alias_epoch");
+    if (!removed_aliases and !removed_receipts and !removed_epoch) return null;
     return try std.json.Stringify.valueAlloc(out, root, .{});
 }
 pub fn physicalProjection(out: A, bytes: []const u8) ![]u8 {
@@ -91,7 +137,8 @@ pub fn queryProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
     const a = arena.allocator();
     var root = try std.json.parseFromSliceLeaky(V, a, bytes, .{});
     if (root != .object) return error.InvalidTableIndexMetadata;
-    if (!root.object.contains(key) and !root.object.contains(receipts_key)) return null;
+    if (!root.object.contains(key) and !root.object.contains(receipts_key) and !root.object.contains("_index_alias_epoch")) return null;
+    _ = root.object.orderedRemove("_index_alias_epoch");
     _ = root.object.orderedRemove(receipts_key);
     if (root.object.getPtr(key)) |declarations| {
         if (declarations.* != .object) return error.InvalidTableIndexMetadata;
@@ -850,4 +897,23 @@ test "alias deletion rejects validators from every prior restore while retaining
     _ = try remove(a, restored, "live", tag);
     const receipt = (try replay(a, root, "live", .{ .index = "text", .idempotency_key = "1" })).?;
     try std.testing.expectEqual(@as(u64, 1), receipt.swapped_at_ms);
+}
+
+test "index alias lifecycle controls never change physical or query projections" {
+    const a = std.testing.allocator;
+    const legacy = "{\"text\":{\"type\":\"full_text\"},\"_index_aliases\":{\"live\":{\"index\":\"text\"}}}";
+    const scoped = try renewRestoreEpoch(a, legacy, "one");
+    defer a.free(scoped);
+    const left = try physicalProjection(a, legacy);
+    defer a.free(left);
+    const right = try physicalProjection(a, scoped);
+    defer a.free(right);
+    try std.testing.expectEqualStrings(left, right);
+    const old_query = try queryProjection(a, legacy);
+    defer a.free(old_query);
+    const new_query = try queryProjection(a, scoped);
+    defer a.free(new_query);
+    try std.testing.expectEqualStrings(old_query, new_query);
+    try std.testing.expectEqual(@as(u16, 3), try requiredStoreProtocol(a, legacy));
+    try std.testing.expectEqual(@as(u16, 4), try requiredStoreProtocol(a, scoped));
 }

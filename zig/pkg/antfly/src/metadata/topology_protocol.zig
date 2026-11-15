@@ -123,7 +123,13 @@ const std = @import("std");
 /// Version 90 admits table-scoped index aliases and durable retry receipts.
 /// Version 91 admits lifecycle-scoped alias deletion validators.
 pub const current_version: u16 = 91;
-pub const index_aliases_version: u16 = 91;
+pub const index_aliases_version: u16 = 90;
+pub const index_alias_lifecycle_version: u16 = 91;
+pub fn indexAliasDecoderVersion(a: std.mem.Allocator, bytes: []const u8, envelope: bool) std.mem.Allocator.Error!u16 {
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const required = if (envelope) try aliases.requiredEnvelopeStoreProtocol(a, bytes) else try aliases.requiredStoreProtocol(a, bytes);
+    return if (required >= 4) index_alias_lifecycle_version else if (required >= 3) index_aliases_version else 0;
+}
 pub fn usesIndexAliases(a: std.mem.Allocator, indexes_json: []const u8) !bool {
     return @import("antfly_local_sources").api_index_metadata.aliases.uses(a, indexes_json);
 }

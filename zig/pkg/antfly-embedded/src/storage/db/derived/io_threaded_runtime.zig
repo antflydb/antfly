@@ -178,6 +178,13 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return .{};
     }
 
+    pub fn requestSequence(self: *@This(), sequence: u64) void {
+        self.notifySequence(sequence);
+    }
+    pub fn requestIndexes(self: *@This(), sequence: u64, names: []const []const u8) void {
+        self.notifyIndexes(sequence, names);
+    }
+
     pub fn notifySequence(self: *@This(), sequence: u64) void {
         _ = self;
         _ = sequence;
@@ -604,35 +611,36 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return stats;
     }
 
-    pub fn notifySequence(self: *DerivedRuntime, sequence: u64) void {
-        const io = self.ioContext();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-
-        self.last_notified_sequence = @max(self.last_notified_sequence, sequence);
-        var changed = false;
-        for (self.workers.items) |worker| {
-            worker.notification_epoch +%= 1;
-            changed = true;
-            const next = @max(worker.target_sequence, sequence);
-            worker.target_sequence = next;
-        }
-        if (changed) self.signalWorkers(io);
+    /// Visibility requests only advance targets; they do not certify that a
+    /// previously missing source has changed. Commit and repair notifications
+    /// explicitly invalidate dependency waits, including same-sequence repairs.
+    pub fn requestSequence(self: *DerivedRuntime, sequence: u64) void {
+        self.updateTargets(sequence, null, false);
     }
-
-    pub fn notifyIndexes(self: *DerivedRuntime, sequence: u64, index_names: []const []const u8) void {
-        if (index_names.len == 0) return;
+    pub fn requestIndexes(self: *DerivedRuntime, sequence: u64, names: []const []const u8) void {
+        if (names.len == 0) return;
+        self.updateTargets(sequence, names, false);
+    }
+    pub fn notifySequence(self: *DerivedRuntime, sequence: u64) void {
+        self.updateTargets(sequence, null, true);
+    }
+    pub fn notifyIndexes(self: *DerivedRuntime, sequence: u64, names: []const []const u8) void {
+        if (names.len == 0) return;
+        self.updateTargets(sequence, names, true);
+    }
+    fn updateTargets(self: *DerivedRuntime, sequence: u64, names: ?[]const []const u8, input_changed: bool) void {
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-
+        if (names == null) self.last_notified_sequence = @max(self.last_notified_sequence, sequence);
         var changed = false;
         for (self.workers.items) |worker| {
-            if (!indexNameInList(worker.name, index_names)) continue;
-            worker.notification_epoch +%= 1;
-            changed = true;
-            const next = @max(worker.target_sequence, sequence);
-            worker.target_sequence = next;
+            if (names) |selected| if (!indexNameInList(worker.name, selected)) continue;
+            if (input_changed or sequence > worker.target_sequence) {
+                worker.notification_epoch +%= 1;
+                changed = true;
+            }
+            worker.target_sequence = @max(worker.target_sequence, sequence);
         }
         if (changed) self.signalWorkers(io);
     }
@@ -724,6 +732,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         defer self.mutex.unlock(io);
         self.force_catch_up_sequence = @max(self.force_catch_up_sequence, sequence);
         for (self.workers.items) |worker| {
+            if (sequence > worker.target_sequence) worker.notification_epoch +%= 1;
             worker.target_sequence = @max(worker.target_sequence, sequence);
         }
         self.signalWorkers(io);
@@ -842,6 +851,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         for (self.workers.items) |worker| {
             if (!indexNameInList(worker.name, index_names)) continue;
             const next = @max(worker.target_sequence, sequence);
+            if (next != worker.target_sequence) worker.notification_epoch +%= 1;
             changed = changed or next != worker.target_sequence;
             worker.target_sequence = next;
         }
@@ -3078,6 +3088,11 @@ test "db pending producer replay parks missing input and wakes on same sequence 
         if (parked) break;
         if (platform_time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
         try io.sleep(Io.Duration.fromMilliseconds(1), .awake);
+    }
+    for (0..100) |_| {
+        runtime.requestSequence(1);
+        runtime.requestIndexes(1, &.{"text"});
+        try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.waitForIndexesWithVisibilityWait(1, &.{"text"}, .{ .deadline_ns = platform_time.monotonicNs() }));
     }
     try io.sleep(Io.Duration.fromMilliseconds(100), .awake);
     try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));

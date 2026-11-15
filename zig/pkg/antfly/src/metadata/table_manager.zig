@@ -949,6 +949,10 @@ pub fn privacyProtocolSupported(reporter_incarnation: u64, protocol_version: u16
 }
 
 pub fn indexAliasesProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
+    return reporter_incarnation != 0 and protocol_version >= 3 and artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
+}
+
+pub fn indexAliasLifecycleProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
     return reporter_incarnation != 0 and protocol_version >= 4 and artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
 }
 

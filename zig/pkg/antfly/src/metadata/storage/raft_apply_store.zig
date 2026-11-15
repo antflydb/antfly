@@ -5827,7 +5827,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "14";
+const derived_catalog_index_version = "15";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -17810,6 +17810,7 @@ pub const RaftApplyStore = struct {
         try system_catalog_storage.rebuildNameIndex(self.alloc, txn, group_id);
         var alias_prefix_buf: [160]u8 = undefined;
         try self.deleteDerivedPrefixTxn(txn, try indexAliasTablePrefix(&alias_prefix_buf, group_id));
+        try self.deleteDerivedPrefixTxn(txn, try indexAliasLifecycleTablePrefix(&alias_prefix_buf, group_id));
         var listing_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer listing_arena.deinit();
         const listing_alloc = listing_arena.allocator();
@@ -17911,7 +17912,9 @@ pub const RaftApplyStore = struct {
             const privacy_raw = try txn.get(try tableKeyForGroup(&privacy_table_buf, group_id, table.id));
             const decoded_table = try decodeTableRecord(privacy_alloc, privacy_raw);
             try putPrivacyWork(privacy_alloc, txn, group_id, decoded_table);
-            try synchronizeIndexAliasTableTxn(txn, group_id, table.id, try topology_protocol.usesIndexAliases(self.alloc, decoded_table.indexes_json));
+            const alias_protocol = try @import("antfly_local_sources").api_index_metadata.aliases.requiredStoreProtocol(self.alloc, decoded_table.indexes_json);
+            try synchronizeIndexAliasTableTxn(txn, group_id, table.id, alias_protocol >= 3);
+            try synchronizeIndexAliasLifecycleTableTxn(txn, group_id, table.id, alias_protocol >= 4);
 
             var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table.id);
             fence.range_membership = .{};
@@ -21983,6 +21986,7 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         try synchronizeIndexAliasTableTxn(txn, group_id, table_id, false);
+        try synchronizeIndexAliasLifecycleTableTxn(txn, group_id, table_id, false);
         if (existing_table_name) |name| try self.deleteTableNameIndexTxn(txn, group_id, name);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id, .table_name = existing_table_name, .table_id = table_id });
@@ -23326,6 +23330,7 @@ pub const RaftApplyStore = struct {
                 try self.removeSystemCatalogTableTxn(txn, group_id, drop.table_id);
                 try txn.delete(table_key);
                 try synchronizeIndexAliasTableTxn(txn, group_id, drop.table_id, false);
+                try synchronizeIndexAliasLifecycleTableTxn(txn, group_id, drop.table_id, false);
                 try relation_reconciliation.advanceTrackedSource(txn, group_id);
                 var fingerprint_key_buf: [192]u8 = undefined;
                 txn.delete(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, drop.table_id)) catch |err| switch (err) {
@@ -23953,6 +23958,12 @@ pub const RaftApplyStore = struct {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
         return hasIndexAliasesTxn(&txn, group_id);
+    }
+
+    pub fn hasIndexAliasLifecycleState(self: *RaftApplyStore, group_id: u64) !bool {
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        return hasIndexAliasLifecycleStateTxn(&txn, group_id);
     }
 
     /// Precondition failures in a committed command are durable rejections,
@@ -26172,7 +26183,9 @@ pub const RaftApplyStore = struct {
         }
         try putPrivacyWork(self.alloc, txn, group_id, record);
         try txn.put(key, value);
-        try synchronizeIndexAliasTableTxn(txn, group_id, record.table_id, try topology_protocol.usesIndexAliases(self.alloc, record.indexes_json));
+        const alias_protocol = try @import("antfly_local_sources").api_index_metadata.aliases.requiredStoreProtocol(self.alloc, record.indexes_json);
+        try synchronizeIndexAliasTableTxn(txn, group_id, record.table_id, alias_protocol >= 3);
+        try synchronizeIndexAliasLifecycleTableTxn(txn, group_id, record.table_id, alias_protocol >= 4);
         const fingerprint = policyTableSchemaRecordDigest(record);
         var fingerprint_key_buf: [192]u8 = undefined;
         try txn.put(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, record.table_id), &fingerprint);
@@ -28066,8 +28079,31 @@ fn hasIndexAliasesTxn(txn: *docstore.DocStore.Txn, group_id: u64) !bool {
     return std.mem.startsWith(u8, row.key, prefix);
 }
 
+fn indexAliasLifecycleTablePrefix(buf: []u8, group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:index_alias_lifecycle_table:{d}:", .{group_id});
+}
+fn synchronizeIndexAliasLifecycleTableTxn(txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, present: bool) !void {
+    var buf: [192]u8 = undefined;
+    const key = try std.fmt.bufPrint(&buf, "\x00\x00__metadata_derived__:index_alias_lifecycle_table:{d}:{x:0>16}", .{ group_id, table_id });
+    if ((try RaftApplyStore.stagingGet(txn, key) != null) == present) return;
+    if (present) return txn.put(key, "");
+    txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+}
+fn hasIndexAliasLifecycleStateTxn(txn: *docstore.DocStore.Txn, group_id: u64) !bool {
+    var buf: [192]u8 = undefined;
+    const prefix = try indexAliasLifecycleTablePrefix(&buf, group_id);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+    return std.mem.startsWith(u8, row.key, prefix);
+}
+
 fn admitIndexAliasTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !bool {
-    if (!try topology_protocol.usesIndexAliases(self.alloc, table.indexes_json)) return true;
+    const required = try @import("antfly_local_sources").api_index_metadata.aliases.requiredStoreProtocol(self.alloc, table.indexes_json);
+    if (required == 0) return true;
     var buf: [160]u8 = undefined;
     const prefix = try storePrefixForGroup(&buf, group_id);
     var cursor = try txn.openCursor();
@@ -28078,7 +28114,11 @@ fn admitIndexAliasTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, g
         const store = try RaftApplyStore.decodeStoredHeader(self.alloc, kv.value);
         defer metadata_table_manager.freeStore(self.alloc, store);
         if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
-        if (!metadata_table_manager.indexAliasesProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return false;
+        const supported = if (required >= 4)
+            metadata_table_manager.indexAliasLifecycleProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)
+        else
+            metadata_table_manager.indexAliasesProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version);
+        if (!supported) return false;
     }
     return true;
 }
@@ -28141,6 +28181,22 @@ test "index alias Raft admission permits rollout and fences returning legacy sto
     try synchronizeIndexAliasTableTxn(&txn, group, table.table_id, true);
     try std.testing.expect(!try admitIndexAliasStoreTxn(&store, &txn, group, legacy));
     try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, modern));
+    var prior_release = modern;
+    prior_release.artifact_sources_protocol_version = 3;
+    // The v90 representation stays usable during mixed-version rollout.
+    try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, prior_release));
+    const prior_bytes = try encodeStoreRecord(a, prior_release);
+    defer a.free(prior_bytes);
+    try txn.put(try storeKeyForGroup(&buf, group, modern.store_id), prior_bytes);
+    try std.testing.expect(try admitIndexAliasTableTxn(&store, &txn, group, table));
+    var scoped = table;
+    scoped.indexes_json = "{\"_index_aliases\":{},\"_index_alias_epoch\":\"new-lifecycle\"}";
+    try std.testing.expect(!try admitIndexAliasTableTxn(&store, &txn, group, scoped));
+    try txn.put(try storeKeyForGroup(&buf, group, modern.store_id), new_store);
+    try std.testing.expect(try admitIndexAliasTableTxn(&store, &txn, group, scoped));
+    try synchronizeIndexAliasLifecycleTableTxn(&txn, group, table.table_id, true);
+    try std.testing.expect(!try admitIndexAliasStoreTxn(&store, &txn, group, prior_release));
+    try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, modern));
     var metadata_only = legacy;
     metadata_only.role = "metadata";
     try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, metadata_only));
@@ -28150,7 +28206,7 @@ test "index alias Raft admission permits rollout and fences returning legacy sto
 }
 
 fn admitIndexAliasStoreTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, incoming: metadata.StoreRecord) !bool {
-    if (!incoming.live or !metadata_table_manager.storeServesTableData(incoming.role) or metadata_table_manager.indexAliasesProtocolSupported(incoming.reporter_incarnation, incoming.artifact_sources_protocol_version)) return true;
+    if (!incoming.live or !metadata_table_manager.storeServesTableData(incoming.role) or metadata_table_manager.indexAliasLifecycleProtocolSupported(incoming.reporter_incarnation, incoming.artifact_sources_protocol_version)) return true;
     var buf: [160]u8 = undefined;
     const raw = (try RaftApplyStore.stagingGet(txn, try RaftApplyStore.topologyActivationKeyForGroup(&buf, group_id))) orelse return true;
     if (raw.len > 1024) return error.InvalidCatalogRecord;
@@ -28161,6 +28217,8 @@ fn admitIndexAliasStoreTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, g
     // exists. Keep legacy heartbeats working during that rollout. Once alias
     // state commits, reject old registrations in the same transaction; neither
     // a racing proposal nor leader/standby promotion can reopen admission.
+    if (metadata_table_manager.indexAliasesProtocolSupported(incoming.reporter_incarnation, incoming.artifact_sources_protocol_version))
+        return !try hasIndexAliasLifecycleStateTxn(txn, group_id);
     return !try hasIndexAliasesTxn(txn, group_id);
 }
 
@@ -45561,4 +45619,40 @@ test "metadata alias presence lookup is bounded and rebuilds across migration re
     defer txn.abort();
     const legacy: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .artifact_sources_protocol_version = 2 };
     try std.testing.expect(try admitIndexAliasStoreTxn(&peer, &txn, group, legacy));
+}
+
+test "index alias lifecycle presence rebuilds from v14 and retires transactionally" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/alias-lifecycle-presence", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group: u64 = 21;
+    const table: metadata.TableRecord = .{ .table_id = 42, .name = "docs", .indexes_json = "{\"_index_aliases\":{},\"_index_alias_epoch\":\"one\"}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    try std.testing.expect(try store.hasIndexAliasLifecycleState(group));
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var buf: [160]u8 = undefined;
+        try txn.put(try derivedCatalogIndexVersionKey(&buf, group), "14");
+        try synchronizeIndexAliasLifecycleTableTxn(&txn, group, table.table_id, false);
+        try txn.commit();
+    }
+    try store.ensureDerivedCatalogIndexes(group);
+    try std.testing.expect(try store.hasIndexAliasLifecycleState(group));
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try synchronizeIndexAliasLifecycleTableTxn(&txn, group, table.table_id, false);
+        try std.testing.expect(!try hasIndexAliasLifecycleStateTxn(&txn, group));
+    }
+    try std.testing.expect(try store.hasIndexAliasLifecycleState(group));
+    var legacy = table;
+    legacy.indexes_json = "{\"_index_aliases\":{}}";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = legacy });
+    try std.testing.expect(!try store.hasIndexAliasLifecycleState(group));
+    try std.testing.expect(try store.hasIndexAliases(group));
 }

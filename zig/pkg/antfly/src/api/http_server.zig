@@ -4754,7 +4754,7 @@ pub const ApiHttpServer = struct {
         defer self.source.freeAdminSnapshot(&snapshot);
         for (snapshot.stores) |store| {
             if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
-            if (!metadata_table_manager.indexAliasesProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.IndexAliasProtocolUpgradeRequired;
+            if (!metadata_table_manager.indexAliasLifecycleProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.IndexAliasProtocolUpgradeRequired;
         }
         // Empty data fleets are valid for object tables. The durable alias
         // admission and subsequent store admission enforce the protocol floor.

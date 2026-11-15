@@ -33813,7 +33813,7 @@ pub const DB = struct {
                 .cancellation = options.cancellation,
             });
         }
-        self.executor.notifySequence(sequence);
+        self.executor.requestSequence(sequence);
         if (!options.follow_new_targets) return;
         if (options.no_progress_timeout_ns != 0) {
             // The threaded executor's waitForAll has no deadline, and the
@@ -33888,7 +33888,7 @@ pub const DB = struct {
             try wait.check();
             return;
         }
-        self.executor.notifySequence(sequence);
+        self.executor.requestSequence(sequence);
         try self.executor.waitForAllWithVisibilityWait(sequence, wait);
     }
 
@@ -33920,7 +33920,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("runDerivedUntilTargets", .{ self, sequence, index_names });
         if (sequence == 0 or index_names.len == 0) return;
         if (!self.executor.hasWorkers()) return;
-        self.executor.notifyIndexes(sequence, index_names);
+        self.executor.requestIndexes(sequence, index_names);
         try self.executor.waitForIndexes(sequence, index_names);
     }
 
@@ -33933,7 +33933,7 @@ pub const DB = struct {
         if (sequence == 0 or index_names.len == 0) return;
         try wait.check();
         if (!self.executor.hasWorkers()) return;
-        self.executor.notifyIndexes(sequence, index_names);
+        self.executor.requestIndexes(sequence, index_names);
         try self.executor.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
     }
 
@@ -154827,6 +154827,9 @@ test "db pending producer replay opens without claiming completion and resumes a
     const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "pending", "dense");
     defer alloc.free(artifact_key);
     try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+    // This fixture writes below the normal commit notifier. Publish availability
+    // explicitly; a visibility wait alone must not invalidate dependency waits.
+    db.executor.notifySequence(sequence);
     try db.runDerivedUntil(sequence);
     const debt = try db.listDerivedReplayDebt(alloc);
     defer {

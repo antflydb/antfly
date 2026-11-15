@@ -351,12 +351,14 @@ protects against deleting a concurrently recreated alias or one restored from a 
 retained PUT idempotency receipts remain intact. Protection remains
 active throughout the transition. Alias mutations require metadata protocol 91
 and store artifact-source protocol 4 so older owners cannot misread the new
-validator state.
+validator state. Legacy alias catalogs continue to admit protocol-3 stores
+during rolling upgrades until lifecycle validator state is committed.
 
 Missing producer input does not become a successful replay merely because a retry
 limit elapsed. Its journal window remains pending until input arrives, a durable
 source deletion or generation proves it retired, or explicit repair resolves the
 missing state. Workers park instead of polling the same failed window; source or
 producer commits and explicit repair notifications wake them, including repairs
-at the same replay sequence. Reopening retries retained debt. This applies to
+at the same replay sequence. Ordinary query visibility waits do not wake an
+unchanged missing-input window. Reopening retries retained debt. This applies to
 full-text consumers as well as vector consumers.
