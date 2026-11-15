@@ -39089,32 +39089,31 @@ pub const DB = struct {
                 break :blk settled;
             };
             if (ready) return producer_sequence;
+            // Drive the identical slice `group_source_owner.Owner.step` runs
+            // in the background, inline, so a foreground visibility wait
+            // doesn't sit idle waiting for that resident owner's own cadence
+            // (a resident owner may not even be registered for every table
+            // that reaches this wait). `runGroupSourceSlice` routinely
+            // returns `EnrichmentSourceChanged` (and the other
+            // `isEnrichmentProgressPending` conditions) when a concurrent
+            // writer or owner turn advances the same partition between this
+            // slice's own reads -- an ordinary mid-flight race, not a
+            // failure. `Owner.step` already treats any error from this
+            // exact call as "no progress this turn, retry" (log and back
+            // off) rather than fatal; mirror that here. Letting it propagate
+            // turned an expected race into a permanent batch failure: the
+            // primary write was already committed, so `batchFailureCode`
+            // surfaced it as ANTFLY_STALLED instead of this loop simply
+            // retrying within its own deadline.
+            _ = self.runGroupSourceSlice() catch |err| {
+                std.log.warn("group source slice deferred during visibility wait: {s}", .{@errorName(err)});
+            };
             if (self.local_execution.optional_runtime_workers_enabled) {
-                // A resident `group_source_owner.Owner`, registered by
-                // `startResidentBackgroundWorkersIfNeeded`, already drives
-                // this exact (possibly borrowed/shared -- `open_table`
-                // points every table's `GroupSourceMaintenanceState` at the
-                // connection-wide `lite_connection.Owner`'s own map, keyed by
-                // table id) state on its own scheduler turn, serialized with
-                // itself through `state.slice_mutex`. Driving the identical
-                // `runGroupSourceSlice` a second time from here, on this
-                // call's own stack, raced that owner's commit through the
-                // same table's writer-base bookkeeping: a benign-looking
-                // `EnrichmentSourceChanged` (the two slices' fan-in reads of
-                // the same partition disagreeing) that, once this loop
-                // retried instead of surfacing it, escalated into a `stale
-                // writer base reached publishCheckpoint` panic. Wake the
-                // owner and the enrichment runtime without waiting for a
-                // global cursor that may be blocked on an independent,
-                // later request -- the durable source debt above is the
-                // completion authority -- instead of duplicating either's
-                // work inline.
-                self.backend_runtime.wakeMaintenance(&self.group_source_owner);
+                // Wake the owner without waiting for a global cursor that
+                // may be blocked on an independent, later request. The
+                // durable source debt above is the completion authority.
                 if (self.enrichment_runtime) |runtime| runtime.notifySequence(producer_sequence);
-            } else {
-                _ = try self.runGroupSourceSlice();
-                try self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
-            }
+            } else try self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
             try wait.check();
             try io.sleep(.fromMilliseconds(5), .awake);
         }
