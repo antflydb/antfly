@@ -2390,6 +2390,21 @@ pub const Owner = struct {
             },
             else => return err,
         };
+        // perf/lwa-grouped-stall: same drain the handoff branches above
+        // perform before handing their lease to maintenance (see
+        // `ensureDurableForReuse`'s own doc comment: its two callers are
+        // this function and `tryWriterLeaseAssumeLocked`, handing the
+        // lease to a *different*, detached `NativeFile` instance than the
+        // one any ride-along work queued against). A fresh kernel
+        // acquisition still hands the same detached instance a lease
+        // next, so it needs the same drain; this branch was the one case
+        // that skipped it, confirmed live alongside
+        // `refreshIfWriterBaseStale`'s own fix (storage/lite/native.zig)
+        // as part of the grouped-source background-maintenance stall --
+        // handoff never actually fires under this owner's own polling
+        // cadence, so this fresh path is not the rare fallback its name
+        // implies here, it is the *common* one.
+        if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
         errdefer held.close();
         stats.recordAcquired(if (held.contended) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
         wal_trace.recordOp(.maintenance_lease_acquired);
@@ -2434,6 +2449,13 @@ pub const Owner = struct {
             break :blk held;
         } else blk: {
             const held = try native.tryFairWriterLockWithIo(alloc, h.handleLockIo(), self.path);
+            // Same drain as the handoff branches above, and
+            // `acquireMaintenancePathLeaseAssumeLocked`'s own fresh-kernel
+            // branch: a fresh acquisition still hands this lease to the
+            // same detached `self.current` instance next, which needs any
+            // still-queued ride-along work on the file physically written
+            // first so its own next commit's sequence check sees it.
+            if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
             stats.recordAcquired(.uncontended, 0);
             break :blk held;
         };
