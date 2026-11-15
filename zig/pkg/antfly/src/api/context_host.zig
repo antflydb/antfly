@@ -251,7 +251,7 @@ pub const Host = struct {
                 req.include_stored = true;
                 req.include_all_fields = true;
                 if (req.limit == 0 or req.limit > body.k) req.limit = body.k;
-                var response = (try p.reads_fn(p.ptr).query(alloc, name, req, .read_index)) orelse return error.ContextSearchUnavailable;
+                const response = (try p.reads_fn(p.ptr).query(alloc, name, req, .read_index)) orelse return error.ContextSearchUnavailable;
                 defer alloc.free(response.json);
                 return hitsPageAlloc(alloc, a, response.json);
             },

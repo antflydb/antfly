@@ -7688,6 +7688,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.coalesced_job_admission.",
             "storage.db.dense_publication_admission.",
             "storage.db.local_runtime_owner.",
+            "storage.db.context_host_json.",
             "storage.db.embedding_activity_cache.",
             "storage.db.managed_admission_owner.",
             "storage.db.result_collectors.",

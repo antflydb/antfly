@@ -10454,15 +10454,15 @@ pub const DB = struct {
                     if (known) continue;
                     var config = @import("enrichment/context_sources.zig").parseStoredJson(a, d.stored_json) catch continue;
                     defer config.deinit();
-                    for (config.sources) |source| {
-                        if (!std.mem.eql(u8, source.table_id, pass.topology.table_id) or !source.isLive()) continue;
+                    for (config.sources) |declared| {
+                        if (!std.mem.eql(u8, declared.table_id, pass.topology.table_id) or !declared.isLive()) continue;
                         const value = try notices.encodeNoticeAlloc(a, .{
                             .dependent_table_id = d.dependent_table_id,
                             .artifact = d.artifact,
-                            .source_name = source.name,
+                            .source_name = declared.name,
                             .source_table_id = pass.topology.table_id,
                             .key = "",
-                            .spec = source.specDigest(),
+                            .spec = declared.specDigest(),
                             .all = true,
                             .change = .member_changed,
                             .refresh = config.refresh,

@@ -2531,6 +2531,8 @@ pub const ProvisionedTableWriteCache = struct {
         context_host: ?*@import("context_host.zig").Host = null,
         context_table_name: []const u8 = "",
         context_adapter: @import("antfly_local_sources").storage_db_context_host_json.Host = undefined,
+        ttl_binding: server_coordinated_ttl.Binding = .{},
+        visibility_binding: server_query_visibility.Binding = .{},
 
         /// Installs the context host on `db` for this owner's group.
         fn installContext(self: *RuntimeHookState, db: *db_mod.DB, table_name: []const u8) void {
@@ -2551,8 +2553,6 @@ pub const ProvisionedTableWriteCache = struct {
             const host = self.context_host orelse return error.ContextSourceTableUnavailable;
             return host.call(alloc, @intFromEnum(op), self.group_id, self.context_table_name, request);
         }
-        ttl_binding: server_coordinated_ttl.Binding = .{},
-        visibility_binding: server_query_visibility.Binding = .{},
 
         fn owner(self: *RuntimeHookState) ?db_mod.PromotionOwner {
             if (self.leadership_source == null) return null;
