@@ -3514,6 +3514,25 @@ pub const Index = struct {
         var accounting = try storage_accounting.txn(view);
         defer accounting.deinit();
         try self.applyBatchMutationsWithTxn(&accounting, batch, options);
+        // Fold any HLL maintenance this same write just dirtied into the
+        // SAME host transaction, instead of leaving `install()` to schedule
+        // a background ride-along job for it. A ride-along job opens its
+        // own transaction and durability ticket on another thread; when no
+        // other foreground write arrives before `ride_along_idle_ns` (50ms)
+        // elapses, `Store.Ticket.waitSequence`'s self-drive fallback forces
+        // that ticket's own commit on the calling thread -- an extra
+        // durable commit per dirtying write (lite-single-commit-write-
+        // path.md §3.3b's "algebraic overwrite" measurement). Running the
+        // (bounded, incremental, already fully txn-scoped) maintenance pass
+        // here instead means the common case needs zero extra commits: the
+        // dirty marker this write itself set is cleared before this same
+        // transaction ever commits. `install()`'s `scheduleHllMaintenanceIfDirty`
+        // remains as a safety net for whatever this pass's row budget left
+        // `pending` (`runHllMaintenanceTxn`'s `tick.pending`) and for the
+        // non-inline worker path, which does not call this function.
+        if (try self.hllAnyDirtyTxn(&accounting)) {
+            _ = try self.runHllMaintenanceTxn(&accounting, self.config().max_hll_maintenance_rows_per_tick);
+        }
         try accounting.finish();
     }
 
