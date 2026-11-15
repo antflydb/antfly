@@ -11196,19 +11196,45 @@ pub const NativeFile = struct {
                 //
                 // Logical debt gets exactly the same treatment as a
                 // staged page here, not a more eager one: an unbudgeted
-                // caller must stay deferred (several tests -- "artifact
-                // leases defer allocator proof until an authored write,"
-                // "ride-along passes force no sync" -- assert exactly
-                // that: a read-driven or idle maintenance pass must not
-                // unilaterally force the proof/fold a caller never asked
-                // for). Skipping this pass's own ledger work entirely
-                // when unbudgeted is always safe for the same reason
-                // skipping it for a staged page is: `redo.checkpoint_sequence`
-                // (and the real checkpoint slot) simply stay exactly
-                // where they were, so nothing here can ever make the
-                // "superseded" boundary used on the next reopen worse
-                // than it already is.
-                if (self.reserve_retirement_capacity and self.max_file_bytes != null) {
+                // *ride-along* caller must stay deferred (several tests --
+                // "artifact leases defer allocator proof until an
+                // authored write," "ride-along passes force no sync" --
+                // assert exactly that: a read-driven or idle maintenance
+                // pass must not unilaterally force the proof/fold a
+                // caller never asked for). Skipping this pass's own
+                // ledger work entirely when unbudgeted is always safe for
+                // the same reason skipping it for a staged page is:
+                // `redo.checkpoint_sequence` (and the real checkpoint
+                // slot) simply stay exactly where they were, so nothing
+                // here can ever make the "superseded" boundary used on
+                // the next reopen worse than it already is.
+                //
+                // perf/lwa-peer-cert: `require_reuse_proof` is exactly
+                // the opposite posture, though -- it marks a caller that
+                // already *asked* for real reclamation, synchronously,
+                // right now (`reclaimPagesWithCancel`/`reclaimPages`;
+                // `reclaimRetirementPressure`'s own doc comment: "a
+                // sustained writer must contribute reclamation before
+                // filling the bounded retirement queue"). Deferring for
+                // such a caller just because no `max_file_bytes` budget
+                // happens to be configured silently turned every explicit
+                // reclaim request into a guaranteed no-op whenever any
+                // logical overlay debt was outstanding, with nothing else
+                // in the system ever unblocking it on its own -- found
+                // live via `reclaimRetirementPressure`'s own foreground
+                // admission loop (`capi.db_test`'s "coalesces allocator
+                // proof outside publication gates": `reclaimPages` calls
+                // retired nothing without a budget, so `reusable_pages`
+                // never moved) and matching `reclaimRetirementPressure`'s
+                // own 16-iteration loop, which would otherwise spin to
+                // `error.FileBusy` with zero progress once pending debt
+                // crossed half the queue limit on any unbudgeted store.
+                // `durable` is always `true` for every existing
+                // `require_reuse_proof = true` caller (`reclaimPagesWithCancel`
+                // hard-codes both), so folding here is exactly as durable
+                // as the rest of this explicit path already is -- never a
+                // surprise ride-along sync.
+                if (require_reuse_proof or (self.reserve_retirement_capacity and self.max_file_bytes != null)) {
                     self.checkpointRedoLog() catch {};
                 }
                 // Whether or not folding ran (skipped above, or
@@ -30449,6 +30475,95 @@ test "lite sustained writers reclaim bounded retirement pressure before admissio
     const current = (try file.getDocumentAtCheckpointAlloc(a, file.activeCheckpoint(), "item-0")).?;
     defer a.free(current);
     try std.testing.expectEqualStrings("replacement", current);
+    try std.testing.expect((try file.check()).valid);
+}
+
+// perf/lwa-peer-cert: reclaimPagesImpl's redo-overlay gate (perf/lwa-reuse-loss,
+// ec28c12c66/2b6ee404e8) deferred its ledger-only body whenever unfolded
+// logical/page-shaped overlay content existed and no `max_file_bytes`
+// budget was configured -- correct for an unbudgeted *ride-along*
+// maintenance pass (`reclaimPagesForMaintenanceWithCancel`, `require_reuse_proof
+// = false`; see the test right after this one), but the same unconditional
+// check also covered `reclaimPagesWithCancel`/`reclaimPages` (`require_reuse_proof
+// = true`), an explicit, synchronous caller that already asked for real
+// reclamation right now and has no ride-along to fall back on
+// (`reclaimRetirementPressure`'s own doc comment: "a sustained writer must
+// contribute reclamation before filling the bounded retirement queue").
+// Silently returning 0 on every call turned every such explicit request
+// into a permanent no-op whenever any logical overlay debt was
+// outstanding and no budget happened to be configured -- found live via
+// `capi.db_test`'s "coalesces allocator proof outside publication gates":
+// an unbudgeted file's `reclaimPages(4096)` loop retired nothing, so
+// `allocatorStats().reusable_pages` never moved, and (unrelated to a
+// budget at all) `reclaimRetirementPressure`'s own foreground admission
+// loop would have spun to `error.FileBusy` with zero progress on any
+// unbudgeted store once pending debt crossed half the queue limit.
+test "lite native reclaimPages folds unfolded redo overlay debt for an explicit caller even without a configured storage budget" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reclaim-explicit-no-budget.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+    defer file.close();
+    // No `max_file_bytes` configured anywhere -- the exact unbudgeted
+    // condition the old gate silently starved an explicit caller under.
+    try std.testing.expect(file.max_file_bytes == null);
+    const large: [32768]u8 = @splat('v');
+    var keys: [16][16]u8 = undefined;
+    var batch: [16]CatalogMutation = undefined;
+    for (&batch, &keys, 0..) |*mutation, *key, i| mutation.* = .{ .key = try std.fmt.bufPrint(key, "doomed-{d}", .{i}), .value = &large };
+    try file.putCatalogBatch(&batch);
+    for (&batch) |*mutation| mutation.* = .{ .key = mutation.key, .is_delete = true };
+    try file.putCatalogBatch(&batch);
+    // Exactly the previously-unexercised case: an active redo log, not
+    // mid-checkpoint, with real unfolded overlay debt from the puts and
+    // deletes above.
+    try std.testing.expect(file.redo != null and !file.redo.?.checkpointing);
+    var reclaimed: usize = 0;
+    for (0..8) |_| reclaimed += try file.reclaimPages(4096);
+    try std.testing.expect(reclaimed > 0);
+    try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 64);
+    try std.testing.expect((try file.check()).valid);
+}
+
+// Companion to the test above: the *ride-along*, non-explicit caller
+// (`require_reuse_proof = false`) must still stay deferred without a
+// budget -- the fix above is scoped to `require_reuse_proof`, not a
+// blanket removal of the gate. Matches docstore.zig's "lite reclamation
+// ride-along passes force no sync before the next durable write" at the
+// `Store` layer; this is the same property one level down, directly on
+// `NativeFile.reclaimPagesForMaintenanceWithCancel`. Checked via
+// `test_sync_calls`/`redo.checkpoint_sequence`, not `reusable_pages`: a
+// diverting commit's own external-value pages are retired through a
+// separate mechanism independent of this gate (`PageWriteBatch`'s own
+// `direct_value_pages` handling), so some incidental free-map movement
+// is expected even while the gated ledger-only fold body itself never
+// runs -- the actual property this gate protects is that no *fold*
+// (a real, syncing commit) happens, not that the free map never moves
+// at all.
+test "lite native reclaimPagesForMaintenanceWithCancel still defers the gated ledger fold without a configured storage budget" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reclaim-ride-along-no-budget.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+    defer file.close();
+    try std.testing.expect(file.max_file_bytes == null);
+    const large: [32768]u8 = @splat('v');
+    var keys: [16][16]u8 = undefined;
+    var batch: [16]CatalogMutation = undefined;
+    for (&batch, &keys, 0..) |*mutation, *key, i| mutation.* = .{ .key = try std.fmt.bufPrint(key, "doomed-{d}", .{i}), .value = &large };
+    try file.putCatalogBatch(&batch);
+    for (&batch) |*mutation| mutation.* = .{ .key = mutation.key, .is_delete = true };
+    try file.putCatalogBatch(&batch);
+    try std.testing.expect(file.redo != null and !file.redo.?.checkpointing);
+    const folded_before = file.redo.?.checkpoint_sequence;
+    const syncs_before = file.test_sync_calls.load(.monotonic);
+    for (0..8) |_| _ = try file.reclaimPagesForMaintenanceWithCancel(4096, null, false);
+    try std.testing.expectEqual(folded_before, file.redo.?.checkpoint_sequence);
+    try std.testing.expectEqual(syncs_before, file.test_sync_calls.load(.monotonic));
     try std.testing.expect((try file.check()).valid);
 }
 
