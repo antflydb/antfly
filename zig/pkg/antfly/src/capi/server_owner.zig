@@ -576,7 +576,7 @@ pub const StorageOwnerRuntimeHooks = struct {
         };
         var collect = Collect{ .alloc = alloc };
         errdefer if (collect.out) |bytes| alloc.free(bytes);
-        try kernel_error_identity.statusToError(call(self.config.context.callback_ctx, @intFromEnum(op), self.group_id, .fromSlice(self.table_name), .fromSlice(request), &collect, Collect.consume));
+        try kernel_error_identity.statusToError(call(self.config.context.callback_ctx, @backingInt(op), self.group_id, .fromSlice(self.table_name), .fromSlice(request), &collect, Collect.consume));
         if (collect.failed) return error.OutOfMemory;
         return collect.out orelse try alloc.dupe(u8, "");
     }

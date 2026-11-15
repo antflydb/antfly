@@ -2551,7 +2551,7 @@ pub const ProvisionedTableWriteCache = struct {
         fn contextCall(ptr: *anyopaque, alloc: std.mem.Allocator, op: @import("antfly_local_sources").storage_db_context_host_json.Op, request: []const u8) anyerror![]u8 {
             const self: *RuntimeHookState = @ptrCast(@alignCast(ptr));
             const host = self.context_host orelse return error.ContextSourceTableUnavailable;
-            return host.call(alloc, @intFromEnum(op), self.group_id, self.context_table_name, request);
+            return host.call(alloc, @backingInt(op), self.group_id, self.context_table_name, request);
         }
 
         fn owner(self: *RuntimeHookState) ?db_mod.PromotionOwner {
