@@ -3463,6 +3463,10 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Same as `replaceSegmentsWithReservedIdOwned`: the pre-merge
+        // segments stay active until this commits, so a lost merge is
+        // redone after a crash and never needs its own durable sync.
+        txn.setDurable(false);
 
         const active_ids = try self.loadActiveSegmentIds(&txn, scratch_alloc);
         defer scratch_alloc.free(active_ids);
