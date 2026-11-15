@@ -64,6 +64,7 @@ pub fn specializationKey(forward: Forward, inputs: []const Input) ![32]u8 {
 }
 
 pub fn trace(allocator: std.mem.Allocator, forward: Forward, inputs: []const Input, weights: tracing.WeightShapeResolver) !program.ModelProgram {
+    for (inputs) |input| _ = try inputShape(input.tensor);
     if (forward.validate) |validate| try validate(forward.context, inputs);
     var tracer = tracing.TracingCompute.initWithWeightResolver(allocator, weights);
     defer tracer.deinit();

@@ -160,7 +160,7 @@ fn populateExternalInputs(
 // ── Test: compiler produces valid HLO accepted by PJRT ─────────────
 
 test "pjrt_compiler: linear partition compiles to valid HLO" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var client = try initClient();
@@ -233,7 +233,7 @@ test "pjrt_compiler: linear partition compiles to valid HLO" {
 // ── Test: executor produces correct output for linear layer ────────
 
 test "pjrt_executor: linear layer end-to-end" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var client = try initClient();
@@ -346,7 +346,7 @@ test "pjrt_executor: linear layer end-to-end" {
 }
 
 test "pjrt_executor: embedding lookup uses runtime embedding ids" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var client = try initClient();
@@ -495,7 +495,7 @@ test "pjrt_executor: embedding lookup uses runtime embedding ids" {
 }
 
 test "pjrt_model_runtime: decode uses single token id" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var client = try initClient();
@@ -582,7 +582,7 @@ test "pjrt_model_runtime: decode uses single token id" {
 // ── Test: gelu activation through PJRT ─────────────────────────────
 
 test "pjrt_executor: gelu activation end-to-end" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var client = try initClient();
@@ -668,7 +668,7 @@ test "pjrt_executor: gelu activation end-to-end" {
 // ── Test: linear + rms_norm + gelu pipeline ────────────────────────
 
 test "pjrt_executor: linear + rms_norm + gelu pipeline" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var client = try initClient();
@@ -787,7 +787,7 @@ test "pjrt_executor: linear + rms_norm + gelu pipeline" {
 // ── Test: PJRT mesh creation ───────────────────────────────────────
 
 test "pjrt_mesh: createPjrtMesh from CPU plugin" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var client = try initClient();
@@ -830,7 +830,7 @@ test "pjrt_mesh: createPjrtMesh from CPU plugin" {
 // ── Test: elem_add through PJRT ────────────────────────────────────
 
 test "pjrt_executor: element-wise add end-to-end" {
-    if (!build_options.enable_pjrt) return;
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var client = try initClient();

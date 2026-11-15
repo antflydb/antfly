@@ -454,10 +454,8 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
 ///   2. `~/Library/Application Support/go-xla/pjrt_c_api_cpu_plugin.dylib`
 ///   3. `~/.antfly/inference/pjrt/darwin-arm64/pjrt_c_api_cpu_plugin.dylib`
 ///
-/// If the plugin is not found, the session is created anyway but without a
-/// PJRT client (falls back to pure native CPU execution — no XLA-compiled
-/// partitions). Callers can check `getPjrtClientPtr` to see whether a client
-/// is actually available.
+/// An explicit PJRT request requires a working provider. Plugin errors are
+/// returned during loading; CPU fallback cannot impersonate compiled coverage.
 ///
 /// For graph-mode (generation) workloads the caller should pass the client
 /// pointer to `NativeGenerationPipeline.pjrt_client` so that compiled HLO
@@ -467,6 +465,7 @@ pub fn createPjrtSession(allocator: std.mem.Allocator, model_path: []const u8) !
 }
 
 pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
+    if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
     return openHostSession(allocator, model_path, override, .{ .backend = .pjrt });
 }
 
@@ -2748,8 +2747,8 @@ const PjrtData = struct {
     /// Native weight store — PJRT uses the native backend for data
     /// conversion (host CTs ↔ PJRT buffers).
     native: NativeData,
-    /// Initialized PJRT client. null when the plugin was not found and we
-    /// fell back to pure native CPU execution.
+    /// Initialized before publication. Null only during construction or in
+    /// ownership-only fixtures; public explicit PJRT loading requires a client.
     client: if (build_options.enable_pjrt) ?pjrt_lib.pjrt.Client else void =
         if (build_options.enable_pjrt) null else {},
 };
@@ -3910,6 +3909,8 @@ fn archRunResidentWithControl(
     control: InferenceExecutionControl,
 ) !?ResidentOutputs {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    // Host transport is not a compiled resident-output implementation.
+    if (self.backend_type == .pjrt) return null;
     if (self.task == .classifier or self.task == .extractor) return null;
     if (self.arch_config == .clip or self.arch_config == .clap) return archRunMediaResident(self, inputs, allocator, control);
     if (self.arch_config == .whisper) return archRunIncrementalEncoderResident(self, inputs, allocator, control);
@@ -4260,6 +4261,8 @@ fn eagerResidentRunWithContext(ptr: *anyopaque, inputs: []const Tensor, allocato
 
 fn archRunResidentImpl(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, context: ?*const @import("invocation_context.zig").Context) !?ResidentOutputs {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    // Host transport is not a compiled resident-output implementation.
+    if (self.backend_type == .pjrt) return null;
     if (self.task == .classifier or self.task == .extractor) return null;
     if (self.arch_config == .clip or self.arch_config == .clap) return archRunMediaResident(self, inputs, allocator, null);
     if (self.arch_config == .whisper) return archRunIncrementalEncoderResident(self, inputs, allocator, null);
@@ -6056,6 +6059,7 @@ fn createHostIncrementalDecoderObserved(
 ) !?WhisperNativeDecoder {
     if (session.vtable != &arch_vtable) return null;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type == .pjrt) return null;
     const cfg = switch (self.arch_config) {
         .whisper => |cfg| cfg,
         else => return null,
@@ -7046,8 +7050,7 @@ fn archSessionHandle(impl: *ArchSession) Session {
         .ptr = impl,
         .vtable = &arch_vtable,
         .compute_backend_provider = .{ .ptr = impl, .services = &archComputeServices },
-        .model_program_forward = if (encoder and impl.task == .generic and impl.glide_head == null) .{ .context = impl, .fingerprint = 0, .output_names = &.{"last_hidden_state"}, .validate = archValidateProgramInputs, .run = archProgramForward } else null,
-        .embedding_program_forward = if (impl.arch_config == .embedding_gemma2 and impl.task == .generic) .{ .context = impl, .fingerprint = 1, .output_names = &.{"sentence_embedding"}, .validate = archValidateProgramInputs, .run = archEmbeddingProgramForward } else null,
+        .model_programs = .{ .context = impl, .resolve = resolveArchModelProgram },
         .resident_preparation = .{ .ptr = impl, .prepare = prepareArchResident },
         .model_contract = .{
             .task = impl.task,
@@ -7799,6 +7802,21 @@ fn eagerHostRunObserved(raw: *anyopaque, inputs: []const Tensor, allocator: std.
     return archRunImplWithContext(raw, inputs, allocator, control, context, receipt, preentry);
 }
 
+fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig").Stage) anyerror!?@import("capture.zig").Forward {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.task != .generic or self.glide_head != null) return null;
+    if (self.arch_config == .whisper) return @import("whisper_frontend.zig").resolve(&self.arch_config.whisper, stage);
+    const encoder = switch (self.arch_config) {
+        .bert, .modern_bert, .nomic_bert, .embedding_gemma2 => true,
+        else => false,
+    };
+    return switch (stage) {
+        .forward => if (encoder) .{ .context = self, .fingerprint = 0, .output_names = &.{"last_hidden_state"}, .validate = archValidateProgramInputs, .run = archProgramForward } else null,
+        .embedding => if (self.arch_config == .embedding_gemma2) .{ .context = self, .fingerprint = 1, .output_names = &.{"sentence_embedding"}, .validate = archValidateProgramInputs, .run = archEmbeddingProgramForward } else null,
+        else => null,
+    };
+}
+
 const ProgramTextInputs = struct { text: BertRunInputs, dimensions: ?usize };
 fn programTextInputs(inputs: []const @import("capture.zig").Input) !ProgramTextInputs {
     var ids: ?Tensor = null;
@@ -7904,11 +7922,15 @@ fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std
     const pooled = for (inputs) |input| {
         if (std.mem.eql(u8, input.name, "output_dimensions")) break true;
     } else false;
-    const forward = (if (pooled) handle.embedding_program_forward else handle.model_program_forward) orelse return error.UnsupportedModelProgram;
+    const stage: @import("model_frontend.zig").Stage = if (self.arch_config == .whisper) stage: {
+        for (inputs) |input| if (std.mem.eql(u8, input.name, "input_features")) break :stage .encoder;
+        break :stage .decoder;
+    } else if (pooled) .embedding else .forward;
+    const forward = (try handle.model_programs.?.get(stage)) orelse return error.UnsupportedModelProgram;
     const client = if (comptime build_options.enable_pjrt) if (self.backend_data.pjrt.client) |*value| @as(*anyopaque, @ptrCast(value)) else return error.MissingPjrtClient else return error.PjrtNotEnabled;
     const declared = try allocator.alloc(@import("capture.zig").Input, inputs.len);
     defer allocator.free(declared);
-    for (inputs, declared) |input, *value| value.* = .{ .tensor = input, .specialize = std.mem.eql(u8, input.name, "attention_mask") or std.mem.eql(u8, input.name, "output_dimensions") };
+    for (inputs, declared) |input, *value| value.* = .{ .tensor = input, .specialize = std.mem.eql(u8, input.name, "attention_mask") or std.mem.eql(u8, input.name, "encoder_attention_mask") or std.mem.eql(u8, input.name, "output_dimensions") };
     return self.captured_programs.run(self.allocator, .{
         .context = self,
         .create = createProgramFrame,
@@ -21458,7 +21480,7 @@ test "model program frontend captures the complete official EG2 encoder and pool
     const session = archSessionHandle(&owner);
     for ([_]bool{ false, true }) |pooled| {
         const declared = [_]@import("capture.zig").Input{ .{ .tensor = ids }, .{ .tensor = mask, .specialize = true }, .{ .tensor = dimensions, .specialize = true } };
-        const forward = if (pooled) session.embedding_program_forward.? else session.model_program_forward.?;
+        const forward = (try session.model_programs.?.get(if (pooled) .embedding else .forward)).?;
         var program = try @import("capture.zig").trace(a, forward, declared[0..if (pooled) @as(usize, 3) else 2], .{ .context = &metadata, .resolve = Shapes.resolve });
         defer program.deinit();
         try std.testing.expect(program.graph.nodeCount() > cfg.num_hidden_layers);

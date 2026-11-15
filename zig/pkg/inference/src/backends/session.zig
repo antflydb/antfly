@@ -2023,8 +2023,7 @@ pub const Session = struct {
     model_contract: ModelContract = .{},
     compute_backend_provider: ?ComputeBackendProvider = null,
     /// Semantic model frontend; its context is retained by model_lifetime.
-    model_program_forward: ?@import("../execution/capture.zig").Forward = null,
-    embedding_program_forward: ?@import("../execution/capture.zig").Forward = null,
+    model_programs: ?@import("../execution/model_frontend.zig").Provider = null,
     resident_preparation: ?ResidentPreparation = null,
     /// Borrowed common preparation owner. Staged models retain it when loaded;
     /// resident outputs retain it independently of the publishing session.

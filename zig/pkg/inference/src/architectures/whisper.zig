@@ -157,7 +157,7 @@ pub fn encoderForwardTensor(
     return encoderForwardOutput(true, cb, allocator, config, mel_features, batch, time_steps);
 }
 
-fn EncoderOutput(comptime resident: bool) type {
+fn ForwardOutput(comptime resident: bool) type {
     return if (resident) CT else []f32;
 }
 
@@ -169,7 +169,7 @@ fn encoderForwardOutput(
     mel_features: CT,
     batch: usize,
     time_steps: usize,
-) !EncoderOutput(resident) {
+) !ForwardOutput(resident) {
     const d_model = config.d_model;
     const num_heads = config.encoder_attention_heads;
     const head_dim = config.encoderHeadDim();
@@ -426,13 +426,45 @@ pub fn decoderForward(
     dec_seq: usize,
     enc_seq: usize,
 ) ![]f32 {
+    return decoderForwardOutput(false, cb, allocator, config, decoder_input_ids, encoder_hidden, encoder_mask, batch, dec_seq, enc_seq);
+}
+
+pub fn decoderForwardTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    decoder_input_ids: []const i64,
+    encoder_hidden: CT,
+    encoder_mask: []const i64,
+    batch: usize,
+    dec_seq: usize,
+    enc_seq: usize,
+) !CT {
+    return decoderForwardOutput(true, cb, allocator, config, decoder_input_ids, encoder_hidden, encoder_mask, batch, dec_seq, enc_seq);
+}
+
+fn decoderForwardOutput(
+    comptime resident: bool,
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    decoder_input_ids: []const i64,
+    encoder_hidden: CT,
+    encoder_mask: []const i64,
+    batch: usize,
+    dec_seq: usize,
+    enc_seq: usize,
+) !ForwardOutput(resident) {
     const d_model = config.d_model;
-    const dec_total = batch * dec_seq;
+    const dec_total = try std.math.mul(usize, batch, dec_seq);
+    if (batch == 0 or dec_seq == 0 or dec_seq > config.max_target_positions or dec_total > 2048) return error.SequenceTooLong;
 
     // 1. Token embeddings
     const embed_w = try cb.getWeight("model.decoder.embed_tokens.weight");
     defer cb.free(embed_w);
     var hidden = try cb.embeddingLookup(embed_w, decoder_input_ids, dec_total, d_model);
+    var hidden_live = true;
+    defer if (hidden_live) cb.free(hidden);
 
     // 2. Learned position embeddings
     var pos_ids_buf: [2048]i64 = undefined;
@@ -465,6 +497,8 @@ pub fn decoderForward(
     defer cb.free(ln_b);
     const normed = try cb.layerNorm(hidden, ln_w, ln_b, d_model, 1e-5);
     cb.free(hidden);
+    hidden_live = false;
+    defer cb.free(normed);
 
     // 5. LM head: project to vocab
     const lm_w = cb.getWeight("proj_out.weight") catch blk: {
@@ -472,11 +506,9 @@ pub fn decoderForward(
     };
     defer cb.free(lm_w);
     const logits = try cb.linearNoBias(normed, lm_w, dec_total, d_model, config.vocab_size);
-    cb.free(normed);
-
-    const result = try cb.toFloat32(logits, allocator);
-    cb.free(logits);
-    return result;
+    if (comptime resident) return logits;
+    defer cb.free(logits);
+    return cb.toFloat32(logits, allocator);
 }
 
 // --- Decoder block ---

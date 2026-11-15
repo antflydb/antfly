@@ -19,9 +19,9 @@
 //! PJRT LoadedExecutable, converts between host ComputeBackend CTs and
 //! PJRT buffers, and runs the compiled HLO on the target device.
 //!
-//! The executor runs on a single PJRT device (CPU or TPU). Input CTs are
-//! converted to f32, uploaded to device memory as PJRT buffers, executed,
-//! and output f32 data is wrapped back into host CTs.
+//! The provider selects CPU, CUDA or TPU execution. Integer inputs and state
+//! retain their physical types. Model-owned immutable operands are uploaded
+//! once, shared across shape specializations and borrowed by invocation frames.
 
 const std = @import("std");
 const ml = @import("ml");

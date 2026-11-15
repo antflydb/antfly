@@ -227,6 +227,7 @@ pub const Cache = struct {
     }
     pub fn run(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control) ![]Tensor {
         if (control) |active| try active.check();
+        for (inputs) |input| _ = try capture.inputShape(input.tensor);
         if (forward.validate) |validate| try validate(forward.context, inputs);
         const entry = try self.acquire(model_allocator, provider, forward, inputs);
         defer entry.release();

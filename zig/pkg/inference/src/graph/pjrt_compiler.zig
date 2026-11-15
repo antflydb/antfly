@@ -370,6 +370,30 @@ pub fn compilePartitionWithOptions(
                 needs_reducer = true;
             },
 
+            .fused_conv1d => |attrs| {
+                const input = try b.reshape(try getHloId(node_map, ins[0]), hlo.Shape.init(.f32, &.{ attrs.batch, attrs.in_channels, attrs.time_steps }));
+                const weight = try b.reshape(try getHloId(node_map, ins[1]), hlo.Shape.init(.f32, &.{ attrs.out_channels, attrs.in_channels, attrs.kernel_size }));
+                var conv = hlo.Convolution{ .spatial_rank = 1 };
+                conv.strides[0] = attrs.stride;
+                conv.padding_low[0] = attrs.padding;
+                conv.padding_high[0] = attrs.padding;
+                const shape = graphShapeToHlo(n);
+                const result = try b.convolution(input, weight, shape, conv);
+                node_map[nid] = try addChannelBias(&b, result, try getHloId(node_map, ins[2]), shape);
+            },
+            .fused_conv2d => |attrs| {
+                if (attrs.in_channels == 0 or attrs.groups == 0 or attrs.in_channels % attrs.groups != 0 or attrs.out_channels % attrs.groups != 0) return error.UnsupportedConvolutionLayout;
+                const input = try b.reshape(try getHloId(node_map, ins[0]), hlo.Shape.init(.f32, &.{ attrs.batch, attrs.in_channels, attrs.height, attrs.width }));
+                const weight = try b.reshape(try getHloId(node_map, ins[1]), hlo.Shape.init(.f32, &.{ attrs.out_channels, @divExact(attrs.in_channels, attrs.groups), attrs.kernel_h, attrs.kernel_w }));
+                var conv = hlo.Convolution{ .spatial_rank = 2, .groups = attrs.groups };
+                conv.strides[0..2].* = .{ attrs.stride_h, attrs.stride_w };
+                conv.padding_low[0..2].* = .{ attrs.padding_h, attrs.padding_w };
+                conv.padding_high[0..2].* = .{ attrs.padding_h, attrs.padding_w };
+                const shape = graphShapeToHlo(n);
+                const result = try b.convolution(input, weight, shape, conv);
+                node_map[nid] = try addChannelBias(&b, result, try getHloId(node_map, ins[2]), shape);
+            },
+
             .fused_gelu_exact => {
                 const x = try getHloId(node_map, ins[0]);
                 const half_x = try b.multiply(x, try b.constantScalarF32(0.5));
@@ -549,6 +573,23 @@ pub fn compilePartitionWithOptions(
 }
 
 // ── HLO composite helpers ──────────────────────────────────────────
+
+fn addChannelBias(b: *hlo.Builder, value: hlo.Id, bias: hlo.Id, shape: hlo.Shape) !hlo.Id {
+    const channel = try b.reshape(bias, hlo.Shape.init(shape.element_type, &.{shape.dimensions[1]}));
+    return b.add(value, try b.broadcast(channel, &.{1}, shape));
+}
+fn convolutionAttrs(attrs: ml.graph.node.ConvAttrs) !hlo.Convolution {
+    if (attrs.transposed or attrs.num_spatial == 0 or attrs.num_spatial > 4 or attrs.groups == 0) return error.UnsupportedConvolutionLayout;
+    var result = hlo.Convolution{ .spatial_rank = attrs.num_spatial, .groups = attrs.groups };
+    for (0..attrs.num_spatial) |axis| {
+        if (attrs.output_padding[axis] != 0) return error.UnsupportedConvolutionLayout;
+        result.strides[axis] = attrs.strides[axis];
+        result.dilations[axis] = attrs.dilations[axis];
+        result.padding_low[axis] = attrs.padding[axis][0];
+        result.padding_high[axis] = attrs.padding[axis][1];
+    }
+    return result;
+}
 
 /// RMS norm: x * rsqrt(mean(x^2) + eps) * gamma
 fn emitRmsNorm(b: *hlo.Builder, x: hlo.Id, gamma: hlo.Id, eps: f32, reducer: *const hlo.Computation) !hlo.Id {
@@ -963,6 +1004,23 @@ fn emitPrimitiveNode(
     const ins = n.getInputs();
     switch (n.op) {
         .stop_gradient => node_map[nid] = try getHloId(node_map, ins[0]),
+        .fused_softmax => {
+            const source = try getHloId(node_map, ins[0]);
+            const shape = b.getInst(source).shape;
+            if (shape.dimensions.len == 0 or shape.dimensions.len > 8 or shape.element_type != .f32) return error.UnsupportedShape;
+            const axis: i64 = @intCast(shape.dimensions.len - 1);
+            const reduced = hlo.Shape.init(.f32, shape.dimensions[0 .. shape.dimensions.len - 1]);
+            const negative = try b.constantScalarF32(-std.math.inf(f32));
+            const maximum = try b.reduce(source, negative, &.{axis}, reduced, max_reducer_comp.id);
+            var axes: [8]i64 = undefined;
+            for (axes[0 .. shape.dimensions.len - 1], 0..) |*dimension, index| dimension.* = @intCast(index);
+            const exp = try b.exponential(try b.subtract(source, try b.broadcast(maximum, axes[0 .. shape.dimensions.len - 1], shape)));
+            const sums = try b.reduce(exp, try b.constantScalarF32(0), &.{axis}, reduced, reducer_comp.id);
+            node_map[nid] = try b.divide(exp, try b.broadcast(sums, axes[0 .. shape.dimensions.len - 1], shape));
+            needs_add_reducer.* = true;
+            needs_max_reducer.* = true;
+        },
+        .conv_general => |attrs| node_map[nid] = try b.convolution(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1]), graphShapeToHlo(n), try convolutionAttrs(attrs)),
         // Unary elementwise ops
         .neg => node_map[nid] = try b.negate(try getHloId(node_map, ins[0])),
         .sqrt => node_map[nid] = try b.sqrt(try getHloId(node_map, ins[0])),

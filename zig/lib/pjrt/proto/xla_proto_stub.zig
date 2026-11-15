@@ -117,6 +117,47 @@ pub const xla = struct {
         }
     };
 
+    pub const WindowDimension = struct {
+        size: i64 = 0,
+        stride: i64 = 1,
+        padding_low: i64 = 0,
+        padding_high: i64 = 0,
+        window_dilation: i64 = 1,
+        base_dilation: i64 = 1,
+        window_reversal: bool = false,
+    };
+    pub const Window = struct {
+        dimensions: []WindowDimension = &.{},
+        pub fn deinit(self: *Window, alloc: Allocator) void {
+            alloc.free(self.dimensions);
+            self.* = .{};
+        }
+    };
+    pub const ConvolutionDimensionNumbers = struct {
+        input_batch_dimension: i64 = 0,
+        input_feature_dimension: i64 = 1,
+        input_spatial_dimensions: []const i64 = &.{},
+        kernel_input_feature_dimension: i64 = 1,
+        kernel_output_feature_dimension: i64 = 0,
+        kernel_spatial_dimensions: []const i64 = &.{},
+        output_batch_dimension: i64 = 0,
+        output_feature_dimension: i64 = 1,
+        output_spatial_dimensions: []const i64 = &.{},
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.input_spatial_dimensions);
+            alloc.free(self.kernel_spatial_dimensions);
+            alloc.free(self.output_spatial_dimensions);
+            self.* = .{};
+        }
+    };
+    pub const PrecisionConfig = struct {
+        operand_precision: []const i32 = &.{},
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.operand_precision);
+            self.* = .{};
+        }
+    };
+
     pub const HloInstructionProto = struct {
         pub const SliceDimensions = struct {
             start: i64 = 0,
@@ -132,6 +173,11 @@ pub const xla = struct {
         dimensions: []const i64 = &.{},
         slice_dimensions: []const SliceDimensions = &.{},
         dot_dimension_numbers: ?DotDimensionNumbers = null,
+        convolution_dimension_numbers: ?ConvolutionDimensionNumbers = null,
+        window: ?Window = null,
+        feature_group_count: i64 = 0,
+        batch_group_count: i64 = 0,
+        precision_config: ?PrecisionConfig = null,
         gather_dimension_numbers: ?GatherDimensionNumbers = null,
         gather_slice_sizes: []const i64 = &.{},
         literal: ?LiteralProto = null,
@@ -145,6 +191,9 @@ pub const xla = struct {
             if (self.dimensions.len > 0) alloc.free(self.dimensions);
             if (self.slice_dimensions.len > 0) alloc.free(self.slice_dimensions);
             if (self.dot_dimension_numbers) |*d| d.deinit(alloc);
+            if (self.convolution_dimension_numbers) |*d| d.deinit(alloc);
+            if (self.window) |*window| window.deinit(alloc);
+            if (self.precision_config) |*precision| precision.deinit(alloc);
             if (self.gather_dimension_numbers) |*g| g.deinit(alloc);
             if (self.gather_slice_sizes.len > 0) alloc.free(self.gather_slice_sizes);
             if (self.literal) |*l| l.deinit(alloc);
@@ -286,6 +335,33 @@ fn encodeSliceDimensions(alloc: Allocator, buf: *wire.Buf, value: xla.HloInstruc
     try writeInt64(alloc, buf, 3, value.stride);
 }
 
+fn encodeWindowDimension(alloc: Allocator, buf: *wire.Buf, value: xla.WindowDimension) !void {
+    try writeInt64(alloc, buf, 1, value.size);
+    try writeInt64(alloc, buf, 2, value.stride);
+    try writeInt64(alloc, buf, 3, value.padding_low);
+    try writeInt64(alloc, buf, 4, value.padding_high);
+    try writeInt64(alloc, buf, 5, value.window_dilation);
+    try writeInt64(alloc, buf, 6, value.base_dilation);
+    if (value.window_reversal) try writeInt64(alloc, buf, 7, 1);
+}
+fn encodeWindow(alloc: Allocator, buf: *wire.Buf, value: xla.Window) !void {
+    for (value.dimensions) |dimension| try encodeMessage(alloc, buf, 1, dimension, encodeWindowDimension);
+}
+fn encodeConvolutionDimensions(alloc: Allocator, buf: *wire.Buf, value: xla.ConvolutionDimensionNumbers) !void {
+    try writeInt64(alloc, buf, 3, value.kernel_input_feature_dimension);
+    try writeInt64(alloc, buf, 4, value.kernel_output_feature_dimension);
+    try wire.writePackedInt64s(alloc, buf, 6, value.kernel_spatial_dimensions);
+    try writeInt64(alloc, buf, 7, value.input_batch_dimension);
+    try writeInt64(alloc, buf, 8, value.input_feature_dimension);
+    try writeInt64(alloc, buf, 9, value.output_batch_dimension);
+    try writeInt64(alloc, buf, 10, value.output_feature_dimension);
+    try wire.writePackedInt64s(alloc, buf, 11, value.input_spatial_dimensions);
+    try wire.writePackedInt64s(alloc, buf, 12, value.output_spatial_dimensions);
+}
+fn encodePrecision(alloc: Allocator, buf: *wire.Buf, value: xla.PrecisionConfig) !void {
+    try writePackedInt32s(alloc, buf, 1, value.operand_precision);
+}
+
 fn encodeHloInstructionProto(alloc: Allocator, buf: *wire.Buf, value: xla.HloInstructionProto) !void {
     if (value.name.len > 0) try wire.writeString(alloc, buf, 1, value.name);
     if (value.opcode.len > 0) try wire.writeString(alloc, buf, 2, value.opcode);
@@ -294,6 +370,11 @@ fn encodeHloInstructionProto(alloc: Allocator, buf: *wire.Buf, value: xla.HloIns
     if (value.parameter_number != 0) try writeInt64(alloc, buf, 9, value.parameter_number);
     if (value.dimensions.len > 0) try wire.writePackedInt64s(alloc, buf, 14, value.dimensions);
     for (value.slice_dimensions) |dim| try encodeMessage(alloc, buf, 17, dim, encodeSliceDimensions);
+    if (value.window) |window| try encodeMessage(alloc, buf, 15, window, encodeWindow);
+    if (value.convolution_dimension_numbers) |dimensions| try encodeMessage(alloc, buf, 16, dimensions, encodeConvolutionDimensions);
+    if (value.feature_group_count != 0) try writeInt64(alloc, buf, 50, value.feature_group_count);
+    if (value.precision_config) |precision| try encodeMessage(alloc, buf, 51, precision, encodePrecision);
+    if (value.batch_group_count != 0) try writeInt64(alloc, buf, 58, value.batch_group_count);
     if (value.dot_dimension_numbers) |dot| try encodeMessage(alloc, buf, 30, dot, encodeDotDimensionNumbers);
     if (value.gather_dimension_numbers) |gather| try encodeMessage(alloc, buf, 33, gather, encodeGatherDimensionNumbers);
     if (value.gather_slice_sizes.len > 0) try wire.writePackedInt64s(alloc, buf, 34, value.gather_slice_sizes);

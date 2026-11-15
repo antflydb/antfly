@@ -862,8 +862,122 @@ pub const TracingCompute = struct {
 
     // ── Attention ops ─────────────────────────────────────────────────
 
-    fn sdpaOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, _: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    fn typedConstant(tc: *TracingCompute, bytes: []const u8, shape: Shape) !NodeId {
+        const count = shape.numElements() orelse return error.UnsupportedShape;
+        if (bytes.len != try std.math.mul(usize, @intCast(count), shape.dtype.byteSize())) return error.InvalidInputShape;
+        const loc = try tc.graph.internConstantBytes(bytes, shape.dtype);
+        return tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } }, .output_shape = shape });
+    }
+    fn selectNode(tc: *TracingCompute, condition: NodeId, yes: NodeId, no: NodeId, shape: Shape) !NodeId {
+        return tc.graph.addNode(.{ .op = .{ .where_select = {} }, .output_shape = shape, .inputs = .{ condition, yes, no, null_node }, .num_inputs = 3 });
+    }
+    fn lessNode(tc: *TracingCompute, a: NodeId, b: NodeId, shape: Shape) !NodeId {
+        return tc.graph.addNode(.{ .op = .{ .less_than = {} }, .output_shape = Shape.init(.bool_, shape.dims[0..shape.rank()]), .inputs = .{ a, b, null_node, null_node }, .num_inputs = 2 });
+    }
+    fn attentionHeads(tc: *TracingCompute, input: CT, batch: usize, sequence: usize, heads: usize, dim: usize, token_major: bool) !NodeId {
+        var builder = Builder.init(&tc.graph);
+        const source = nodeIdFromCT(input);
+        const shape = tc.graph.node(source).output_shape;
+        const count = try std.math.mul(usize, try std.math.mul(usize, batch, sequence), try std.math.mul(usize, heads, dim));
+        if (shape.numElements() != std.math.cast(i64, count)) return error.InvalidAttentionShape;
+        const layout = if (token_major) blk: {
+            const tokens = try builder.reshape(source, Shape.init(.f32, &.{ @intCast(batch), @intCast(sequence), @intCast(heads), @intCast(dim) }));
+            break :blk try builder.transpose(tokens, &.{ 0, 2, 1, 3 });
+        } else source;
+        return builder.reshape(layout, Shape.init(.f32, &.{ @intCast(try std.math.mul(usize, batch, heads)), @intCast(sequence), @intCast(dim) }));
+    }
+    /// Capture the ordinary dense attention definition without dropping its
+    /// mask or bias. Mask metadata is linear in tokens, never a host Q*K array.
+    fn denseAttention(tc: *TracingCompute, Q: CT, K: CT, V: CT, mask: []const i64, bias: ?CT, batch: usize, queries: usize, keys: usize, heads: usize, dim: usize, causal: bool, token_major: bool) !CT {
+        if (batch == 0 or queries == 0 or keys == 0 or heads == 0 or dim == 0) return error.InvalidAttentionShape;
+        const bh = try std.math.mul(usize, batch, heads);
+        const mask_count = try std.math.mul(usize, batch, keys);
+        if (mask.len != 0 and mask.len != mask_count) return error.InvalidAttentionMask;
+        var builder = Builder.init(&tc.graph);
+        const query = try tc.attentionHeads(Q, batch, queries, heads, dim, token_major);
+        const key = try tc.attentionHeads(K, batch, keys, heads, dim, token_major);
+        var value = try tc.attentionHeads(V, batch, keys, heads, dim, token_major);
+        const score_shape = Shape.init(.f32, &.{ @intCast(bh), @intCast(queries), @intCast(keys) });
+        var score = try builder.matmul3D(query, try builder.transpose(key, &.{ 0, 2, 1 }));
+        score = try builder.mul(score, try builder.scalarConst(.f32, 1 / @sqrt(@as(f32, @floatFromInt(dim)))));
+        if (bias) |tensor| {
+            const source = nodeIdFromCT(tensor);
+            const count = tc.graph.node(source).output_shape.numElements() orelse return error.UnsupportedAttentionBias;
+            const per_head = try std.math.mul(usize, queries, keys);
+            const per_batch = try std.math.mul(usize, heads, per_head);
+            const normalized = if (count == try std.math.mul(usize, bh, per_head)) try builder.reshape(source, score_shape) else if (count == per_batch) shared: {
+                const shaped = try builder.reshape(source, Shape.init(.f32, &.{ @intCast(heads), @intCast(queries), @intCast(keys) }));
+                const expanded = try tc.broadcastNode(shaped, &.{ 1, 2, 3 }, Shape.init(.f32, &.{ @intCast(batch), @intCast(heads), @intCast(queries), @intCast(keys) }));
+                break :shared try builder.reshape(expanded, score_shape);
+            } else if (count == per_head) shared: {
+                const shaped = try builder.reshape(source, Shape.init(.f32, &.{ @intCast(queries), @intCast(keys) }));
+                break :shared try tc.broadcastNode(shaped, &.{ 1, 2 }, score_shape);
+            } else return error.UnsupportedAttentionBias;
+            score = try builder.add(score, normalized);
+        }
+        const negative = try tc.broadcastNode(try builder.scalarConst(.f32, -std.math.inf(f32)), &.{}, score_shape);
+        var empty_row = false;
+        if (mask.len != 0) {
+            const flags = try tc.allocator.alloc(u8, try std.math.mul(usize, bh, keys));
+            defer tc.allocator.free(flags);
+            for (0..batch) |item| {
+                var active: usize = 0;
+                for (mask[item * keys ..][0..keys], 0..) |valid, index| {
+                    if (valid != 0 and valid != 1) return error.InvalidAttentionMask;
+                    active += @intFromBool(valid != 0);
+                    for (0..heads) |head| flags[(item * heads + head) * keys + index] = @intCast(valid);
+                }
+                empty_row = empty_row or active == 0;
+            }
+            const visible = try tc.typedConstant(flags, Shape.init(.bool_, &.{ @intCast(bh), @intCast(keys) }));
+            score = try tc.selectNode(try tc.broadcastNode(visible, &.{ 0, 2 }, Shape.init(.bool_, score_shape.dims[0..score_shape.rank()])), score, negative, score_shape);
+            const value_shape = tc.graph.node(value).output_shape;
+            const value_zero = try tc.broadcastNode(try builder.scalarConst(.f32, 0), &.{}, value_shape);
+            value = try tc.selectNode(try tc.broadcastNode(visible, &.{ 0, 1 }, Shape.init(.bool_, value_shape.dims[0..value_shape.rank()])), value, value_zero, value_shape);
+        }
+        if (causal) {
+            const columns = try tc.allocator.alloc(i32, keys);
+            defer tc.allocator.free(columns);
+            const upper = try tc.allocator.alloc(i32, queries);
+            defer tc.allocator.free(upper);
+            for (columns, 0..) |*column, index| column.* = std.math.cast(i32, index) orelse return error.UnsupportedShape;
+            for (upper, 0..) |*limit, index| limit.* = std.math.cast(i32, index + 1) orelse return error.UnsupportedShape;
+            const integer_shape = Shape.init(.i32, score_shape.dims[0..score_shape.rank()]);
+            const column = try tc.broadcastNode(try tc.typedConstant(std.mem.sliceAsBytes(columns), Shape.init(.i32, &.{@intCast(keys)})), &.{2}, integer_shape);
+            const limit = try tc.broadcastNode(try tc.typedConstant(std.mem.sliceAsBytes(upper), Shape.init(.i32, &.{@intCast(queries)})), &.{1}, integer_shape);
+            score = try tc.selectNode(try tc.lessNode(column, limit, integer_shape), score, negative, score_shape);
+        }
+        const probabilities = if (!empty_row and bias == null) try builder.softmax(score) else safe: {
+            const reduced_shape = Shape.init(.f32, &.{ @intCast(bh), @intCast(queries), 1 });
+            const maximum = try builder.reduceMax(score, &.{2});
+            const minimum = try tc.broadcastNode(try builder.scalarConst(.f32, -std.math.floatMax(f32)), &.{}, reduced_shape);
+            const safe_maximum = try tc.selectNode(try tc.lessNode(maximum, minimum, reduced_shape), minimum, maximum, reduced_shape);
+            const exponentials = try builder.expOp(try builder.sub(score, try tc.broadcastNode(safe_maximum, &.{ 0, 1, 2 }, score_shape)));
+            const sums = try builder.reduceSum(exponentials, &.{2});
+            const one = try tc.broadcastNode(try builder.scalarConst(.f32, 1), &.{}, reduced_shape);
+            const denominator = try tc.selectNode(try tc.lessNode(sums, one, reduced_shape), one, sums, reduced_shape);
+            break :safe try builder.div(exponentials, try tc.broadcastNode(denominator, &.{ 0, 1, 2 }, score_shape));
+        };
+        var result = try builder.matmul3D(probabilities, value);
+        if (token_major) {
+            result = try builder.reshape(result, Shape.init(.f32, &.{ @intCast(batch), @intCast(heads), @intCast(queries), @intCast(dim) }));
+            result = try builder.transpose(result, &.{ 0, 2, 1, 3 });
+        }
+        return tc.makeHandle(try builder.reshape(result, tc.graph.node(nodeIdFromCT(Q)).output_shape));
+    }
+
+    fn sdpaOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
         const tc = fromCtx(ctx);
+        if (tc.require_resident_outputs) {
+            const shape = tc.graph.node(nodeIdFromCT(Q)).output_shape;
+            const token_major = @import("../ops/kernel_geometry.zig").DenseAttentionLayout.fromShape(i64, shape.dims[0..shape.rank()], batch, seq_len, num_heads, head_dim) == .token_major;
+            if (num_heads > 1) for ([_]CT{ K, V }) |tensor| {
+                const other = tc.graph.node(nodeIdFromCT(tensor)).output_shape;
+                const other_tokens = @import("../ops/kernel_geometry.zig").DenseAttentionLayout.fromShape(i64, other.dims[0..other.rank()], batch, seq_len, num_heads, head_dim) == .token_major;
+                if (token_major != other_tokens) return error.InvalidAttentionShape;
+            };
+            return tc.denseAttention(Q, K, V, mask, attn_bias, batch, seq_len, seq_len, num_heads, head_dim, false, token_major);
+        }
         const q_id = nodeIdFromCT(Q);
         const out_shape = tc.graph.node(q_id).output_shape;
         var inputs: [4]NodeId = .{ q_id, nodeIdFromCT(K), nodeIdFromCT(V), null_node };
@@ -888,6 +1002,7 @@ pub const TracingCompute = struct {
 
     fn causalSelfAttentionOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
         const tc = fromCtx(ctx);
+        if (tc.require_resident_outputs) return tc.denseAttention(Q, K, V, &.{}, attn_bias, batch, seq_len, seq_len, num_heads, head_dim, true, true);
         const q_id = nodeIdFromCT(Q);
         const out_shape = tc.graph.node(q_id).output_shape;
         var inputs: [4]NodeId = .{ q_id, nodeIdFromCT(K), nodeIdFromCT(V), null_node };
@@ -910,8 +1025,9 @@ pub const TracingCompute = struct {
         return tc.makeHandle(id);
     }
 
-    fn crossAttentionOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, _: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    fn crossAttentionOp(ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, dec_seq: usize, enc_seq: usize, num_heads: usize, head_dim: usize) anyerror!CT {
         const tc = fromCtx(ctx);
+        if (tc.require_resident_outputs) return tc.denseAttention(Q, K, V, mask, null, batch, dec_seq, enc_seq, num_heads, head_dim, false, true);
         const q_id = nodeIdFromCT(Q);
         const out_shape = tc.graph.node(q_id).output_shape;
         const id = try tc.graph.addNode(.{
@@ -1321,7 +1437,7 @@ pub const TracingCompute = struct {
         weight: CT,
         bias: CT,
         batch: usize,
-        _: usize, // in_channels
+        in_channels: usize,
         out_channels: usize,
         height: usize,
         width: usize,
@@ -1331,37 +1447,29 @@ pub const TracingCompute = struct {
         stride_w: usize,
         padding_h: usize,
         padding_w: usize,
-        _: usize, // groups
+        groups: usize,
     ) anyerror!CT {
         const tc = fromCtx(ctx);
-        const out_h = (height + 2 * padding_h - kernel_h) / stride_h + 1;
-        const out_w = (width + 2 * padding_w - kernel_w) / stride_w + 1;
-        const out_shape = Shape.init(.f32, &.{
-            @intCast(batch * out_h * out_w),
-            @intCast(out_channels),
-        });
-        const id = try tc.graph.addNode(.{
-            .op = .{
-                .fused_conv2d = .{
-                    .batch = @intCast(batch),
-                    .in_channels = 0, // token grid layout
-                    .out_channels = @intCast(out_channels),
-                    .height = @intCast(height),
-                    .width = @intCast(width),
-                    .kernel_h = @intCast(kernel_h),
-                    .kernel_w = @intCast(kernel_w),
-                    .stride_h = @intCast(stride_h),
-                    .stride_w = @intCast(stride_w),
-                    .padding_h = @intCast(padding_h),
-                    .padding_w = @intCast(padding_w),
-                    .groups = 0, // token grid marker
-                },
-            },
-            .output_shape = out_shape,
-            .inputs = .{ nodeIdFromCT(input), nodeIdFromCT(weight), nodeIdFromCT(bias), null_node },
-            .num_inputs = 3,
-        });
-        return tc.makeHandle(id);
+        if (stride_h == 0 or stride_w == 0 or groups == 0 or in_channels % groups != 0 or out_channels % groups != 0) return error.InvalidInputShape;
+        const padded_h = try std.math.add(usize, height, try std.math.mul(usize, 2, padding_h));
+        const padded_w = try std.math.add(usize, width, try std.math.mul(usize, 2, padding_w));
+        if (kernel_h == 0 or kernel_w == 0 or padded_h < kernel_h or padded_w < kernel_w) return error.InvalidInputShape;
+        const out_h = (padded_h - kernel_h) / stride_h + 1;
+        const out_w = (padded_w - kernel_w) / stride_w + 1;
+        const grid = try primitiveReshape(ctx, input, &.{ @intCast(batch), @intCast(height), @intCast(width), @intCast(in_channels) });
+        const channels = try primitiveTranspose(ctx, grid, &.{ 0, 3, 1, 2 }, &.{ @intCast(batch), @intCast(height), @intCast(width), @intCast(in_channels) });
+        const shape = Shape.init(.f32, &.{ @intCast(batch), @intCast(out_channels), @intCast(out_h), @intCast(out_w) });
+        var attrs = ml.graph.node.ConvAttrs{ .num_spatial = 2, .groups = @intCast(groups) };
+        attrs.strides[0..2].* = .{ @intCast(stride_h), @intCast(stride_w) };
+        attrs.padding[0..2].* = .{ .{ @intCast(padding_h), @intCast(padding_h) }, .{ @intCast(padding_w), @intCast(padding_w) } };
+        const convolution = try tc.graph.addNode(.{ .op = .{ .conv_general = attrs }, .output_shape = shape, .inputs = .{ nodeIdFromCT(channels), nodeIdFromCT(weight), null_node, null_node }, .num_inputs = 2 });
+        var builder = Builder.init(&tc.graph);
+        const bias_node = try builder.reshape(nodeIdFromCT(bias), Shape.init(.f32, &.{@intCast(out_channels)}));
+        const biased = try builder.add(convolution, try tc.broadcastNode(bias_node, &.{1}, shape));
+        const result = try tc.makeHandle(biased);
+        const tokens = try primitiveTranspose(ctx, result, &.{ 0, 2, 3, 1 }, shape.dims[0..shape.rank()]);
+        const rows = try std.math.mul(usize, batch, try std.math.mul(usize, out_h, out_w));
+        return primitiveReshape(ctx, tokens, &.{ @intCast(rows), @intCast(out_channels) });
     }
 
     // ── Linear pair / MoE / misc ────────────────────────────────────────

@@ -87,6 +87,18 @@ pub const DotDimensionNumbers = struct {
     rhs_batch_dimensions: []const i64 = &.{},
 };
 
+/// Canonical N,C,spatial convolution; frontends express other layouts using
+/// explicit transposes. Fixed metadata carries no borrowed array lifetimes.
+pub const Convolution = struct {
+    spatial_rank: u8,
+    kernel_sizes: [4]i64 = @splat(0),
+    strides: [4]i64 = @splat(1),
+    padding_low: [4]i64 = @splat(0),
+    padding_high: [4]i64 = @splat(0),
+    dilations: [4]i64 = @splat(1),
+    groups: i64 = 1,
+};
+
 pub const GatherDimensionNumbers = struct {
     offset_dims: []const i64 = &.{},
     collapsed_slice_dims: []const i64 = &.{},
@@ -118,6 +130,8 @@ pub const Builder = struct {
         // Op-specific payloads (null if unused):
         parameter_number: ?u32 = null,
         dot_dimension_numbers: ?DotDimensionNumbers = null,
+        convolution: ?Convolution = null,
+        strict_float32: bool = false,
         gather_dimension_numbers: ?GatherDimensionNumbers = null,
         gather_slice_sizes: ?[]const i64 = null,
         slice_dimensions: ?[]const xla.HloInstructionProto.SliceDimensions = null,
@@ -359,6 +373,7 @@ pub const Builder = struct {
         var actual_lhs = lhs;
         var actual_rhs = rhs;
         var result_shape = lhs_shape;
+        var sizes: [8]i64 = undefined;
 
         // HLO requires explicit broadcasts — no implicit broadcasting.
         // Auto-broadcast the lower-rank operand to match the higher-rank one
@@ -368,6 +383,17 @@ pub const Builder = struct {
             result_shape = rhs_shape;
         } else if (rhs_shape.dimensions.len < lhs_shape.dimensions.len) {
             actual_rhs = try self.broadcastToMatch(rhs, rhs_shape, lhs_shape);
+        } else if (!std.mem.eql(i64, lhs_shape.dimensions, rhs_shape.dimensions)) {
+            if (lhs_shape.dimensions.len > 8 or lhs_shape.element_type != rhs_shape.element_type) return error.UnsupportedShape;
+            var axes: [8]i64 = undefined;
+            for (lhs_shape.dimensions, rhs_shape.dimensions, 0..) |left, right, axis| {
+                if (left != right and left != 1 and right != 1) return error.UnsupportedShape;
+                sizes[axis] = if (left == 1) right else left;
+                axes[axis] = @intCast(axis);
+            }
+            result_shape = Shape.init(lhs_shape.element_type, sizes[0..lhs_shape.dimensions.len]);
+            actual_lhs = try self.broadcast(lhs, axes[0..lhs_shape.dimensions.len], result_shape);
+            actual_rhs = try self.broadcast(rhs, axes[0..rhs_shape.dimensions.len], result_shape);
         }
 
         const ids = try self.dupeIds(&.{ actual_lhs, actual_rhs });
@@ -490,6 +516,29 @@ pub const Builder = struct {
 
     // ── Contraction ─────────────────────────────────────────────────
 
+    pub fn convolution(self: *Builder, lhs: Id, rhs: Id, shape: Shape, attrs: Convolution) !Id {
+        if (attrs.spatial_rank == 0 or attrs.spatial_rank > 4 or attrs.groups <= 0) return error.UnsupportedShape;
+        const input = self.getInst(lhs).shape;
+        const weight = self.getInst(rhs).shape;
+        const rank: usize = @as(usize, attrs.spatial_rank) + 2;
+        if (input.dimensions.len != rank or weight.dimensions.len != rank or shape.dimensions.len != rank) return error.UnsupportedShape;
+        if (input.element_type != weight.element_type or input.element_type != shape.element_type) return error.UnsupportedTensorType;
+        for (input.dimensions) |dimension| if (dimension <= 0) return error.UnsupportedShape;
+        for (weight.dimensions) |dimension| if (dimension <= 0) return error.UnsupportedShape;
+        for (shape.dimensions) |dimension| if (dimension <= 0) return error.UnsupportedShape;
+        if (input.dimensions[0] != shape.dimensions[0] or weight.dimensions[0] != shape.dimensions[1]) return error.UnsupportedShape;
+        if (@mod(input.dimensions[1], attrs.groups) != 0 or @mod(weight.dimensions[0], attrs.groups) != 0 or weight.dimensions[1] != @divExact(input.dimensions[1], attrs.groups)) return error.UnsupportedShape;
+        for (0..attrs.spatial_rank) |axis| {
+            if (attrs.strides[axis] <= 0 or attrs.dilations[axis] <= 0 or weight.dimensions[axis + 2] <= 0) return error.UnsupportedShape;
+            const extent = try std.math.add(i64, try std.math.mul(i64, weight.dimensions[axis + 2] - 1, attrs.dilations[axis]), 1);
+            const padded = try std.math.add(i64, try std.math.add(i64, input.dimensions[axis + 2], attrs.padding_low[axis]), attrs.padding_high[axis]);
+            if (padded < extent or shape.dimensions[axis + 2] != @divFloor(padded - extent, attrs.strides[axis]) + 1) return error.UnsupportedShape;
+        }
+        var resolved = attrs;
+        for (0..attrs.spatial_rank) |axis| resolved.kernel_sizes[axis] = weight.dimensions[axis + 2];
+        return self.addInst(.{ .id = self.nextId(), .opcode = "convolution", .name = "convolution", .shape = shape, .operand_ids = try self.dupeIds(&.{ lhs, rhs }), .convolution = resolved, .strict_float32 = input.element_type == .f32 });
+    }
+
     pub fn dot(self: *Builder, lhs: Id, rhs: Id, result_shape: Shape, dot_dims: DotDimensionNumbers) !Id {
         const ids = try self.dupeIds(&.{ lhs, rhs });
         return self.addInst(.{
@@ -499,6 +548,7 @@ pub const Builder = struct {
             .shape = result_shape,
             .operand_ids = ids,
             .dot_dimension_numbers = dot_dims,
+            .strict_float32 = self.getInst(lhs).shape.element_type == .f32,
         });
     }
 
@@ -576,15 +626,50 @@ pub const Builder = struct {
     }
 
     pub fn broadcast(self: *Builder, operand: Id, broadcast_dimensions: []const i64, result_shape: Shape) !Id {
-        const ids = try self.dupeIds(&.{operand});
-        const dims = try self.dupeI64s(broadcast_dimensions);
+        const input = self.getInst(operand).shape;
+        if (input.dimensions.len != broadcast_dimensions.len or input.dimensions.len > 8 or result_shape.dimensions.len > 8 or input.element_type != result_shape.element_type) return error.UnsupportedShape;
+        var dims: [8]i64 = undefined;
+        var targets: [8]i64 = undefined;
+        var seen: [8]bool = @splat(false);
+        var count: usize = 0;
+        for (input.dimensions, broadcast_dimensions) |size, destination| {
+            const axis = std.math.cast(usize, destination) orelse return error.UnsupportedShape;
+            if (axis >= result_shape.dimensions.len or seen[axis] or size < 0 or result_shape.dimensions[axis] < 0) return error.UnsupportedShape;
+            seen[axis] = true;
+            if (size == 1 and result_shape.dimensions[axis] != 1) continue;
+            if (size != result_shape.dimensions[axis]) return error.UnsupportedShape;
+            dims[count] = size;
+            targets[count] = destination;
+            count += 1;
+        }
+        // HLO broadcast maps equal-sized operand axes. Expanding singleton
+        // axes must first be removed, including keepdims reduction results.
+        var source = if (count != input.dimensions.len) try self.reshape(operand, Shape.init(input.element_type, dims[0..count])) else operand;
+        var permutation: [8]i64 = undefined;
+        var sorted: [8]i64 = undefined;
+        var sorted_dims: [8]i64 = undefined;
+        for (0..count) |index| permutation[index] = @intCast(index);
+        for (0..count) |index| {
+            var smallest_axis = index;
+            for (index + 1..count) |other| if (targets[@intCast(permutation[other])] < targets[@intCast(permutation[smallest_axis])]) {
+                smallest_axis = other;
+            };
+            std.mem.swap(i64, &permutation[index], &permutation[smallest_axis]);
+            sorted[index] = targets[@intCast(permutation[index])];
+            sorted_dims[index] = dims[@intCast(permutation[index])];
+        }
+        var reordered = false;
+        for (permutation[0..count], 0..) |axis, index| if (axis != index) {
+            reordered = true;
+        };
+        if (reordered) source = try self.transpose(source, permutation[0..count], Shape.init(input.element_type, sorted_dims[0..count]));
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "broadcast",
             .name = "broadcast",
             .shape = result_shape,
-            .operand_ids = ids,
-            .dimensions = dims,
+            .operand_ids = try self.dupeIds(&.{source}),
+            .dimensions = try self.dupeI64s(sorted[0..count]),
         });
     }
 
@@ -956,6 +1041,29 @@ fn buildInstructionProto(alloc: Allocator, inst: Builder.Instruction) !xla.HloIn
     if (inst.dot_dimension_numbers) |dot_dims| {
         proto.dot_dimension_numbers = try buildDotDimensionNumbers(alloc, dot_dims);
     }
+    if (inst.convolution) |conv| {
+        var window: xla.Window = .{};
+        var transferred = false;
+        errdefer if (!transferred) window.deinit(alloc);
+        window.dimensions = try alloc.alloc(xla.WindowDimension, conv.spatial_rank);
+        // Kernel sizes are recorded by the builder alongside the canonical window.
+        for (window.dimensions, 0..) |*dimension, axis| dimension.* = .{ .size = conv.kernel_sizes[axis], .stride = conv.strides[axis], .padding_low = conv.padding_low[axis], .padding_high = conv.padding_high[axis], .window_dilation = conv.dilations[axis], .base_dilation = 1 };
+        proto.window = window;
+        transferred = true;
+        var dimensions: xla.ConvolutionDimensionNumbers = .{};
+        var dims_transferred = false;
+        errdefer if (!dims_transferred) dimensions.deinit(alloc);
+        var spatial: [4]i64 = undefined;
+        for (spatial[0..conv.spatial_rank], 0..) |*axis, i| axis.* = @intCast(i + 2);
+        dimensions.input_spatial_dimensions = try alloc.dupe(i64, spatial[0..conv.spatial_rank]);
+        dimensions.kernel_spatial_dimensions = try alloc.dupe(i64, spatial[0..conv.spatial_rank]);
+        dimensions.output_spatial_dimensions = try alloc.dupe(i64, spatial[0..conv.spatial_rank]);
+        proto.convolution_dimension_numbers = dimensions;
+        dims_transferred = true;
+        proto.feature_group_count = conv.groups;
+        proto.batch_group_count = 1;
+    }
+    if (inst.strict_float32) proto.precision_config = .{ .operand_precision = try alloc.dupe(i32, &.{ 2, 2 }) };
     if (inst.gather_dimension_numbers) |gather_dims| {
         proto.gather_dimension_numbers = try buildGatherDimensionNumbers(alloc, gather_dims);
     }

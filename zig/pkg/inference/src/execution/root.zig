@@ -18,6 +18,7 @@
 pub const LoadedModel = @import("../architectures/model_definition.zig").LoadedModel;
 pub const ModelProgram = @import("program.zig").ModelProgram;
 pub const capture = @import("capture.zig");
+pub const model_frontend = @import("model_frontend.zig");
 pub const captured_forward = @import("captured_forward.zig");
 pub const Binding = @import("program.zig").Binding;
 pub const Executable = @import("executable.zig").Executable;
@@ -64,6 +65,9 @@ test {
     _ = capture;
     _ = captured_forward;
     _ = @import("pjrt_typed_test.zig");
+    _ = @import("captured_primitives_test.zig");
+    _ = @import("model_program_e2e_test.zig");
+    _ = @import("whisper_frontend.zig");
     _ = @import("../backends/compute_factory.zig");
     _ = @import("decoder_forward.zig");
     _ = @import("native_decoder_program.zig");
