@@ -2952,12 +2952,13 @@ test "commit requirements read validation maps quota exhaustion and releases all
         fn put(_: *anyopaque, _: tree.Ref, _: []const u8) !void {
             return error.UnexpectedWrite;
         }
+        fn check(_: *anyopaque) !void {}
     };
     var memory = objectstore.MemoryClient.init(a);
     defer memory.deinit();
     var wal = try IndexedObjectStore.init(a, memory.client(), "db", "quota");
     defer wal.deinit();
-    const pages: tree.Store = .{ .ptr = &memory, .get = Probe.get, .put = Probe.put };
+    const pages: tree.Store = .{ .ptr = &memory, .get = Probe.get, .put = Probe.put, .check = Probe.check };
     const head: IndexedObjectStore.Head = .{ .latest_lsn = 2, .document_index = .{ .first_lsn = 1, .root = .{ .digest = @splat(1), .bytes = 128, .height = 0, .records = 1 } } };
     try std.testing.expectError(error.CommitRequirementTooLarge, wal.requirePreparedReadSet(pages, head, .{ .after_lsn = 1, .documents = &.{"source"} }));
 }
