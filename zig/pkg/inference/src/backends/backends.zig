@@ -264,6 +264,7 @@ pub const SessionManager = struct {
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     /// Provider allocator quantities are fixed at load, independently of format.
     pjrt_memory_policy: ?session_factory.PjrtSessionOptions.MemoryPolicy = null,
+    pjrt_precision: @import("../execution/precision.zig").Policy = .f32,
     kernel_jit: kernel_jit_mod.Config = .{},
     kernel_jit_load_context: kernel_jit_mod.LoadContext = .dynamic,
     /// Load-time A4B policy. It is copied into the created session and is
@@ -599,7 +600,7 @@ pub const SessionManager = struct {
 
     fn createDirectSession(self: *SessionManager, source: ModelSource, backend: BackendType) !Session {
         if (backend == .pjrt) {
-            const options = session_factory.PjrtSessionOptions{ .memory_policy = self.pjrt_memory_policy };
+            const options = session_factory.PjrtSessionOptions{ .memory_policy = self.pjrt_memory_policy, .precision = self.pjrt_precision };
             return if (source.manifest) |manifest|
                 session_factory.createPjrtSessionFromManifestWithOptions(self.allocator, source.path, manifest, options)
             else

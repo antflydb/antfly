@@ -56,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
     var suite_path: ?[]const u8 = null;
     var output: ?[]const u8 = null;
     var backend: Backend = .metal;
+    var pjrt_precision: internal.architectures.session_factory.PjrtSessionOptions.Precision = .f32;
     var pjrt_capacity: usize = 0;
     var pjrt_device_bytes: usize = 0;
     var warmups: usize = 2;
@@ -67,10 +68,11 @@ pub fn main(init: std.process.Init) !void {
         if (i + 1 >= args.len) return error.MissingArgument;
         const key = args[i];
         const value = args[i + 1];
-        if (std.mem.eql(u8, key, "--pjrt-capacity-bytes")) pjrt_capacity = try positivePolicyBytes(value) else if (std.mem.eql(u8, key, "--pjrt-device-bytes")) pjrt_device_bytes = try positivePolicyBytes(value) else if (std.mem.eql(u8, key, "--model")) model = value else if (std.mem.eql(u8, key, "--suite")) suite_path = value else if (std.mem.eql(u8, key, "--output")) output = value else if (std.mem.eql(u8, key, "--case")) try selected.append(a, value) else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--iterations")) iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--long-iterations")) long_iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--backend")) {
+        if (std.mem.eql(u8, key, "--pjrt-precision")) pjrt_precision = std.meta.stringToEnum(@TypeOf(pjrt_precision), value) orelse return error.InvalidPjrtPrecision else if (std.mem.eql(u8, key, "--pjrt-capacity-bytes")) pjrt_capacity = try positivePolicyBytes(value) else if (std.mem.eql(u8, key, "--pjrt-device-bytes")) pjrt_device_bytes = try positivePolicyBytes(value) else if (std.mem.eql(u8, key, "--model")) model = value else if (std.mem.eql(u8, key, "--suite")) suite_path = value else if (std.mem.eql(u8, key, "--output")) output = value else if (std.mem.eql(u8, key, "--case")) try selected.append(a, value) else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--iterations")) iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--long-iterations")) long_iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--backend")) {
             backend = std.meta.stringToEnum(Backend, value) orelse return error.InvalidBackend;
         } else return error.UnknownArgument;
     }
+    if (backend != .pjrt and pjrt_precision != .f32) return error.InvalidPjrtPrecision;
     if ((pjrt_capacity == 0) != (pjrt_device_bytes == 0) or (backend != .pjrt and pjrt_capacity != 0)) return error.InvalidPjrtMemoryPolicy;
     if (iterations == 0 or iterations > 100 or long_iterations == 0 or long_iterations > 100 or warmups > 100) return error.InvalidIterations;
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, suite_path orelse return error.MissingSuite, a, .limited(16 * 1024 * 1024));
@@ -89,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
         .native => try factory.createNativeSession(a, model orelse return error.MissingModel),
         .cuda => if (comptime @import("build_options").enable_cuda) try factory.createCudaSession(std.heap.c_allocator, model orelse return error.MissingModel) else return error.CudaNotEnabled,
         // Frames retain this allocator, so request temporaries must be reusable.
-        .pjrt => try factory.createPjrtSessionWithOptions(std.heap.c_allocator, model orelse return error.MissingModel, .{ .memory_policy = if (pjrt_capacity != 0) .{ .cuda = .{ .capacity_bytes = pjrt_capacity, .device_bytes = pjrt_device_bytes } } else null }),
+        .pjrt => try factory.createPjrtSessionWithOptions(std.heap.c_allocator, model orelse return error.MissingModel, .{ .precision = pjrt_precision, .memory_policy = if (pjrt_capacity != 0) .{ .cuda = .{ .capacity_bytes = pjrt_capacity, .device_bytes = pjrt_device_bytes } } else null }),
     };
     defer session.close();
     if (!metal) factory.attachIo(session, init.io);
@@ -137,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("encoder {s}: {d} samples, host peak {d}\n", .{ case.name, n, peak });
     }
     if (measurements.items.len == 0) return error.NoCases;
-    const report = try std.json.Stringify.valueAlloc(a, .{ .version = 1, .timing_scope = "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback", .backend = @tagName(backend), .memory_scope = "tracked Antfly host workspace; provider heaps excluded", .call_includes_public_session = backend == .pjrt or backend == .cuda, .compiled_call_includes_public_session = backend == .pjrt, .cuda_policy = factory.getEmbeddingGemma2CudaPolicy(session), .pjrt_pool_cap_bytes = pjrt_capacity, .pjrt_device_bytes = pjrt_device_bytes, .warmups = warmups, .vm_counters_available = @import("build_options").enable_metal, .cases = measurements.items }, .{ .whitespace = .indent_2 });
+    const report = try std.json.Stringify.valueAlloc(a, .{ .version = 1, .timing_scope = "prepared IDs/mask: embedding lookup, encoder, pooling, normalization and synchronized vector readback", .backend = @tagName(backend), .memory_scope = "tracked Antfly host workspace; provider heaps excluded", .call_includes_public_session = backend == .pjrt or backend == .cuda, .compiled_call_includes_public_session = backend == .pjrt, .cuda_policy = factory.getEmbeddingGemma2CudaPolicy(session), .pjrt_precision = @tagName(pjrt_precision), .pjrt_pool_cap_bytes = pjrt_capacity, .pjrt_device_bytes = pjrt_device_bytes, .warmups = warmups, .vm_counters_available = @import("build_options").enable_metal, .cases = measurements.items }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output orelse return error.MissingOutput, .data = report });
 }
 

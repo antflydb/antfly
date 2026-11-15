@@ -83,6 +83,7 @@ pub const InputBinding = union(enum) {
 };
 
 pub const CompileOptions = struct {
+    precision: @import("../execution/precision.zig").Policy = .f32,
     /// Emit graph parameter nodes as HLO parameters instead of embedding their
     /// current f32 values as HLO constants. This is host-assisted and mainly
     /// useful for validation or plugins that cannot compile huge constant HLO.
@@ -166,6 +167,7 @@ pub fn compilePartitionWithOptions(
     max_reducer_comp.id = max_reducer_comp_id;
 
     var b = hlo.Builder.init(allocator, "main");
+    if (options.precision == .bf16) b.matrix_operand_type = .bf16;
     defer b.deinit();
 
     var next_param: u32 = 0;
@@ -286,7 +288,7 @@ pub fn compilePartitionWithOptions(
                 defer allocator.free(f32_data);
 
                 const shape = graphShapeToHlo(n);
-                node_map[nid] = try b.constantF32(shape, f32_data);
+                node_map[nid] = try floatingConstant(&b, shape, f32_data);
             },
 
             .constant => {
@@ -862,48 +864,7 @@ fn emitStaticRope(
     return b.add(x_scaled, rotated_scaled);
 }
 
-const RopeScaleKind = enum { cos, sin };
-
-fn buildRopeScaleMask(
-    allocator: Allocator,
-    rows: usize,
-    hidden: usize,
-    head_dim: usize,
-    rope_dim: usize,
-    theta: f32,
-    freq_scale: f32,
-    position_offset: usize,
-    consecutive_pairs: bool,
-    kind: RopeScaleKind,
-) ![]f32 {
-    const data = try allocator.alloc(f32, rows * hidden);
-    @memset(data, switch (kind) {
-        .cos => 1.0,
-        .sin => 0.0,
-    });
-    const num_heads = hidden / head_dim;
-    const half = rope_dim / 2;
-    const head_half = head_dim / 2;
-    for (0..rows) |row| {
-        const pos = position_offset + row;
-        for (0..num_heads) |head| {
-            const head_base = row * hidden + head * head_dim;
-            for (0..half) |j| {
-                const freq = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(rope_dim)));
-                const angle = @as(f32, @floatFromInt(pos)) * freq_scale * freq;
-                const value = switch (kind) {
-                    .cos => @cos(angle),
-                    .sin => @sin(angle),
-                };
-                const idx0 = if (consecutive_pairs) 2 * j else j;
-                const idx1 = if (consecutive_pairs) 2 * j + 1 else j + head_half;
-                data[head_base + idx0] = value;
-                data[head_base + idx1] = value;
-            }
-        }
-    }
-    return data;
-}
+const buildRopeScaleMask = @import("rotary_program.zig").coefficients;
 
 /// Pair-local coordinate rotation. No dense permutation operand or matmul.
 fn emitRopePermutation(b: *hlo.Builder, x: hlo.Id, rows: usize, hidden: usize, head_dim: usize, rope_dim: usize, consecutive: bool) !hlo.Id {
@@ -1228,28 +1189,37 @@ fn emitSegmentAttention(
         const window_grid = try b.broadcast(wide_window, &.{}, hlo.Shape.init(.s64, &.{ rows, columns }));
         visible = try b.logicalAnd(visible.?, try b.compare(distance, window_grid, "LE"));
     }
-    const query = try reshapeAttentionInputToHeads(b, q, rows, heads, dim);
-    const key = try reshapeAttentionInputToHeads(b, k, columns, heads, dim);
-    const value = try reshapeAttentionInputToHeads(b, v, columns, heads, dim);
-    const key_t = try b.transpose(key, &.{ 0, 2, 1 }, hlo.Shape.init(.f32, &.{ heads, dim, columns }));
-    const score_shape = hlo.Shape.init(.f32, &.{ heads, rows, columns });
-    var scores = try b.dot(query, key_t, score_shape, .{ .lhs_contracting_dimensions = &.{2}, .rhs_contracting_dimensions = &.{1}, .lhs_batch_dimensions = &.{0}, .rhs_batch_dimensions = &.{0} });
-    scores = try b.multiply(scores, try b.constantScalarF32(1 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim)))));
-    const mask = try b.broadcast(visible.?, &.{ 1, 2 }, hlo.Shape.init(.pred, &.{ heads, rows, columns }));
+    const kv: i64 = if (attrs.num_kv_heads == 0) heads else attrs.num_kv_heads;
+    if (kv == 0 or @mod(heads, kv) != 0) return error.UnsupportedAttentionShape;
+    const groups = @divExact(heads, kv);
+    const query_flat = try b.reshape(q, hlo.Shape.init(.f32, &.{ rows, kv, groups, dim }));
+    const query = try b.transpose(query_flat, &.{ 1, 2, 0, 3 }, hlo.Shape.init(.f32, &.{ kv, groups, rows, dim }));
+    const key = try reshapeAttentionInputToHeads(b, k, columns, kv, dim);
+    const value = try reshapeAttentionInputToHeads(b, v, columns, kv, dim);
+    const key_t = try b.transpose(key, &.{ 0, 2, 1 }, hlo.Shape.init(.f32, &.{ kv, dim, columns }));
+    const score_shape = hlo.Shape.init(.f32, &.{ kv, groups, rows, columns });
+    var scores = try b.dot(query, key_t, score_shape, .{ .lhs_contracting_dimensions = &.{3}, .rhs_contracting_dimensions = &.{1}, .lhs_batch_dimensions = &.{0}, .rhs_batch_dimensions = &.{0} });
+    scores = try b.multiply(scores, try b.constantScalarF32(attrs.score_scale orelse (1 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))))));
+    const mask = try b.broadcast(visible.?, &.{ 2, 3 }, hlo.Shape.init(.pred, score_shape.dimensions));
     const negative_infinity = try b.constantScalarF32(-std.math.inf(f32));
     scores = try b.select(mask, scores, try b.broadcast(negative_infinity, &.{}, score_shape));
-    const row_shape = hlo.Shape.init(.f32, &.{ heads, rows });
-    const maximum = try b.reduce(scores, negative_infinity, &.{2}, row_shape, max_reducer.id);
+    const row_shape = hlo.Shape.init(.f32, &.{ kv, groups, rows });
+    const maximum = try b.reduce(scores, negative_infinity, &.{3}, row_shape, max_reducer.id);
     const safe_maximum = try b.maximum(maximum, try b.constantScalarF32(-std.math.floatMax(f32)));
-    const exp = try b.exponential(try b.subtract(scores, try b.broadcast(safe_maximum, &.{ 0, 1 }, score_shape)));
-    const sums = try b.reduce(exp, zero, &.{2}, row_shape, add_reducer.id);
+    const exp = try b.exponential(try b.subtract(scores, try b.broadcast(safe_maximum, &.{ 0, 1, 2 }, score_shape)));
+    const sums = try b.reduce(exp, zero, &.{3}, row_shape, add_reducer.id);
     const one = try b.constantScalarF32(1);
-    const probabilities = try b.divide(exp, try b.broadcast(try b.maximum(sums, one), &.{ 0, 1 }, score_shape));
-    const output_shape = hlo.Shape.init(.f32, &.{ heads, rows, dim });
-    var attended = try b.dot(probabilities, value, output_shape, .{ .lhs_contracting_dimensions = &.{2}, .rhs_contracting_dimensions = &.{1}, .lhs_batch_dimensions = &.{0}, .rhs_batch_dimensions = &.{0} });
+    const denominator = try b.maximum(sums, one);
+    const probabilities = if (attrs.bf16_probability)
+        try b.convertType(try b.convertType(exp, .bf16), .f32)
+    else
+        try b.divide(exp, try b.broadcast(denominator, &.{ 0, 1, 2 }, score_shape));
+    const output_shape = hlo.Shape.init(.f32, &.{ kv, groups, rows, dim });
+    var attended = try b.dot(probabilities, value, output_shape, .{ .lhs_contracting_dimensions = &.{3}, .rhs_contracting_dimensions = &.{1}, .lhs_batch_dimensions = &.{0}, .rhs_batch_dimensions = &.{0} });
+    if (attrs.bf16_probability) attended = try b.divide(attended, try b.broadcast(denominator, &.{ 0, 1, 2 }, output_shape));
     const active = try b.compare(sums, try b.broadcast(zero, &.{}, row_shape), "NE");
-    attended = try b.select(try b.broadcast(active, &.{ 0, 1 }, hlo.Shape.init(.pred, &.{ heads, rows, dim })), attended, try b.broadcast(zero, &.{}, output_shape));
-    const transposed = try b.transpose(attended, &.{ 1, 0, 2 }, hlo.Shape.init(.f32, &.{ rows, heads, dim }));
+    attended = try b.select(try b.broadcast(active, &.{ 0, 1, 2 }, hlo.Shape.init(.pred, output_shape.dimensions)), attended, try b.broadcast(zero, &.{}, output_shape));
+    const transposed = try b.transpose(attended, &.{ 2, 0, 1, 3 }, hlo.Shape.init(.f32, &.{ rows, kv, groups, dim }));
     return b.reshape(transposed, graphShapeToHlo(node));
 }
 
@@ -1413,11 +1383,23 @@ fn hloShapeIsConcretePositive(shape: ml.graph.Shape) bool {
     return true;
 }
 
+fn floatingConstant(b: *hlo.Builder, shape: hlo.Shape, values: []const f32) !hlo.Id {
+    const value = try b.constantF32(hlo.Shape.init(.f32, shape.dimensions), values);
+    return if (shape.element_type == .f32) value else b.convertType(value, shape.element_type);
+}
+
 fn emitGraphConstant(b: *hlo.Builder, graph: *const Graph, n: *const Node) !hlo.Id {
     const attrs = n.op.constant;
     const shape = graphShapeToHlo(n);
     return switch (n.output_shape.dtype) {
         .f32 => b.constantF32(shape, graph.constantData(attrs.data_offset, attrs.data_len)),
+        .f16, .bf16 => floating: {
+            const raw = graph.constantDataAs(u16, attrs.data_offset, attrs.data_len);
+            const values = try b.allocator.alloc(f32, raw.len);
+            defer b.allocator.free(values);
+            for (raw, values) |bits, *value| value.* = if (n.output_shape.dtype == .bf16) @bitCast(@as(u32, bits) << 16) else @floatCast(@as(f16, @bitCast(bits)));
+            break :floating try floatingConstant(b, shape, values);
+        },
         .i32 => b.constantS32(shape, graph.constantDataAs(i32, attrs.data_offset, attrs.data_len)),
         .i64 => b.constantS64(shape, graph.constantDataAs(i64, attrs.data_offset, attrs.data_len)),
         .bool_ => b.constantPred(shape, graph.constantDataAs(u8, attrs.data_offset, attrs.data_len)),
@@ -1427,7 +1409,9 @@ fn emitGraphConstant(b: *hlo.Builder, graph: *const Graph, n: *const Node) !hlo.
 
 fn graphDTypeToHlo(dtype: ml.graph.DType) hlo.ElementType {
     return switch (dtype) {
-        .f32, .f16, .bf16 => .f32,
+        .f32 => .f32,
+        .f16 => .f16,
+        .bf16 => .bf16,
         .f64 => .f64,
         .i8 => .s8,
         .i16 => .s16,
@@ -1729,8 +1713,8 @@ test "computeOutputs finds graph outputs in partition" {
 
 test "graphDTypeToHlo mapping" {
     try std.testing.expectEqual(hlo.ElementType.f32, graphDTypeToHlo(.f32));
-    try std.testing.expectEqual(hlo.ElementType.f32, graphDTypeToHlo(.f16));
-    try std.testing.expectEqual(hlo.ElementType.f32, graphDTypeToHlo(.bf16));
+    try std.testing.expectEqual(hlo.ElementType.f16, graphDTypeToHlo(.f16));
+    try std.testing.expectEqual(hlo.ElementType.bf16, graphDTypeToHlo(.bf16));
     try std.testing.expectEqual(hlo.ElementType.s32, graphDTypeToHlo(.i32));
     try std.testing.expectEqual(hlo.ElementType.s64, graphDTypeToHlo(.i64));
     try std.testing.expectEqual(hlo.ElementType.u8, graphDTypeToHlo(.u8));

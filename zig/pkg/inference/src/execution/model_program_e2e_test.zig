@@ -173,3 +173,53 @@ test "model program real Whisper PJRT encoder and decoder stages match native" {
         for (want, logits[0].asFloat32()) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-4);
     }
 }
+
+// Exercise both public loading paths against the explicit constructor. F32
+// checkpoint parity above is separate: ignoring this policy must fail here.
+test "model program real EG2 public loaders preserve explicit BF16 precision" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    if (!platform.env.getenvBool("ANTFLY_EG2_PJRT_QUALIFICATION")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 3 }, &.{ 2, 7314, 236786 });
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", ids.shape, &.{ 1, 0, 1 });
+    defer mask.deinit();
+    var dimensions = try Tensor.initInt64(a, "output_dimensions", &.{1}, &.{128});
+    defer dimensions.deinit();
+    const inputs = [_]Tensor{ ids, mask, dimensions };
+    const expected = reference: {
+        const session = try factory.createPjrtSessionWithOptions(a, model, .{ .precision = .bf16, .memory_policy = .cpu });
+        defer session.close();
+        const outputs = try session.runWithControl(&inputs, a, .{ .native_call_policy = .in_process });
+        defer a.free(outputs);
+        defer for (outputs) |*output| output.deinit();
+        break :reference try a.dupe(f32, outputs[0].asFloat32());
+    };
+    defer a.free(expected);
+    var manager = @import("../backends/backends.zig").SessionManager.init(a);
+    manager.required_backend = .pjrt;
+    manager.pjrt_memory_policy = .cpu;
+    manager.pjrt_precision = .bf16;
+    manager.required_backend_invalid = false;
+    manager.native_call_policy = .in_process;
+    manager.preferred_backends = &.{.pjrt};
+    var source = try @import("../architectures/model_definition.zig").LoadedModel.open(a, model);
+    defer source.deinit();
+    for ([_]bool{ false, true }) |manifest| {
+        const session = if (manifest)
+            try manager.loadModelSource(.{ .path = model, .kind = .directory, .manifest = &source.manifest }, null)
+        else
+            try manager.loadModel(model);
+        defer session.close();
+        const outputs = try session.runWithControl(&inputs, a, .{ .native_call_policy = .in_process });
+        defer a.free(outputs);
+        defer for (outputs) |*output| output.deinit();
+        try std.testing.expectEqualStrings("sentence_embedding", outputs[0].name);
+        try std.testing.expectEqualSlices(i64, &.{ 1, 128 }, outputs[0].shape);
+        for (expected, outputs[0].asFloat32()) |want, actual| {
+            try std.testing.expect(std.math.isFinite(actual));
+            try std.testing.expectApproxEqAbs(want, actual, 1e-6);
+        }
+    }
+}

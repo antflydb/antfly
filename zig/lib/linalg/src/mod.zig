@@ -1268,6 +1268,8 @@ test "sgemmTransBF16Weights column dispatch matches the serial kernel for few ro
 }
 
 pub const segmentAttentionGroupedHostWithGemmIo = attention.segmentAttentionGroupedHostWithGemmIo;
+pub const segmentAttentionGroupedBf16HostWithGemmIo = attention.segmentAttentionGroupedBf16HostWithGemmIo;
+pub const segmentAttentionGroupedBf16HostWithGemmIoObserved = attention.segmentAttentionGroupedBf16HostWithGemmIoObserved;
 pub const denseAttentionHostWithGemmIo = attention.denseAttentionHostWithGemmIo;
 pub const denseAttentionPortableHostWithIo = attention.denseAttentionPortableHostWithIo;
 

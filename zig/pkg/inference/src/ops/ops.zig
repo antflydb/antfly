@@ -108,6 +108,8 @@ pub const SegmentAttention = struct {
 /// Grouped K/V rows retain their original head count. Optional compact-head
 /// contract: a declined request uses the caller's existing expanded-head path.
 pub const SegmentAttentionGrouped = struct {
+    /// Explicit unnormalized BF16 probability storage, with an F32 denominator.
+    bf16_probability: bool = false,
     visibility: SegmentAttention,
     /// Request-owned i32 ranges/positions in the aligned device layout.
     metadata: ?CT = null,

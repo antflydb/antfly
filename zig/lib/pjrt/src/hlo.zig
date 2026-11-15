@@ -120,6 +120,8 @@ pub const Builder = struct {
     next_id: Id,
     /// First ID this builder will assign. Used by getInst to compute array index.
     base_id: Id = 1,
+    /// Explicit mixed-precision dot operands; result type controls accumulation.
+    matrix_operand_type: ?ElementType = null,
 
     const Instruction = struct {
         id: Id,
@@ -503,13 +505,46 @@ pub const Builder = struct {
 
     // ── Contraction ─────────────────────────────────────────────────
 
+    /// Recover half storage only through exact widening and layout operations.
+    /// F32 probabilities/reductions are never silently rounded to fit a GEMM.
+    fn provenBf16(self: *Builder, value: Id) anyerror!?Id {
+        const inst = self.getInst(value).*;
+        if (inst.shape.element_type == .bf16) return value;
+        if (inst.shape.element_type != .f32) return null;
+        if (std.mem.eql(u8, inst.opcode, "convert")) {
+            return if (self.getInst(inst.operand_ids[0]).shape.element_type == .bf16) inst.operand_ids[0] else null;
+        }
+        const layout = std.mem.eql(u8, inst.opcode, "reshape") or std.mem.eql(u8, inst.opcode, "transpose") or std.mem.eql(u8, inst.opcode, "slice") or std.mem.eql(u8, inst.opcode, "broadcast") or std.mem.eql(u8, inst.opcode, "concatenate");
+        if (!layout) return null;
+        const operands = try self.allocator.alloc(Id, inst.operand_ids.len);
+        defer self.allocator.free(operands);
+        for (inst.operand_ids, operands) |input, *output| output.* = (try self.provenBf16(input)) orelse return null;
+        var narrow = inst;
+        narrow.id = self.nextId();
+        narrow.shape.element_type = .bf16;
+        narrow.operand_ids = operands;
+        return try self.addInst(narrow);
+    }
+
+    fn matrixOperands(self: *Builder, lhs: Id, rhs: Id) ![2]Id {
+        if (self.matrix_operand_type == .bf16) {
+            const left = try self.provenBf16(lhs);
+            const right = try self.provenBf16(rhs);
+            if (left != null and right != null) return .{ left.?, right.? };
+        }
+        return .{ lhs, rhs };
+    }
+
     pub fn convolution(self: *Builder, lhs: Id, rhs: Id, shape: Shape, attrs: Convolution) !Id {
         if (attrs.spatial_rank == 0 or attrs.spatial_rank > 4 or attrs.groups <= 0) return error.UnsupportedShape;
-        const input = self.getInst(lhs).shape;
-        const weight = self.getInst(rhs).shape;
+        const operands = try self.matrixOperands(lhs, rhs);
+        const left = operands[0];
+        const right = operands[1];
+        const input = self.getInst(left).shape;
+        const weight = self.getInst(right).shape;
         const rank: usize = @as(usize, attrs.spatial_rank) + 2;
         if (input.dimensions.len != rank or weight.dimensions.len != rank or shape.dimensions.len != rank) return error.UnsupportedShape;
-        if (input.element_type != weight.element_type or input.element_type != shape.element_type) return error.UnsupportedTensorType;
+        if (input.element_type != weight.element_type or (input.element_type != shape.element_type and !(input.element_type == .bf16 and shape.element_type == .f32))) return error.UnsupportedTensorType;
         for (input.dimensions) |dimension| if (dimension <= 0) return error.UnsupportedShape;
         for (weight.dimensions) |dimension| if (dimension <= 0) return error.UnsupportedShape;
         for (shape.dimensions) |dimension| if (dimension <= 0) return error.UnsupportedShape;
@@ -523,18 +558,21 @@ pub const Builder = struct {
         }
         var resolved = attrs;
         for (0..attrs.spatial_rank) |axis| resolved.kernel_sizes[axis] = weight.dimensions[axis + 2];
-        return self.addInst(.{ .id = self.nextId(), .opcode = "convolution", .name = "convolution", .shape = shape, .operand_ids = &.{ lhs, rhs }, .convolution = resolved, .strict_float32 = input.element_type == .f32 });
+        return self.addInst(.{ .id = self.nextId(), .opcode = "convolution", .name = "convolution", .shape = shape, .operand_ids = &.{ left, right }, .convolution = resolved, .strict_float32 = input.element_type == .f32 });
     }
 
     pub fn dot(self: *Builder, lhs: Id, rhs: Id, result_shape: Shape, dot_dims: DotDimensionNumbers) !Id {
+        const operands = try self.matrixOperands(lhs, rhs);
+        const left = operands[0];
+        const right = operands[1];
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "dot",
             .name = "dot",
             .shape = result_shape,
-            .operand_ids = &.{ lhs, rhs },
+            .operand_ids = &.{ left, right },
             .dot_dimension_numbers = dot_dims,
-            .strict_float32 = self.getInst(lhs).shape.element_type == .f32,
+            .strict_float32 = self.getInst(left).shape.element_type == .f32,
         });
     }
 
@@ -715,7 +753,10 @@ pub const Builder = struct {
     }
 
     pub fn convertType(self: *Builder, operand: Id, target_type: ElementType) !Id {
-        const op_shape = self.getInst(operand).shape;
+        const inst = self.getInst(operand).*;
+        const op_shape = inst.shape;
+        if (op_shape.element_type == target_type) return operand;
+        if (target_type == .bf16 and op_shape.element_type == .f32 and std.mem.eql(u8, inst.opcode, "convert") and self.getInst(inst.operand_ids[0]).shape.element_type == .bf16) return inst.operand_ids[0];
         return self.addInst(.{
             .id = self.nextId(),
             .opcode = "convert",
@@ -770,6 +811,10 @@ pub const Builder = struct {
 
     pub fn gatherWithDimensions(self: *Builder, operand: Id, indices: Id, result_shape: Shape, dimensions: GatherDimensionNumbers, slice_sizes: []const i64) !Id {
         const input = self.getInst(operand).shape;
+        if (input.element_type == .f32 and result_shape.element_type == .f32) if (try self.provenBf16(operand)) |narrow| {
+            const selected = try self.gatherWithDimensions(narrow, indices, Shape.init(.bf16, result_shape.dimensions), dimensions, slice_sizes);
+            return self.convertType(selected, .f32);
+        };
         if (slice_sizes.len != input.dimensions.len or dimensions.index_vector_dim < 0 or dimensions.index_vector_dim > self.getInst(indices).shape.dimensions.len) return error.UnsupportedShape;
         for (slice_sizes, input.dimensions) |size, bound| if (size < 0 or size > bound) return error.UnsupportedShape;
         return self.addInst(.{
@@ -1394,4 +1439,38 @@ fn checkBuilderOwnedPayloads(allocator: Allocator) !void {
 test "hlo builder owns all borrowed payloads and unwinds every allocation failure" {
     try checkBuilderOwnedPayloads(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkBuilderOwnedPayloads, .{});
+}
+
+test "mixed BF16 matrix operands retain F32 accumulation without changing default precision" {
+    const a = std.testing.allocator;
+    var b = Builder.init(a, "bf16_matrix");
+    defer b.deinit();
+    const x = try b.parameter(0, Shape.init(.f32, &.{ 2, 3 }), "x");
+    const w = try b.parameter(1, Shape.init(.f32, &.{ 3, 4 }), "w");
+    const strict = try b.matmul(x, w);
+    try std.testing.expect(b.getInst(strict).strict_float32);
+    b.matrix_operand_type = .bf16;
+    const unchanged = try b.matmul(x, w);
+    try std.testing.expect(b.getInst(unchanged).strict_float32);
+    const x_view = try b.convertType(try b.convertType(x, .bf16), .f32);
+    const w_view = try b.convertType(try b.convertType(w, .bf16), .f32);
+    const mixed = try b.matmul(x_view, w_view);
+    try std.testing.expectEqual(ElementType.f32, b.getInst(mixed).shape.element_type);
+    try std.testing.expect(!b.getInst(mixed).strict_float32);
+    for (b.getInst(mixed).operand_ids) |operand| try std.testing.expectEqual(ElementType.bf16, b.getInst(operand).shape.element_type);
+}
+
+test "BF16 gather widens selected rows instead of the complete operand" {
+    const a = std.testing.allocator;
+    var b = Builder.init(a, "narrow_gather");
+    defer b.deinit();
+    const table = try b.parameter(0, Shape.init(.bf16, &.{ 1000, 4 }), "table");
+    const wide = try b.convertType(table, .f32);
+    const ids = try b.constantS64(Shape.init(.s64, &.{2}), &.{ 1, 7 });
+    const selected = try b.gather(wide, ids, Shape.init(.f32, &.{ 2, 4 }));
+    const gather = b.getInst(b.getInst(selected).operand_ids[0]);
+    try std.testing.expectEqualStrings("gather", gather.opcode);
+    try std.testing.expectEqual(table, gather.operand_ids[0]);
+    try std.testing.expectEqual(ElementType.bf16, gather.shape.element_type);
+    try std.testing.expectEqual(ElementType.f32, b.getInst(selected).shape.element_type);
 }

@@ -94,6 +94,7 @@ pub const TracingCompute = struct {
     runtime_inputs: std.ArrayListUnmanaged(RuntimeInput) = .empty,
     /// Shared program capture cannot observe provisional host values.
     require_resident_outputs: bool = false,
+    precision: @import("../execution/precision.zig").Policy = .f32,
 
     const RuntimeInput = struct {
         bytes: []const u8,
@@ -232,6 +233,19 @@ pub const TracingCompute = struct {
     // ── Handle management ─────────────────────────────────────────────
 
     fn makeHandle(self: *TracingCompute, node_id: NodeId) !CT {
+        var value = node_id;
+        const dtype = self.graph.node(value).output_shape.dtype;
+        if (self.precision == .bf16 and (dtype == .f32 or dtype == .bf16)) {
+            var builder = Builder.init(&self.graph);
+            if (dtype == .f32) value = try builder.convertDtype(value, .bf16);
+            // F32 arithmetic views fuse into their consumer; the explicit BF16
+            // edge fixes storage/rounding without reducing sensitive arithmetic.
+            value = try builder.convertDtype(value, .f32);
+        }
+        return self.makeHandleExact(value);
+    }
+
+    fn makeHandleExact(self: *TracingCompute, node_id: NodeId) !CT {
         const h = try self.allocator.create(TracingHandle);
         errdefer self.allocator.destroy(h);
         h.* = .{ .node_id = node_id };
@@ -278,6 +292,7 @@ pub const TracingCompute = struct {
         .windowedSelfAttention = &windowedSelfAttentionOp,
         .channelSelfAttention = &channelSelfAttentionOp,
         .segmentAttention = &segmentAttentionOp,
+        .segmentAttentionGrouped = &segmentAttentionGroupedOp,
         .tokenGridConv2d = &tokenGridConv2dOp,
         .multiply = &multiplyOp,
         .conv1d = &conv1dOp,
@@ -614,7 +629,7 @@ pub const TracingCompute = struct {
             const norms = try builder.reshape(try builder.sqrt(try builder.reduceSum(try builder.mul(result, result), &.{1})), Shape.init(.f32, &.{@intCast(batch)}));
             result = try builder.div(result, try tc.broadcastNode(norms, &.{0}, shape));
         }
-        return try tc.makeHandle(result);
+        return try tc.makeHandleExact(result);
     }
 
     fn tensorShapeOp(ctx: *anyopaque, value: CT, allocator: std.mem.Allocator) anyerror![]i64 {
@@ -632,7 +647,7 @@ pub const TracingCompute = struct {
     fn convertDTypeOp(ctx: *anyopaque, value: CT, target: ops.GraphDType) anyerror!?CT {
         const tc = fromCtx(ctx);
         var builder = Builder.init(&tc.graph);
-        return try tc.makeHandle(try builder.convertDtype(nodeIdFromCT(value), target));
+        return try tc.makeHandleExact(try builder.convertDtype(nodeIdFromCT(value), target));
     }
 
     fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
@@ -658,7 +673,8 @@ pub const TracingCompute = struct {
                 }
             }
         }
-        const shape = tc.weight_shapes.get(name) orelse tc.default_weight_shape;
+        var shape = tc.weight_shapes.get(name) orelse tc.default_weight_shape;
+        if (shape.dtype == .f32 or shape.dtype == .bf16 or shape.dtype == .f16) shape.dtype = if (tc.precision == .bf16) .bf16 else .f32;
         var b = Builder.init(tc.getGraphMut());
         const id = try b.parameter(name, shape);
         return tc.makeHandle(id);
@@ -1320,6 +1336,7 @@ pub const TracingCompute = struct {
         const tc = fromCtx(ctx);
         const in_id = nodeIdFromCT(input);
         const out_shape = tc.graph.node(in_id).output_shape;
+        if (tc.precision == .bf16) return tc.makeHandleExact(try @import("rotary_program.zig").emitBf16(&tc.graph, in_id, .{ .seq_len = @intCast(seq_len), .head_dim = @intCast(head_dim), .rope_dim = @intCast(rope_dim), .theta = theta, .freq_scale = freq_scale, .position_offset = @intCast(position_offset), .consecutive_pairs = consecutive_pairs }));
         const id = try tc.graph.addNode(.{
             .op = .{ .fused_rope = .{
                 .seq_len = @intCast(seq_len),
@@ -1385,7 +1402,11 @@ pub const TracingCompute = struct {
                 attrs.limits[1] = @intCast(width);
                 const shape = Shape.init(original.dtype, &.{ @intCast(count), @intCast(width) });
                 const slice = try tc.graph.addNode(.{ .op = .{ .slice = attrs }, .output_shape = shape, .inputs = .{ flat, null_node, null_node, null_node }, .num_inputs = 1 });
-                const part = if (active) try tc.graph.addNode(.{ .op = .{ .fused_rope = .{ .seq_len = @intCast(count), .head_dim = @intCast(head_dim), .rope_dim = @intCast(rope_dim), .theta = theta, .freq_scale = freq_scale, .position_offset = std.math.cast(u32, offset) orelse return error.InvalidRoPEInput, .consecutive_pairs = consecutive_pairs } }, .output_shape = shape, .inputs = .{ slice, null_node, null_node, null_node }, .num_inputs = 1 }) else slice;
+                const rotary_attrs = ml.graph.node.RopeAttrs{ .seq_len = @intCast(count), .head_dim = @intCast(head_dim), .rope_dim = @intCast(rope_dim), .theta = theta, .freq_scale = freq_scale, .position_offset = std.math.cast(u32, offset) orelse return error.InvalidRoPEInput, .consecutive_pairs = consecutive_pairs };
+                const part = if (!active) slice else if (tc.precision == .bf16)
+                    try @import("rotary_program.zig").emitBf16(&tc.graph, slice, rotary_attrs)
+                else
+                    try tc.graph.addNode(.{ .op = .{ .fused_rope = rotary_attrs }, .output_shape = shape, .inputs = .{ slice, null_node, null_node, null_node }, .num_inputs = 1 });
                 result = if (result) |previous| try builder.concat(previous, part, 0) else part;
             }
         }
@@ -1393,7 +1414,17 @@ pub const TracingCompute = struct {
     }
 
     fn segmentAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttention) anyerror!?CT {
+        return recordSegmentAttention(fromCtx(ctx), q, k, v, request, 0, null, false);
+    }
+
+    fn segmentAttentionGroupedOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttentionGrouped) anyerror!?CT {
         const tc = fromCtx(ctx);
+        if (!tc.require_resident_outputs) return null;
+        if (request.num_kv_heads == 0 or request.visibility.num_heads % request.num_kv_heads != 0 or !std.math.isFinite(request.score_scale)) return error.InvalidAttentionShape;
+        return recordSegmentAttention(tc, q, k, v, &request.visibility, request.num_kv_heads, request.score_scale, request.bf16_probability or tc.precision == .bf16);
+    }
+
+    fn recordSegmentAttention(tc: *TracingCompute, q: CT, k: CT, v: CT, request: *const ops.SegmentAttention, kv_heads: usize, score_scale: ?f32, bf16_probability: bool) !CT {
         if (request.ranges.len != try std.math.mul(usize, request.queries, 6) or request.query_positions.len != request.queries or request.key_positions.len != request.keys or request.num_heads == 0 or request.head_dim == 0) return error.InvalidAttentionShape;
         const metadata_len = try std.math.add(usize, request.ranges.len, try std.math.add(usize, request.queries, request.keys));
         const metadata = try tc.allocator.alloc(i32, metadata_len);
@@ -1404,7 +1435,7 @@ pub const TracingCompute = struct {
         const loc = try tc.graph.internConstantBytes(std.mem.sliceAsBytes(metadata), .i32);
         const visibility = try tc.graph.addNode(.{ .op = .{ .constant = .{ .data_offset = loc.offset, .data_len = loc.len } }, .output_shape = Shape.init(.i32, &.{@intCast(metadata_len)}) });
         const node = try tc.graph.addNode(.{
-            .op = .{ .fused_segment_attention = .{ .queries = @intCast(request.queries), .keys = @intCast(request.keys), .num_heads = @intCast(request.num_heads), .head_dim = @intCast(request.head_dim), .window = request.window } },
+            .op = .{ .fused_segment_attention = .{ .queries = @intCast(request.queries), .keys = @intCast(request.keys), .num_heads = @intCast(request.num_heads), .head_dim = @intCast(request.head_dim), .window = request.window, .num_kv_heads = @intCast(kv_heads), .bf16_probability = bf16_probability, .score_scale = score_scale } },
             .output_shape = Shape.init(.f32, &.{ @intCast(request.queries), @intCast(try std.math.mul(usize, request.num_heads, request.head_dim)) }),
             .inputs = .{ nodeIdFromCT(q), nodeIdFromCT(k), nodeIdFromCT(v), visibility },
             .num_inputs = 4,

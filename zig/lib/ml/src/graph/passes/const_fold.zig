@@ -547,9 +547,13 @@ fn encodeF32ToBf16(src: []const f32, out_bytes: []u8) void {
     const dst = @as([*]u16, @ptrCast(dst_aligned))[0..src.len];
     for (src, dst) |v, *o| {
         const bits: u32 = @bitCast(v);
-        const lsb: u32 = (bits >> 16) & 1;
-        const rounded = bits +% 0x7FFF +% lsb;
-        o.* = @truncate(rounded >> 16);
+        if (bits & 0x7fffffff > 0x7f800000) {
+            o.* = @truncate((bits >> 16) | 0x40);
+        } else {
+            const lsb: u32 = (bits >> 16) & 1;
+            const rounded = bits +% 0x7FFF +% lsb;
+            o.* = @truncate(rounded >> 16);
+        }
     }
 }
 
@@ -1905,4 +1909,11 @@ test "fold integer shape operations without floating point loss" {
     const output = result.graph.node(result.graph.outputs.items[0]);
     try std.testing.expectEqual(.constant, std.meta.activeTag(output.op));
     try std.testing.expectEqualSlices(i64, &.{large + 1}, result.graph.constantDataAs(i64, output.op.constant.data_offset, output.op.constant.data_len));
+}
+
+test "BF16 constants preserve nonfinite values signed zero and nearest-even ties" {
+    const values = [_]f32{ @bitCast(@as(u32, 0x3f808000)), @bitCast(@as(u32, 0x3f818000)), -0.0, std.math.inf(f32), -std.math.inf(f32), @bitCast(@as(u32, 0x7f800001)) };
+    var output: [12]u8 align(8) = undefined;
+    try std.testing.expect(try convertDtypeBytes(std.testing.allocator, std.mem.sliceAsBytes(&values), .f32, &output, .bf16, values.len));
+    try std.testing.expectEqualSlices(u16, &.{ 0x3f80, 0x3f82, 0x8000, 0x7f80, 0xff80, 0x7fc0 }, std.mem.bytesAsSlice(u16, &output));
 }

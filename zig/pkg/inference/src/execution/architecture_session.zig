@@ -383,15 +383,19 @@ const HostSessionOptions = struct {
     backend: enum { native, pjrt } = .native,
     weights: host_weights.HostPreparation = .{},
     pjrt_memory_policy: ?PjrtSessionOptions.MemoryPolicy = null,
+    pjrt_precision: @import("precision.zig").Policy = .f32,
 };
 
 pub const PjrtSessionOptions = struct {
+    pub const Precision = @import("precision.zig").Policy;
     /// Backend-neutral quantities; the optional SDK boundary converts them.
     pub const MemoryPolicy = union(enum) {
         cpu,
         cuda: struct { capacity_bytes: usize, device_bytes: usize },
     };
     task_override: ?TaskOverride = null,
+    /// BF16 is explicit opt-in; model/device qualification gates default rollout.
+    precision: @import("precision.zig").Policy = .f32,
     /// Explicit provider allocator policy, fixed before client creation.
     memory_policy: ?PjrtSessionOptions.MemoryPolicy = null,
 };
@@ -454,7 +458,7 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
         .gliner_decision_identity = gliner_decision_identity,
         .backend_data = switch (preparation.backend) {
             .native => .{ .native = prepared.takeWeights() },
-            .pjrt => .{ .pjrt = .{ .native = prepared.takeWeights() } },
+            .pjrt => .{ .pjrt = .{ .native = prepared.takeWeights(), .precision = preparation.pjrt_precision } },
         },
     };
     glide_head_owned = false;
@@ -502,13 +506,13 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 
 pub fn createPjrtSessionWithOptions(allocator: std.mem.Allocator, model_path: []const u8, options: PjrtSessionOptions) !Session {
     if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
-    return openHostSession(allocator, model_path, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy });
+    return openHostSession(allocator, model_path, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy, .pjrt_precision = options.precision });
 }
 
 /// Retains the caller's resolved source and policy through synchronous loading.
 pub fn createPjrtSessionFromManifestWithOptions(allocator: std.mem.Allocator, model_path: []const u8, manifest: *const manifest_mod.ModelManifest, options: PjrtSessionOptions) !Session {
     if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
-    return openHostSessionFromManifest(allocator, model_path, manifest, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy });
+    return openHostSessionFromManifest(allocator, model_path, manifest, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy, .pjrt_precision = options.precision });
 }
 
 test "host preparation shares execution and device-upload ownership and unwinds allocation failures" {
@@ -2786,6 +2790,7 @@ const GpuHostedData = if (false or build_options.enable_metal) gpu_hosted_store_
 /// PJRT backend data: weights are stored and served via the native backend,
 /// while the PJRT client is used for compiled partition execution.
 const PjrtData = struct {
+    precision: @import("precision.zig").Policy = .f32,
     /// Native weight store — PJRT uses the native backend for data
     /// conversion (host CTs ↔ PJRT buffers).
     native: NativeData,
@@ -8040,7 +8045,8 @@ fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std
         for (inputs) |input| if (std.mem.eql(u8, input.name, "input_features")) break :stage .encoder;
         break :stage .decoder;
     } else if (pooled) .embedding else .forward;
-    const forward = (try handle.model_programs.?.get(stage)) orelse return error.UnsupportedModelProgram;
+    var forward = (try handle.model_programs.?.get(stage)) orelse return error.UnsupportedModelProgram;
+    forward.precision = self.backend_data.pjrt.precision;
     const client = if (comptime build_options.enable_pjrt) if (self.backend_data.pjrt.client) |*value| @as(*anyopaque, @ptrCast(value)) else return error.MissingPjrtClient else return error.PjrtNotEnabled;
     const declared = try allocator.alloc(@import("capture.zig").Input, inputs.len);
     defer allocator.free(declared);
@@ -8060,7 +8066,7 @@ fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std
         .context = self,
         .create = createProgramFrame,
         .import = importProgramInput,
-        .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = client },
+        .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = client, .pjrt_precision = forward.precision },
     }, forward, declared, allocator, control);
 }
 

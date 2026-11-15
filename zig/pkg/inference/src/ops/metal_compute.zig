@@ -18049,6 +18049,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn segmentAttentionGroupedOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, request: *const ops.SegmentAttentionGrouped) anyerror!?CT {
+        if (request.bf16_probability) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var q = try self.ownedDeviceMetalTensorFromCt(q_ct);
         defer self.retireTemporaryWorkspaceValue(&q);

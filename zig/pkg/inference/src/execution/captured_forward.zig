@@ -159,7 +159,7 @@ pub const Cache = struct {
         if (a.context != b.context or a.create != b.create or a.import != b.import or (a.compiled_context != null) != (b.compiled_context != null)) return false;
         if (a.compiled_context) |left| {
             const right = b.compiled_context.?;
-            return left.requested_backend == right.requested_backend and left.pjrt_client == right.pjrt_client and left.attachment_target == right.attachment_target;
+            return left.requested_backend == right.requested_backend and left.pjrt_client == right.pjrt_client and left.attachment_target == right.attachment_target and left.pjrt_precision == right.pjrt_precision;
         }
         return true;
     }
@@ -462,6 +462,9 @@ const TestPooling = struct {
         return outputs;
     }
     fn qualify(client: ?*anyopaque) !void {
+        return qualifyPrecision(client, .f32);
+    }
+    fn qualifyPrecision(client: ?*anyopaque, precision: @import("precision.zig").Policy) !void {
         const a = std.testing.allocator;
         var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
         defer source.weights.deinitOwned();
@@ -470,10 +473,10 @@ const TestPooling = struct {
         defer input.deinit();
         var mask = try Tensor.initInt64(a, "attention_mask", &.{ 2, 2 }, &.{ 1, 0, 1, 1 });
         defer mask.deinit();
-        const provider = Provider{ .context = &source, .create = TestProvider.create, .import = TestProvider.import, .compiled_context = if (client) |actual| .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = actual } else null };
+        const provider = Provider{ .context = &source, .create = TestProvider.create, .import = TestProvider.import, .compiled_context = if (client) |actual| .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = actual, .pjrt_precision = precision } else null };
         var cache = Cache{};
         defer cache.deinit(a);
-        const outputs = try cache.run(a, provider, .{ .context = &source, .fingerprint = 0, .output_names = &.{"embedding"}, .run = forward }, &.{ .{ .tensor = input }, .{ .tensor = mask } }, a, null);
+        const outputs = try cache.run(a, provider, .{ .context = &source, .fingerprint = 0, .precision = precision, .output_names = &.{"embedding"}, .run = forward }, &.{ .{ .tensor = input }, .{ .tensor = mask } }, a, null);
         defer a.free(outputs);
         defer for (outputs) |*output| output.deinit();
         const want = [_]f32{ 1 / @sqrt(@as(f32, 5)), 2 / @sqrt(@as(f32, 5)), 2 / @sqrt(@as(f32, 13)), 3 / @sqrt(@as(f32, 13)) };
@@ -481,7 +484,7 @@ const TestPooling = struct {
         for (want, outputs[0].asFloat32()) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
         const bits: []i64 = @alignCast(std.mem.bytesAsSlice(i64, mask.data));
         bits[2] = 0;
-        const changed = try cache.run(a, provider, .{ .context = &source, .fingerprint = 0, .output_names = &.{"embedding"}, .run = forward }, &.{ .{ .tensor = input }, .{ .tensor = mask } }, a, null);
+        const changed = try cache.run(a, provider, .{ .context = &source, .fingerprint = 0, .precision = precision, .output_names = &.{"embedding"}, .run = forward }, &.{ .{ .tensor = input }, .{ .tensor = mask } }, a, null);
         defer a.free(changed);
         defer for (changed) |*output| output.deinit();
         const changed_want = [_]f32{ want[0], want[1], 0.6, 0.8 };
@@ -502,4 +505,45 @@ test "captured forward PJRT pooling excludes nonfinite padding and normalizes tr
     };
     defer client.deinit();
     try TestPooling.qualify(@ptrCast(&client));
+}
+
+test "captured forward BF16 storage preserves F32 pooling and output normalization" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    var client = try @import("pjrt").pjrt.Client.initFromEnvWithMemoryPolicy(std.testing.allocator, .cpu);
+    defer client.deinit();
+    try TestPooling.qualifyPrecision(@ptrCast(&client), .bf16);
+}
+
+test "captured forward BF16 rotary preserves coefficient product and partial-layout rounding" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const round = @import("antfly_tile").fexpr.roundBf16Value;
+    var client = try @import("pjrt").pjrt.Client.initFromEnvWithMemoryPolicy(a, .cpu);
+    defer client.deinit();
+    var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
+    defer source.weights.deinitOwned();
+    var input = try Tensor.initFloat32(a, "x", &.{ 2, 8 }, &.{ 0.1, -0.2, 3.14, -4.23, 0.875, 0.125, -2.3, 7.1, -0.2, 0.3, -0.4, 0.5, 8.01, -6.12, 4.23, -2.34 });
+    defer input.deinit();
+    for ([_]bool{ false, true }) |consecutive| for ([_]usize{ 2, 4 }) |rotary_dim| {
+        var mode = TestRotary{ .consecutive = consecutive, .rotary_dim = rotary_dim };
+        var expected: [16]f32 = undefined;
+        for (input.asFloat32(), &expected) |value, *out| out.* = round(value);
+        for (0..2) |row| for (0..2) |head| for (0..rotary_dim / 2) |pair| {
+            const angle = @as(f32, @floatFromInt(row + 7)) / std.math.pow(f32, 10000, @as(f32, @floatFromInt(2 * pair)) / @as(f32, @floatFromInt(rotary_dim)));
+            const cosine = round(@cos(angle));
+            const sine = round(@sin(angle));
+            const lo = row * 8 + head * 4 + (if (consecutive) 2 * pair else pair);
+            const hi = if (consecutive) lo + 1 else lo + 2;
+            const x0 = round(input.asFloat32()[lo]);
+            const x1 = round(input.asFloat32()[hi]);
+            expected[lo] = round(round(x0 * cosine) - round(x1 * sine));
+            expected[hi] = round(round(x1 * cosine) + round(x0 * sine));
+        };
+        var cache = Cache{};
+        defer cache.deinit(a);
+        const outputs = try cache.run(a, .{ .context = &source, .create = TestProvider.create, .import = TestProvider.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client), .pjrt_precision = .bf16 } }, .{ .context = &mode, .fingerprint = 0, .precision = .bf16, .output_names = &.{"rotary"}, .run = TestRotary.forward }, &.{.{ .tensor = input }}, a, null);
+        defer a.free(outputs);
+        defer for (outputs) |*output| output.deinit();
+        try std.testing.expectEqualSlices(f32, &expected, outputs[0].asFloat32());
+    };
 }

@@ -659,6 +659,12 @@ pub const SegmentAttentionAttrs = struct {
     num_heads: u32,
     head_dim: u32,
     window: u32 = 0xffffffff,
+    /// Zero retains the legacy one-KV-head-per-query-head contract.
+    num_kv_heads: u32 = 0,
+    /// Unnormalized softmax weights cross BF16 before the value dot; denominator stays F32.
+    bf16_probability: bool = false,
+    /// Null retains rsqrt(head_dim); an explicit scale avoids activation rescaling.
+    score_scale: ?f32 = null,
 };
 
 pub const RopeTableAttrs = struct {

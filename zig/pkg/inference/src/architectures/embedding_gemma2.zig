@@ -549,7 +549,7 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     const offsets = try allocator.alloc(usize, if (fused) 0 else batch);
     defer allocator.free(offsets);
     @memset(offsets, 0);
-    const grouped = (cb.kind() == .native or cb.kind() == .metal) and cb.vtable.segmentAttentionGrouped != null and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_GROUPED_ATTENTION");
+    const grouped = (cb.kind() == .native or cb.kind() == .metal or cb.kind() == .graph) and cb.vtable.segmentAttentionGrouped != null and !@import("antfly_platform").env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_GROUPED_ATTENTION");
     const identity = grouped and row_identity;
     const gathered_heads = if (grouped) kv else heads;
     const ids = try allocator.alloc(i64, if (fused) 0 else vis.gather.len * gathered_heads);

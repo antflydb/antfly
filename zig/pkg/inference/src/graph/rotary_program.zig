@@ -1,0 +1,136 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shared rotary coefficients and explicit low-precision arithmetic. Layouts
+//! use slices/concatenation; no dense permutation or activation host readback.
+const std = @import("std");
+const ml = @import("ml");
+const Allocator = std.mem.Allocator;
+const Graph = ml.graph.Graph;
+const Builder = ml.graph.Builder;
+const Shape = ml.graph.Shape;
+const Id = ml.graph.NodeId;
+
+pub const Kind = enum { cos, sin };
+
+pub fn coefficients(
+    allocator: Allocator,
+    rows: usize,
+    hidden: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    theta: f32,
+    freq_scale: f32,
+    position_offset: usize,
+    consecutive_pairs: bool,
+    kind: Kind,
+) ![]f32 {
+    const data = try allocator.alloc(f32, rows * hidden);
+    @memset(data, switch (kind) {
+        .cos => 1.0,
+        .sin => 0.0,
+    });
+    const num_heads = hidden / head_dim;
+    const half = rope_dim / 2;
+    const head_half = head_dim / 2;
+    for (0..rows) |row| {
+        const pos = position_offset + row;
+        for (0..num_heads) |head| {
+            const head_base = row * hidden + head * head_dim;
+            for (0..half) |j| {
+                const freq = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(rope_dim)));
+                const angle = @as(f32, @floatFromInt(pos)) * freq_scale * freq;
+                const value = switch (kind) {
+                    .cos => @cos(angle),
+                    .sin => @sin(angle),
+                };
+                const idx0 = if (consecutive_pairs) 2 * j else j;
+                const idx1 = if (consecutive_pairs) 2 * j + 1 else j + head_half;
+                data[head_base + idx0] = value;
+                data[head_base + idx1] = value;
+            }
+        }
+    }
+    return data;
+}
+
+fn narrow(builder: *Builder, value: Id) !Id {
+    return builder.convertDtype(try builder.convertDtype(value, .bf16), .f32);
+}
+fn slice(g: *Graph, input: Id, start: i64, stop: i64, stride: i64) !Id {
+    const source = g.node(input).output_shape;
+    var attrs = ml.graph.node.SliceAttrs{};
+    attrs.num_axes = source.rank();
+    var shape = source;
+    for (0..source.rank()) |axis| {
+        attrs.limits[axis] = source.dims[axis];
+        attrs.strides[axis] = 1;
+    }
+    const axis = source.rank() - 1;
+    attrs.starts[axis] = start;
+    attrs.limits[axis] = stop;
+    attrs.strides[axis] = stride;
+    shape.dims[axis] = @divFloor(stop - start + stride - 1, stride);
+    return g.addNode(.{ .op = .{ .slice = attrs }, .output_shape = shape, .inputs = .{ input, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+}
+fn zeros(g: *Graph, b: *Builder, shape: Shape) !Id {
+    return g.addNode(.{ .op = .{ .broadcast_in_dim = .{ .target_shape = shape, .num_axes = 0 } }, .output_shape = shape, .inputs = .{ try b.scalarConst(.f32, 0), ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+}
+
+/// BF16 coefficients, separately rounded products and a BF16 publication.
+/// F32 input/output views keep reduction and host ABI contracts independent.
+pub fn emitBf16(g: *Graph, input: Id, attrs: ml.graph.node.RopeAttrs) !Id {
+    const source = g.node(input).output_shape;
+    if (source.dtype != .f32 or source.rank() != 2) return error.UnsupportedShape;
+    const rows: usize = @intCast(source.dims[0]);
+    const width: usize = @intCast(source.dims[1]);
+    const dim: usize = attrs.head_dim;
+    const rotary: usize = if (attrs.rope_dim == 0) dim else attrs.rope_dim;
+    if (dim == 0 or width % dim != 0 or rotary == 0 or rotary > dim or rotary % 2 != 0 or rows != attrs.seq_len) return error.UnsupportedShape;
+    var b = Builder.init(g);
+    const heads: i64 = @intCast(width / dim);
+    const r: i64 = @intCast(rows);
+    const d: i64 = @intCast(dim);
+    const rot: i64 = @intCast(rotary);
+    const half = @divExact(rot, 2);
+    const shape = Shape.init(.f32, &.{ r, heads, d });
+    const x = try b.reshape(input, shape);
+    var rotated: Id = undefined;
+    if (attrs.consecutive_pairs) {
+        const even = try slice(g, x, 0, rot, 2);
+        const odd = try b.neg(try slice(g, x, 1, rot, 2));
+        const pair_shape = Shape.init(.f32, &.{ r, heads, half, 1 });
+        rotated = try b.reshape(try b.concat(try b.reshape(odd, pair_shape), try b.reshape(even, pair_shape), 3), Shape.init(.f32, &.{ r, heads, rot }));
+        if (rot != d) rotated = try b.concat(rotated, try zeros(g, &b, Shape.init(.f32, &.{ r, heads, d - rot })), 2);
+    } else {
+        const head_half = @divExact(d, 2);
+        var first = try slice(g, x, 0, half, 1);
+        var negative = try b.neg(try slice(g, x, head_half, head_half + half, 1));
+        if (half != head_half) {
+            const gap = try zeros(g, &b, Shape.init(.f32, &.{ r, heads, head_half - half }));
+            first = try b.concat(first, gap, 2);
+            negative = try b.concat(negative, gap, 2);
+        }
+        rotated = try b.concat(negative, first, 2);
+    }
+    const flat = try b.reshape(rotated, source);
+    const cos_values = try coefficients(g.allocator, rows, width, dim, rotary, attrs.theta, attrs.freq_scale, attrs.position_offset, attrs.consecutive_pairs, .cos);
+    defer g.allocator.free(cos_values);
+    const sin_values = try coefficients(g.allocator, rows, width, dim, rotary, attrs.theta, attrs.freq_scale, attrs.position_offset, attrs.consecutive_pairs, .sin);
+    defer g.allocator.free(sin_values);
+    const cosine = try narrow(&b, try b.tensorConst(cos_values, source));
+    const sine = try narrow(&b, try b.tensorConst(sin_values, source));
+    const result = try narrow(&b, try b.add(try narrow(&b, try b.mul(input, cosine)), try narrow(&b, try b.mul(flat, sine))));
+    if (rotary == dim) return result;
+    const active = try g.allocator.alloc(u8, width);
+    defer g.allocator.free(active);
+    for (active, 0..) |*flag, column| {
+        const lane = column % dim;
+        flag.* = @intFromBool(if (attrs.consecutive_pairs) lane < rotary else lane < rotary / 2 or (lane >= dim / 2 and lane < dim / 2 + rotary / 2));
+    }
+    const flags = try b.tensorConstBytes(active, Shape.init(.bool_, &.{@intCast(width)}));
+    var broadcast = ml.graph.node.BroadcastAttrs{ .target_shape = Shape.init(.bool_, source.dims[0..source.rank()]), .num_axes = 1 };
+    broadcast.broadcast_axes[0] = 1;
+    const predicate = try g.addNode(.{ .op = .{ .broadcast_in_dim = broadcast }, .output_shape = broadcast.target_shape, .inputs = .{ flags, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+    return g.addNode(.{ .op = .{ .where_select = {} }, .output_shape = source, .inputs = .{ predicate, result, input, ml.graph.null_node }, .num_inputs = 3 });
+}

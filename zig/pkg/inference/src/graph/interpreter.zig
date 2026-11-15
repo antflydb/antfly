@@ -2582,7 +2582,14 @@ pub fn executeNode(
         .parameter => |attrs| {
             const name = graph.parameterName(n);
             _ = attrs;
-            return cb.acquireWeight(name);
+            const value = try cb.acquireWeight(name);
+            if (n.output_shape.dtype == .bf16 or n.output_shape.dtype == .f16) {
+                errdefer cb.free(value);
+                const converted = (try cb.tryConvertDType(value, n.output_shape.dtype)) orelse return error.UnsupportedTensorType;
+                if (converted != value) cb.free(value);
+                return converted;
+            }
+            return value;
         },
 
         .constant => |attrs| {
@@ -3158,6 +3165,16 @@ pub fn executeNode(
             const ranges_len = try std.math.mul(usize, attrs.queries, 6);
             if (metadata.len != try std.math.add(usize, ranges_len, try std.math.add(usize, attrs.queries, attrs.keys))) return error.InvalidAttentionMetadata;
             const ranges: []const u32 = @ptrCast(metadata[0..ranges_len]);
+            if (attrs.num_kv_heads != 0) {
+                const run = cb.vtable.segmentAttentionGrouped orelse return error.UnsupportedGroupedAttention;
+                return (try run(cb.ptr, V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), &.{
+                    .visibility = .{ .ranges = ranges, .query_positions = metadata[ranges_len..][0..attrs.queries], .key_positions = metadata[ranges_len + attrs.queries ..], .window = attrs.window, .queries = attrs.queries, .keys = attrs.keys, .num_heads = attrs.num_heads, .head_dim = attrs.head_dim },
+                    .num_kv_heads = attrs.num_kv_heads,
+                    .bf16_probability = attrs.bf16_probability,
+                    .score_scale = attrs.score_scale orelse (1 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim)))),
+                    .control = state.options.execution_control,
+                })) orelse error.UnsupportedGroupedAttention;
+            }
             return cb.segmentAttention(state.allocator orelse graph.allocator, V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), &.{ .ranges = ranges, .query_positions = metadata[ranges_len..][0..attrs.queries], .key_positions = metadata[ranges_len + attrs.queries ..], .window = attrs.window, .queries = attrs.queries, .keys = attrs.keys, .num_heads = attrs.num_heads, .head_dim = attrs.head_dim });
         },
 

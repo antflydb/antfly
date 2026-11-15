@@ -198,7 +198,7 @@ pub fn attachPjrtExecutors(
     pjrt_client: *anyopaque,
     attachment_target: compiled_backend.AttachmentTarget,
 ) !void {
-    return attachPjrtExecutorsWithParameters(allocator, entry, graph, dpp, cb, pjrt_client, attachment_target, null, null, false);
+    return attachPjrtExecutorsWithParameters(allocator, entry, graph, dpp, cb, pjrt_client, attachment_target, null, null, false, .f32);
 }
 
 fn attachPjrtExecutorsWithParameters(
@@ -212,6 +212,7 @@ fn attachPjrtExecutorsWithParameters(
     mutable_parameters: ?[]const bool,
     parameter_store: ?*anyopaque,
     required: bool,
+    precision: @import("../execution/precision.zig").Policy,
 ) !void {
     if (!build_options.enable_pjrt) return;
 
@@ -253,7 +254,7 @@ fn attachPjrtExecutorsWithParameters(
                 cb,
                 cb,
                 client,
-                .{ .mutable_parameters = mutable_parameters },
+                .{ .mutable_parameters = mutable_parameters, .precision = precision },
                 if (parameter_store) |store| @ptrCast(@alignCast(store)) else null,
             ) catch |err| {
                 if (required) return err;
@@ -311,7 +312,7 @@ pub fn isPartitionPjrtEligible(
 
 fn pjrtSupportsGraphConstantDType(dtype: @import("ml").graph.DType) bool {
     return switch (dtype) {
-        .f32, .i32, .i64, .bool_ => true,
+        .f32, .f16, .bf16, .i32, .i64, .bool_ => true,
         else => false,
     };
 }
@@ -374,7 +375,7 @@ fn attachExecutorsViaDefinition(
         return error.PjrtLoadOnlyArtifactsRequired;
     }
     const client = context.pjrt_client orelse return error.MissingPjrtClient;
-    return attachPjrtExecutorsWithParameters(allocator, entry, graph, dpp, context.cb, client, context.attachment_target, context.mutable_parameters, context.pjrt_parameter_store, context.require_compiled);
+    return attachPjrtExecutorsWithParameters(allocator, entry, graph, dpp, context.cb, client, context.attachment_target, context.mutable_parameters, context.pjrt_parameter_store, context.require_compiled, context.pjrt_precision);
 }
 
 fn executeModelForwardViaDefinition(

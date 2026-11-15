@@ -5,9 +5,10 @@ const ops = @import("../ops/ops.zig");
 const capture = @import("capture.zig");
 const prepared = @import("captured_forward.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
-const Kind = enum { conv1d, conv2d, grid_grouped, grid_depthwise, sdpa_token, sdpa_heads, sdpa_bias, causal, cross, relative, gqa, marker_head, interleaved_pairs };
+const Kind = enum { conv1d, conv2d, grid_grouped, grid_depthwise, sdpa_token, sdpa_heads, sdpa_bias, causal, cross, relative, gqa, marker_head, interleaved_pairs, segment_grouped };
 const Fixture = struct {
     kind: Kind,
+    bf16_probability: bool = false,
     weights: @import("../ops/native_compute.zig").WeightStore,
     fn create(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!ops.ComputeBackend {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -64,6 +65,12 @@ const Fixture = struct {
                 defer cb.free(key);
                 const value = try tensor(cb, inputs[2].tensor);
                 defer cb.free(value);
+                if (self.kind == .segment_grouped) {
+                    var ranges: [36]u32 = @splat(0);
+                    const positions = [_]i32{ 0, 1, 2, 3, 4, 5 };
+                    for (0..6) |row| ranges[row * 6 + 1] = 6;
+                    break :attention (try cb.vtable.segmentAttentionGrouped.?(cb.ptr, x, key, value, &.{ .visibility = .{ .ranges = &ranges, .query_positions = &positions, .key_positions = &positions, .queries = 6, .keys = 6, .num_heads = 2, .head_dim = 2 }, .num_kv_heads = 1, .score_scale = 1, .bf16_probability = self.bf16_probability })).?;
+                }
                 if (self.kind == .gqa) break :attention try cb.gqaCausalAttention(x, key, value, null, 1, 3, 4, 2, 2);
                 if (self.kind == .causal) break :attention try cb.causalSelfAttention(x, key, value, null, 2, 3, 2, 2);
                 if (self.kind == .relative) {
@@ -106,6 +113,12 @@ fn numbers(a: std.mem.Allocator, name: []const u8, dims: []const i64, shift: i32
     return Tensor.initFloat32(a, name, dims, data);
 }
 fn qualify(kind: Kind) !void {
+    return qualifyWithPrecision(kind, .f32);
+}
+fn qualifyWithPrecision(kind: Kind, precision: @import("precision.zig").Policy) !void {
+    return qualifyProfile(kind, precision, false);
+}
+fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_probability: bool) !void {
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
     const a = std.testing.allocator;
     var client = @import("pjrt").pjrt.Client.initFromEnv(a) catch |err| switch (err) {
@@ -113,7 +126,7 @@ fn qualify(kind: Kind) !void {
         else => return err,
     };
     defer client.deinit();
-    var source = Fixture{ .kind = kind, .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
+    var source = Fixture{ .kind = kind, .bf16_probability = bf16_probability, .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
     defer source.weights.deinitOwned();
     var inputs: std.ArrayList(capture.Input) = .empty;
     defer inputs.deinit(a);
@@ -158,14 +171,14 @@ fn qualify(kind: Kind) !void {
             try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "decision_marker_mask", &.{ 2, 2 }, &.{ 1, 0, 1, 1 }) });
         },
         else => {
-            const key_shape: []const i64 = if (kind == .cross) &.{ 6, 4 } else if (kind == .gqa) &.{ 3, 4 } else shape;
+            const key_shape: []const i64 = if (kind == .cross) &.{ 6, 4 } else if (kind == .gqa) &.{ 3, 4 } else if (kind == .segment_grouped) &.{ 6, 2 } else shape;
             try inputs.append(a, .{ .tensor = try numbers(a, "key", key_shape, 1) });
             try inputs.append(a, .{ .tensor = try numbers(a, "value", key_shape, 2) });
             if (kind == .relative) {
                 try inputs.append(a, .{ .tensor = try numbers(a, "query_relative", &.{ 5, 4 }, -1) });
                 try inputs.append(a, .{ .tensor = try numbers(a, "key_relative", &.{ 5, 4 }, 3) });
                 try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, &.{ 1, 0, 1, 0, 0, 0 }) });
-            } else if (kind != .causal and kind != .gqa) try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, &.{ 1, 0, 1, 1, 1, 0 }) });
+            } else if (kind != .causal and kind != .gqa and kind != .segment_grouped) try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, &.{ 1, 0, 1, 1, 1, 0 }) });
             if (kind == .sdpa_bias) try inputs.append(a, .{ .tensor = try numbers(a, "bias", &.{ 2, 3, 3 }, -1) });
         },
     }
@@ -173,6 +186,9 @@ fn qualify(kind: Kind) !void {
     defer reference.deinit();
     var cache = prepared.Cache{};
     defer cache.deinit(a);
+    var reference_cache = prepared.Cache{};
+    defer reference_cache.deinit(a);
+    const frontend = capture.Forward{ .context = &source, .fingerprint = @backingInt(kind), .precision = precision, .output_names = &.{"result"}, .run = Fixture.forward };
     const dynamic_mask = switch (kind) {
         .relative, .sdpa_heads, .sdpa_token, .sdpa_bias, .cross => true,
         else => false,
@@ -184,12 +200,21 @@ fn qualify(kind: Kind) !void {
             @memcpy(mask, if (iteration == 1) &[_]i64{ 1, 1, 1, 1, 1, 1 } else &[_]i64{ 0, 1, 1, 1, 0, 1 });
         }
         if (kind == .marker_head and iteration == 1) @as([*]i64, @ptrCast(@alignCast(inputs.items[1].tensor.data.ptr)))[0] = 1;
-        const expected = try Fixture.forward(&source, &reference, a, inputs.items);
-        defer a.free(expected);
-        defer for (expected) |output| reference.free(output.value);
-        const values = try reference.toFloat32(expected[0].value, a);
+        const values = if (precision == .bf16) reference_values: {
+            // Separate CPU graph execution performs the declared BF16
+            // publications and F32 arithmetic without the HLO lowerer.
+            const expected = try reference_cache.run(a, .{ .context = &source, .create = Fixture.create, .import = Fixture.import }, frontend, inputs.items, a, null);
+            defer a.free(expected);
+            defer for (expected) |*output| output.deinit();
+            break :reference_values try a.dupe(f32, expected[0].asFloat32());
+        } else reference_values: {
+            const expected = try Fixture.forward(&source, &reference, a, inputs.items);
+            defer a.free(expected);
+            defer for (expected) |output| reference.free(output.value);
+            break :reference_values try reference.toFloat32(expected[0].value, a);
+        };
         defer a.free(values);
-        const actual = try cache.run(a, .{ .context = &source, .create = Fixture.create, .import = Fixture.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client) } }, .{ .context = &source, .fingerprint = @backingInt(kind), .output_names = &.{"result"}, .run = Fixture.forward }, inputs.items, a, null);
+        const actual = try cache.run(a, .{ .context = &source, .create = Fixture.create, .import = Fixture.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client), .pjrt_precision = precision } }, frontend, inputs.items, a, null);
         defer a.free(actual);
         defer for (actual) |*output| output.deinit();
         try std.testing.expectEqual(values.len, actual[0].asFloat32().len);
@@ -240,4 +265,18 @@ test "captured primitive PJRT marker classifier keeps row indices dynamic across
 
 test "captured primitive PJRT interleaved linear pairs preserve producer-specific secondary results" {
     try qualify(.interleaved_pairs);
+}
+
+test "captured primitive PJRT BF16 projection and activation storage matches rounded CPU arithmetic" {
+    try qualifyWithPrecision(.marker_head, .bf16);
+}
+test "captured primitive PJRT BF16 attention retains F32 reductions across dynamic masks" {
+    try qualifyWithPrecision(.sdpa_token, .bf16);
+    try qualifyWithPrecision(.relative, .bf16);
+}
+
+test "captured primitive PJRT grouped segment descriptor preserves explicit scale and compact KV" {
+    try qualifyWithPrecision(.segment_grouped, .f32);
+    try qualifyWithPrecision(.segment_grouped, .bf16);
+    try qualifyProfile(.segment_grouped, .f32, true);
 }

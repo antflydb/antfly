@@ -40473,6 +40473,26 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
 
 fn convertDTypeOp(ctx: *anyopaque, input: CT, target: ops.GraphDType) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (target == .bf16 or target == .f16) {
+        const values = try toFloat32Op(ctx, input, self.allocator);
+        defer self.allocator.free(values);
+        const bits = try self.allocator.alloc(u16, values.len);
+        defer self.allocator.free(bits);
+        for (values, bits) |element, *out| out.* = if (target == .bf16)
+            @truncate(@as(u32, @bitCast(@import("antfly_tile").fexpr.roundBf16Value(element))) >> 16)
+        else
+            @bitCast(@as(f16, @floatCast(element)));
+        const fallback = [_]i64{@intCast(values.len)};
+        return fromConstantBytesOp(ctx, std.mem.sliceAsBytes(bits), target, tensorStoredShape(input) orelse &fallback);
+    }
+    if (target == .f32) if (toBuf(input).source_tensor) |source_tensor| {
+        if (source_tensor.dtype == .bf16 or source_tensor.dtype == .f16) {
+            const data = try convertTensorToOwnedF32(self.allocator, source_tensor);
+            const output = try self.makeOwnedBuf(data);
+            errdefer self.computeBackend().free(output);
+            return self.withLogicalShape(output, source_tensor.shape);
+        }
+    };
     const source = integerSource(input);
     const target_integer = switch (target) {
         .i8, .i16, .i32, .i64, .u8, .bool_ => true,
@@ -40520,7 +40540,7 @@ fn convertDTypeOp(ctx: *anyopaque, input: CT, target: ops.GraphDType) anyerror!?
 fn fromConstantBytesOp(ctx: *anyopaque, data: []const u8, dtype: ops.GraphDType, shape: []const i64) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const storage_dtype: tensor_mod.DType = switch (dtype) {
-        inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| @field(tensor_mod.DType, @tagName(tag)),
+        inline .i8, .i16, .i32, .i64, .u8, .bool_, .bf16, .f16 => |tag| @field(tensor_mod.DType, @tagName(tag)),
         else => return null,
     };
     if (shape.len > 8) return error.InvalidTensorShape;
@@ -40590,6 +40610,7 @@ fn segmentAttentionGroupedOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *con
 }
 fn groupedAttentionForSession(comptime Gemm: type, self: *NativeCompute, q: CT, k: CT, v: CT, request: *const ops.SegmentAttentionGrouped) ![]f32 {
     const r = request.visibility;
+    if (request.bf16_probability) return observedAttention(linalg.segmentAttentionGroupedBf16HostWithGemmIo, linalg.segmentAttentionGroupedBf16HostWithGemmIoObserved, .{ Gemm, self.allocator, self.io, try getDataChecked(q), try getDataChecked(k), try getDataChecked(v), r.ranges, r.query_positions, r.key_positions, r.window, r.queries, r.keys, r.num_heads, request.num_kv_heads, r.head_dim, request.score_scale });
     // Portable head workers own parallelism. BLAS keeps its own GEMM scheduler.
     const scratch = (r.queries * r.num_heads * r.head_dim * 3 + r.keys * request.num_kv_heads * r.head_dim * 2 + r.num_heads * 128 * 512) * @sizeOf(f32);
     if (!native.useBlas() and self.io != null and r.queries >= 128 and r.num_heads <= 4 and scratch <= request.workspace_limit_bytes) {
@@ -62023,4 +62044,32 @@ fn checkLinearScratchAllocationFailures(a: std.mem.Allocator) !void {
 
 test "native linear conversion scratch rolls back every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkLinearScratchAllocationFailures, .{});
+}
+
+test "native BF16 narrowing preserves ties signed zero NaNs shape and source ownership" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const values = [_]f32{ @bitCast(@as(u32, 0x3f808000)), @bitCast(@as(u32, 0x3f818000)), -0.0, @bitCast(@as(u32, 0x7f800001)) };
+    const input = try cb.fromFloat32Shape(&values, &.{ 2, 2 });
+    defer cb.free(input);
+    const narrow = (try cb.tryConvertDType(input, .bf16)).?;
+    defer cb.free(narrow);
+    const expanded = (try cb.tryConvertDType(narrow, .f32)).?;
+    defer cb.free(expanded);
+    const actual = try cb.toFloat32(expanded, a);
+    defer a.free(actual);
+    try std.testing.expectEqual(@as(f32, 1), actual[0]);
+    try std.testing.expectEqual(@as(f32, 1.015625), actual[1]);
+    try std.testing.expectEqual(@as(u32, 0x80000000), @as(u32, @bitCast(actual[2])));
+    try std.testing.expect(std.math.isNan(actual[3]));
+    const shape = try cb.tensorShape(expanded, a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, shape);
+    const original = try cb.toFloat32(input, a);
+    defer a.free(original);
+    try std.testing.expectEqual(@as(u32, 0x3f808000), @as(u32, @bitCast(original[0])));
 }

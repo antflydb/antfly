@@ -58,6 +58,7 @@ pub const AttachContext = struct {
     pjrt_client: ?*anyopaque = null,
     mutable_parameters: ?[]const bool = null,
     pjrt_parameter_store: ?*anyopaque = null,
+    pjrt_precision: @import("../execution/precision.zig").Policy = .f32,
     require_compiled: bool = false,
     pjrt_admission: ?*const @import("pjrt_admission.zig").Context = null,
     pjrt_plugin_path: ?[:0]const u8 = null,

@@ -996,7 +996,7 @@ pub fn segmentAttentionHostWithGemm(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(false, Gemm, allocator, null, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
+    return segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, null, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
 }
 
 /// Independent heads share immutable inputs and use caller-preallocated scratch.
@@ -1017,38 +1017,45 @@ pub fn segmentAttentionHostWithGemmParallelIo(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
+    return segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
 }
 pub fn segmentAttentionHostWithGemmParallelIoObserved(comptime Gemm: type, allocator: std.mem.Allocator, io: std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize, observation: ?*AttentionObservation) ![]f32 {
-    return if (observation) |out| segmentAttentionHostWithGemmImpl(true, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, out) else segmentAttentionHostWithGemmImpl(false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
+    return if (observation) |out| segmentAttentionHostWithGemmImpl(false, true, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, out) else segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
 }
 
 /// Serial heads with cancellation between bounded GEMM tiles. A threaded
 /// system BLAS owns parallelism; scratch remains independent of head count.
 pub fn segmentAttentionHostWithGemmSerialIo(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
+    return segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
 }
 pub fn segmentAttentionHostWithGemmSerialIoObserved(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize, observation: ?*AttentionObservation) ![]f32 {
-    return if (observation) |out| segmentAttentionHostWithGemmImpl(true, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, out) else segmentAttentionHostWithGemmImpl(false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
+    return if (observation) |out| segmentAttentionHostWithGemmImpl(false, true, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, out) else segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null, {});
 }
 
 /// Compact grouped K/V, reusing one packed K/V head across its query heads.
 /// Threaded BLAS owns parallelism; no expanded [keys, query_heads, dim] tensors.
+pub fn segmentAttentionGroupedBf16HostWithGemmIo(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32) ![]f32 {
+    return segmentAttentionHostWithGemmImpl(true, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
+}
+pub fn segmentAttentionGroupedBf16HostWithGemmIoObserved(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, observation: ?*AttentionObservation) ![]f32 {
+    return if (observation) |out| segmentAttentionHostWithGemmImpl(true, true, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, out) else segmentAttentionHostWithGemmImpl(true, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
+}
+
 pub fn segmentAttentionGroupedHostWithGemmIo(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
+    return segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
 }
 pub fn segmentAttentionGroupedHostWithGemmIoObserved(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, observation: ?*AttentionObservation) ![]f32 {
-    return if (observation) |out| segmentAttentionHostWithGemmImpl(true, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, out) else segmentAttentionHostWithGemmImpl(false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
+    return if (observation) |out| segmentAttentionHostWithGemmImpl(false, true, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, out) else segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
 }
 
 pub fn segmentAttentionGroupedHostWithGemmParallelIo(comptime Gemm: type, allocator: std.mem.Allocator, io: std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
+    return segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
 }
 pub fn segmentAttentionGroupedHostWithGemmParallelIoObserved(comptime Gemm: type, allocator: std.mem.Allocator, io: std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, observation: ?*AttentionObservation) ![]f32 {
-    return if (observation) |out| segmentAttentionHostWithGemmImpl(true, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, out) else segmentAttentionHostWithGemmImpl(false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
+    return if (observation) |out| segmentAttentionHostWithGemmImpl(false, true, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, out) else segmentAttentionHostWithGemmImpl(false, false, Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale, {});
 }
 
-fn segmentAttentionHostWithGemmImpl(comptime observing: bool, comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, parallel: bool, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize, num_kv_heads: usize, score_scale: ?f32, observation: if (observing) *AttentionObservation else void) ![]f32 {
+fn segmentAttentionHostWithGemmImpl(comptime bf16_probability: bool, comptime observing: bool, comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, parallel: bool, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize, num_kv_heads: usize, score_scale: ?f32, observation: if (observing) *AttentionObservation else void) ![]f32 {
     const block_q = if (@hasDecl(Gemm, "query_block")) Gemm.query_block else BLOCK_Q;
     const block_kv = if (@hasDecl(Gemm, "key_block")) Gemm.key_block else BLOCK_KV;
     if (num_kv_heads == 0 or num_heads % num_kv_heads != 0 or num_heads == 0 or head_dim == 0 or queries == 0 or keys == 0) return error.InvalidAttentionShape;
@@ -1078,7 +1085,7 @@ fn segmentAttentionHostWithGemmImpl(comptime observing: bool, comptime Gemm: typ
     defer allocator.free(ohs);
     const scores = try allocator.alloc(f32, score_count);
     defer allocator.free(scores);
-    const Head = SegmentHeadWork(Gemm);
+    const Head = SegmentHeadWork(Gemm, bf16_probability);
     if (parallel and io != null) {
         const handle = io.?;
         const heads = try allocator.alloc(Head, num_heads);
@@ -1112,7 +1119,7 @@ fn segmentAttentionHostWithGemmImpl(comptime observing: bool, comptime Gemm: typ
     return output;
 }
 
-fn SegmentHeadWork(comptime Gemm: type) type {
+fn SegmentHeadWork(comptime Gemm: type, comptime bf16_probability: bool) type {
     const block_q = if (@hasDecl(Gemm, "query_block")) Gemm.query_block else BLOCK_Q;
     const block_kv = if (@hasDecl(Gemm, "key_block")) Gemm.key_block else BLOCK_KV;
     return struct {
@@ -1221,32 +1228,46 @@ fn SegmentHeadWork(comptime Gemm: type) type {
                 }
                 const q_block = qh[q_start * head_dim ..][0 .. cur_bq * head_dim];
                 const out_block = oh[q_start * head_dim ..][0 .. cur_bq * head_dim];
-                for (intervals[0..merged]) |interval| {
-                    var kv_start: usize = interval[0];
-                    while (kv_start < interval[1]) {
-                        if (self.io) |io| try io.checkCancel();
-                        const kv_end = @min(kv_start + block_kv, interval[1]);
-                        const cur_bkv = kv_end - kv_start;
-                        const tile = score_tile[0 .. cur_bq * cur_bkv];
-                        attentionGemm(observing, true, Gemm, cur_bq, cur_bkv, head_dim, scale, q_block, kh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 0.0, tile, values);
-                        for (0..cur_bq) |r| {
-                            const qi = q_start + r;
-                            const own = ranges[qi * 6 ..][0..6];
-                            const qp = query_positions[qi];
-                            const row = tile[r * cur_bkv ..][0..cur_bkv];
-                            if (window == std.math.maxInt(u32)) {
-                                maskSegmentRangeGaps(row, kv_start, own);
-                            } else {
-                                for (row, kv_start..) |*score, k| {
-                                    const in_range = (k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5]);
-                                    const near = @abs(@as(i64, qp) - key_positions[k]) <= window;
-                                    if (!in_range or !near) score.* = -std.math.inf(f32);
+                // BF16 probability rounding must use the global maximum.
+                // Two passes retain tiled scratch instead of a dense score bank.
+                for (0..if (bf16_probability) @as(usize, 2) else 1) |pass| {
+                    for (intervals[0..merged]) |interval| {
+                        var kv_start: usize = interval[0];
+                        while (kv_start < interval[1]) {
+                            if (self.io) |io| try io.checkCancel();
+                            const kv_end = @min(kv_start + block_kv, interval[1]);
+                            const cur_bkv = kv_end - kv_start;
+                            const tile = score_tile[0 .. cur_bq * cur_bkv];
+                            attentionGemm(observing, true, Gemm, cur_bq, cur_bkv, head_dim, scale, q_block, kh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 0.0, tile, values);
+                            for (0..cur_bq) |r| {
+                                const qi = q_start + r;
+                                const own = ranges[qi * 6 ..][0..6];
+                                const qp = query_positions[qi];
+                                const row = tile[r * cur_bkv ..][0..cur_bkv];
+                                if (window == std.math.maxInt(u32)) {
+                                    maskSegmentRangeGaps(row, kv_start, own);
+                                } else {
+                                    for (row, kv_start..) |*score, k| {
+                                        const in_range = (k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5]);
+                                        const near = @abs(@as(i64, qp) - key_positions[k]) <= window;
+                                        if (!in_range or !near) score.* = -std.math.inf(f32);
+                                    }
                                 }
+                                if (comptime bf16_probability) {
+                                    if (pass == 0) {
+                                        for (row) |score| row_max[r] = @max(row_max[r], score);
+                                    } else {
+                                        for (row) |*score| {
+                                            const probability: f32 = if (row_max[r] == -std.math.inf(f32)) 0 else @exp(score.* - row_max[r]);
+                                            row_sum[r] += probability;
+                                            score.* = @import("antfly_tile").fexpr.roundBf16Value(probability);
+                                        }
+                                    }
+                                } else updateOnlineRow(.segment, row, out_block[r * head_dim ..][0..head_dim], &row_max[r], &row_sum[r]);
                             }
-                            updateOnlineRow(.segment, row, out_block[r * head_dim ..][0..head_dim], &row_max[r], &row_sum[r]);
+                            if (!bf16_probability or pass != 0) attentionGemm(observing, false, Gemm, cur_bq, head_dim, cur_bkv, 1.0, tile, vh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 1.0, out_block, values);
+                            kv_start = kv_end;
                         }
-                        attentionGemm(observing, false, Gemm, cur_bq, head_dim, cur_bkv, 1.0, tile, vh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 1.0, out_block, values);
-                        kv_start = kv_end;
                     }
                 }
                 for (0..cur_bq) |r| {
@@ -3776,7 +3797,7 @@ test "attention returned values preserve actual flash segment and dense worker s
     try std.testing.expectEqual(@as(u64, heads), segment_values.submitted);
     try std.testing.expectEqual(segment_values.submitted, segment_values.returns);
     try std.testing.expect(attentionValueReturns(segment_values) > segment_values.submitted);
-    try std.testing.expectEqual(@intFromPtr(&SegmentHeadWork(ValueGemm).executeValue), segment_values.records[0].program_identity);
+    try std.testing.expectEqual(@intFromPtr(&SegmentHeadWork(ValueGemm, false).executeValue), segment_values.records[0].program_identity);
     var dense_values: AttentionObservation = .{};
     const dense = try denseAttentionHostWithGemmIo(SequentialGemm, a, std.testing.io, &q, &k, &v, 1, seq, heads, dim);
     defer a.free(dense);
@@ -4003,8 +4024,8 @@ test "attention disabled worker contexts retain original sizes alignments and ca
         oh: []f32,
         score_tile: []f32,
     };
-    try std.testing.expectEqual(@sizeOf(OriginalSegment), @sizeOf(SegmentHeadWork(SequentialGemm)));
-    try std.testing.expectEqual(@alignOf(OriginalSegment), @alignOf(SegmentHeadWork(SequentialGemm)));
+    try std.testing.expectEqual(@sizeOf(OriginalSegment), @sizeOf(SegmentHeadWork(SequentialGemm, false)));
+    try std.testing.expectEqual(@alignOf(OriginalSegment), @alignOf(SegmentHeadWork(SequentialGemm, false)));
     const OriginalRelative = struct {
         Q: []const f32,
         K: []const f32,
@@ -4046,7 +4067,7 @@ test "attention disabled worker contexts retain original sizes alignments and ca
     try std.testing.expectEqual(@alignOf(OriginalDense), @alignOf(DenseTileRows));
     const legacy_flash: *const fn (*anyopaque) void = FlashHeadWork.run;
     const legacy_rows: *const fn (*anyopaque) void = DenseTileRows.run;
-    const Head = SegmentHeadWork(SequentialGemm);
+    const Head = SegmentHeadWork(SequentialGemm, false);
     const legacy_segment: *const fn (*Head) anyerror!void = Head.execute;
     const legacy_relative: *const fn (*DebertaJobCtx) void = debertaDisentangledHead;
     _ = legacy_flash;
@@ -4360,4 +4381,32 @@ test "prepared host attention workspace reuses scratch without retaining previou
 test "host attention validates shape before allocating workspace" {
     try std.testing.expectError(error.InvalidAttentionShape, flashCausalAttentionHost(std.testing.failing_allocator, &.{1}, &.{1}, &.{1}, null, null, 0, 1, 1, 1, 0, 0, 0, 0, 1));
     try std.testing.expectError(error.InvalidAttentionShape, flashCausalAttentionHost(std.testing.failing_allocator, &.{1}, &.{1}, &.{1}, null, null, 0, 1, 2, 1, 0, 0, 1, 1, 1));
+}
+
+test "BF16 segment probabilities use global maxima across tiles and preserve empty rows" {
+    const a = std.testing.allocator;
+    const Tiny = struct {
+        pub const query_block = 1;
+        pub const key_block = 2;
+        pub const sgemmTransBSync = gemm.sgemmTransBSequential;
+        pub const sgemmSync = gemm.sgemmSequential;
+    };
+    const q = [_]f32{ 1, -1, 0, 1 };
+    const k = [_]f32{ 0, 1, 4, 2, -1 };
+    const v = [_]f32{ 1, -8, 2, 3, -2 };
+    const ranges = [_]u32{ 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const out = try segmentAttentionGroupedBf16HostWithGemmIo(Tiny, a, null, &q, &k, &v, &ranges, &.{ 0, 1 }, &.{ 0, 1, 2, 3, 4 }, std.math.maxInt(u32), 2, 5, 2, 1, 1, 1);
+    defer a.free(out);
+    for (0..2) |head| {
+        const maximum: f32 = if (head == 0) 4 else 1;
+        var numerator: f32 = 0;
+        var denominator: f32 = 0;
+        for (k, v) |key, value| {
+            const probability = @exp(q[head] * key - maximum);
+            denominator += probability;
+            numerator += @import("antfly_tile").fexpr.roundBf16Value(probability) * value;
+        }
+        try std.testing.expectApproxEqAbs(numerator / denominator, out[head], 1e-6);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, out[2..]);
 }

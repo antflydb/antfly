@@ -29,6 +29,7 @@ pub const Forward = struct {
     /// Checkpoint/configuration and arithmetic-contract identity. The cache
     /// belongs to its loaded model, never a process-global checkpoint name.
     fingerprint: u64,
+    precision: @import("precision.zig").Policy = .f32,
     /// Public output ABI names retained by the model, independent of cache entries.
     output_names: []const []const u8 = &.{},
     /// Rechecked on every invocation, including cache hits with new values.
@@ -51,6 +52,7 @@ pub fn inputShape(input: tensor.Tensor) !ml.graph.Shape {
 pub fn specializationKey(forward: Forward, inputs: []const Input) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(std.mem.asBytes(&forward.fingerprint));
+    hash.update(&.{@backingInt(forward.precision)});
     for (inputs) |input| {
         const shape = try inputShape(input.tensor);
         const name_len = input.tensor.name.len;
@@ -69,6 +71,7 @@ pub fn trace(allocator: std.mem.Allocator, forward: Forward, inputs: []const Inp
     var tracer = tracing.TracingCompute.initWithWeightResolver(allocator, weights);
     defer tracer.deinit();
     tracer.require_resident_outputs = true;
+    tracer.precision = forward.precision;
     var bindings: std.ArrayList(program.Binding) = .empty;
     defer bindings.deinit(allocator);
     for (inputs) |input| {
@@ -185,4 +188,12 @@ test "model program capture rejects host observations and refunds every failed a
     defer x.deinit();
     try std.testing.expectError(error.HostReadbackDuringCapture, trace(a, .{ .context = &marker, .fingerprint = 1, .run = TestForward.readback }, &.{.{ .tensor = x }}, .{ .resolve = TestForward.noWeight }));
     try std.testing.checkAllAllocationFailures(a, TestForward.failureCase, .{});
+}
+
+test "model program precision participates in specialization identity" {
+    var context: u8 = 0;
+    var forward = Forward{ .context = &context, .fingerprint = 0, .run = TestForward.run };
+    const strict = try specializationKey(forward, &.{});
+    forward.precision = .bf16;
+    try std.testing.expect(!std.mem.eql(u8, &strict, &try specializationKey(forward, &.{})));
 }

@@ -55,7 +55,9 @@ fn shouldLogPjrtInput(index: usize, total: usize) bool {
 
 fn bufferType(dtype: ml.graph.DType) pjrt_lib.c_types.BufferType {
     return switch (dtype) {
-        .f32, .f16, .bf16 => .float32,
+        .f32 => .float32,
+        .f16 => .float16,
+        .bf16 => .bfloat16,
         .f64 => .float64,
         .i8 => .int8,
         .i16 => .int16,
@@ -67,10 +69,11 @@ fn bufferType(dtype: ml.graph.DType) pjrt_lib.c_types.BufferType {
 }
 fn downloadTypedOutput(buffer: *const pjrt_lib.pjrt.Buffer, backend: *const ComputeBackend, dtype: ml.graph.DType, shape: []const i64, allocator: Allocator) !CT {
     return switch (dtype) {
-        inline .i8, .i16, .i32, .i64, .u8, .bool_, .f64 => |tag| output: {
+        inline .i8, .i16, .i32, .i64, .u8, .bool_, .f64, .f16, .bf16 => |tag| output: {
             const T = switch (tag) {
                 .i8 => i8,
                 .i16 => i16,
+                .f16, .bf16 => u16,
                 .i32 => i32,
                 .i64 => i64,
                 .u8, .bool_ => u8,
@@ -143,12 +146,23 @@ pub const PjrtExecutor = struct {
 
     fn uploadTensor(self: *PjrtExecutor, backend: *const ComputeBackend, value: CT, index: usize, allocator: Allocator) !pjrt_lib.pjrt.Buffer {
         const dtype = if (self.input_dtypes.len == 0) ml.graph.DType.f32 else self.input_dtypes[index];
-        if (dtype == .f32 or dtype == .f16 or dtype == .bf16) {
+        const expected: @import("../backends/tensor.zig").DType = switch (dtype) {
+            inline else => |tag| @field(@import("../backends/tensor.zig").DType, @tagName(tag)),
+        };
+        // Preserve an already-typed checkpoint/activation without a full F32
+        // staging copy. Other floating operands are converted once on upload.
+        const matching_half = (dtype == .f16 or dtype == .bf16) and
+            (try backend.tensorDType(value)) == expected;
+        if ((dtype == .f32 or dtype == .f16 or dtype == .bf16) and !matching_half) {
             const data = try backend.toFloat32(value, allocator);
             defer allocator.free(data);
             const shape = try resolveUploadShapeFromTensor(allocator, backend, value, self.input_shapes_[index], data.len);
             defer allocator.free(shape);
-            return self.client.bufferFromHostFloat32(data, shape);
+            if (dtype == .f32) return self.client.bufferFromHostFloat32(data, shape);
+            const narrow = try allocator.alloc(u16, data.len);
+            defer allocator.free(narrow);
+            for (data, narrow) |element, *bits| bits.* = if (dtype == .bf16) @truncate(@as(u32, @bitCast(@import("antfly_tile").fexpr.roundBf16Value(element))) >> 16) else @bitCast(@as(f16, @floatCast(element)));
+            return self.client.bufferFromHostBytes(std.mem.sliceAsBytes(narrow), bufferType(dtype), shape);
         }
         const exported = (try backend.exportTensorData(value, allocator)) orelse return error.UnsupportedPjrtInputType;
         const bytes = switch (exported.payload) {
@@ -160,9 +174,6 @@ pub const PjrtExecutor = struct {
             },
         };
         defer allocator.free(bytes);
-        const expected: @import("../backends/tensor.zig").DType = switch (dtype) {
-            inline else => |tag| @field(@import("../backends/tensor.zig").DType, @tagName(tag)),
-        };
         if (exported.dtype != expected or bytes.len % dtype.byteSize() != 0) return error.UnsupportedPjrtInputType;
         const shape = try resolveUploadShapeFromElementCount(allocator, self.input_shapes_[index], bytes.len / dtype.byteSize());
         defer allocator.free(shape);
@@ -685,10 +696,7 @@ fn createExecutorFromLoadedExecutable(
     const output_types = try allocator.alloc(pjrt_lib.c_types.BufferType, num_outputs);
     defer allocator.free(output_types);
     for (output_node_ids_source, output_dtypes, output_types) |node_id, *dtype, *kind| {
-        dtype.* = switch (graph.node(node_id).output_shape.dtype) {
-            .f16, .bf16 => .f32,
-            else => |tag| tag,
-        };
+        dtype.* = graph.node(node_id).output_shape.dtype;
         kind.* = bufferType(dtype.*);
     }
     try executable.validateOutputSignature(output_shapes, output_types);

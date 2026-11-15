@@ -252,10 +252,7 @@ fn executeNativePlannedNode(
     // request shape tracker. Static graphs keep the planned fast path.
     if (exec_state.runtime_shapes != null and nodeTouchesSymbolicShape(graph, node_id)) return null;
     return switch (n.op) {
-        .parameter => blk: {
-            const name = graph.parameterName(n);
-            break :blk try cb.getWeight(name);
-        },
+        .parameter => try interpreter.executeNode(graph, cb, values, node_id, exec_state),
         // Constants are control data as well as activations. Use the shared
         // typed materialization path so scalar/vector shapes, exact integer
         // payloads, and strict-integer policy match interpreted execution.
