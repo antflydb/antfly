@@ -29340,29 +29340,28 @@ pub const DB = struct {
 
     /// Physical graph reads retain the same admission, identity fence, and
     /// scan budget through selection and the owned result.
-    pub fn graphEdgesForInternalReadBoundedAt(
+    pub fn graphEdgesForInternalRead(
         self: *DB,
         alloc: Allocator,
-        index_name: []const u8,
-        key: []const u8,
-        edge_types: []const []const u8,
-        direction: graph_mod.EdgeDirection,
-        identity_read_generation: ?u64,
-        ttl_now_ns: u64,
-        max_edges: usize,
-        max_owned_bytes: usize,
-        max_scanned_rows: usize,
-    ) !graph_mod.GraphIndex.BoundedEdgeResult {
+        request: @import("../../api/graph.zig").GraphEdgesRequest,
+    ) !@import("../../api/graph.zig").GraphEdgesResponse {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
-        _ = try self.currentIdentityReadGenerationForRequest(identity_read_generation);
-        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
-        const result = try entry.index.getEdgesByTypesBoundedWithStatsAt(alloc, key, edge_types, direction, max_edges, max_owned_bytes, max_scanned_rows, if (ttl_now_ns == 0) entry.index.clock.nowRealtimeNs() else ttl_now_ns);
-        errdefer graph_mod.GraphIndex.freeEdges(alloc, result.edges);
+        _ = try self.currentIdentityReadGenerationForRequest(request.identity_read_generation);
+        const entry = self.core.graphIndex(request.index_name) orelse return error.IndexNotFound;
+        // Preserve batched key prefixes and generation-fenced continuation
+        // cursors through the storage owner, just as direct native readers do.
+        var result = try @import("../../api/graph.zig").readGraphEdgesRequest(
+            alloc,
+            &entry.index,
+            request,
+            if (request.ttl_now_ns == 0) entry.index.clock.nowRealtimeNs() else request.ttl_now_ns,
+        );
+        errdefer result.deinit(alloc);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
     }
@@ -122551,6 +122550,28 @@ test "db storage kernel graph edges retain typed filters and physical scan budge
     };
     defer request.deinit(alloc);
     const local = @import("../query.zig");
+    {
+        // The storage-owner bridge must preserve complete key prefixes,
+        // including an empty first key; a scalar read silently drops both
+        // the second key and the metadata required by distributed paths.
+        var batched = request;
+        batched.key = @constCast("missing");
+        batched.keys = @constCast(&[_][]const u8{ "missing", "doc:a" });
+        batched.max_edges = 8;
+        batched.max_scanned_rows = 16;
+        batched.allow_partial_keys = true;
+        var result = try local.executeStorageKernelGraphEdges(alloc, &db, batched);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), result.edges.len);
+        try std.testing.expectEqualSlices(u32, &.{ 0, 0, 2 }, result.key_offsets);
+        try std.testing.expectEqual(@as(usize, 2), result.key_scanned_rows.len);
+        const wire = try graph.encodeGraphEdgesResponse(alloc, result);
+        defer alloc.free(wire);
+        var decoded = try graph.parseGraphEdgesResponse(alloc, wire);
+        defer decoded.deinit(alloc);
+        try std.testing.expectEqualSlices(u32, result.key_offsets, decoded.key_offsets);
+        try std.testing.expectEqualSlices(u32, result.key_scanned_rows, decoded.key_scanned_rows);
+    }
     {
         var result = try local.executeStorageKernelGraphEdges(alloc, &db, request);
         defer result.deinit(alloc);

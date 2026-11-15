@@ -1430,3 +1430,128 @@ def test_launch_failure_reaches_diagnostic_hook_before_log_is_deleted(
             server._start_process(truncate_logs=False)
     assert captured == ["complete launch diagnostics"]
     assert stopped == [True]
+
+
+def test_root_enrollment_observation_follows_leader_without_replaying(monkeypatch):
+    import json
+    import test_backup_restore as backup
+
+    now = [0.0]
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        ),
+    )
+    identity = {"node_id": 4}
+    writes, reads, budgets = [], [], []
+
+    def resolve(remaining):
+        budgets.append(remaining)
+        now[0] += 0.05
+        # The first status still reaches the old leader; the next follows its successor.
+        return "http://old/db/v1" if len(budgets) <= 2 else "http://new/db/v1"
+
+    def post(url, **kwargs):
+        assert 0 < kwargs["timeout"] <= 1 - now[0]
+        result = requests.Response()
+        if url.endswith("/enroll"):
+            writes.append(url)
+            result.status_code = 503
+            result._content = json.dumps(
+                {"error": "MetadataMutationOutcomeUnknown"}
+            ).encode()
+        else:
+            reads.append(url)
+            assert kwargs["json"] == identity
+            result.status_code = 503 if len(reads) == 1 else 200
+            result._content = (
+                b"NotLeader" if len(reads) == 1 else json.dumps(identity).encode()
+            )
+        return result
+
+    backup._enroll_store_root_once(
+        SimpleNamespace(post=post),
+        "http://unused/db/v1",
+        {"identity": identity},
+        timeout_s=1,
+        resolve_api_url=resolve,
+    )
+    assert writes == ["http://old/db/v1/store-roots/enroll"]
+    assert reads == [
+        "http://old/db/v1/store-roots/enrollment-status",
+        "http://new/db/v1/store-roots/enrollment-status",
+    ]
+    assert len(budgets) == 3 and now[0] < 1
+
+
+def test_root_enrollment_discovery_consumes_the_shared_deadline(monkeypatch):
+    import test_backup_restore as backup
+
+    now = [0.0]
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        ),
+    )
+
+    def resolve(remaining):
+        assert remaining == 1
+        now[0] = 1
+        return "http://leader/db/v1"
+
+    def post(*args, **kwargs):
+        pytest.fail("discovery exhausted the budget before mutation submission")
+
+    with pytest.raises(AssertionError, match="route unavailable"):
+        backup._enroll_store_root_once(
+            SimpleNamespace(post=post),
+            "http://unused/db/v1",
+            {"identity": {}},
+            timeout_s=1,
+            resolve_api_url=resolve,
+        )
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_root_enrollment_rejects_late_success(monkeypatch, uncertain):
+    import json
+    import test_backup_restore as backup
+
+    now = [0.0]
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        ),
+    )
+    calls = []
+    identity = {"node_id": 4}
+
+    def post(url, **kwargs):
+        calls.append(url)
+        result = requests.Response()
+        if uncertain and len(calls) == 1:
+            result.status_code = 503
+            result._content = b'{"error":"MetadataMutationOutcomeUnknown"}'
+        else:
+            now[0] = 2
+            result.status_code = 200
+            result._content = json.dumps(identity).encode()
+        return result
+
+    with pytest.raises(AssertionError, match="exceeded deadline"):
+        backup._enroll_store_root_once(
+            SimpleNamespace(post=post),
+            "http://metadata/db/v1",
+            {"identity": identity},
+            timeout_s=1,
+        )
+    assert sum(url.endswith("/enroll") for url in calls) == 1
