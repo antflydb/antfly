@@ -1710,6 +1710,52 @@ Production dispatch, terminal reconciliation of ambiguous/superseded submissions
 root discovery/registration, coherent bootstrap and the complete long-term issue
 acceptance scopes remain required.
 
+## In progress: ordered root-control dispatch and recovery
+
+The private root driver connects the durable journal, typed outcome validator,
+metadata service and ordered control port. Prepare validates the immutable
+request/fence scope and the policy's current root binding before recording it.
+A fresh actor and confirmed metadata begin CAS grant one stack invocation
+permission for one submit. The owner reloads and rechecks the attempt before
+I/O. A recovered dispatching intent remains ambiguous and is never submitted
+again; a never-dispatched prepared intent can be cancelled during close/reset.
+Accepted intents recover the original command and receipt through the read-only
+recovery operation.
+
+Known positive receipts survive in the driver's fixed-size result when metadata
+persistence, cancellation or ACK fails. recordAcceptance can attach that exact
+attempt under a fresh maintenance request without I/O; stale sequence/actor/body
+bindings cannot replace another intent. It recognizes an already-settled matching
+receipt as an idempotent completion. Applied and rejected outcomes both settle
+atomically; settled does not imply a successful native command or an ACK grant.
+The policy must authorize maintenance, validate the current incarnation/capability
+and owner binding, generate fresh unpredictable actors, and preserve the original
+transport deadline/cancellation. No lock spans transport or metadata I/O.
+
+Nine physical metadata/reopen cases cover confirmed submission, accepted-but-
+unconfirmed response, ambiguous transport, lost begin/acceptance/settlement ACK,
+superseded recovery, rejection and cancellation after a known native response.
+The cancellation case recovers a returned receipt under a fresh maintenance
+request when the original request could not persist it. They verify bounded submission counts, no
+redispatch after restart, retained exact receipts and persisted root effects.
+The actual native-Raft fixture now additionally drives a second consumer through
+signed remote HTTP with a deliberately lost metadata acceptance ACK, reopens the
+metadata store, recovers the original receipt, and checks the live Raft log index.
+The metadata service in this fixture uses its standalone durable projection; this
+is not a claim of full metadata-Raft failover qualification. Qualification passed:
+`zig build history-control-entry-test history-control-apply-test -j2`, including
+all nine driver recovery cases and all five real native-Raft checks, without
+leaks. The large HTTP-server and metadata-store test objects live on the heap to
+keep the combined native fixture within the main thread stack. Authoritative
+log: `root-control-driver-final-test.log`.
+
+This ordered driver is not yet registered as a production feed-root factory.
+Ambiguous/superseded reconciliation still needs positive grant-state or fencing
+proofs; an absent observation cannot authorize blind resubmission. Standalone
+native controls need their qualified observation/receipt path, and discovery,
+retired-root ownership, coherent cuts, public feeds, destination integration and
+existing-client qualification remain required by the full issues.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

@@ -43334,9 +43334,11 @@ fn consumerTests() type {
                         return error.UnexpectedHistoryPeerRefresh;
                     }
                 };
-                var api_server = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = &server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = &server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = &server, .read_fn = DataServer.historyGrantOperation } }, .{ .ptr = &server, .vtable = &.{ .status = Status.read } }, null, null);
+                const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
+                defer a.destroy(api_server);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = &server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = &server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = &server, .read_fn = DataServer.historyGrantOperation } }, .{ .ptr = &server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
-                var handler = try antfly.public_api.kernel_bridge.createHandler(&api_server);
+                var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
                 try handler.initRuntime(a);
                 var network_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -43449,6 +43451,76 @@ fn consumerTests() type {
                     break :blk host.raftStatus(601).?.last_index;
                 };
                 try std.testing.expectEqual(unknown_remote.receipt.?.index, recovered_remote_last);
+                // Drive an actual second consumer through durable metadata,
+                // signed remote control, native apply and exact recovery.
+                const feed_control = @import("../metadata/changefeed_control.zig");
+                const feed_driver = @import("../metadata/root_control_driver.zig");
+                const feed_fixture = @import("../pg_spool_cleanup_test.zig");
+                const feed_policy = @import("../metadata/root_control_driver_test.zig").Policy;
+                const FeedStore = @import("../metadata/storage/raft_apply_store.zig").RaftApplyStore;
+                const meta_path = try std.fmt.allocPrint(a, "{s}/feed-control-meta", .{root});
+                defer a.free(meta_path);
+                const meta_store = try a.create(FeedStore);
+                defer a.destroy(meta_store);
+                meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
+                defer meta_store.deinit();
+                var feed_svc: feed_fixture.Service = .{ .store = meta_store, .id = @splat(6), .authority = grant.authority };
+                const feed_table: antfly.metadata.table_manager.TableRecord = .{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" };
+                try meta_store.applyStandaloneCommand(feed_svc.metadata_group_id, .{ .upsert_table = feed_table });
+                try feed_svc.mutate(a, .{ .create = .{ .id = feed_svc.id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = feed_control.tableBinding(feed_table), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } });
+                try feed_svc.mutate(a, .{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} });
+                const DriverPolicy = struct {
+                    source: *RemoteMetadataSource,
+                    base: feed_policy = .{},
+                    pub fn authorizeRoot(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, request: feed_fixture.Request) !void {
+                        return self.base.authorizeRoot(state, ns, request);
+                    }
+                    pub fn validateRoot(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, frozen: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: feed_fixture.Request) !void {
+                        try self.base.validateRoot(state, ns, frozen, table, request);
+                        self.source.control_read_generation_at_ms = self.source.awakeMs();
+                    }
+                    pub fn newAttempt(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, request: feed_fixture.Request) !feed_control.Id {
+                        return self.base.newAttempt(state, ns, request);
+                    }
+                    pub fn context(self: *@This(), request: feed_fixture.Request) !antfly.public_api.operation.RequestContext {
+                        return self.base.context(request);
+                    }
+                };
+                var driver_policy: DriverPolicy = .{ .source = &metadata_source };
+                {
+                    var feed_state = try feed_svc.load(a);
+                    defer feed_state.deinit();
+                    const plan_input: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .enroll = .{ .namespace = namespace, .authority = feed_state.value.authority, .consumer = feed_state.value.consumerId(), .definition = feed_state.value.definition.?.identity(), .sequence = feed_state.value.roots[0].grant_sequence, .expires_at_seconds = 1000, .policy_revision = 1 } } };
+                    const plan_body = try std.json.Stringify.valueAlloc(a, plan_input, .{});
+                    defer a.free(plan_body);
+                    try feed_driver.prepare(&feed_svc, &driver_policy, a, feed_svc.id, namespace, .{ .command = plan_body, .fence = encoded_fence, .table = "docs" }, feed_fixture.Request{});
+                }
+                feed_svc.lose_ack_at = feed_svc.proposals + 2; // begin succeeds, accepted receipt ACK is lost
+                const accepted_driver = try feed_driver.drive(&feed_svc, &driver_policy, origin.historyControlPort(), a, feed_svc.id, namespace, feed_fixture.Request{});
+                try std.testing.expectEqual(.accepted, accepted_driver.status);
+                try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, accepted_driver.deferred_error.?);
+                const driver_receipt = accepted_driver.acceptance.?.receipt;
+                try std.testing.expectEqual(recovered_remote_last + 1, driver_receipt.index);
+                feed_svc.lose_ack_at = null;
+                meta_store.deinit();
+                meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
+                const settled_driver = try feed_driver.drive(&feed_svc, &driver_policy, origin.historyControlPort(), a, feed_svc.id, namespace, feed_fixture.Request{});
+                try std.testing.expectEqual(.settled, settled_driver.status);
+                try std.testing.expectEqualDeep(driver_receipt, settled_driver.acceptance.?.receipt);
+                try std.testing.expectEqual(@as(u64, 2), settled_driver.settlement.?.effect.enrolled.consumer_epoch);
+                try std.testing.expectEqual(@as(u64, 2), settled_driver.settlement.?.effect.enrolled.start);
+                {
+                    var feed_state = try feed_svc.load(a);
+                    defer feed_state.deinit();
+                    try std.testing.expect(feed_state.value.roots[0].pending_control == null);
+                    try std.testing.expectEqualDeep(settled_driver.settlement.?, feed_state.value.roots[0].last_control.?);
+                }
+                const final_driver_index = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    break :blk host.raftStatus(601).?.last_index;
+                };
+                try std.testing.expectEqual(driver_receipt.index, final_driver_index);
             }
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
             try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);

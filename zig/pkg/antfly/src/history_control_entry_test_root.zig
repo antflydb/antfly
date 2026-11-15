@@ -24,3 +24,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 test "history root control outcome verifies exact accepted scope before metadata settlement" {
     try @import("metadata/root_control_outcome.zig").test_support.contracts();
 }
+
+test "history root control driver recovers physical metadata without duplicate submission" {
+    try @import("metadata/root_control_driver_test.zig").run();
+}

@@ -34,6 +34,7 @@ pub const Request = struct {
 pub const Service = struct {
     store: *Store,
     id: control.Id,
+    authority: control.Digest = @splat(9),
     metadata_group_id: u64 = group,
     proposals: u64 = 0,
     lose_ack: bool = false,
@@ -61,7 +62,7 @@ pub const Service = struct {
     pub fn mutate(self: *@This(), a: A, mutation: control.Mutation) !void {
         var before = try self.load(a);
         defer before.deinit();
-        try control.mutateOnService(self, a, .{ .id = self.id, .authority = @splat(9), .owner = @splat(1), .authorization = @splat(2), .expected_revision = before.value.revision, .expected_epoch = before.value.epoch, .mutation = mutation }, Request{});
+        try control.mutateOnService(self, a, .{ .id = self.id, .authority = self.authority, .owner = @splat(1), .authorization = @splat(2), .expected_revision = before.value.revision, .expected_epoch = before.value.epoch, .mutation = mutation }, Request{});
     }
 };
 const Registry = struct {
