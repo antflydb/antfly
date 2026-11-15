@@ -19,6 +19,16 @@ alone establishes cross-shard transaction completion.
 - PostgreSQL polling only exposes complete source transactions.
 - CDC progress advances after the whole source transaction applies.
 - Unsupported mutation messages fail rather than silently advance progress.
+- The PostgreSQL parser now retains update before-images and old-image kind,
+  identity-key column flags, and before/after completeness. Key-only NULL
+  placeholders are removed from non-key fields; unchanged TOAST remains absent
+  rather than becoming SQL NULL. Tuple/schema column-count and trailing-byte
+  mismatches fail before granting a checkpoint. Value ownership covers both
+  images and malformed tuple error paths.
+- Expanded parser checks cover changed keys, full old rows, NULL versus unchanged
+  TOAST, delete old-row identity and malformed tuples. The full
+  `source-transaction-test` target passes; current log:
+  `zig/source-before-images-final-test.log`.
 - `zig build source-transaction-test -j2` passes native CDC, parser, envelope,
   retry and real Iceberg row-commit checks.
 
@@ -141,7 +151,8 @@ local artifacts. Keep draft PR scope/status honest as implementation grows.
   still calls the per-row writer. Preserve configured transform order and route
   fan-out when replacing that with transaction admission. Key changes and
   filtered enter/leave need provider before-images; the current pgoutput update
-  parser discards its old tuple, which must be fixed before claiming that scope.
+  parser now retains old tuples and completeness; routed apply still must consume
+  those images before claiming that scope.
 - Pgwire `backend.zig:Backend.VTable` has no replication callbacks yet, and
   `protocol.zig` rejects replication startup. Add actual replication commands,
   CopyBoth and feedback through authenticated backend capabilities; HTTP/SQL

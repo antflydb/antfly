@@ -173,6 +173,8 @@ pub const ReplicationOp = enum {
     delete,
 };
 
+pub const ReplicationBeforeKind = enum { none, key, full };
+
 pub const ReplicationChange = struct {
     op: ReplicationOp,
     /// Complete source transaction's resume position. All changes in one
@@ -180,13 +182,24 @@ pub const ReplicationChange = struct {
     /// A destination must not acknowledge this position after only one member.
     checkpoint: []u8,
     row: ?std.json.Value = null,
+    /// Update old images are owned here. Delete old images remain in row.
+    before: ?std.json.Value = null,
+    before_kind: ReplicationBeforeKind = .none,
+    /// Absent unchanged TOAST fields differ from SQL NULL.
+    row_complete: bool = true,
+    before_complete: bool = false,
     key: ?[]u8 = null,
     lag_records: u64 = 0,
     commit_timestamp_ms: u64 = 0,
 
+    pub fn beforeImage(self: @This()) ?std.json.Value {
+        return if (self.op == .delete) self.row else self.before;
+    }
+
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.checkpoint);
         if (self.row) |*row| deinitJsonValue(alloc, row);
+        if (self.before) |*row| deinitJsonValue(alloc, row);
         if (self.key) |key| alloc.free(key);
         self.* = undefined;
     }
