@@ -909,13 +909,27 @@ test "external lake execution private source caps narrow SST entry counts across
         try backend.beginBulkIngestSession();
         var fresh = FreshVectors.init(budget.allocator());
         defer fresh.deinit();
-        for (0..count) |row| {
+        for (0..32) |row| {
             var key: [32]u8 = undefined;
             try fresh.append("exact_vectors", try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row}), encoded);
-            // Match the thousands of ingest runs in a corpus-scale source.
-            if (row % 32 == 31) try fresh.flush(&backend);
         }
         try fresh.flush(&backend);
+        {
+            // Retired metadata may be reclaimed while this immutable cut
+            // continues to own its first source run.
+            var pinned = try backend.beginRead();
+            defer pinned.abort();
+            for (32..count) |row| {
+                var key: [32]u8 = undefined;
+                try fresh.append("exact_vectors", try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row}), encoded);
+                // Match the thousands of ingest runs in a corpus-scale source.
+                if (row % 32 == 31) try fresh.flush(&backend);
+            }
+            try fresh.flush(&backend);
+            try std.testing.expectEqualSlices(u8, encoded, try pinned.get(.{ .name = "exact_vectors" }, "row-00000000"));
+            var last_key: [32]u8 = undefined;
+            try std.testing.expectError(error.NotFound, pinned.get(.{ .name = "exact_vectors" }, try std.fmt.bufPrint(&last_key, "row-{d:0>8}", .{count - 1})));
+        }
         try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
         try backend.checkpointRecoveryManifest();
         try std.testing.expect(backend.runs.count() >= 2);
