@@ -70,6 +70,7 @@ const Stream = struct {
 
     fn onUnit(ptr: *anyopaque, unit: *extraction.Unit) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.request.cancellation.is_cancelled) |callback| if (callback(self.request.cancellation.context) != 0) return error.Canceled;
         var cloned = try cloneUnit(self.alloc, unit.*);
         var owns_cloned = true;
         errdefer if (owns_cloned) cloned.deinit(self.alloc);
@@ -196,6 +197,13 @@ pub fn extractStream(
         .max_working_set_bytes = std.math.cast(usize, request.max_working_set_bytes) orelse
             return fail(error.InvalidPdfDecodeLimits, .extract_stream, out_failure),
     };
+    const Control = struct {
+        fn canceled(raw: ?*const anyopaque) bool {
+            const input: *const abi.EnrichmentExtractRequest = @ptrCast(@alignCast(raw.?));
+            return if (input.cancellation.is_cancelled) |callback| callback(input.cancellation.context) != 0 else false;
+        }
+    };
+    config.cancellation = .{ .context = request, .is_cancelled_fn = Control.canceled };
     extraction.applySourceMetadataFromJson(alloc, &config, request.raw_document_json.slice()) catch |err| {
         return fail(err, .extract_stream, out_failure);
     };

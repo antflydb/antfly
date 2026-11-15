@@ -57,6 +57,21 @@ pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatch
     defer parsed.deinit();
     return parseBatchValue(alloc, parsed.value);
 }
+
+test "public batch commit requirements preserve omitted versus explicit none" {
+    const a = std.testing.allocator;
+    var legacy = try parseBatchRequest(a, "{\"sync_level\":\"enrichments\"}");
+    defer legacy.deinit(a);
+    try std.testing.expect(legacy.req.commit_requires == null);
+    var disabled = try parseBatchRequest(a, "{\"sync_level\":\"full_index\",\"commit_requires\":\"none\"}");
+    defer disabled.deinit(a);
+    try std.testing.expectEqual(mutation.CommitRequires.none, disabled.req.commit_requires.?);
+    var gated = try parseBatchRequest(a, "{\"sync_level\":\"write\",\"commit_requires\":\"direct_enrichments\"}");
+    defer gated.deinit(a);
+    try std.testing.expectEqual(mutation.CommitRequires.direct_enrichments, gated.req.commit_requires.?);
+    for ([_][]const u8{ "{\"commit_requires\":false}", "{\"commit_requires\":\"enrichments\"}", "{\"commit_requires\":{}}" }) |body|
+        try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, body));
+}
 /// Decode an existing lossless JSON tree directly. Every retained field is
 /// copied, so neither the tree nor its allocator must survive this call.
 pub fn parseBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedBatchRequest {
@@ -81,7 +96,7 @@ pub fn parseBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedBa
         owned.graph_deletes = try parseGraphDeletes(alloc, item);
     };
     const sync_level = if (root.get("sync_level")) |item| if (item == .null) mutation.SyncLevel.propose else try syncLevelFromValue(item) else mutation.SyncLevel.propose;
-    owned.req = .{ .writes = owned.writes, .deletes = owned.deletes, .transforms = owned.transforms, .graph_writes = owned.graph_writes, .graph_deletes = owned.graph_deletes, .sync_level = sync_level };
+    owned.req = .{ .writes = owned.writes, .deletes = owned.deletes, .transforms = owned.transforms, .graph_writes = owned.graph_writes, .graph_deletes = owned.graph_deletes, .sync_level = sync_level, .commit_requires = if (root.get("commit_requires")) |item| try mutation.parseCommitRequires(item) else null };
     for (owned.writes) |write| if (isReservedControlKey(write.key)) return error.InvalidBatchRequest;
     for (owned.deletes) |key| if (isReservedControlKey(key)) return error.InvalidBatchRequest;
     for (owned.transforms) |item| if (isReservedControlKey(item.key)) return error.InvalidBatchRequest;
@@ -101,6 +116,7 @@ pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 
     return ant_json.valueAlloc(alloc, result, .{ .emit_null_optional_fields = false });
 }
 const private_fields = [_][]const u8{
+    "_prepared_enrichments",
     "_activate_range_tracking",
     "_artifact_catalog",
     "_artifact_publication",

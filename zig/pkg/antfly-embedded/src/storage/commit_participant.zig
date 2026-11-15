@@ -25,6 +25,7 @@ pub const View = struct {
     ptr: *anyopaque,
     get_fn: *const fn (*anyopaque, []const u8) anyerror![]const u8,
     put_fn: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+    delete_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
 
     pub fn get(self: View, key: []const u8) ![]const u8 {
         return self.get_fn(self.ptr, key);
@@ -36,6 +37,12 @@ pub const View = struct {
         // is writable through this restricted commit view.
         if (key.len < 2 or key[0] != 0 or key[1] != 0) return error.InvalidCommitMetadata;
         return self.put_fn(self.ptr, key, value);
+    }
+
+    pub fn delete(self: View, key: []const u8) !void {
+        if (key.len < 2 or key[0] != 0 or key[1] != 0) return error.InvalidCommitMetadata;
+        const remove = self.delete_fn orelse return error.InvalidCommitMetadata;
+        return remove(self.ptr, key);
     }
 
     /// The view and every returned slice are borrowed only through callback
@@ -51,13 +58,20 @@ pub const View = struct {
                 const typed: T = @ptrCast(@alignCast(ptr));
                 return typed.*.put(key, value);
             }
+            fn remove(ptr: *anyopaque, key: []const u8) !void {
+                const typed: T = @ptrCast(@alignCast(ptr));
+                return typed.*.delete(key);
+            }
         };
-        return .{ .ptr = @ptrCast(txn), .get_fn = Bridge.get, .put_fn = Bridge.put };
+        return .{ .ptr = @ptrCast(txn), .get_fn = Bridge.get, .put_fn = Bridge.put, .delete_fn = Bridge.remove };
     }
 };
 
 pub const Participant = struct {
     ptr: *anyopaque,
+    /// Fallible accounting covers physical mutations, including stamps staged
+    /// by the host and private metadata staged by this participant.
+    charge: ?*const fn (*anyopaque, []const u8, ?[]const u8) anyerror!void = null,
     /// Called on attachment to a fresh writer attempt, before any mutation.
     reset: *const fn (*anyopaque) void,
     observe: *const fn (*anyopaque, []const u8, ?[]const u8) void,

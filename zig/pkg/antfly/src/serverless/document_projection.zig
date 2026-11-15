@@ -26,6 +26,7 @@ pub const Projection = struct {
     chunk_preview: ?[][]u8 = null,
     chunk_embeddings: ?[]ChunkEmbedding = null,
     rerank_terms: ?[][]u8 = null,
+    prepared_catalog: ?[32]u8 = null,
     lexical_sparse_version: ?u32 = null,
     chunk_preview_version: ?u32 = null,
     chunk_embeddings_version: ?u32 = null,
@@ -213,6 +214,7 @@ pub fn parseAllocWithSourceFields(alloc: Allocator, body: []const u8, source_fie
         .chunk_preview = chunk_preview,
         .chunk_embeddings = chunk_embeddings,
         .rerank_terms = rerank_terms,
+        .prepared_catalog = findPreparedCatalog(obj),
         .lexical_sparse_version = findLexicalSparseVersion(obj),
         .chunk_preview_version = findChunkPreviewVersion(obj),
         .chunk_embeddings_version = findChunkEmbeddingsVersion(obj),
@@ -377,6 +379,16 @@ fn findSparseEmbedding(obj: std.json.ObjectMap) ?std.json.Value {
         return entry.value_ptr.*;
     }
     return null;
+}
+
+fn findPreparedCatalog(obj: std.json.ObjectMap) ?[32]u8 {
+    const state = obj.get("_enrichment") orelse return null;
+    if (state != .object) return null;
+    const value = state.object.get("commit_catalog") orelse return null;
+    if (value != .string or value.string.len != 64) return null;
+    var result: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&result, value.string) catch return null;
+    return result;
 }
 
 fn findLexicalSparseVersion(obj: std.json.ObjectMap) ?u32 {

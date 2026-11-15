@@ -65,6 +65,9 @@ pub fn parseRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedLinearMerg
     const scoped_value = outer.get("scoped_merge");
     if (scoped_value != null and (outer.count() != 1 or scoped_value.? != .object)) return error.InvalidLinearMergeRequest;
     const root = if (scoped_value) |value| value.object else outer;
+    // This surface has no admission-prerequisite contract yet. Never silently
+    // downgrade an explicit gate (or explicit wait-only selection).
+    if (root.contains("commit_requires")) return error.InvalidLinearMergeRequest;
     if (scoped_value == null and (root.contains("key_range") or root.contains("delete_missing") or root.contains("retain_ids"))) return error.InvalidLinearMergeRequest;
     var scope_from: []const u8 = "";
     errdefer if (scope_from.len > 0) alloc.free(scope_from);
@@ -690,4 +693,16 @@ test "linear merge scoped updates preserve gaps and finalize only the bounded re
     defer a.free(fixture.ndjson);
     try std.testing.expectError(error.InvalidLinearMergeRequest, executeResponse(a, fixture.reads(), fixture.writes(), "docs", cleanup, .{}));
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "commit requirements linear merge rejects unsupported explicit prerequisites" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "\"none\"", "\"direct_enrichments\"", "null" }) |requirement| {
+        const ordinary = try std.fmt.allocPrint(a, "{{\"records\":{{\"a\":{{}}}},\"commit_requires\":{s}}}", .{requirement});
+        defer a.free(ordinary);
+        try std.testing.expectError(error.InvalidLinearMergeRequest, parseRequest(a, ordinary));
+        const scoped = try std.fmt.allocPrint(a, "{{\"scoped_merge\":{{\"key_range\":{{\"from\":\"a\",\"to\":\"z\"}},\"records\":{{\"b\":{{}}}},\"commit_requires\":{s}}}}}", .{requirement});
+        defer a.free(scoped);
+        try std.testing.expectError(error.InvalidLinearMergeRequest, parseRequest(a, scoped));
+    }
 }
