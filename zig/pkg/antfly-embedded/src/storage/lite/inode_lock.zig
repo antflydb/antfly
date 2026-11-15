@@ -324,6 +324,37 @@ pub const Entry = struct {
     /// path/fd, and the overlay is addressed by inode via this `Entry`,
     /// never by path directly.
     redo_overlay: ?redo_overlay.SharedRedoOverlay = null,
+    /// perf/lwa-proof-fork: the pid that populated `redo_overlay` above.
+    /// This registry (`registry` below) is a plain process-global `var`:
+    /// `fork()` duplicates it, `Entry` included, into the child's own
+    /// address space verbatim -- correct for every other field here (the
+    /// child gets its own fd/region/reader_pins lazily, or inherits
+    /// harmless-to-share bookkeeping), but wrong for `redo_overlay`
+    /// specifically, because `ensureRedoOverlay`'s whole cheapness
+    /// depends on "already populated" meaning "already reflects every
+    /// commit made so far" -- true only in the process that has actually
+    /// been keeping it live via every commit's own `appendVersion`/
+    /// `appendPage` call. A forked child inherits a `redo_overlay` that
+    /// is already populated (by its parent, as of fork time) but frozen
+    /// exactly there: no write this child ever makes, and no commit its
+    /// parent makes after the fork, ever updates this copy again, so a
+    /// child that opens its own `NativeFile` and trusts "already
+    /// populated, nothing to replay" permanently can't see anything the
+    /// parent committed after the fork point -- confirmed live via "lite
+    /// redo log cross-process: a forked child sees commits the parent
+    /// makes after the child opens" hanging (the child's own
+    /// `getDocumentAlloc` never finds the parent's post-fork commit,
+    /// `crossProcessParkForever`s, and the parent's `crossProcessReadBounded`
+    /// on the result pipe times out). `ensureRedoOverlay` compares this
+    /// field against the caller's own pid and rebuilds (replays fresh,
+    /// from `folded_through`, exactly as a genuine first population
+    /// would) whenever they differ -- free in the steady state (same
+    /// pid, same process, one comparison), and safe even mid-fork-race
+    /// because nothing else in a freshly forked child can hold a pointer
+    /// into the stale overlay yet (fork only duplicates the calling
+    /// thread; the child has made no `NativeFile` calls of its own
+    /// before this one).
+    redo_overlay_owner_pid: ?u32 = null,
     /// The in-process half of the reuse-safety frontier: every live,
     /// same-process reader that can dereference tree pages at a fixed
     /// checkpoint registers its own pinned sequence here, guarded by
@@ -500,6 +531,14 @@ pub fn minimumMetadataReaderSequence(entry: *Entry, io: Io) ?u64 {
 /// either duplicate versions or race the live writer's own in-flight
 /// appends. `entry.mutex` serializes concurrent first-use the same way it
 /// already serializes every other field above, including `region`.
+///
+/// perf/lwa-proof-fork: "already populated" is only trustworthy in the
+/// process that has actually been keeping it live -- see
+/// `Entry.redo_overlay_owner_pid`'s own doc comment for the fork-inherits-
+/// a-stale-copy bug this guards against. A pid mismatch means this
+/// process never participated in whatever commits built the inherited
+/// overlay, so it is rebuilt here exactly as a genuine first population
+/// would be (discarded and replayed fresh via `populate`), not reused.
 pub fn ensureRedoOverlay(
     entry: *Entry,
     io: Io,
@@ -508,11 +547,17 @@ pub fn ensureRedoOverlay(
 ) !*redo_overlay.SharedRedoOverlay {
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    if (entry.redo_overlay != null and entry.redo_overlay_owner_pid != own_pid) {
+        entry.redo_overlay.?.deinit(std.heap.page_allocator);
+        entry.redo_overlay = null;
+    }
     if (entry.redo_overlay == null) {
         entry.redo_overlay = redo_overlay.SharedRedoOverlay{};
         errdefer {
             entry.redo_overlay.?.deinit(std.heap.page_allocator);
             entry.redo_overlay = null;
+            entry.redo_overlay_owner_pid = null;
         }
         // Like `region` above: this registry's own bookkeeping always
         // uses `std.heap.page_allocator`, never a caller-supplied one --
@@ -520,6 +565,7 @@ pub fn ensureRedoOverlay(
         // individual NativeFile happened to populate or last reference
         // it, so it cannot safely be tied to any one of their allocators.
         try populate(ctx, &entry.redo_overlay.?, std.heap.page_allocator);
+        entry.redo_overlay_owner_pid = own_pid;
     }
     return &entry.redo_overlay.?;
 }
