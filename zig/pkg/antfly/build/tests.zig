@@ -494,6 +494,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const pgoutput_step = b.step("pgoutput-test", "Verify pgoutput v1 encoding, feedback framing and replication command negotiation");
     pgoutput_step.dependOn(&run_pgoutput_tests.step);
 
+    const history_control_entry_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/history_control_entry_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, history_control_entry_mod, true, true);
+    history_control_entry_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const history_control_entry_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{ "history control entry", "raft batch", "raft protocol barrier", "ordered artifact merge adoption" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_history_control_entry_tests = b.addRunArtifact(history_control_entry_tests);
+    b.step("history-control-entry-test", "Verify bounded fail-closed ordered retention envelopes").dependOn(&run_history_control_entry_tests.step);
+
     const changefeed_storage_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "metadata changefeed control", "metadata raft apply store snapshot key registry covers every durable projection class" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const run_changefeed_storage_tests = b.addRunArtifact(changefeed_storage_tests);
     const changefeed_service_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"changefeed control requires its coordinated decoder floor"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
@@ -3300,6 +3307,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
+    unit_test_step.dependOn(&run_history_control_entry_tests.step);
     unit_test_step.dependOn(&run_changefeed_control_tests.step);
     unit_test_step.dependOn(&run_changefeed_delivery_tests.step);
     unit_test_step.dependOn(&run_changefeed_projection_tests.step);

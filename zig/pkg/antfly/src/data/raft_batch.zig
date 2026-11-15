@@ -151,6 +151,9 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidReplicatedBatch;
     const root = parsed.value.object;
+    // Retention has a separate ordered apply/result contract. Until its owner
+    // dispatch is selected, never reinterpret a future envelope as row work.
+    if (root.contains("history_control")) return error.UnsupportedRaftBatchProtocolVersion;
     const table_value = root.get("table") orelse return error.InvalidReplicatedBatch;
     if (table_value != .string) return error.InvalidReplicatedBatch;
     const batch_value = root.get("batch") orelse return error.InvalidReplicatedBatch;

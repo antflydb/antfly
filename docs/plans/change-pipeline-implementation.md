@@ -1056,6 +1056,38 @@ The expanded physical writer tests, provisioned-native regression and compiled
 standalone configuration/native-export smoke check all pass. This qualifies the
 storage primitive and ABI, not end-to-end Raft submission or public feeds.
 
+## In progress: dedicated Raft retention envelope
+
+`data/history_control_entry.zig` defines the private retained-history entry
+separately from document batches. It carries an exact table/range namespace,
+original storage-owner generation/schema/index/range/settings and one typed
+consumer command. Explicit protocol and command-version fields are mandatory;
+the owner fields cannot disappear into parser defaults. Unknown and duplicate
+fields are rejected. Descriptor text, range keys and the total envelope are
+bounded, and non-native storage or restore/hidden-child bootstrap authority is
+not accepted by this entry type.
+
+The required protocol number is reserved as 30. **The advertised data-Raft
+maximum remains 29.** Encoding requires evidence of an activated protocol at
+least 30; this codec's presence does not activate that protocol. The outer
+`batch: null` poisons older row-batch parsers. The current ordinary envelope
+decoder also explicitly rejects `history_control`, including a forged envelope
+with an empty object batch, so it cannot acknowledge retention work as an empty
+row mutation while dedicated dispatch is still absent.
+
+`zig build history-control-entry-test -j2` passes 17 tests. It checks all seven
+consumer command forms, owner binding, mandatory version/metadata fields,
+unknown/duplicate fields, size limits, every allocation-failure point and owned
+decode lifetime. The same target reruns the existing row-batch, transaction,
+split/merge, binary range and protocol-barrier codec regressions, and belongs to
+the normal unit gate. Log:
+`zig/history-control-entry-regression-qualification.log`.
+
+Dedicated state-machine/native-owner dispatch, durable all-member activation,
+owner-routed submission and linearizable inspection/pages remain the next
+integration boundary. No public feed or replication capability is advertised by
+this codec milestone.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
