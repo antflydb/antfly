@@ -1147,6 +1147,10 @@ fn beginSourceTransaction(self: *DB, command: @import("source_admission.zig").Co
 fn nativeHistoryConsumerControl(self: *DB, command: @import("history_consumer.zig").Command) engine.Outcome(@import("history_consumer.zig").Result) {
     return .{ .value = self.nativeHistoryConsumerControl(command) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn provisionNativeHistoryAuthority(self: *DB, expected_namespace: [24]u8) engine.Outcome(void) {
+    self.provisionNativeHistoryAuthority(expected_namespace) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
+}
 fn nativeHistoryPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request) engine.Outcome(@import("history_page.zig").Page) {
     return .{ .value = self.nativeHistoryPage(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

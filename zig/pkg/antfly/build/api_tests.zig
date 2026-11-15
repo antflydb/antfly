@@ -1017,6 +1017,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     write_implementation_imports.runtime = @import("lake_execution_tests.zig").sourceImports(b, antfly_imports);
     write_implementation_imports.configure(b, write_implementation_module, true, true);
     write_implementation_module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const native_history_root_tests = b.addTest(.{ .root_module = write_implementation_module, .filters = &.{"provisioned native history root"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("provisioned-native-history-test", "Verify provisioned native history identity, resident leases and writer reopen").dependOn(&b.addRunArtifact(native_history_root_tests).step);
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
         .target = target,
@@ -1845,6 +1847,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
         .filters = &.{
             "restore staging private provisioning",
+            "provisioned native history root",
             "provisioned table write source drop table",
             "provisioned table drop cache drain",
             "provisioned writer cache starts DB workers after stable entry installation",

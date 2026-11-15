@@ -7011,6 +7011,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// Set only after startup proves this process is the non-Raft standalone
     /// data owner. A temporarily absent Raft callback is not that proof.
     standalone_sql_range_guards: bool = false,
+    native_history_owner: bool = false,
     local_write_owner: ?*ProvisionedTableWriteSource = null,
     /// Optional local physical-operation provider. Top-level routing,
     /// coalescing, admission, and lifecycle remain on this source; a compiled
@@ -7747,6 +7748,12 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn withStandaloneSqlRangeGuards(self: *ProvisionedTableWriteSource, enabled: bool) *ProvisionedTableWriteSource {
         self.standalone_sql_range_guards = enabled;
+        return self;
+    }
+
+    /// Set only by runtime owner selection, independently of SQL capabilities.
+    pub fn withNativeHistoryOwner(self: *ProvisionedTableWriteSource, enabled: bool) *ProvisionedTableWriteSource {
+        self.native_history_owner = enabled;
         return self;
     }
 
@@ -20139,6 +20146,111 @@ pub const ProvisionedTableWriteSource = struct {
             removed.deinit(cache.alloc);
         }
         self.local_db_mutex.unlock();
+    }
+
+    /// Owned single-root capability for a provisioned native writer. A locator
+    /// is copied, but its original table/range identity is never recomputed as
+    /// a replacement identity. Keep this value stable while using source().
+    pub const NativeHistoryRoot = struct {
+        owner: *ProvisionedTableWriteSource,
+        storage_owner: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []u8,
+        group_id: u64,
+        namespace: [24]u8,
+
+        const history = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+        pub fn deinit(self: *@This()) void {
+            self.alloc.free(self.table_name);
+            self.* = undefined;
+        }
+        fn qualify(self: *@This()) !void {
+            // Ordered and hot-standby control need their durable apply/mirror
+            // path. Never silently mutate retention through a local handle.
+            if (comptime control_only_storage_sources) return error.ChangefeedCapabilityUnsupported;
+            if (!self.owner.native_history_owner or self.owner.raft_batcher != null or
+                self.storage_owner.raft_batcher != null or self.storage_owner.replication_write_gate != null or
+                self.storage_owner.groupLocalWriteSource() != null or self.storage_owner.write_cache == null)
+                return error.ChangefeedCapabilityUnsupported;
+        }
+        fn validateCatalog(self: *@This()) !void {
+            try self.qualify();
+            const current = try loadTableIdentityNamespaceForGroup(self.alloc, self.owner.catalog, self.table_name, self.group_id) orelse return error.HistoryResynchronizationRequired;
+            const bytes = namespaceBytes(current);
+            if (!std.mem.eql(u8, &bytes, &self.namespace)) return error.HistoryResynchronizationRequired;
+        }
+        fn namespaceBytes(value: doc_identity.Namespace) [24]u8 {
+            var bytes: [24]u8 = undefined;
+            std.mem.writeInt(u64, bytes[0..8], value.table_id, .big);
+            std.mem.writeInt(u64, bytes[8..16], value.shard_id, .big);
+            std.mem.writeInt(u64, bytes[16..24], value.range_id, .big);
+            return bytes;
+        }
+        const Lease = struct {
+            root: *NativeHistoryRoot,
+            cached: ProvisionedTableWriteCache.CachedDb,
+            fn deinit(self: *@This()) void {
+                self.cached.deinit(self.root.alloc);
+                self.root.storage_owner.endGroupOperation(self.root.table_name, self.root.group_id);
+            }
+        };
+        fn acquire(self: *@This()) !Lease {
+            try self.qualify();
+            const owner = self.storage_owner;
+            owner.beginGroupOperation(self.table_name, self.group_id);
+            errdefer owner.endGroupOperation(self.table_name, self.group_id);
+            try self.validateCatalog();
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(self.alloc, owner.replica_root_dir, self.group_id);
+            defer self.alloc.free(path);
+            var cached = try owner.getOrOpenCachedDbForLocalMutation(self.alloc, owner.write_cache.?, path, self.group_id, owner.visibleRootGeneration(self.group_id), self.table_name, false);
+            errdefer cached.deinit(self.alloc);
+            try cached.db.provisionNativeHistoryAuthority(self.namespace);
+            try self.validateCatalog();
+            return .{ .root = self, .cached = cached };
+        }
+        fn admissionNamespace(raw: *anyopaque) ![24]u8 {
+            const self: *NativeHistoryRoot = @ptrCast(@alignCast(raw));
+            var lease = try self.acquire();
+            defer lease.deinit();
+            const result = try lease.cached.db.nativeSourceAdmissionNamespace();
+            try self.validateCatalog();
+            return result;
+        }
+        fn consumerControl(raw: *anyopaque, command: history.history_consumer.Command) !history.history_consumer.Result {
+            const self: *NativeHistoryRoot = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, &command.namespace(), &self.namespace)) return error.HistoryResynchronizationRequired;
+            var lease = try self.acquire();
+            defer lease.deinit();
+            const result = try lease.cached.db.nativeHistoryConsumerControl(command);
+            try self.validateCatalog();
+            return result;
+        }
+        fn page(raw: *anyopaque, alloc: std.mem.Allocator, request: history.history_page.Request) !history.history_page.Page {
+            const self: *NativeHistoryRoot = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, &request.reference.namespace, &self.namespace)) return error.HistoryResynchronizationRequired;
+            var lease = try self.acquire();
+            defer lease.deinit();
+            var result = try lease.cached.db.nativeHistoryPage(alloc, request);
+            errdefer result.deinit();
+            try self.validateCatalog();
+            return result;
+        }
+        pub fn source(self: *@This()) TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{ .batch = unsupportedBatch, .native_source_admission_namespace = admissionNamespace, .native_history_consumer_control = consumerControl, .native_history_page = page } };
+        }
+        fn unsupportedBatch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    pub fn bindNativeHistoryRoot(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64) !NativeHistoryRoot {
+        var result: NativeHistoryRoot = .{ .owner = self, .storage_owner = self.local_write_owner orelse self, .alloc = alloc, .table_name = try alloc.dupe(u8, table_name), .group_id = group_id, .namespace = @splat(0) };
+        errdefer result.deinit();
+        try result.qualify();
+        const namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id) orelse return error.HistoryResynchronizationRequired;
+        result.namespace = NativeHistoryRoot.namespaceBytes(namespace);
+        _ = try NativeHistoryRoot.admissionNamespace(&result);
+        return result;
     }
 
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
@@ -40275,6 +40387,78 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "provisioned native history root retains committed images across writer reopen and fences replacement" {
+            if (comptime control_only_storage_sources) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            const Catalog = struct {
+                tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs", .placement_role = "data", .indexes_json = "{}" }},
+                ranges: [1]metadata_table_manager.RangeRecord = .{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }},
+                fn iface(self: *@This()) table_catalog.CatalogSource {
+                    const Routing = table_catalog.TestAdminRoutingAdapter(snapshot, free);
+                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = Routing.routingSnapshot, .linearizable_routing_snapshot = Routing.linearizableSnapshot, .free_routing_snapshot = Routing.freeRoutingSnapshot } };
+                }
+                fn snapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.tables, .ranges = &self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-history-root", .{tmp.sub_path});
+            defer a.free(path);
+            var catalog: Catalog = .{};
+            var cache = ProvisionedTableWriteCache.init(a);
+            defer cache.deinit();
+            var owner = ProvisionedTableWriteSource.init(path, catalog.iface());
+            defer deinitManagedSourceForTest(&owner, &cache);
+            owner.write_cache = &cache;
+            try std.testing.expectError(error.ChangefeedCapabilityUnsupported, owner.bindNativeHistoryRoot(a, "docs", 7001));
+            _ = owner.withNativeHistoryOwner(true);
+            var root = try owner.bindNativeHistoryRoot(a, "docs", 7001);
+            defer root.deinit();
+            const source = root.source();
+            const namespace = try source.nativeSourceAdmissionNamespace();
+            try std.testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, namespace[0..8], .big));
+            const enrolled = (try source.nativeHistoryConsumerControl(.{ .enroll = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 } })).consumer.?;
+            const history = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+            const request: history.history_page.Request = .{ .reference = .{ .namespace = namespace, .authority = @splat(1), .consumer = @splat(2), .epoch = enrolled.epoch, .grant = 1, .definition = @splat(3) }, .after = .{ .sequence = enrolled.start }, .now_seconds = 100, .max_events = 10, .max_bytes = 65536 };
+            _ = try owner.source().batch(a, "docs", .{ .writes = &.{.{ .key = "one", .value = "{\"n\":1}" }}, .sync_level = .write });
+            var first = try source.nativeHistoryPage(a, request);
+            defer first.deinit();
+            try std.testing.expectEqual(@as(usize, 1), first.events.len);
+            try std.testing.expectEqualStrings("{\"n\":1}", first.events[0].after.?);
+            cache.deinit();
+            cache = ProvisionedTableWriteCache.init(a);
+            try std.testing.expectEqual(namespace, try source.nativeSourceAdmissionNamespace());
+            _ = try owner.source().batch(a, "docs", .{ .writes = &.{.{ .key = "one", .value = "{\"n\":99}" }}, .sync_level = .write });
+            var replay = try source.nativeHistoryPage(a, request);
+            defer replay.deinit();
+            try std.testing.expectEqual(first.header.?.sequence, replay.header.?.sequence);
+            try std.testing.expectEqualStrings("{\"n\":1}", replay.events[0].after.?);
+            catalog.tables[0].table_id = 8;
+            catalog.ranges[0].table_id = 8;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, source.nativeSourceAdmissionNamespace());
+            try std.testing.expectError(error.HistoryResynchronizationRequired, source.nativeHistoryPage(a, request));
+            catalog.tables[0].table_id = 7;
+            catalog.ranges[0].table_id = 7;
+            _ = owner.withNativeHistoryOwner(false);
+            try std.testing.expectError(error.ChangefeedCapabilityUnsupported, source.nativeHistoryPage(a, request));
+            _ = owner.withNativeHistoryOwner(true);
+            // A serving profile cannot convert a persisted Raft root, or a
+            // legacy ordered artifact without a versioned authority record.
+            for ([_]u64{ 7002, 7003 }) |group| {
+                catalog.ranges[0].group_id = group;
+                const db_path = try metadata_mod.groupDbPathFromReplicaRoot(a, path, group);
+                defer a.free(db_path);
+                {
+                    var ordered = try db_mod.DB.open(a, db_path, .{ .identity_namespace = tableIdentityNamespaceForRangeId(7, catalog.ranges[0]), .online_source_authority = if (group == 7002) .raft else null, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false });
+                    defer ordered.close();
+                    if (group == 7003) try ordered.core.store.putBatch(&.{.{ .key = &internal_keys.ordered_document_applied_entry_key, .value = "ordered-owner-proof" }}, &.{});
+                }
+                try std.testing.expectError(error.OnlineSourceScopeChanged, owner.bindNativeHistoryRoot(a, "docs", group));
+            }
+        }
         // Source quiescence joins source-owned work; cached DB workers also
         // borrow it through runtime hooks and must drain before its destruction.
         fn deinitManagedSourceForTest(source: *ProvisionedTableWriteSource, cache: *ProvisionedTableWriteCache) void {

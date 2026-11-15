@@ -548,6 +548,7 @@ pub const VTable = struct {
     writeValidateGroupedSourceBatch: *const fn (std.mem.Allocator, *DB, []const types.BatchWrite, []const []const u8, []const types.DocumentTransform) Outcome(void),
     nativeHistoryConsumerControl: *const fn (self: *DB, command: @import("history_consumer.zig").Command) Outcome(@import("history_consumer.zig").Result),
     nativeHistoryPage: *const fn (self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request) Outcome(@import("history_page.zig").Page),
+    provisionNativeHistoryAuthority: *const fn (self: *DB, expected_namespace: [24]u8) Outcome(void),
 };
 pub const Boundary = callback.Boundary(VTable);
 pub const FieldLayout = extern struct { name: [*:0]const u8, type_name: [*:0]const u8, offset: usize, size: usize, alignment: usize };

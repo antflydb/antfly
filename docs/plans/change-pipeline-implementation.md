@@ -966,6 +966,50 @@ now emits distinct identities across calls. Logs:
 before that correction), and `zig/identity-lineage-abi-qualification.log`
 (corrected archive tests pass).
 
+## In progress: provisioned native history root binding
+
+`ProvisionedTableWriteSource.bindNativeHistoryRoot` supplies an owned, narrowly
+scoped `TableWriteSource` for the native history adapter. The general production
+writer still routes across many tables and does not pretend to have one native
+namespace. The binding copies its table locator and records the exact catalog
+table/range namespace. Every callback rechecks that namespace behind the
+linearizable routing barrier before and after storage work, holds the existing
+group operation guard, and leases the resident writer through the production
+cache. No DB pointer outlives that lease. History pages own their bytes after the
+lease is released. The binding cannot be used as a general batch writer.
+Runtime owner selection supplies an explicit `native_history_owner` capability,
+independent of SQL range guards. The provisioning method is appended to the
+storage-engine method table and native exports, with descriptor layout checking.
+
+Resident native provisioning atomically persists the exact DB identity and
+native authority under the apply/snapshot/replication mutation guards. Existing
+bindings take a read-only outcome without another WAL write. A mismatched
+namespace, persisted Raft authority or legacy ordered-apply marker cannot be
+converted by selecting a standalone serving profile. Restoring hidden/staged
+roots and read-only handles retain their existing admission guards.
+
+This initial production owner capability qualifies an unreplicated standalone
+native writer with a resident cache. Ordered Raft control, mirrored hot-standby
+pins, linked/hosted owner dispatch and coherent snapshot cuts still require their
+own completed control paths; this capability rejects those profiles. It does
+not register a public endpoint or pgwire factory.
+
+`zig build provisioned-native-history-test -j2` executes the physical writer
+suite, not the HTTP discovery root. It enrolls an empty production-cache table,
+captures a write, closes and reopens the writer, changes the current row and
+replays the original historical image. Table replacement and live serving-profile
+changes fence the old binding. The test is also selected by the normal
+table-write lifecycle gate. Initial qualification is recorded in
+`zig/provisioned-native-history-qualification.log`; the expanded Raft-authority
+and legacy-marker checks plus the existing changefeed control suite are tracked
+in `zig/provisioned-native-history-final-qualification.log`.
+Those expanded checks and the changefeed control suite pass. The final explicit
+owner-capability integration passes in
+`zig/provisioned-native-history-owner-qualification.log`. The compiled standalone
+configuration smoke check also passes in
+`zig/provisioned-native-history-native-build.log`; this checks compiled native
+exports/runtime wiring, not end-to-end replication startup.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

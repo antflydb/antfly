@@ -25878,6 +25878,42 @@ pub const DB = struct {
     pub const HistoryConsumerGrant = @import("../history_consumer.zig").Grant;
     pub const HistoryConsumerReference = @import("../history_consumer.zig").Reference;
 
+    /// Authenticated native owner provisioning for a resident managed writer.
+    /// The serving owner must already have resolved this exact namespace from
+    /// its linearizable catalog. This cannot convert a Raft-owned artifact.
+    pub fn provisionNativeHistoryAuthority(self: *DB, expected_namespace: [24]u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("provisionNativeHistoryAuthority", .{ self, expected_namespace });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (self.core.identity_namespace.table_id == 0 or !std.mem.eql(u8, &namespace, &expected_namespace)) return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &txn, null);
+        const stored_identity = try doc_identity.loadNamespaceTxn(&txn);
+        if (stored_identity) |stored| {
+            if (!stored.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        }
+        const authority = @import("../source_authority.zig");
+        const existing_authority = try authority.load(&txn);
+        if (existing_authority != null) _ = try authority.require(&txn, .native, namespace);
+        if (stored_identity != null and existing_authority != null) {
+            txn.abort();
+            return;
+        }
+        if (stored_identity == null) try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
+        if (existing_authority == null) try authority.bind(&txn, .native, namespace);
+        try txn.commit();
+    }
+
     /// Private single-root consumer control. Raft-owned roots must use their
     /// ordered apply path; a local DB handle cannot mutate their retention pins.
     pub fn nativeHistoryConsumerControl(self: *DB, command: @import("../history_consumer.zig").Command) !@import("../history_consumer.zig").Result {
