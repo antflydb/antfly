@@ -32,3 +32,7 @@ test "history root control driver recovers physical metadata without duplicate s
 test "history root control observation reconciles only stable scoped predicates" {
     try @import("metadata/root_control_observation.zig").test_support.contracts();
 }
+
+test "history root discovery captures authoritative immutable namespaces and complete coverage" {
+    try @import("api/history_roots.zig").test_support.contracts();
+}

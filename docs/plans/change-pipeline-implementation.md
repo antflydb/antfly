@@ -1831,6 +1831,38 @@ Production registration, standalone native outcome qualification, retired-root
 handoff/bootstrap, destination/public transports and pinned client qualification
 remain required by the full goal.
 
+## In progress: registered retained-root discovery source
+
+Data-server API configuration now installs a retained-root source for linked
+routed runtimes. The source bundles concrete routed control/page/grant ports and
+the actual catalog source; local-only HTTP receivers remain unchanged. Discovery
+captures one authoritative compact routing generation under the original
+request budget/cancellation (at most five seconds), never an operational admin
+fallback. It resolves immutable selected table IDs, verifies base-incarnation
+bindings and native destination contracts, requires complete keyspace coverage,
+uses canonical document identity overrides, bounds the vector to 4096 roots and
+rejects duplicate namespaces. Names and ranges remain owned by the captured
+generation even after publisher retirement. Initial ownership counters belong
+to feed metadata; topology hashes are not substituted for them.
+
+This source discovers candidates, not proof of full serving capability. Actual
+root admission still checks the compiled owner/protocol. Capture does not grant
+public authorization, a consistent snapshot, global transaction completion or
+unsupported destination guarantees. validate re-captures current bindings and
+requires the same root identity/topology and table locator before/after driver
+work. Root-set planning and validation are now exercised by the real routed
+native fixture rather than hand-built root plans alone.
+
+Discovery contracts and signed HTTP compatibility pass, including generation
+lifetime, recreate-under-same-name rejection, incomplete topology, deadlines and
+allocation-failure cleanup. Current incarnation mismatch is also explicitly
+checked. Live native qualification passes all five checks with root plans and
+before/after binding validation supplied by the configured source. Logs:
+`history-root-discovery-test.log`, `history-root-discovery-qualified-test.log`.
+Production feed management/authorization, consumer scheduling, retired-root transfer,
+standalone native outcomes, bootstrap and the full inbound/outbound contracts
+remain required.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

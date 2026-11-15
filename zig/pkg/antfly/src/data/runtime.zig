@@ -7067,6 +7067,7 @@ pub const DataServer = struct {
         api_server_cfg.native_history_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = historyControlOperation } else null;
         api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
         api_server_cfg.native_history_grant = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyGrantOperation } else null;
+        api_server_cfg.native_history_roots = if (linked_storage and (self.data_raft != null or self.remote_metadata != null)) self.historyRootsSource() else null;
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.restore_owner = .{ .ptr = self, .execute_fn = restoreOwnerControl };
         api_server_cfg.restore_parent_activation = .{ .ptr = self, .execute_fn = restoreParentActivationControl };
@@ -13339,6 +13340,10 @@ pub const DataServer = struct {
 
     /// Request-scoped feed-root transport. HTTP ingress continues to use the
     /// local-only callback so a forwarded request cannot bounce between peers.
+    pub fn historyRootsSource(self: *DataServer) @import("../api/history_roots.zig").Source {
+        return .{ .catalog = self.write_source.catalog, .controls = self.historyControlPort(), .pages = self.historyPagePort(), .grants = self.historyGrantPort() };
+    }
+
     pub fn historyControlPort(self: *DataServer) @import("../api/history_control_operations.zig").Port {
         return .{ .ptr = self, .execute_fn = historyControlRoutedOperation };
     }
@@ -43338,7 +43343,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation } }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -43472,15 +43477,29 @@ fn consumerTests() type {
                 const feed_table: antfly.metadata.table_manager.TableRecord = .{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" };
                 try meta_store.applyStandaloneCommand(feed_svc.metadata_group_id, .{ .upsert_table = feed_table });
                 try feed_svc.mutate(a, .{ .create = .{ .id = feed_svc.id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = feed_control.tableBinding(feed_table), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } });
-                try feed_svc.mutate(a, .{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} });
+                {
+                    var discovery_state = try feed_svc.load(a);
+                    defer discovery_state.deinit();
+                    const root_source = origin.historyRootsSource();
+                    var discovered = try root_source.capture(a, discovery_state.value.definition.?, .{});
+                    defer discovered.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), discovered.roots.len);
+                    try std.testing.expectEqual(namespace, discovered.roots[0].namespace);
+                    try std.testing.expectEqualStrings("docs", discovered.roots[0].table_name);
+                    const plans = try discovered.initialPlans(a);
+                    defer a.free(plans);
+                    try feed_svc.mutate(a, .{ .plan_roots = plans });
+                }
                 const DriverPolicy = struct {
                     source: *RemoteMetadataSource,
+                    roots: @import("../api/history_roots.zig").Source,
                     base: feed_policy = .{},
                     pub fn authorizeRoot(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, request: feed_fixture.Request) !void {
                         return self.base.authorizeRoot(state, ns, request);
                     }
                     pub fn validateRoot(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, frozen: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: feed_fixture.Request) !void {
                         try self.base.validateRoot(state, ns, frozen, table, request);
+                        try self.roots.validate(std.testing.allocator, state, ns, frozen, table, try self.base.context(request));
                         self.source.control_read_generation_at_ms = self.source.awakeMs();
                     }
                     pub fn newAttempt(self: *@This(), state: feed_control.State, ns: feed_control.Namespace, request: feed_fixture.Request) !feed_control.Id {
@@ -43490,7 +43509,7 @@ fn consumerTests() type {
                         return self.base.context(request);
                     }
                 };
-                var driver_policy: DriverPolicy = .{ .source = &metadata_source };
+                var driver_policy: DriverPolicy = .{ .source = &metadata_source, .roots = origin.historyRootsSource() };
                 {
                     var feed_state = try feed_svc.load(a);
                     defer feed_state.deinit();
