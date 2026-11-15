@@ -677,6 +677,43 @@ empty PostgreSQL transactions/LSN increments or leaking hidden participant
 counts. That needs a certified checkpoint-only native progress operation,
 separate from delivery/confirmation of serialized PostgreSQL transactions.
 
+## In progress: immutable committed PostgreSQL spool
+
+`metadata/pg_spool.zig` stores complete committed pgoutput transactions as
+content-addressed message parts and an authenticated bounded-fanout seek index.
+It writes the sealed manifest last. A failed upload poisons the writer; recovery
+rebuilds from the original retained input instead of continuing after an unknown
+partial write. The manifest binds feed incarnation, definition, publication
+projection, original native cursor interval, completion proof, LSN interval,
+transaction ID and commit time. Its storage locator also binds the immutable
+storage/upload scope. Exact historical rebuilds in a replacement storage scope
+preserve the separate serialization identity used by the slot mapping.
+
+The builder retains only an index frontier. Reads authenticate the manifest and
+index path and return one complete bounded message at an exact message boundary;
+interior cursors, changed bindings and corrupted parts fail explicitly. Limits
+are 1 GiB per transaction, 65,536 messages, 16 MiB per message and 256 KiB per
+storage part. A transaction larger than 32 MiB builds and seeks within a 64 KiB
+independent working-memory budget. Multipart corruption and allocation failures
+are covered as well.
+
+`metadata/pg_spool_artifacts.zig` adapts the existing scoped immutable artifact
+store, including checksum/size verification, cancellation, upload journaling and
+persisted closure witnesses. It requires a trusted immutable storage namespace;
+HA callers must additionally require shared storage. Local filesystem tests
+supply a fixture namespace and explicitly reject HA qualification. They reopen
+the actual filesystem backend and replay exact indexed messages while preserving
+closure evidence. `zig build pg-spool-test -j2` runs the codec and filesystem
+qualification with local caches (`zig/pg-spool-artifact-qualification.log`).
+
+This format and adapter do not yet reserve/persist upload quota, publish spool
+locators through slot metadata, or implement acknowledgement-driven reclamation.
+Closure witnesses alone do not authorize publication or protect a live slot.
+Those operations must share fenced metadata authority, charge unfinished and
+uncollected uploads, and retain cleanup debt until bounded reclamation succeeds.
+Production row serialization, coherent database cuts and client qualification
+also remain required; the native runtime still has no replication factory.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
@@ -703,10 +740,10 @@ local artifacts. Keep draft PR scope/status honest as implementation grows.
   filtered enter/leave need provider before-images; the current pgoutput update
   parser now retains old tuples and completeness; routed apply still must consume
   those images before claiming that scope.
-- Pgwire `backend.zig:Backend.VTable` has no replication callbacks yet, and
-  `protocol.zig` rejects replication startup. Add actual replication commands,
-  CopyBoth and feedback through authenticated backend capabilities; HTTP/SQL
-  polling alone cannot satisfy #1639.
+- Pgwire `backend.zig:Backend.VTable` now has optional authenticated replication
+  sessions and CopyBoth streaming. The native runtime still needs to register a
+  production owner backed by coherent cuts, typed retained rows and fenced slot
+  spooling. HTTP/SQL polling alone cannot satisfy #1639.
 - Durable metadata commands/snapshot storage live in
   `metadata/storage/raft_apply_store.zig`; feed/slot records need this authority,
   not process-local maps. Public specs remain under `specs/openapi/antfly` and

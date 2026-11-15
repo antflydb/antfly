@@ -43,8 +43,10 @@ queued results. Connection memory contains at most a bounded message, not a whol
 committed transaction.
 
 START is rejected when the owner has no stream callback. The native runtime
-adapter does not yet register the replication capability; durable spooling and
-its database-cut/publication integration remain required. These private contracts
+adapter does not yet register the replication capability. The private
+`metadata/pg_spool.zig` format and artifact-store adapter support authenticated
+message seeks and immutable rebuilds, but slot publication, quota/reclamation and
+database-cut/publication integration remain required. These private contracts
 and wire tests do not establish existing-client compatibility or activate a
 production replication endpoint. Unknown slot administration stays with the
 replication owner rather than becoming SQL transaction completion work.

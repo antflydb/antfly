@@ -463,6 +463,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/pgwire/replication_commands.zig"), .target = target, .optimize = optimize }),
     });
     const run_pgoutput_tests = b.addRunArtifact(pgoutput_tests);
+    const pg_spool_codec_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/pg_spool_codec_test_root.zig"), .target = target, .optimize = optimize }),
+    });
+    const run_pg_spool_codec_tests = b.addRunArtifact(pg_spool_codec_tests);
+    const pg_spool_artifact_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/pg_spool_artifact_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, pg_spool_artifact_mod, true, true);
+    pg_spool_artifact_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const pg_spool_artifact_tests = b.addTest(.{
+        .root_module = pg_spool_artifact_mod,
+        .filters = &.{"pg spool artifact"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_pg_spool_artifact_tests = addFilteredTestRunArtifact(b, pg_spool_artifact_tests);
+    const pg_spool_step = b.step("pg-spool-test", "Verify bounded committed spooling, authenticated seeks and durable artifact reopen");
+    pg_spool_step.dependOn(&run_pg_spool_codec_tests.step);
+    pg_spool_step.dependOn(&run_pg_spool_artifact_tests.step);
+
     const pgoutput_step = b.step("pgoutput-test", "Verify pgoutput v1 encoding, feedback framing and replication command negotiation");
     pgoutput_step.dependOn(&run_pgoutput_tests.step);
 
@@ -3278,6 +3299,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_changefeed_projection_cursor_tests.step);
     unit_test_step.dependOn(&run_changefeed_json_tests.step);
     unit_test_step.dependOn(&run_pgoutput_tests.step);
+    unit_test_step.dependOn(&run_pg_spool_codec_tests.step);
+    unit_test_step.dependOn(&run_pg_spool_artifact_tests.step);
     unit_test_step.dependOn(&run_changefeed_storage_tests.step);
     unit_test_step.dependOn(&run_changefeed_service_tests.step);
     unit_test_step.dependOn(&remote_content_adapter_run.step);
