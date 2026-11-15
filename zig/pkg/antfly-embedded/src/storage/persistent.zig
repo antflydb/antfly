@@ -1269,7 +1269,16 @@ pub const PersistentIndex = struct {
 
         pub fn commit(self: *MainTxn) !void {
             if (self.write) |*txn| {
-                const wal_trace_scope = wal_trace.scope(.main_txn_commit);
+                // `scopeDefault`, not `scope`: this is the generic/shared
+                // fallback tag for every non-inline full-text/dense/sparse/
+                // graph publication's own commit. A caller that already
+                // pushed a more specific tag before reaching here (e.g.
+                // `db.zig`'s `.text_merge_drain` around
+                // `drainScheduledTextMerges`) must keep its own
+                // attribution instead of having it shadowed by this push --
+                // see `write_amplification_trace.zig`'s `scopeDefault` doc
+                // comment and its own regression test.
+                const wal_trace_scope = wal_trace.scopeDefault(.main_txn_commit);
                 defer wal_trace_scope.end();
                 try txn.commit();
                 self.write = null;

@@ -478,6 +478,17 @@ const ModeReport = struct {
     /// amplification) everywhere that distinction matters below.
     const redo_checkpoint_fold_stages = [_]wal_trace.Stage{ .ride_along_flush, .redo_checkpoint_fold };
 
+    /// perf/lwa-wamp-regress: `.text_merge_drain` (`db.zig`'s synchronous
+    /// `drainScheduledTextMerges` fallback for a `.full_index` write with
+    /// no `text_merge_runtime` attached) is the same kind of cost as
+    /// `redo_checkpoint_fold_stages` above for ceiling-exclusion purposes
+    /// -- a genuinely bounded background self-sufficiency commit (one per
+    /// tiered-merge cycle, not one per write), not the inline write path's
+    /// own per-write amplification -- but it is not driven by the same
+    /// idle-flush timer, so it is tracked (and bounded) separately via
+    /// `textMergeDrains` rather than folded into `idleFlushDrains`.
+    const background_maintenance_stages = redo_checkpoint_fold_stages ++ [_]wal_trace.Stage{.text_merge_drain};
+
     fn totalCommitsExcluding(self: ModeReport, excluded: []const wal_trace.Stage) u64 {
         var total: u64 = 0;
         for (std.meta.tags(wal_trace.Stage)) |s| {
@@ -529,6 +540,25 @@ const ModeReport = struct {
         var total: u64 = 0;
         for (redo_checkpoint_fold_stages) |s| total += self.report.stage(s).commits_background;
         return total;
+    }
+
+    /// Durable commits/write, excluding both idle-flush drains
+    /// (`redo_checkpoint_fold_stages`) and `.text_merge_drain` -- see
+    /// `background_maintenance_stages`.
+    fn durableCommitsPerWriteExcludingBackgroundMaintenance(self: ModeReport) f64 {
+        return @as(f64, @floatFromInt(self.totalCommitsExcluding(&background_maintenance_stages))) / @as(f64, @floatFromInt(self.updates));
+    }
+
+    /// How many times the `.full_index`-with-no-`text_merge_runtime`
+    /// fallback (`db.zig`'s `drainScheduledTextMerges` call sites) actually
+    /// found and ran a scheduled merge during this run -- on the calling
+    /// thread, since nothing else drives it without an attached runtime.
+    /// Unlike `idleFlushDrains`, this always lands on the calling thread
+    /// (there is no background runtime to attribute it to in this mode),
+    /// so count both lanes.
+    fn textMergeDrains(self: ModeReport) u64 {
+        const counts = self.report.stage(.text_merge_drain);
+        return counts.commits_calling_thread + counts.commits_background;
     }
 
     /// Every durable fsync this run issued, calling-thread and background
@@ -2246,7 +2276,23 @@ test "lite write amplification report: full_index with text index (sparse-text-i
     // defers to the slow worker-driven path -- see
     // `batchInternalPreparedOwned`'s comment on "the very first write this
     // worker has ever been asked to apply") plus slack.
-    try expectAtMost(indexed.durableCommitsPerWrite(), 1.25, "full_index-with-text durable commits/write (workers on)");
+    //
+    // Excludes `.text_merge_drain` (see `background_maintenance_stages`):
+    // this fixture runs with no `text_merge_runtime` attached, so once
+    // `IndexManager.noteInlineTextPublicationSegments` (perf/lwa-wamp-
+    // regress) correctly marks this index's inline-published segments as
+    // needing a merge, `.full_index`'s own self-sufficiency fallback
+    // periodically runs and commits one for real -- a bounded background
+    // maintenance cost, not this write's own amplification; see
+    // `textMergeDrains` just below for that cost's own, separate bound.
+    try expectAtMost(indexed.durableCommitsPerWriteExcludingBackgroundMaintenance(), 1.25, "full_index-with-text durable commits/write (workers on)");
+    // One merge per tiered-merge cycle at most, not one per write: with
+    // `default_updates` (128) single-document inserts of near-identical
+    // size, a tiered policy should fold the previous cycle's segments into
+    // one roughly every `updates / 4` writes at the very loosest -- far
+    // short of a merge on every write, which would mean the scheduling fix
+    // regressed into draining unconditionally again.
+    try expectAtMost(@floatFromInt(indexed.textMergeDrains()), @floatFromInt(updates / 4), "full_index-with-text text-merge drains (self-sufficiency fallback)");
 }
 
 // Steady-state counterpart to the `full_text` alternation regression test
@@ -2343,7 +2389,13 @@ test "lite write amplification: mixed text+sparse write engages both inline fast
     // path) plus slack. Two indexes' startup writes can land on the SAME
     // update (doc-0's very first write touches both), so this stays at
     // the single-index ceiling, not double it.
-    try expectAtMost(mixed.durableCommitsPerWrite(), 1.25, "mixed text+sparse durable commits/write (workers on)");
+    //
+    // Excludes `.text_merge_drain` for the same reason as the "full_index
+    // with text index" report above: this fixture's text index has no
+    // attached `text_merge_runtime`, so the periodic self-sufficiency
+    // merge drain is background maintenance, not this write's own cost.
+    try expectAtMost(mixed.durableCommitsPerWriteExcludingBackgroundMaintenance(), 1.25, "mixed text+sparse durable commits/write (workers on)");
+    try expectAtMost(@floatFromInt(mixed.textMergeDrains()), @floatFromInt(updates / 4), "mixed text+sparse text-merge drains (self-sufficiency fallback)");
 }
 
 // lite-single-commit-write-path.md §3.3c: the relational write surface --

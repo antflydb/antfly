@@ -34427,6 +34427,11 @@ pub const DB = struct {
         self.notifyResolverReplayRuntimes(sequence);
         try self.waitForSyncLevelWithPublicationCut(sync_level, sequence, sync_targets, cancellation, false, publication_cut);
         if (sync_level == .full_index and self.text_merge_runtime == null) {
+            // See the identical drain in `waitForSyncLevelWithPublicationCut`'s
+            // own `.full_index` branch and `write_amplification_trace.zig`'s
+            // `.text_merge_drain` doc comment.
+            const wal_trace_scope = wal_trace.scope(.text_merge_drain);
+            defer wal_trace_scope.end();
             try self.drainScheduledTextMerges();
         }
     }
@@ -38817,6 +38822,18 @@ pub const DB = struct {
                 } else try self.runMaintenanceUntilWithCancellation(sequence, sync_targets, cancellation, deadline_ns);
                 if (self.text_merge_runtime == null) {
                     try wait.check();
+                    // See `write_amplification_trace.zig`'s `.text_merge_drain`
+                    // doc comment: this is the self-sufficiency fallback that
+                    // runs any scheduled text-index merge synchronously when
+                    // no background `TextMergeRuntime` is attached. Tag it
+                    // distinctly so its commit is attributed to this call
+                    // site -- a bounded, periodic background-maintenance
+                    // cost -- rather than folding into the unattributed
+                    // generic `.main_txn_commit` bucket every other
+                    // non-inline publication's own commit still falls back
+                    // to.
+                    const wal_trace_scope = wal_trace.scope(.text_merge_drain);
+                    defer wal_trace_scope.end();
                     try self.drainScheduledTextMerges();
                     try wait.check();
                 }

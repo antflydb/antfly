@@ -184,6 +184,34 @@ pub const Stage = enum(u8) {
     // for where both still count as the same kind of idle-flush cost for
     // ceiling-exclusion purposes.
     redo_checkpoint_fold,
+    // perf/lwa-wamp-regress: `db.zig`'s `waitForResolvedTransactionSyncImpl`
+    // synchronously draining any scheduled text-index merge
+    // (`DB.drainScheduledTextMerges`) when a `.full_index` write finds no
+    // `text_merge_runtime` attached -- the self-sufficiency fallback that
+    // keeps segment count (and `IndexWriter.deleteAllByIdsTracked`'s
+    // per-write delete scan) bounded even with no background merge worker
+    // running (see `IndexManager.noteInlineTextPublicationSegments`,
+    // added so the WS4 phase-2 inline text fast path's one-segment-per-
+    // write growth is actually noticed by the merge scheduler). Before
+    // that fix, an inline-published write's segment never set
+    // `compaction_pending`, so this drain always found nothing scheduled
+    // for it; now it periodically finds a real merge to run and publish
+    // (`PersistentIndex.replaceSegmentsIfActiveManyPreparedWithDeletesAndScratch`,
+    // which commits through the same generic `PersistentIndex.MainTxn
+    // .commit` every non-inline text/dense/sparse/graph publication
+    // falls back to -- see that type's own doc comment). Pushed here, at
+    // the specific call site responsible, so `MainTxn.commit`'s own
+    // `scopeDefault` push (converted from a shadowing `scope` push by this
+    // same change) defers to it instead of folding it into the
+    // unattributed `.main_txn_commit` bucket. Like `.ride_along_flush`/
+    // `.redo_checkpoint_fold`, this is a genuinely bounded background
+    // self-sufficiency cost (one commit per tiered-merge cycle, not one
+    // per write) rather than the inline write path's own per-write
+    // amplification -- see `write_amplification_bench_test.zig`'s
+    // `background_maintenance_stages` for where this and the two
+    // idle-flush tags are all excluded from the foreground ceiling the
+    // same way.
+    text_merge_drain,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;
