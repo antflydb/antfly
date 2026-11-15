@@ -18926,6 +18926,7 @@ pub const ApiHttpServer = struct {
             error.PersistentDescriptorAdmissionExhausted,
             => return error.ReadUnavailable,
             error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor => return error.StorageReadTemporarilyUnavailable,
+            error.ResourceBudgetExceeded => return error.ResourceBudgetExceeded,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });

@@ -10395,17 +10395,38 @@ pub const DB = struct {
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
+        var primary_capture: ?snapshot_admission_mod.SnapshotAdmission.CaptureLease = null;
+        defer if (primary_capture) |*lease| lease.release();
+        var replay_capture: ?snapshot_admission_mod.SnapshotAdmission.CaptureLease = null;
+        defer if (replay_capture) |*lease| lease.release();
+        var apply_locked = true;
         lockApplyShared(self);
-        defer self.core.unlockApplyShared();
+        defer if (apply_locked) self.core.unlockApplyShared();
+        if (self.core.index_manager.denseIndex(artifact_name) != null) {
+            // Mutation admission precedes apply ownership throughout native
+            // publication. Never wait for capture while retaining apply.
+            self.core.unlockApplyShared();
+            apply_locked = false;
+            primary_capture = self.core.snapshot_admission.tryAcquireCapture() orelse return error.StorageReadTemporarilyUnavailable;
+            replay_capture = self.core.snapshot_replay_admission.tryAcquireCapture() orelse return error.StorageReadTemporarilyUnavailable;
+            lockApplyShared(self);
+            apply_locked = true;
+        }
 
         const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
         defer alloc.free(manifest_key);
         const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse {
-            var inspection = @import("dense_index_inspection.zig").inspect(self, alloc, doc_key, artifact_name) catch |err| {
-                if (@import("privacy_read.zig").pending(err) or err == error.IndexRebuilding or err == error.ResourceBudgetExceeded) return error.StorageReadTemporarilyUnavailable;
+            var captured = (@import("dense_index_inspection.zig").capture(self, alloc, doc_key, artifact_name) catch |err| {
+                if (@import("privacy_read.zig").pending(err) or err == error.IndexRebuilding or err == error.DeadlineExceeded) return error.StorageReadTemporarilyUnavailable;
                 return err;
-            };
-            errdefer if (inspection) |*result| result.deinit(alloc);
+            }) orelse return null;
+            defer captured.deinit();
+            self.core.unlockApplyShared();
+            apply_locked = false;
+            if (replay_capture) |*lease| lease.release();
+            if (primary_capture) |*lease| lease.release();
+            var inspection = try captured.render(alloc);
+            errdefer inspection.deinit(alloc);
             try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             return inspection;
         };
@@ -154982,6 +155003,49 @@ test "db dense index inspection binds current chunk vectors and never invokes in
     try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = config, .coverage_generation = 7 });
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Orchard guidance.\",\"version\":5}" }}, .sync_level = .write });
     try db.runUntilIdle();
+    var replay_busy = db.core.snapshot_replay_admission.acquireMutation();
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.getDocumentArtifactManifest(a, "doc", "dense"));
+    replay_busy.release();
+    var released_primary = db.core.snapshot_admission.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    released_primary.release();
+    const Probe = struct {
+        db: *DB,
+        output_arena: *std.heap.ArenaAllocator,
+        captured: bool = false,
+        rendered: bool = false,
+        fn captureHook(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expect(!self.db.core.snapshot_admission.lock.tryLockShared());
+            try std.testing.expect(!self.db.core.snapshot_replay_admission.lock.tryLockShared());
+            self.captured = true;
+        }
+        fn renderHook(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expect(self.db.core.snapshot_admission.lock.tryLockShared());
+            self.db.core.snapshot_admission.lock.unlockShared();
+            try std.testing.expect(self.db.core.snapshot_replay_admission.lock.tryLockShared());
+            self.db.core.snapshot_replay_admission.lock.unlockShared();
+            // Only the outer manifest lookup key belongs to the output arena;
+            // capture payload and per-producer temporaries must be reclaimable.
+            try std.testing.expect(self.output_arena.queryCapacity() < 4096);
+            self.rendered = true;
+        }
+    };
+    var output_arena = std.heap.ArenaAllocator.init(a);
+    defer output_arena.deinit();
+    var probe: Probe = .{ .db = &db, .output_arena = &output_arena };
+    const inspection = @import("dense_index_inspection.zig");
+    inspection.test_after_open = .{ .context = &probe, .run = Probe.captureHook };
+    inspection.test_before_render = .{ .context = &probe, .run = Probe.renderHook };
+    defer {
+        inspection.test_after_open = null;
+        inspection.test_before_render = null;
+    }
+    var arena_result = (try db.getDocumentArtifactManifest(output_arena.allocator(), "doc", "dense")) orelse return error.TestUnexpectedResult;
+    arena_result.deinit(output_arena.allocator());
+    try std.testing.expect(probe.captured and probe.rendered);
+    inspection.test_after_open = null;
+    inspection.test_before_render = null;
     const calls_before_inspection = embedder.calls;
     var result = (try db.getDocumentArtifactManifest(a, "doc", "dense")) orelse return error.TestUnexpectedResult;
     defer result.deinit(a);
@@ -154998,6 +155062,27 @@ test "db dense index inspection binds current chunk vectors and never invokes in
     const expected = try embedder_mod.DeterministicDenseEmbedder.embedDense(&embedder.deterministic, a, embedding, "Orchard guidance.", 3);
     defer a.free(expected);
     try std.testing.expectEqualSlices(f32, expected, parsed.value.vectors[0].values);
+    // Empty unit heads produce no output, but still consume cursor work. One
+    // shared visit budget must stop them before an unbounded manifest walk.
+    const manifests = @import("artifact_chunk_manifest.zig");
+    const generations = @import("artifact_chunk_generation.zig");
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (0..1024) |i| {
+            var unit_buf: [32]u8 = undefined;
+            const unit = try std.fmt.bufPrint(&unit_buf, "empty-{d:0>4}", .{i});
+            const scope = try manifests.scopedKeyAlloc(a, "doc", chunks, unit);
+            defer a.free(scope);
+            const spec = try generations.Spec.init(.{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, scope, @splat(3), manifests.Builder.init().finish(), 1);
+            var plan = try generations.Plan.init(a, scope, spec);
+            defer plan.deinit();
+            const encoded = spec.encode();
+            try txn.put(plan.head_key, &encoded);
+        }
+        try txn.commit();
+    }
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.getDocumentArtifactManifest(a, "doc", "dense"));
     try db.batch(.{ .deletes = &.{"doc"}, .sync_level = .write });
     try std.testing.expect((try db.getDocumentArtifactManifest(a, "doc", "dense")) == null);
 }

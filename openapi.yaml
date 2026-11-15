@@ -7858,7 +7858,7 @@ paths:
 
         index recipe, sanitized source and vector publication evidence belong
 
-        to one apply-fenced storage cut. The top-level artifact_id is empty;
+        to one publication-fenced storage cut. The top-level artifact_id is empty;
 
         member artifact IDs are included in the raw snapshot. This bounded
 
@@ -7896,6 +7896,37 @@ paths:
           $ref: '#/components/responses/NotFound'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          description: >
+            Dense inspection exceeds fixed payload or traversal limits. The JSON
+
+            response has code `inspection_limit_exceeded`, retryable `false`,
+
+            and a `limits` object. Reduce the source or selected index recipe.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - code
+                  - retryable
+                  - message
+                  - limits
+                properties:
+                  code:
+                    type: string
+                    enum:
+                      - inspection_limit_exceeded
+                  retryable:
+                    type: boolean
+                    enum:
+                      - false
+                  message:
+                    type: string
+                  limits:
+                    type: object
+                    additionalProperties:
+                      type: integer
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
         '500':

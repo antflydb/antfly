@@ -408,7 +408,16 @@ The operation never calls an embedding provider to reconstruct missing values.
 It seeks only the selected producers for this document and bounds inspection
 to 16 producers, 128 vectors, 65,536 float values and 1 MiB of source payloads.
 Identities are limited to 4 KiB and each producer configuration to 1 MiB.
-An inspection that exceeds those bounds is unavailable rather than truncated.
+Traversal also shares a 512-visit, 2 MiB budget across all producers, including
+empty unit heads, with a five-second deadline. Fixed payload or traversal limits
+return HTTP 413 with code `inspection_limit_exceeded`, `retryable: false`, and
+the configured limits; deadline or publication contention remains retryable.
+No response is truncated. Capture excludes primary and replay publication using
+the existing snapshot admission gates, then releases those gates before JSON
+encoding. `checkpoint_generation` and `checkpoint_config_hash` can be checked
+against the independent live index status fields
+`projection_checkpoint_generation` and `projection_checkpoint_config_fingerprint`
+(the latter is hexadecimal).
 
 An independent oracle should compare these values against a separate invocation
 of the intended model on independently retrieved sanitized text. Check source

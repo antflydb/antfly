@@ -14,7 +14,8 @@
 // limitations under the License.
 
 //! Administrator artifact inspection for the current dense index recipe.
-//! Called under DB's apply-shared lock. All source heads, publication guards,
+//! Called under DB's publication admission gates and apply-shared lock.
+//! All source heads, publication guards,
 //! vectors and recipe identities belong to this same immutable read cut.
 const std = @import("std");
 const types = @import("types.zig");
@@ -27,9 +28,15 @@ const contract = @import("../../privacy/contract.zig");
 const manager = @import("catalog/index_manager.zig");
 const Store = @import("../docstore.zig").DocStore;
 const A = std.mem.Allocator;
-const max_vectors = 128;
-const max_values = 65536;
-const max_source_bytes = 1024 * 1024;
+const scratchAllocator = @import("antfly_platform").allocator.reclaimingScratch;
+const builtin = @import("builtin");
+pub const Hook = struct { context: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
+pub var test_after_open: ?Hook = null;
+pub var test_before_render: ?Hook = null;
+const limits = types.dense_index_inspection_limits;
+const max_vectors = limits.vectors;
+const max_values = limits.float_values;
+const max_source_bytes = limits.source_bytes;
 
 const Vector = struct {
     artifact_id: []const u8,
@@ -56,6 +63,7 @@ const Snapshot = struct {
     index_config_hash: u64,
     checkpoint_config_hash: u64,
     checkpoint_status: []const u8,
+    checkpoint_generation: u64,
     applied_sequence: u64,
     replay_target_sequence: u64,
     current: bool,
@@ -65,11 +73,13 @@ const Snapshot = struct {
 
 /// Existing asset names take precedence. A dense index name otherwise selects
 /// this versioned raw inspection; summary responses never serialize vectors.
-pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !?types.DocumentArtifactManifest {
-    if (document.len > 4096 or name.len > 4096) return error.ResourceBudgetExceeded;
+pub fn capture(db: anytype, output: A, document: []const u8, name: []const u8) !?Captured {
+    if (document.len > limits.identity_bytes or name.len > limits.identity_bytes) return error.ResourceBudgetExceeded;
     const entry = db.core.index_manager.denseIndex(name) orelse return null;
-    var arena = std.heap.ArenaAllocator.init(output);
-    defer arena.deinit();
+    const backing = scratchAllocator(output);
+    var arena = std.heap.ArenaAllocator.init(backing);
+    var owned = true;
+    defer if (owned) arena.deinit();
     const a = arena.allocator();
     if (try db.core.getEnrichment(a, .asset, name)) |configured| {
         var asset = configured;
@@ -80,6 +90,7 @@ pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !
     if (policy.prepared.policy.mode != .redact_for_search_and_ai) return null;
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
+    if (builtin.is_test) if (test_after_open) |hook| try hook.run(hook.context);
     const primary = try keys.documentKeyAlloc(a, document);
     const original = read.get(primary) catch |err| if (err == error.NotFound) return null else return err;
     if (original.len > max_source_bytes) return error.ResourceBudgetExceeded;
@@ -93,17 +104,18 @@ pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !
     if (db.executor.appliedSequence(name)) |live| applied = @max(applied, live);
     const target = try db.managedIndexReplayTargetSequence(a, name, entry.config.kind, applied);
     var snapshot: Snapshot = .{
-        .index = name,
+        .index = try a.dupe(u8, name),
         .index_generation = entry.config.coverage_generation,
         .index_fingerprint = try digest(a, entry.config.config_json),
-        .document_id = document,
-        .policy_version = &policy.prepared.version,
+        .document_id = try a.dupe(u8, document),
+        .policy_version = try a.dupe(u8, &policy.prepared.version),
         .document_json = safe,
         .document_fingerprint = try digest(a, safe),
         .publication_authority = if (local) "standalone_guarded_coverage" else "ordered_causal_provenance",
         .index_config_hash = types.indexConfigHash(entry.config),
         .checkpoint_config_hash = checkpoint.config_hash,
         .checkpoint_status = @tagName(checkpoint.status),
+        .checkpoint_generation = checkpoint.generation,
         .applied_sequence = applied,
         .replay_target_sequence = target,
         .current = true,
@@ -122,30 +134,43 @@ pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !
     var vectors: std.ArrayList(Vector) = .empty;
     var values: usize = 0;
     var source_bytes: usize = safe.len;
+    var scan_budget: @import("artifact_scan_budget.zig").Budget = .{
+        .max_visits = limits.scan_visits,
+        .max_bytes = limits.scan_bytes,
+        .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s,
+    };
     if (snapshot.current) {
         const producers = try manager.denseConfigArtifactNamesAlloc(a, entry.config);
-        if (producers.len > 16) return error.ResourceBudgetExceeded;
+        if (producers.len > limits.producers) return error.ResourceBudgetExceeded;
         for (producers) |producer| {
-            var producer_scratch = std.heap.ArenaAllocator.init(output);
+            var producer_scratch = std.heap.ArenaAllocator.init(backing);
             defer producer_scratch.deinit();
             const producer_alloc = producer_scratch.allocator();
             var cfg = (try db.core.getEnrichment(producer_alloc, .embedding, producer)) orelse return error.InvalidIndexConfiguration;
             defer cfg.deinit(producer_alloc);
             if (cfg.source_artifact_name.len == 0 or cfg.embedding_input != .text or cfg.template.len != 0 or cfg.source != null or cfg.prior_context != null or cfg.neighbor_context != null or !std.mem.eql(u8, cfg.field, "text")) return null;
-            if (producer.len > 4096 or cfg.source_artifact_name.len > 4096 or cfg.producer_json.len > max_source_bytes) return error.ResourceBudgetExceeded;
+            if (producer.len > limits.identity_bytes or cfg.source_artifact_name.len > limits.identity_bytes or cfg.producer_json.len > limits.producer_config_bytes) return error.ResourceBudgetExceeded;
             const config = try std.json.parseFromSlice(std.json.Value, producer_alloc, cfg.producer_json, .{});
             const provider_value = string(config.value, "provider");
             const model_value = string(config.value, "model");
-            if (provider_value.len > 4096 or model_value.len > 4096) return error.ResourceBudgetExceeded;
+            if (provider_value.len > limits.identity_bytes or model_value.len > limits.identity_bytes) return error.ResourceBudgetExceeded;
             const provider = try a.dupe(u8, provider_value);
             const model = try a.dupe(u8, model_value);
             const producer_fingerprint = try digest(a, cfg.producer_json);
-            var chunks = try @import("artifact_chunk_cursor.zig").Cursor(Store.Txn).openNamed(a, &read, document, cfg.source_artifact_name);
+            var chunks = try @import("artifact_chunk_cursor.zig").Cursor(Store.Txn).openNamed(producer_alloc, &read, document, cfg.source_artifact_name);
             defer chunks.close();
-            while (try chunks.next()) |chunk| {
+            while (true) {
+                const chunk = switch (try chunks.poll(&scan_budget)) {
+                    .end => break,
+                    .yielded => {
+                        if (@import("antfly_platform").time.monotonicNs() >= scan_budget.deadline_ns.?) return error.DeadlineExceeded;
+                        return error.ResourceBudgetExceeded;
+                    },
+                    .row => |row| row,
+                };
                 if (vectors.items.len == max_vectors or chunk.value.len > max_source_bytes -| source_bytes) return error.ResourceBudgetExceeded;
                 source_bytes += chunk.value.len;
-                var proof_scratch = std.heap.ArenaAllocator.init(output);
+                var proof_scratch = std.heap.ArenaAllocator.init(backing);
                 defer proof_scratch.deinit();
                 const transient = proof_scratch.allocator();
                 const text = (try @import("../../chunking/chunk.zig").artifactTextAlloc(transient, chunk.value, cfg.field)) orelse return error.InvalidChunkArtifact;
@@ -171,8 +196,8 @@ pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !
                 if (vector.len != entry.dims) return error.InvalidIndexConfiguration;
                 var ref = (try ids.decodeArtifactRefAlloc(transient, key)) orelse return error.InvalidArgument;
                 defer ref.deinit(transient);
-                if (ref.unit_id) |unit| if (unit.len > 4096) return error.ResourceBudgetExceeded;
-                if (ref.source) |source| if (source.unit_id) |unit| if (unit.len > 4096) return error.ResourceBudgetExceeded;
+                if (ref.unit_id) |unit| if (unit.len > limits.identity_bytes) return error.ResourceBudgetExceeded;
+                if (ref.source) |source| if (source.unit_id) |unit| if (unit.len > limits.identity_bytes) return error.ResourceBudgetExceeded;
                 try vectors.append(a, .{
                     .artifact_id = try ids.artifactPublicIdAlloc(a, ref),
                     .producer = producer,
@@ -193,25 +218,41 @@ pub fn inspect(db: anytype, output: A, document: []const u8, name: []const u8) !
             snapshot.incomplete_reason = "NoEmbeddingArtifacts";
         }
     }
-    var result: types.DocumentArtifactManifest = .{
-        .document_id = try output.dupe(u8, document),
-        .artifact_name = &.{},
-        .artifact_id = &.{},
-        .manifest_json = &.{},
-        .manifest_version = 1,
-        .generation = snapshot.index_generation,
-        .chunk_count = vectors.items.len,
-    };
-    errdefer result.deinit(output);
-    result.artifact_name = try output.dupe(u8, name);
-    // The index inspection has no single physical artifact ID. Individual
-    // immutable member identities are carried in the versioned raw payload.
-    result.manifest_json = try std.json.Stringify.valueAlloc(output, snapshot, .{});
-    result.source_fingerprint = try output.dupe(u8, snapshot.document_fingerprint);
-    result.content_type = try output.dupe(u8, "application/vnd.antfly.dense-index-inspection+json");
-    result.route_type = try output.dupe(u8, "dense_index_inspection");
-    return result;
+    owned = false;
+    return .{ .arena = arena, .snapshot = snapshot };
 }
+
+/// Payload ownership is independent of DB admission. Encode only after the
+/// caller has released publication gates and apply ownership.
+pub const Captured = struct {
+    arena: std.heap.ArenaAllocator,
+    snapshot: Snapshot,
+    pub fn deinit(self: *Captured) void {
+        self.arena.deinit();
+    }
+    pub fn render(self: *const Captured, output: A) !types.DocumentArtifactManifest {
+        if (builtin.is_test) if (test_before_render) |hook| try hook.run(hook.context);
+        const snapshot = self.snapshot;
+        var result: types.DocumentArtifactManifest = .{
+            .document_id = try output.dupe(u8, snapshot.document_id),
+            .artifact_name = &.{},
+            .artifact_id = &.{},
+            .manifest_json = &.{},
+            .manifest_version = 1,
+            .generation = snapshot.index_generation,
+            .chunk_count = snapshot.vectors.len,
+        };
+        errdefer result.deinit(output);
+        result.artifact_name = try output.dupe(u8, snapshot.index);
+        // The index inspection has no single physical artifact ID. Individual
+        // immutable member identities are carried in the versioned raw payload.
+        result.manifest_json = try std.json.Stringify.valueAlloc(output, snapshot, .{});
+        result.source_fingerprint = try output.dupe(u8, snapshot.document_fingerprint);
+        result.content_type = try output.dupe(u8, "application/vnd.antfly.dense-index-inspection+json");
+        result.route_type = try output.dupe(u8, "dense_index_inspection");
+        return result;
+    }
+};
 
 fn string(value: std.json.Value, field: []const u8) []const u8 {
     if (value != .object) return "";
