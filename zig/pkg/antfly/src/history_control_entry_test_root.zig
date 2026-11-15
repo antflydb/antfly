@@ -20,3 +20,7 @@ test {
 }
 pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+test "history root control outcome verifies exact accepted scope before metadata settlement" {
+    try @import("metadata/root_control_outcome.zig").test_support.contracts();
+}

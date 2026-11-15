@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 98;
+pub const protocol_version: u16 = 99;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -157,6 +157,7 @@ pub const Root = struct {
     snapshot_released: bool = false,
     released: bool = false,
     pending_control: ?root_intent.State = null,
+    last_control: ?root_intent.Settlement = null,
 };
 pub const RootPlan = struct { namespace: Namespace, ownership_epoch: u64 };
 pub const Advance = struct { namespace: Namespace, position: Position, snapshot: ?BootstrapPosition = null };
@@ -262,6 +263,10 @@ pub const State = struct {
             (self.bootstrap_expires_at != 0 and (self.bootstrap_expires_at <= self.created_at or self.bootstrap_expires_at > self.expires_at))) return error.InvalidChangefeed;
         if ((self.phase == .reset_required) != (self.reset_reason != .none)) return error.InvalidChangefeed;
         for (self.roots, 0..) |root, index| {
+            if (root.last_control) |settlement| {
+                try settlement.validate();
+                if (settlement.sequence > self.authority_sequence) return error.InvalidChangefeed;
+            }
             if (root.pending_control) |pending| {
                 try pending.validate();
                 if (pending.sequence > self.authority_sequence or pending.ownership_epoch != root.ownership_epoch or pending.grant_sequence != root.grant_sequence or root.released) return error.InvalidChangefeed;
@@ -344,6 +349,7 @@ pub const RootControlMutation = union(enum) {
     prepare: struct { ownership_epoch: u64, grant_sequence: u64, payload: root_intent.Payload },
     begin: struct { sequence: u64, actor: root_intent.Actor },
     accepted: struct { sequence: u64, actor: root_intent.Actor, receipt: root_intent.Receipt },
+    settled: root_intent.Settlement,
     cancel_prepared: u64,
     pub fn validate(self: RootControlMutation) !void {
         switch (self) {
@@ -356,6 +362,7 @@ pub const RootControlMutation = union(enum) {
                 if (v.sequence == 0 or !nz(v.actor)) return error.InvalidChangefeed;
                 try v.receipt.validate();
             },
+            .settled => |v| try v.validate(),
             .cancel_prepared => |sequence| if (sequence == 0) return error.InvalidChangefeed,
         }
     }
@@ -447,10 +454,14 @@ pub const Mutation = union(enum) {
         if (changed_root) |namespace| if (state.roots[try state.rootIndex(namespace)].pending_control != null) return error.ChangefeedConflict;
         switch (self) {
             .root_control => |value| {
-                if (state.phase == .empty or state.phase == .deleted) return error.ChangefeedConflict;
+                if (state.phase == .empty) return error.ChangefeedConflict;
                 const index = try state.rootIndex(value.namespace);
                 const root = state.roots[index];
-                if (root.released) return error.ChangefeedConflict;
+                if (value.operation == .settled and root.pending_control == null) {
+                    if (root.last_control) |last| if (std.meta.eql(last, value.operation.settled)) return state;
+                    return error.ChangefeedConflict;
+                }
+                if (state.phase == .deleted or root.released) return error.ChangefeedConflict;
                 const roots = try a.dupe(Root, state.roots);
                 switch (value.operation) {
                     .prepare => |v| {
@@ -468,6 +479,42 @@ pub const Mutation = union(enum) {
                         const accepted = try pending.accept(v.actor, v.receipt);
                         if (pending.stage == .accepted) return state;
                         roots[index].pending_control = accepted;
+                    },
+                    .settled => |settlement| {
+                        const pending = root.pending_control orelse return error.ChangefeedConflict;
+                        try pending.verifySettlement(settlement);
+                        switch (settlement.effect) {
+                            .enrolled => |v| {
+                                // Grant refresh may recover an existing epoch
+                                // without replacing its progress or snapshot.
+                                if (state.definition.?.start != .now and root.consumer_epoch == 0) return error.ChangefeedCapabilityUnsupported;
+                                if (root.consumer_epoch != 0) {
+                                    if (root.consumer_epoch != v.consumer_epoch or root.start != v.start) return error.ChangefeedConflict;
+                                } else {
+                                    roots[index].consumer_epoch = v.consumer_epoch;
+                                    roots[index].start = v.start;
+                                    roots[index].delivered = .{ .sequence = v.start };
+                                    roots[index].acknowledged = .{ .sequence = v.start };
+                                    roots[index].reclaimed_through = v.start;
+                                }
+                            },
+                            .acknowledged => |v| {
+                                if (root.consumer_epoch != v.consumer_epoch or root.reclaimed_through != v.previous or v.next > root.acknowledged.sequence) return error.ChangefeedConflict;
+                                roots[index].reclaimed_through = v.next;
+                            },
+                            .renewed => |v| {
+                                if (root.consumer_epoch != v.consumer_epoch or v.expires_at > state.expires_at) return error.ChangefeedConflict;
+                            },
+                            .retired => |v| {
+                                if ((state.phase != .closing and state.phase != .reset_required) or v.sequence <= root.grant_sequence or v.sequence >= pending.sequence) return error.ChangefeedConflict;
+                                roots[index].released = true;
+                            },
+                            .maintenance, .rejected => {},
+                        }
+                        // The result receipt and corresponding metadata effect
+                        // become durable in the same metadata transaction.
+                        roots[index].last_control = settlement;
+                        roots[index].pending_control = null;
                     },
                     .cancel_prepared => |sequence| {
                         const pending = root.pending_control orelse return error.ChangefeedConflict;
@@ -1260,7 +1307,10 @@ test "changefeed control reads legacy envelopes without rebinding cursor identit
     defer raw.deinit();
     const record = raw.value.object.getPtr("state").?;
     _ = record.object.orderedRemove("slot");
-    for (record.object.getPtr("roots").?.array.items) |*root| _ = root.object.orderedRemove("pending_control");
+    for (record.object.getPtr("roots").?.array.items) |*root| {
+        _ = root.object.orderedRemove("pending_control");
+        _ = root.object.orderedRemove("last_control");
+    }
     _ = record.object.orderedRemove("latest_provider_context");
     _ = record.object.orderedRemove("acknowledged_provider_context");
     for (record.object.getPtr("cursors").?.array.items) |*receipt| _ = receipt.object.orderedRemove("provider_context");
@@ -1448,4 +1498,85 @@ test "changefeed root control journal retains exact accepted request across clos
     try std.testing.expectEqualDeep(pending, state.roots[0].pending_control.?);
     try std.testing.expectError(error.ChangefeedConflict, step(scratch, state, .{ .release_root = .{ .namespace = ns, .ownership_epoch = 2, .proof = @splat(1) } }));
     try std.testing.expectError(error.ChangefeedConflict, step(scratch, state, .finish_close));
+}
+
+fn testPendingControl(a: A, before: State) !State {
+    const root = before.roots[0];
+    var state = try step(a, before, .{ .root_control = .{ .namespace = root.namespace, .operation = .{ .prepare = .{ .ownership_epoch = root.ownership_epoch, .grant_sequence = root.grant_sequence, .payload = .{ .command = "{}", .fence = "{}", .table = "docs" } } } } });
+    const sequence = state.roots[0].pending_control.?.sequence;
+    state = try step(a, state, .{ .root_control = .{ .namespace = root.namespace, .operation = .{ .begin = .{ .sequence = sequence, .actor = @splat(3) } } } });
+    return step(a, state, .{ .root_control = .{ .namespace = root.namespace, .operation = .{ .accepted = .{ .sequence = sequence, .actor = @splat(3), .receipt = .{ .term = 4, .index = sequence + 100 } } } } });
+}
+fn testSettlement(state: State, effect: root_intent.Effect) Mutation {
+    const pending = state.roots[0].pending_control.?;
+    return .{ .root_control = .{ .namespace = state.roots[0].namespace, .operation = .{ .settled = .{ .sequence = pending.sequence, .actor = pending.actor, .receipt = pending.receipt.?, .request_digest = pending.digest, .proof = @splat(8), .effect = effect } } } };
+}
+test "changefeed accepted control settlement atomically folds authorized effects and retains lost reply proof" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ns = testNamespace(7);
+    var state = try step(a, .{}, .{ .create = .{ .id = @splat(4), .definition = testDefinition(.now), .now = 100, .expires_at = 1000 } });
+    state = try step(a, state, .{ .plan_roots = &.{.{ .namespace = ns, .ownership_epoch = 1 }} });
+    state = try testPendingControl(a, state);
+    const enroll = testSettlement(state, .{ .enrolled = .{ .consumer_epoch = 7, .start = 42 } });
+    var forged = enroll;
+    forged.root_control.operation.settled.request_digest[0] ^= 1;
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, forged));
+    forged = enroll;
+    forged.root_control.operation.settled.receipt.index += 1;
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, forged));
+    var ambiguous = state;
+    const roots = try a.dupe(Root, state.roots);
+    roots[0].pending_control.?.stage = .dispatching;
+    roots[0].pending_control.?.receipt = null;
+    ambiguous.roots = roots;
+    try std.testing.expectError(error.ChangefeedConflict, step(a, ambiguous, enroll));
+    state = try step(a, state, enroll);
+    try std.testing.expect(state.roots[0].pending_control == null);
+    try std.testing.expectEqual(@as(u64, 42), state.roots[0].reclaimed_through);
+    try std.testing.expectEqualDeep(state, try step(a, state, enroll));
+    const raw = try encode(a, state);
+    var parsed = try parse(std.testing.allocator, raw);
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(state.roots[0].last_control, parsed.value.roots[0].last_control);
+    state = try step(a, state, .{ .seal = .{ .cut = @splat(1) } });
+    const delivery = testDelivery(state, &.{.{ .namespace = ns, .position = .{ .sequence = 50 } }});
+    state = try step(a, state, .{ .issue = delivery });
+    state = try step(a, state, .{ .acknowledge = delivery.cursor });
+    state = try testPendingControl(a, state);
+    var ack = testSettlement(state, .{ .acknowledged = .{ .consumer_epoch = 7, .previous = 42, .next = 51 } });
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, ack));
+    ack.root_control.operation.settled.effect.acknowledged.next = 50;
+    state = try step(a, state, ack);
+    try std.testing.expectEqual(@as(u64, 50), state.roots[0].reclaimed_through);
+    state = try step(a, state, .{ .refresh_grant = .{ .namespace = ns, .previous = state.roots[0].grant_sequence } });
+    state = try testPendingControl(a, state);
+    const refresh = testSettlement(state, .{ .enrolled = .{ .consumer_epoch = 7, .start = 42 } });
+    var moved_start = refresh;
+    moved_start.root_control.operation.settled.effect.enrolled.start = 43;
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, moved_start));
+    state = try step(a, state, refresh);
+    try std.testing.expectEqual(@as(u64, 50), state.roots[0].reclaimed_through);
+    try std.testing.expectEqual(@as(u64, 50), state.roots[0].acknowledged.sequence);
+    state = try testPendingControl(a, state);
+    const retire_early = testSettlement(state, .{ .retired = .{ .sequence = state.roots[0].grant_sequence } });
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, retire_early));
+    const rejected = testSettlement(state, .{ .rejected = 5 });
+    state = try step(a, state, rejected);
+    try std.testing.expectEqual(@as(u64, 50), state.roots[0].reclaimed_through);
+    try std.testing.expect(!state.roots[0].released);
+    state = try step(a, state, .close);
+    const close_sequence = state.authority_sequence;
+    state = try testPendingControl(a, state);
+    const retired = testSettlement(state, .{ .retired = .{ .sequence = close_sequence } });
+    state = try step(a, state, retired);
+    try std.testing.expect(state.roots[0].released);
+    try std.testing.expectEqualDeep(state, try step(a, state, retired));
+    state = try step(a, state, .finish_close);
+    try std.testing.expectEqual(Phase.deleted, state.phase);
+    try std.testing.expectEqualDeep(state, try step(a, state, retired));
+    var changed_receipt = retired;
+    changed_receipt.root_control.operation.settled.receipt.index += 1;
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, changed_receipt));
 }

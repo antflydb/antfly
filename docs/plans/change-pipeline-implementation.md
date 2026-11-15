@@ -1669,6 +1669,47 @@ metadata suite (31 checks, including legacy omitted journal fields, monotonic
 intent stamps and idempotent accepted-receipt recording). Logs:
 `root-control-recovery-test.log`, `root-control-metadata-final-test.log`.
 
+## In progress: atomic accepted-control settlement
+
+Metadata decoder protocol 99 adds settlement of an accepted exact receipt with
+its corresponding root effect in the same transaction. One bounded last-result
+record remains after the pending request is removed, so a lost metadata reply
+can be recognized without another native command. Exact retries are no-ops;
+changed receipts, actors, request digests and stale intents conflict. Dispatching
+or otherwise unconfirmed work cannot use this path. Enrollment preserves the
+actual consumer/start, ACK propagation cannot exceed the metadata-authorized
+whole-frame cursor, and retirement requires an irrevocably closing/reset feed.
+A rejected native command clears pending work without reporting a successful
+root effect. Snapshot enrollment still requires its distinct implemented cut.
+
+The private typed outcome boundary decodes the retained original submit request
+and catalog fence, verifies immutable feed/namespace/consumer/definition/grant,
+checks policy and lease bounds, then validates the response against that command
+and its exact accepted receipt. Initial enrollment may not have advanced native
+ACKs; known consumers must match the retained epoch/start and authorized ACK
+range. Unknown and superseded outcomes are rejected. The settlement proof is an
+internal audit binding over feed/epoch/root/intent/request/receipt/outcome; it is
+not a public credential or an independent authentication mechanism. The owner
+must obtain the response through the authenticated root transport.
+
+Qualification passed: `zig build history-control-entry-test changefeed-control-test
+-j2` covers the typed private boundary, all-allocation-failure cleanup, physical
+metadata snapshot/install/reopen and idempotent settlement replay, existing
+native adapters, and decoder-floor enforcement. The final standalone metadata
+suite passes all 32 checks, including exact retries after deletion. Logs:
+`root-control-settlement-final-qualification.log` and
+`root-control-settlement-final-metadata-test.log`.
+
+The same request-scope checks can run before prepare/dispatch; validation alone
+is not permission to dispatch again. Grant refresh preserves an existing
+consumer epoch/start, cursor/ACK progress and any already-pinned snapshot.
+Initial snapshot enrollment still requires its separate coherent-cut provider;
+this native boundary rejects unsupported destination contracts.
+
+Production dispatch, terminal reconciliation of ambiguous/superseded submissions,
+root discovery/registration, coherent bootstrap and the complete long-term issue
+acceptance scopes remain required.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

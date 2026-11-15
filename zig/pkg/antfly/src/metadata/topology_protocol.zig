@@ -128,7 +128,8 @@ const std = @import("std");
 /// Version 96 freezes preflight wire identity and single-use spool build grants.
 /// Version 97 binds publication sets and atomically renews confirmed slot feedback.
 /// Version 98 retains exact pending root-control attempts and their receipts.
-pub const current_version: u16 = 98;
+/// Version 99 atomically settles accepted root controls with their metadata effects.
+pub const current_version: u16 = 99;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;

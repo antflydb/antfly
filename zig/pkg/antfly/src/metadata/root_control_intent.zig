@@ -50,6 +50,39 @@ pub const Payload = struct {
         return sha.finalResult();
     }
 };
+/// Metadata effects of a result already validated by the typed root owner.
+/// A proof is a private audit binding, not a public credential or authorization.
+pub const Effect = union(enum) {
+    enrolled: struct { consumer_epoch: u64, start: u64 },
+    acknowledged: struct { consumer_epoch: u64, previous: u64, next: u64 },
+    renewed: struct { consumer_epoch: u64, expires_at: u64 },
+    retired: struct { sequence: u64 },
+    maintenance,
+    rejected: u8,
+    pub fn validate(self: Effect) !void {
+        switch (self) {
+            .enrolled => |v| if (v.consumer_epoch == 0) return error.InvalidChangefeed,
+            .acknowledged => |v| if (v.consumer_epoch == 0 or v.next < v.previous) return error.InvalidChangefeed,
+            .renewed => |v| if (v.consumer_epoch == 0 or v.expires_at == 0) return error.InvalidChangefeed,
+            .retired => |v| if (v.sequence == 0) return error.InvalidChangefeed,
+            .rejected => |code| if (code == 0 or code > 7) return error.InvalidChangefeed,
+            .maintenance => {},
+        }
+    }
+};
+pub const Settlement = struct {
+    sequence: u64,
+    actor: Actor,
+    receipt: Receipt,
+    request_digest: Digest,
+    proof: Digest,
+    effect: Effect,
+    pub fn validate(self: Settlement) !void {
+        try self.receipt.validate();
+        try self.effect.validate();
+        if (self.sequence == 0 or std.mem.allEqual(u8, &self.actor, 0) or std.mem.allEqual(u8, &self.request_digest, 0) or std.mem.allEqual(u8, &self.proof, 0)) return error.InvalidChangefeed;
+    }
+};
 pub const State = struct {
     sequence: u64,
     ownership_epoch: u64,
@@ -76,6 +109,14 @@ pub const State = struct {
                 try (self.receipt orelse return error.InvalidChangefeed).validate();
             },
         }
+    }
+    pub fn verifySettlement(self: State, settlement: Settlement) !void {
+        try self.validate();
+        try settlement.validate();
+        if (self.stage != .accepted or self.sequence != settlement.sequence or
+            !std.mem.eql(u8, &self.actor, &settlement.actor) or
+            !std.mem.eql(u8, &self.digest, &settlement.request_digest) or
+            !std.meta.eql(self.receipt.?, settlement.receipt)) return error.ChangefeedConflict;
     }
     pub fn begin(self: State, actor: Actor) !State {
         try self.validate();

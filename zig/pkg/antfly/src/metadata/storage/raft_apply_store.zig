@@ -45697,6 +45697,26 @@ test "metadata changefeed control snapshot preserves enrollment authority and pe
     try std.testing.expectEqualDeep((changefeed_control.root_intent.Receipt{ .term = 9, .index = 700 }), pending.receipt.?);
     try std.testing.expectEqualStrings(intent_payload.command, pending.payload.command);
     try std.testing.expectEqualStrings(intent_payload.fence, pending.payload.fence);
+    const settlement: changefeed_control.root_intent.Settlement = .{ .sequence = pending.sequence, .actor = pending.actor, .receipt = pending.receipt.?, .request_digest = pending.digest, .proof = @splat(8), .effect = .{ .rejected = 5 } };
+    write.expected_revision = parsed.value.revision;
+    write.mutation = .{ .root_control = .{ .namespace = namespace, .operation = .{ .settled = settlement } } };
+    try target.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    target.deinit();
+    target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    const settled_bytes = try target.getChangefeedControl(a, group, write.id);
+    defer a.free(settled_bytes);
+    var settled = try changefeed_control.parse(a, settled_bytes);
+    defer settled.deinit();
+    try std.testing.expect(settled.value.roots[0].pending_control == null);
+    try std.testing.expect(!settled.value.roots[0].released);
+    try std.testing.expectEqualDeep(settlement, settled.value.roots[0].last_control.?);
+    const authority_before_retry = try target.getChangefeedAuthority(a, group);
+    write.expected_revision = settled.value.revision;
+    try target.applyStandaloneCommand(group, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    try std.testing.expectEqualDeep(authority_before_retry, try target.getChangefeedAuthority(a, group));
+    const replayed = try target.getChangefeedControl(a, group, write.id);
+    defer a.free(replayed);
+    try std.testing.expectEqualStrings(settled_bytes, replayed);
 }
 
 test "metadata changefeed control logical slot survives reopen snapshot failover and lost confirmation reply" {
