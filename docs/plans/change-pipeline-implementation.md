@@ -1542,6 +1542,38 @@ PostgreSQL production, coherent bootstrap, global completion certification,
 retired-root transfer or WAL-backed multi-node failover qualification. Those
 requirements remain mandatory before the full issues can be completed.
 
+## In progress: read-only retained grant observation
+
+A production root must recover an enrollment whose receipt was lost without
+blindly proposing enrollment again. `history_consumer.observeGrant` now reads
+an immutable namespace/authority/consumer/definition/grant/policy identity and
+returns an explicit observation: authority unbound, grant absent above the
+retirement floor, grant fenced by retirement, exact active lease, or a different
+current grant for the same immutable consumer/definition. The active result
+contains the actual epoch, start, ACK, expiry, policy and retained-byte limit.
+This is a state observation, not proof of an original command's full payload,
+requested expiry/quota or successful completion.
+
+The operation never binds authority, enrolls, renews, acknowledges or writes a
+receipt. Namespace/authority/definition/policy conflicts fail closed. A native
+lease missing under a valid control record is corruption, and an uncontrolled
+legacy consumer cannot be adopted as an absent grant. The DB exposes separate
+native and ordered authority entry points; ordered reads require a positive
+applied cut checked in the same transaction as authority and lease state.
+Both methods are appended to the internal storage-engine interface.
+
+Physical qualification passes: unbound versus absent/retired/different-grant
+states, renewal, close/reopen, policy/scope mismatch, unavailable applied cuts,
+wrong authority kind, missing native state/consumer, missing control authority,
+malformed records, and preservation of ordinary apply and exact command receipts.
+The physical gate passes, including standalone observation without a Raft marker
+and mutual rejection of authority kinds. All three existing compiled native
+consumer boundary checks also pass without leaks. The generated inference error
+inventory now includes the retained RPC errors from the preceding boundary
+change. The compiled-owner C ABI,
+routed observation endpoint, durable root-control recovery and production root
+registration remain required; this DB observer alone does not finish them.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

@@ -1154,6 +1154,12 @@ fn provisionNativeHistoryAuthority(self: *DB, expected_namespace: [24]u8) engine
 fn applyOrderedHistoryConsumerControl(self: *DB, command: @import("history_consumer.zig").Command, entry: types.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(@import("history_ordered.zig").Outcome) {
     return .{ .value = self.applyOrderedHistoryConsumerControl(command, entry, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn nativeHistoryGrant(self: *DB, requested: @import("history_consumer.zig").GrantIdentity) engine.Outcome(@import("history_consumer.zig").GrantObservation) {
+    return .{ .value = self.nativeHistoryGrant(requested) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn orderedHistoryGrant(self: *DB, requested: @import("history_consumer.zig").GrantIdentity, minimum_applied_index: u64) engine.Outcome(@import("history_consumer.zig").GrantObservation) {
+    return .{ .value = self.orderedHistoryGrant(requested, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn orderedHistoryOutcome(self: *DB, allocator: std.mem.Allocator, recovery: @import("history_ordered.zig").Lookup) engine.Outcome(@import("history_ordered.zig").Outcome) {
     return .{ .value = self.orderedHistoryOutcome(allocator, recovery) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

@@ -244,6 +244,7 @@ pub const storage_backup_bundle_io = @import("storage/backup_bundle_io.zig");
 pub const storage_backup_codec = @import("storage/backup_codec.zig");
 pub const storage_backup_restore = @import("storage/backup_restore.zig");
 pub const storage_byte_range = @import("storage/byte_range.zig");
+pub const storage_committed_history = @import("storage/committed_history.zig");
 pub const storage_coordinated_ttl = @import("storage/coordinated_ttl.zig");
 pub const storage_coverage_identity = @import("storage/coverage_identity.zig");
 pub const storage_db_aggregations = @import("storage/db/aggregations.zig");

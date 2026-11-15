@@ -146,6 +146,62 @@ pub fn enroll(txn: anytype, grant: Grant) !history.Consumer {
     try txn.put(key, &state.encode());
     return consumer;
 }
+/// Read-only admission identity. This observes a lease; it does not certify
+/// the payload/outcome of an enrollment, its requested quota, or its expiry.
+pub const GrantIdentity = struct {
+    namespace: Namespace,
+    authority: Digest,
+    consumer: Id,
+    definition: Digest,
+    sequence: u64,
+    policy_revision: u64,
+    pub fn fromGrant(value: Grant) GrantIdentity {
+        return .{ .namespace = value.namespace, .authority = value.authority, .consumer = value.consumer, .definition = value.definition, .sequence = value.sequence, .policy_revision = value.policy_revision };
+    }
+    pub fn validate(self: GrantIdentity) !void {
+        if (!nonzero(self.namespace) or !nonzero(self.authority) or !nonzero(self.consumer) or !nonzero(self.definition) or self.sequence == 0 or self.policy_revision == 0) return error.InvalidHistoryAdmission;
+    }
+};
+pub const GrantObservation = union(enum) {
+    /// No control authority is bound yet. This is not a reserved admission.
+    unbound,
+    /// No lease exists at this cut, and the grant is above the retirement floor.
+    absent: u64,
+    /// No lease exists and this grant is irrevocably fenced by the floor.
+    retired: u64,
+    active: Active,
+    /// Same immutable consumer/definition, but a different grant is current.
+    /// Never treat this as confirmation of the requested grant.
+    other_grant: Active,
+    pub const Active = struct { grant: u64, consumer: history.Consumer, limit: u64 };
+};
+/// Observe authority, retirement floor and lease in one stable transaction.
+/// This never writes a receipt, enrolls, renews, acknowledges or binds authority.
+pub fn observeGrant(txn: anytype, requested: GrantIdentity) !GrantObservation {
+    try requested.validate();
+    try requireRoot(txn, requested.namespace);
+    var native = try history.load(txn);
+    var state = (try load(txn)) orelse {
+        if (native) |value| for (value.consumers) |consumer| {
+            if (consumer.epoch != 0 and same(consumer.id, requested.consumer)) return error.HistoryConsumerConflict;
+        };
+        return .unbound;
+    };
+    if (!same(state.namespace, requested.namespace) or !same(state.authority, requested.authority)) return error.HistoryResynchronizationRequired;
+    if (state.find(requested.consumer)) |lease| {
+        if (!same(lease.definition, requested.definition)) return error.HistoryConsumerConflict;
+        const physical = if (native) |*value| value else return error.HistoryCorrupt;
+        const consumer = (physical.findConsumer(lease.id, lease.epoch) catch return error.HistoryCorrupt).*;
+        if (consumer.policy_revision != requested.policy_revision) return error.HistoryConsumerConflict;
+        const result: GrantObservation.Active = .{ .grant = lease.grant, .consumer = consumer, .limit = physical.limit };
+        return if (lease.grant == requested.sequence) .{ .active = result } else .{ .other_grant = result };
+    }
+    if (native) |value| for (value.consumers) |consumer| {
+        if (consumer.epoch != 0 and same(consumer.id, requested.consumer)) return error.HistoryConsumerConflict;
+    };
+    return if (requested.sequence <= state.floor) .{ .retired = state.floor } else .{ .absent = state.floor };
+}
+
 pub const Reference = struct {
     namespace: Namespace,
     authority: Digest,

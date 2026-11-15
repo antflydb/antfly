@@ -40395,6 +40395,121 @@ fn implementationTests() type {
             try @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire.test_support.malformedPages();
         }
 
+        test "ordered history consumer grant observations recover leases without mutation" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/history-grant-observation", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false };
+            var db = try db_mod.DB.open(a, path, options);
+            var opened = true;
+            defer if (opened) db.close();
+            const history = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            var namespace: [24]u8 = @splat(0);
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 1, .big);
+            std.mem.writeInt(u64, namespace[16..24], 1, .big);
+            var grant: history.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+            const identity = history.GrantIdentity.fromGrant(grant);
+            try std.testing.expectError(error.InvalidHistoryAdmission, db.orderedHistoryGrant(identity, 0));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedHistoryGrant(identity, 1));
+            var invalid = grant;
+            invalid.limit = 1;
+            _ = try db.applyOrderedHistoryConsumerControl(.{ .enroll = invalid }, .{ .term = 1, .index = 1 }, false);
+            const initial_marker = try db.orderedApplyReceipt();
+            try std.testing.expectEqual(.unbound, try db.orderedHistoryGrant(identity, 1));
+            try std.testing.expectEqualDeep(initial_marker, try db.orderedApplyReceipt());
+            try std.testing.expectError(error.NotFound, db.core.store.get(a, history.key));
+            const admitted = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 2 }, false);
+            const observed = try db.orderedHistoryGrant(identity, 2);
+            try std.testing.expectEqualDeep(admitted.applied.consumer.?, observed.active.consumer);
+            try std.testing.expectEqual(grant.limit, observed.active.limit);
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.orderedHistoryGrant(identity, 3));
+            try std.testing.expectError(error.OnlineSourceScopeChanged, db.nativeHistoryGrant(identity));
+            var different = identity;
+            different.sequence = 2;
+            try std.testing.expectEqual(@as(u64, 1), (try db.orderedHistoryGrant(different, 2)).other_grant.grant);
+            different = identity;
+            different.consumer = @splat(4);
+            different.sequence = 3;
+            try std.testing.expectEqual(@as(u64, 0), (try db.orderedHistoryGrant(different, 2)).absent);
+            different = identity;
+            different.authority[0] ^= 1;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedHistoryGrant(different, 2));
+            different = identity;
+            different.namespace[0] ^= 1;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.orderedHistoryGrant(different, 2));
+            different = identity;
+            different.definition[0] ^= 1;
+            try std.testing.expectError(error.HistoryConsumerConflict, db.orderedHistoryGrant(different, 2));
+            different = identity;
+            different.policy_revision += 1;
+            try std.testing.expectError(error.HistoryConsumerConflict, db.orderedHistoryGrant(different, 2));
+            const ref: history.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .epoch = observed.active.consumer.epoch, .grant = grant.sequence };
+            _ = try db.applyOrderedHistoryConsumerControl(.{ .renew = .{ .reference = ref, .previous = 1000, .next = 2000 } }, .{ .term = 1, .index = 3 }, false);
+            try std.testing.expectEqual(@as(u64, 2000), (try db.orderedHistoryGrant(identity, 3)).active.consumer.expires_at_seconds);
+            _ = try db.applyOrderedHistoryConsumerControl(.{ .retire = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .sequence = 2, .grant = 1 } }, .{ .term = 1, .index = 4 }, false);
+            try std.testing.expectEqual(@as(u64, 2), (try db.orderedHistoryGrant(identity, 4)).retired);
+            different = identity;
+            different.sequence = 3;
+            try std.testing.expectEqual(@as(u64, 2), (try db.orderedHistoryGrant(different, 4)).absent);
+            grant.sequence = 3;
+            const fresh_command: history.Command = .{ .enroll = grant };
+            const fresh = try db.applyOrderedHistoryConsumerControl(fresh_command, .{ .term = 1, .index = 5 }, false);
+            const current = history.GrantIdentity.fromGrant(grant);
+            try std.testing.expectEqual(@as(u64, 2), (try db.orderedHistoryGrant(current, 5)).active.consumer.epoch);
+            const superseded = try db.orderedHistoryGrant(identity, 5);
+            try std.testing.expectEqual(@as(u64, 3), superseded.other_grant.grant);
+            db.close();
+            opened = false;
+            db = try db_mod.DB.open(a, path, options);
+            opened = true;
+            const before = try db.orderedApplyReceipt();
+            try std.testing.expectEqualDeep(fresh.applied.consumer.?, (try db.orderedHistoryGrant(current, 5)).active.consumer);
+            try std.testing.expectEqualDeep(before, try db.orderedApplyReceipt());
+            try std.testing.expectEqualDeep(fresh, try db.orderedHistoryOutcome(a, .{ .command = fresh_command, .entry = .{ .term = 1, .index = 5 }, .minimum_applied_index = 5 }));
+            const native_history = @import("antfly_local_sources").storage_committed_history;
+            const native_bytes = try db.core.store.get(a, native_history.state_key);
+            defer a.free(native_bytes);
+            const authority_bytes = try db.core.store.get(a, history.key);
+            defer a.free(authority_bytes);
+            // A missing native lease under a valid authority record is corrupt,
+            // never proof that enrollment can start over.
+            try db.core.store.putBatch(&.{}, &.{native_history.state_key});
+            try std.testing.expectError(error.HistoryCorrupt, db.orderedHistoryGrant(current, 5));
+            try db.core.store.putBatch(&.{.{ .key = native_history.state_key, .value = native_bytes }}, &.{});
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                errdefer txn.abort();
+                try native_history.release(&txn, namespace, grant.consumer, fresh.applied.consumer.?.epoch);
+                try txn.commit();
+            }
+            try std.testing.expectError(error.HistoryCorrupt, db.orderedHistoryGrant(current, 5));
+            try db.core.store.putBatch(&.{.{ .key = native_history.state_key, .value = native_bytes }}, &.{});
+            // An uncontrolled legacy consumer cannot be adopted as a missing
+            // grant merely because its authority record is absent.
+            try db.core.store.putBatch(&.{}, &.{history.key});
+            try std.testing.expectError(error.HistoryConsumerConflict, db.orderedHistoryGrant(current, 5));
+            try db.core.store.putBatch(&.{.{ .key = history.key, .value = authority_bytes }}, &.{});
+            try std.testing.expectEqualDeep(fresh.applied.consumer.?, (try db.orderedHistoryGrant(current, 5)).active.consumer);
+            try db.core.store.putBatch(&.{.{ .key = history.key, .value = "corrupt grant authority" }}, &.{});
+            try std.testing.expectError(error.HistoryCorrupt, db.orderedHistoryGrant(current, 5));
+            try std.testing.expectEqualDeep(before, try db.orderedApplyReceipt());
+            const standalone_path = try std.fmt.allocPrint(a, "{s}-standalone", .{path});
+            defer a.free(standalone_path);
+            var standalone_options = options;
+            standalone_options.online_source_authority = .native;
+            var standalone = try db_mod.DB.open(a, standalone_path, standalone_options);
+            defer standalone.close();
+            try standalone.provisionNativeHistoryAuthority(namespace);
+            try std.testing.expectEqual(.unbound, try standalone.nativeHistoryGrant(current));
+            try std.testing.expectError(error.OnlineSourceScopeChanged, standalone.orderedHistoryGrant(current, 1));
+            const native_admitted = try standalone.nativeHistoryConsumerControl(.{ .enroll = grant });
+            try std.testing.expectEqualDeep(native_admitted.consumer.?, (try standalone.nativeHistoryGrant(current)).active.consumer);
+            try std.testing.expect((try standalone.orderedApplyReceipt()) == null);
+        }
+
         test "ordered history consumer effects and rejections survive reopen without replaying collection" {
             const a = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});

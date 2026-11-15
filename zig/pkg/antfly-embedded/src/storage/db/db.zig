@@ -26037,6 +26037,32 @@ pub const DB = struct {
         return @import("../history_page.zig").read(allocator, &txn, request);
     }
 
+    pub fn nativeHistoryGrant(self: *DB, requested: @import("../history_consumer.zig").GrantIdentity) !@import("../history_consumer.zig").GrantObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeHistoryGrant", .{ self, requested });
+        return self.historyGrantForAuthority(requested, .native, 0);
+    }
+
+    /// The owner must establish ReadIndex first. The persisted cut, authority
+    /// and lease observation are checked in the same read transaction.
+    pub fn orderedHistoryGrant(self: *DB, requested: @import("../history_consumer.zig").GrantIdentity, minimum_applied_index: u64) !@import("../history_consumer.zig").GrantObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedHistoryGrant", .{ self, requested, minimum_applied_index });
+        if (minimum_applied_index == 0) return error.InvalidHistoryAdmission;
+        return self.historyGrantForAuthority(requested, .raft, minimum_applied_index);
+    }
+
+    fn historyGrantForAuthority(self: *DB, requested: @import("../history_consumer.zig").GrantIdentity, kind: @import("../source_authority.zig").Kind, minimum_applied_index: u64) !@import("../history_consumer.zig").GrantObservation {
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        try requested.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &requested.namespace)) return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try @import("../source_authority.zig").require(&txn, kind, namespace);
+        if (kind == .raft) _ = try orderedHistoryReadCut(&txn, minimum_applied_index);
+        return @import("../history_consumer.zig").observeGrant(&txn, requested);
+    }
+
     fn orderedHistoryReadCut(txn: anytype, minimum_applied_index: u64) !OrderedApplyReceipt {
         const marker = txn.get(&internal_keys.ordered_document_applied_entry_key) catch |err| switch (err) {
             error.NotFound => return error.StorageReadTemporarilyUnavailable,
