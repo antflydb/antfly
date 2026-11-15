@@ -1114,6 +1114,21 @@ pub const WriterLane = struct {
     /// resetting this exactly like they keep the lease itself warm.
     /// Meaningless while `parked` is `null`.
     parked_since_ns: i96 = 0,
+    /// The exact `NativeStore` `checkinImpl` was given when it parked
+    /// `parked` -- the same value `checkin`'s own immediate foreign/idle
+    /// release already trusted unconditionally, with no root comparison
+    /// at all. `maintainParkedLease` must sync through this store, not
+    /// re-derive one from `last_root`/`Owner.current`: those can lag a
+    /// same-process generation swap that happens while this lease sits
+    /// parked (see `takeParkedAnyRoot`'s own doc comment), and syncing
+    /// the *wrong* store -- or skipping the sync because the comparison
+    /// came up stale -- leaves this write's buffered pages never pwritten
+    /// before the lease is handed to the next holder, which reads a file
+    /// missing them (observed live as `test_cross_process_writers_do_not
+    /// _lose_each_others_rows` turning a resolved `FileBusy` into a
+    /// silent `NotFound` once the lease could actually change hands).
+    /// Meaningless while `parked` is `null`.
+    parked_store: ?*NativeStore = null,
 
     const poll_initial_ns: i96 = 50 * std.time.ns_per_us;
     const poll_max_ns: i96 = 2 * std.time.ns_per_ms;
@@ -1510,6 +1525,7 @@ pub const WriterLane = struct {
         if (self.waiting != 0) {
             self.parked = lease;
             self.parked_since_ns = now;
+            self.parked_store = store;
             self.checked_out = false;
             self.mutex.unlock(io);
             // A local waiter takes this immediately (its own poll, not
@@ -1523,6 +1539,7 @@ pub const WriterLane = struct {
         if (!foreign_overdue) {
             self.parked = lease;
             self.parked_since_ns = now;
+            self.parked_store = store;
             self.checked_out = false;
             self.mutex.unlock(io);
             // Bare `self.wake.set(io)` isn't enough: `Owner.maintenanceLoop`
@@ -1563,22 +1580,23 @@ pub const WriterLane = struct {
     /// out again -- `checkin` itself only reacts to those conditions on
     /// its *own* next call, which an idle holder never makes.
     ///
-    /// `current_root` is the owner's own `current` (a hint, not
-    /// dereferenced unless it still matches `last_root`): see
-    /// `takeParkedAnyRoot`'s own doc comment for why a mismatch means the
-    /// parked lease's cached root may already be retired by a same-process
-    /// replacement the lane itself never noticed (`checkout`'s "no
-    /// self-replacement" fast path deliberately does not chase every
-    /// refresh). On that rare mismatch this still releases the kernel
-    /// lease -- holding it any longer serves nothing -- just skips the
-    /// store sync a retired `NativeStore` could no longer safely take.
+    /// Uses `parked_store` for the sync, never `Owner.current`/`last_root`:
+    /// those can lag a same-process generation swap that lands while this
+    /// lease sits parked (see `takeParkedAnyRoot`'s own doc comment for
+    /// why `last_root` can miss `self.current` -- the same mismatch would
+    /// make a root-keyed lookup here either skip the sync it must do, or
+    /// run it against the wrong store). `checkin`'s own immediate
+    /// foreign/idle release already trusts its `store` parameter
+    /// unconditionally, with no root comparison at all; this mirrors that
+    /// exactly, just reading the store back from where `checkinImpl`
+    /// stashed it instead of having it handed in fresh.
     ///
     /// Returns the nanoseconds until this should be called again (bounding
     /// `Owner.maintenanceLoop`'s own sleep), or `null` once there is
     /// nothing parked left to check -- including right after this call
     /// releases it, so a released lease stops the loop from polling at
     /// all rather than spinning on an empty `parked`.
-    pub fn maintainParkedLease(self: *WriterLane, current_root: ?*h.Handle) ?i96 {
+    pub fn maintainParkedLease(self: *WriterLane) ?i96 {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         var lease = self.parked orelse {
@@ -1596,11 +1614,10 @@ pub const WriterLane = struct {
             return @max(1 * std.time.ns_per_ms, @min(quantum_remaining, idle_remaining));
         }
         self.parked = null;
-        const root_matches = self.last_root != null and self.last_root == current_root;
+        const store = self.parked_store;
+        self.parked_store = null;
         self.mutex.unlock(io);
-        if (root_matches) {
-            if (current_root.?.owned_lite_backend.?.native_docstore) |store| store.sync() catch {};
-        }
+        if (store) |held_store| held_store.sync() catch {};
         lease.close();
         return null;
     }
@@ -3414,13 +3431,9 @@ pub const Owner = struct {
 
     /// Drives `WriterLane.maintainParkedLease` from `maintenanceLoop`,
     /// converting its nanosecond bound to the milliseconds
-    /// `maintenanceLoop`'s own wait is expressed in. `self.current` is
-    /// read without the gate, same as `WriterLane.checkout`'s own
-    /// "no self-replacement" comparison -- `maintainParkedLease` only
-    /// ever uses it as a hint (an `==` check against `last_root`), never
-    /// dereferenced on a stale read.
+    /// `maintenanceLoop`'s own wait is expressed in.
     fn maintainParkedWriterLaneMs(self: *Owner) ?i64 {
-        const remaining_ns = self.writer_lane.maintainParkedLease(self.current) orelse return null;
+        const remaining_ns = self.writer_lane.maintainParkedLease() orelse return null;
         return @intCast(@divCeil(remaining_ns, std.time.ns_per_ms));
     }
 
