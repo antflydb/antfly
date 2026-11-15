@@ -22,6 +22,19 @@ const std = @import("std");
 const c = @import("pjrt_c_types.zig");
 const hlo = @import("hlo.zig");
 
+// CompileOptionsProto env_option_overrides changes just this option, retaining
+// provider defaults for optimization and scheduling. XLA excess precision can
+// otherwise erase explicit F32→BF16→F32 rounding, even at observable outputs.
+// Schema: xla/pjrt/proto/compile_options.proto (fields 3 and 7).
+const strict_compile_options = blk: {
+    const build_options = [_]u8{ 0x1a, 0x04, 0x20, 0x01, 0x28, 0x01 };
+    const key = "xla_allow_excess_precision";
+    // Map entry: key(1), value(2): OptionOverrideProto.bool_field(2)=false.
+    // The zero is explicitly present in the oneof; omitting it is not false.
+    const entry = [_]u8{ 0x0a, key.len } ++ key.* ++ [_]u8{ 0x12, 0x02, 0x10, 0x00 };
+    break :blk build_options ++ [_]u8{ 0x3a, entry.len } ++ entry;
+};
+
 pub const PjrtError = error{
     PjrtApiError,
     PluginLoadFailed,
@@ -630,40 +643,7 @@ pub const Client = struct {
     /// `num_outputs` is the number of output buffers the program produces
     /// (1 for single-output, N for tuple-root programs).
     pub fn compile(self: *const Client, hlo_bytes: []const u8, num_outputs: usize) PjrtError!LoadedExecutable {
-        const format = "hlo";
-        var program = c.Program{
-            .struct_size = @sizeOf(c.Program),
-            .extension_start = null,
-            .code = @constCast(hlo_bytes.ptr),
-            .code_size = hlo_bytes.len,
-            .format = format,
-            .format_size = format.len,
-        };
-
-        // Build CompileOptionsProto: { executable_build_options(3): { num_replicas(4): 1, num_partitions(5): 1 } }
-        const compile_options = comptime blk: {
-            // ExecutableBuildOptionsProto
-            const num_replicas = [_]u8{ 0x20, 0x01 }; // field 4, varint 1
-            const num_partitions = [_]u8{ 0x28, 0x01 }; // field 5, varint 1
-            const build_opts = num_replicas ++ num_partitions;
-            // CompileOptionsProto field 3 (message)
-            const tag = [_]u8{0x1a}; // (3 << 3) | 2 = 26 = 0x1a
-            const len = [_]u8{build_opts.len};
-            break :blk tag ++ len ++ build_opts;
-        };
-
-        var args = c.ClientCompileArgs{
-            .struct_size = @sizeOf(c.ClientCompileArgs),
-            .extension_start = null,
-            .client = self.handle,
-            .program = &program,
-            .compile_options = &compile_options,
-            .compile_options_size = compile_options.len,
-            .executable = null,
-        };
-        try checkError(self.api, self.api.clientCompile(&args));
-
-        return self.validateLoadedOutputs(args.executable orelse return PjrtError.PjrtApiError, self.device, num_outputs);
+        return self.compileForDevice(hlo_bytes, num_outputs, self.device);
     }
 
     /// Compile an HLO program targeting a specific device.
@@ -679,14 +659,7 @@ pub const Client = struct {
             .format_size = format.len,
         };
 
-        const compile_options = comptime blk: {
-            const num_replicas = [_]u8{ 0x20, 0x01 };
-            const num_partitions = [_]u8{ 0x28, 0x01 };
-            const build_opts = num_replicas ++ num_partitions;
-            const tag = [_]u8{0x1a};
-            const len = [_]u8{build_opts.len};
-            break :blk tag ++ len ++ build_opts;
-        };
+        const compile_options = strict_compile_options;
 
         var args = c.ClientCompileArgs{
             .struct_size = @sizeOf(c.ClientCompileArgs),
@@ -958,6 +931,28 @@ test "end-to-end: compile and execute HLO add via PJRT CPU plugin" {
     try std.testing.expectApproxEqAbs(@as(f32, 22.0), result[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 33.0), result[2], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 44.0), result[3], 1e-6);
+
+    // Both values are observable: preserve F32 arithmetic and the separate
+    // BF16 publication. Excess precision must not merge these tuple leaves.
+    var rounding = hlo.Builder.init(alloc, "rounding");
+    defer rounding.deinit();
+    const source = try rounding.parameter(0, shape, "x");
+    const product = try rounding.multiply(source, try rounding.constantScalarF32(@sqrt(@as(f32, 512))));
+    const published = try rounding.convertType(try rounding.convertType(product, .bf16), .f32);
+    _ = try rounding.tuple(&.{ product, published });
+    const rounding_bytes = try hlo.Module.init("rounding", rounding.build()).serialize(alloc);
+    defer alloc.free(rounding_bytes);
+    var rounding_executable = try client.compile(rounding_bytes, 2);
+    defer rounding_executable.deinit();
+    const rounding_outputs = try rounding_executable.execute(&.{buf_x}, alloc);
+    defer alloc.free(rounding_outputs);
+    defer for (rounding_outputs) |*output| output.deinit();
+    const before = try rounding_outputs[0].toFloat32(alloc);
+    defer alloc.free(before);
+    const after = try rounding_outputs[1].toFloat32(alloc);
+    defer alloc.free(after);
+    for (x_data, before) |x, value| try std.testing.expectEqual(x * @sqrt(@as(f32, 512)), value);
+    try std.testing.expectEqualSlices(f32, &.{ 22.625, 45.25, 68.0, 90.5 }, after);
 }
 
 test "end-to-end: serialize and deserialize HLO add executable when PJRT plugin supports it" {
@@ -1263,7 +1258,30 @@ test "compile and deserialize reject native output arity with balanced ownership
     const Fake = struct {
         var loaded_destroyed: usize = 0;
         var executable_destroyed: usize = 0;
+        var strict_compiles: usize = 0;
+        fn checkOptions(bytes: []const u8) !void {
+            const wire = @import("protobuf").wire;
+            var pos: usize = 0;
+            try std.testing.expectEqual(@as(u32, 3), (try wire.readTag(bytes, &pos)).field);
+            const build = try wire.readLengthDelimited(bytes, &pos);
+            try std.testing.expectEqualSlices(u8, &.{ 0x20, 1, 0x28, 1 }, build);
+            try std.testing.expectEqual(@as(u32, 7), (try wire.readTag(bytes, &pos)).field);
+            const entry = try wire.readLengthDelimited(bytes, &pos);
+            try std.testing.expectEqual(bytes.len, pos);
+            pos = 0;
+            try std.testing.expectEqual(@as(u32, 1), (try wire.readTag(entry, &pos)).field);
+            try std.testing.expectEqualStrings("xla_allow_excess_precision", try wire.readLengthDelimited(entry, &pos));
+            try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(entry, &pos)).field);
+            const value = try wire.readLengthDelimited(entry, &pos);
+            try std.testing.expectEqual(entry.len, pos);
+            pos = 0;
+            try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(value, &pos)).field);
+            try std.testing.expectEqual(@as(u64, 0), try wire.readVarint(value, &pos));
+            try std.testing.expectEqual(value.len, pos);
+        }
         fn compile(args: *c.ClientCompileArgs) callconv(.c) ?*c.PjrtError {
+            checkOptions(args.compile_options.?[0..args.compile_options_size]) catch @panic("invalid precision compile options");
+            strict_compiles += 1;
             args.executable = @ptrFromInt(1);
             return null;
         }
@@ -1300,9 +1318,11 @@ test "compile and deserialize reject native output arity with balanced ownership
     const client = Client{ .lib = undefined, .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1) };
     Fake.loaded_destroyed = 0;
     Fake.executable_destroyed = 0;
+    Fake.strict_compiles = 0;
     try std.testing.expectError(error.OutputCountMismatch, client.compile("hlo", 2));
     try std.testing.expectError(error.OutputCountMismatch, client.compileForDevice("hlo", 2, @ptrFromInt(1)));
     try std.testing.expectError(error.OutputCountMismatch, client.deserializeExecutable("serialized", 2));
+    try std.testing.expectEqual(@as(usize, 2), Fake.strict_compiles);
     try std.testing.expectEqual(@as(usize, 3), Fake.loaded_destroyed);
     try std.testing.expectEqual(@as(usize, 3), Fake.executable_destroyed);
 }

@@ -47,6 +47,7 @@ const NodeId = node_mod.NodeId;
 const null_node = node_mod.null_node;
 const OpCode = node_mod.OpCode;
 const Shape = shape_mod.Shape;
+const DType = shape_mod.DType;
 
 pub const FuseResult = struct {
     graph: Graph,
@@ -428,10 +429,9 @@ fn resolve(redirect: []const NodeId, id: NodeId) NodeId {
     return cur;
 }
 
-/// Walk through shape-only / dtype-only ops (convert_dtype, reshape)
-/// to find the underlying op. Used by primitive→fused matchers so that
-/// FP16 ONNX exports — which routinely surround Softmax / LayerNorm with
-/// `Cast(f32) → … → Cast(f16)` for numerical stability — still match.
+/// Walk through layout wrappers and identity casts, preserving all changes
+/// of arithmetic dtype. Rounding casts and F32 widening views are semantic
+/// inputs; fusing across either changes low-precision numerical contracts.
 fn skipShapeOps(graph: *const Graph, id: NodeId) NodeId {
     var cur = id;
     var depth: u32 = 0;
@@ -439,7 +439,11 @@ fn skipShapeOps(graph: *const Graph, id: NodeId) NodeId {
         if (cur == null_node or cur >= graph.nodeCount()) return cur;
         const tag = std.meta.activeTag(graph.node(cur).op);
         if (tag != .convert_dtype and tag != .reshape) return cur;
-        cur = graph.node(cur).inputs[0];
+        const node = graph.node(cur);
+        const input = node.inputs[0];
+        if (input == null_node or input >= graph.nodeCount()) return cur;
+        if (tag == .convert_dtype and node.output_shape.dtype != graph.node(input).output_shape.dtype) return cur;
+        cur = input;
     }
     return cur;
 }
@@ -4625,14 +4629,19 @@ test "fuse detects primitive softmax pattern" {
     try std.testing.expectEqual(@as(u32, 5), result.graph.node(out_id).op.fused_softmax.dim);
 }
 
-test "fuse detects softmax surrounded by Cast(f32→f16→f32)" {
+test "fuse detects softmax while preserving F16 and BF16 rounding and F32 arithmetic" {
+    for ([_]DType{ .f16, .bf16 }) |dtype| for ([_]bool{ false, true }) |internal_round| try checkSoftmaxPrecision(dtype, internal_round);
+}
+
+fn checkSoftmaxPrecision(dtype: DType, internal_round: bool) !void {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
     var b = Builder.init(&g);
 
-    // FP16 LLM stability pattern: x is f16, the softmax body runs in f32.
-    const x_f16 = try b.parameter("x", Shape.init(.f16, &.{ 2, 5 }));
+    // Preserve the input rounding while the softmax body runs in F32.
+    const raw = try b.parameter("x", Shape.init(.f32, &.{ 2, 5 }));
+    const x_f16 = try b.convertDtype(raw, dtype);
     const x = try b.convertDtype(x_f16, .f32);
     const in_shape = g.node(x).output_shape;
 
@@ -4648,12 +4657,11 @@ test "fuse detects softmax surrounded by Cast(f32→f16→f32)" {
         .inputs = .{ max_val, null_node, null_node, null_node },
         .num_inputs = 1,
     });
-    // Cast in the middle of the chain — should be transparently
-    // walked through by skipShapeOps.
+    // Identity casts are transparent; value-changing internal casts are not.
     const max_bc_cast = try b.convertDtype(max_bc, .f32);
     const shifted = try b.sub(x, max_bc_cast);
     const exp_v = try b.expOp(shifted);
-    const exp_cast = try b.convertDtype(exp_v, .f32);
+    const exp_cast = if (internal_round) try b.convertDtype(try b.convertDtype(exp_v, dtype), .f32) else try b.convertDtype(exp_v, .f32);
     const sum_v = try g.addNode(.{
         .op = .{ .reduce_sum = .{ .axes = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .num_axes = 1 } },
         .output_shape = Shape.init(.f32, &.{ 2, 1 }),
@@ -4666,9 +4674,9 @@ test "fuse detects softmax surrounded by Cast(f32→f16→f32)" {
         .inputs = .{ sum_v, null_node, null_node, null_node },
         .num_inputs = 1,
     });
-    const out = try b.div(exp_v, sum_bc);
+    const out = try b.div(exp_cast, sum_bc);
     // Cast result back to f16 — the matcher should still fire.
-    const out_f16 = try b.convertDtype(out, .f16);
+    const out_f16 = try b.convertDtype(out, dtype);
     try g.markOutput(out_f16);
 
     var result = try fuse(allocator, &g);
@@ -4677,11 +4685,12 @@ test "fuse detects softmax surrounded by Cast(f32→f16→f32)" {
     var found = false;
     for (0..result.graph.nodeCount()) |i| {
         if (std.meta.activeTag(result.graph.node(@intCast(i)).op) == .fused_softmax) {
+            try expectPrecisionInput(&result.graph, result.graph.node(@intCast(i)).inputs[0], dtype);
             found = true;
             break;
         }
     }
-    try std.testing.expect(found);
+    try std.testing.expectEqual(!internal_round, found);
 }
 
 test "fuse detects primitive silu pattern" {
@@ -4915,13 +4924,18 @@ test "fuse detects QuickGELU pattern" {
     try std.testing.expectEqual(@as(std.meta.Tag(node_mod.OpCode), .fused_quick_gelu), std.meta.activeTag(result.graph.node(out_id).op));
 }
 
-test "fuse detects primitive RMSNorm pattern" {
+test "fuse detects primitive RMSNorm pattern preserves floating-point casts" {
+    for ([_]DType{ .f32, .f16, .bf16 }) |dtype| try checkRmsNormPrecision(dtype);
+}
+
+fn checkRmsNormPrecision(dtype: DType) !void {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
     var b = Builder.init(&g);
 
-    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 8 }));
+    const raw = try b.parameter("x", Shape.init(.f32, &.{ 2, 8 }));
+    const x = if (dtype == .f32) raw else try b.convertDtype(try b.convertDtype(raw, dtype), .f32);
     const w = try b.parameter("w", Shape.init(.f32, &.{8}));
     const x_shape = g.node(x).output_shape;
     const eps_val: f32 = 1e-5;
@@ -4954,15 +4968,21 @@ test "fuse detects primitive RMSNorm pattern" {
     const a = result.graph.node(out_id).op.fused_rms_norm;
     try std.testing.expectEqual(@as(u32, 8), a.dim);
     try std.testing.expectApproxEqAbs(@as(f32, eps_val), a.eps, 1e-9);
+    try expectPrecisionInput(&result.graph, result.graph.node(out_id).inputs[0], dtype);
 }
 
-test "fuse detects primitive LayerNorm pattern" {
+test "fuse detects primitive LayerNorm pattern preserves floating-point casts" {
+    for ([_]DType{ .f32, .f16, .bf16 }) |dtype| try checkLayerNormPrecision(dtype);
+}
+
+fn checkLayerNormPrecision(dtype: DType) !void {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
     var b = Builder.init(&g);
 
-    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 8 }));
+    const raw = try b.parameter("x", Shape.init(.f32, &.{ 2, 8 }));
+    const x = if (dtype == .f32) raw else try b.convertDtype(try b.convertDtype(raw, dtype), .f32);
     const gamma = try b.parameter("gamma", Shape.init(.f32, &.{8}));
     const beta = try b.parameter("beta", Shape.init(.f32, &.{8}));
     const x_shape = g.node(x).output_shape;
@@ -5010,6 +5030,7 @@ test "fuse detects primitive LayerNorm pattern" {
     const a = result.graph.node(out_id).op.fused_layer_norm;
     try std.testing.expectEqual(@as(u32, 8), a.dim);
     try std.testing.expectApproxEqAbs(@as(f32, eps_val), a.eps, 1e-9);
+    try expectPrecisionInput(&result.graph, result.graph.node(out_id).inputs[0], dtype);
 }
 
 // ── Tests for algebraic / shape canonicalizations ─────────────────────
@@ -5691,4 +5712,18 @@ test "SDPA key fusion preserves a composed token to head transpose" {
     try std.testing.expectEqualDeep(Shape.init(.f32, &.{ -1, 16, -1, 64 }), key.output_shape);
     const unsupported = try builder.transpose(token_keys, &.{ 2, 0, 3, 1 });
     try std.testing.expectEqual(null_node, (try findScaledTransposeTensor(&graph, unsupported)).k_id);
+}
+
+fn expectPrecisionInput(g: *const Graph, input: NodeId, dtype: DType) !void {
+    const node = g.node(input);
+    try std.testing.expectEqual(DType.f32, node.output_shape.dtype);
+    if (dtype == .f32) {
+        try std.testing.expectEqual(.parameter, std.meta.activeTag(node.op));
+    } else {
+        try std.testing.expectEqual(.convert_dtype, std.meta.activeTag(node.op));
+        try std.testing.expectEqual(DType.f32, node.op.convert_dtype.target);
+        const narrow = g.node(node.inputs[0]);
+        try std.testing.expectEqual(.convert_dtype, std.meta.activeTag(narrow.op));
+        try std.testing.expectEqual(dtype, narrow.op.convert_dtype.target);
+    }
 }
