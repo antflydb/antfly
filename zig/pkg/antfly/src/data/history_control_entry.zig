@@ -65,14 +65,19 @@ pub fn decode(a: std.mem.Allocator, bytes: []const u8) !Owned {
     if (bytes.len > max_bytes) return error.InvalidReplicatedBatch;
     var raw = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
     defer raw.deinit();
-    if (raw.value != .object) return error.InvalidReplicatedBatch;
-    for ([_][]const u8{ "table", "batch", "protocol", "storage_owner", "history_control" }) |name| if (!raw.value.object.contains(name)) return error.InvalidReplicatedBatch;
-    const control_value = raw.value.object.get("history_control").?;
+    return decodeValue(a, raw.value);
+}
+/// Reuse the applying owner's already parsed envelope. All strings in the
+/// returned value are independently owned; the original parse may be released.
+pub fn decodeValue(a: std.mem.Allocator, value: std.json.Value) !Owned {
+    if (value != .object) return error.InvalidReplicatedBatch;
+    for ([_][]const u8{ "table", "batch", "protocol", "storage_owner", "history_control" }) |name| if (!value.object.contains(name)) return error.InvalidReplicatedBatch;
+    const control_value = value.object.get("history_control").?;
     if (control_value != .object or !control_value.object.contains("version") or !control_value.object.contains("command")) return error.InvalidReplicatedBatch;
-    const owner_value = raw.value.object.get("storage_owner").?;
+    const owner_value = value.object.get("storage_owner").?;
     if (owner_value != .object) return error.InvalidReplicatedBatch;
     for ([_][]const u8{ "lsm_root_generation", "identity", "schema_json", "indexes_json", "initial_range", "table_storage" }) |name| if (!owner_value.object.contains(name)) return error.InvalidReplicatedBatch;
-    var parsed = try std.json.parseFromValue(Entry, a, raw.value, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    var parsed = try std.json.parseFromValue(Entry, a, value, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     errdefer parsed.deinit();
     try parsed.value.validate();
     return .{ .parsed = parsed };
@@ -107,6 +112,12 @@ test "history control entry binds bounded immutable owner data and requires acti
     defer a.free(duplicate);
     try std.testing.expectError(error.DuplicateField, decode(a, duplicate));
     try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, @import("raft_batch.zig").decode(a, bytes));
+    {
+        var applying = try @import("raft_batch.zig").decodeForApply(a, bytes);
+        defer applying.deinit(a);
+        try std.testing.expectEqualDeep(entry, applying.history_control.value());
+        try std.testing.expectEqualStrings("docs", applying.history_control.value().table);
+    }
     try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, @import("raft_batch.zig").decode(a, "{\"table\":\"docs\",\"batch\":{},\"history_control\":{}}"));
     {
         var raw = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always });
@@ -155,16 +166,31 @@ test "history control entry binds bounded immutable owner data and requires acti
     wrong = entry;
     wrong.storage_owner.schema_json = oversized[0 .. max_catalog_bytes + 1];
     try std.testing.expectError(error.InvalidReplicatedBatch, encode(a, wrong, required_protocol_version));
+    var binary = entry;
+    binary.storage_owner.lsm_root_generation = std.math.maxInt(u64);
+    binary.storage_owner.identity = .{ .table_id = std.math.maxInt(u64), .shard_id = std.math.maxInt(u64) - 1, .range_id = std.math.maxInt(u64) - 2 };
+    binary.storage_owner.initial_range = .{ .start = &.{ 0, 128, 255 }, .end = &.{ 1, 0, 255 } };
+    var maximum_grant = entry.history_control.command.enroll;
+    std.mem.writeInt(u64, maximum_grant.namespace[0..8], binary.storage_owner.identity.table_id, .big);
+    std.mem.writeInt(u64, maximum_grant.namespace[8..16], binary.storage_owner.identity.shard_id, .big);
+    std.mem.writeInt(u64, maximum_grant.namespace[16..24], binary.storage_owner.identity.range_id, .big);
+    maximum_grant.sequence = std.math.maxInt(u64);
+    maximum_grant.expires_at_seconds = std.math.maxInt(u64);
+    maximum_grant.policy_revision = std.math.maxInt(u64);
+    binary.history_control.command = .{ .enroll = maximum_grant };
     // No ordinary batch decoder, public or private, may silently accept the
     // poison null payload as an empty write.
     try std.testing.expectError(error.InvalidBatchRequest, @import("antfly_local_sources").api_internal_batch.parseInternalBatchRequest(a, "null"));
-    try std.testing.checkAllAllocationFailures(a, struct {
+    for ([_]Entry{ entry, binary }) |candidate| try std.testing.checkAllAllocationFailures(a, struct {
         fn run(alloc: std.mem.Allocator, value: Entry) !void {
             const encoded = try encode(alloc, value, required_protocol_version);
             defer alloc.free(encoded);
             var result = try decode(alloc, encoded);
             defer result.deinit();
             try std.testing.expectEqualDeep(value, result.value());
+            var applying = try @import("raft_batch.zig").decodeForApply(alloc, encoded);
+            defer applying.deinit(alloc);
+            try std.testing.expectEqualDeep(value, applying.history_control.value());
         }
-    }.run, .{entry});
+    }.run, .{candidate});
 }

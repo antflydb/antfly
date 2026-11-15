@@ -306,6 +306,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "membership reducer",
         "FK retirement worker",
         "data raft online topology arbitration persists exact rejection and scopes release across reopen",
+        "data raft history control",
         // Regressions previously selected only by unit-test-progress.
         "split status decodes an omitted nullable source phase",
         "derive merge transition phases",
@@ -425,6 +426,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
     };
     const lib_data_storage_runtime_filters = selectTestFilters(b, &lib_data_storage_default_filters);
+    const history_projection_filters = &.{ "data raft history control", "data raft protocol barrier persists and transfers in snapshots", "data raft merge pages projection cannot acknowledge native source retention controls", "data raft merge pages native source projection requires trusted delegate and retries before shared applied publication" };
+    const history_projection_tests = b.addTest(.{ .root_module = data_storage_test_mod, .filters = compileFiltersWithAnchors(b, &.{"data storage module tests are reachable"}, history_projection_filters), .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_history_projection_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, history_projection_tests, history_projection_filters);
+    b.step("history-control-projection-test", "Verify retention projection cannot advance without native ownership and activation").dependOn(&run_history_projection_tests.step);
     const lib_data_storage_tests = b.addTest(.{
         .root_module = data_storage_test_mod,
         .filters = compileFiltersWithAnchors(

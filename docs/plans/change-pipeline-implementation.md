@@ -1128,6 +1128,42 @@ submission and linearizable history inspection/pages are still outstanding.
 The advertised data-Raft maximum remains 29 and ordinary entry decode continues
 to reject retention envelopes until that integration is complete.
 
+## In progress: typed applying decoder and projection retention gate
+
+`raft_batch.decodeForApply` returns `OwnedApplyEntry`, a tagged union of a row
+batch and a dedicated history control. A history command has no synthetic empty
+document batch. The ordinary decoder remains fail-closed for retention entries;
+existing callers cannot accidentally acknowledge one through their row path.
+Both applying branches reuse one parsed envelope and return independently owned
+bytes. Codec tests exercise every allocation-failure point, binary range bounds
+and maximum-width owner IDs/generations and grant counters without precision
+loss.
+
+The projection decoder now recognizes the applying history variant and requires
+a trusted native delegate before appending anything. Its only operation is a
+minimum durable protocol guard; it manufactures neither rows nor split deltas.
+The new guard is appended to the internal operation union to retain existing tag
+values. It checks persisted activation for an isolated command and follows
+ordered staged barriers in a larger apply batch, without additional row effects.
+
+The real projection-store test rejects retention before activation and after an
+older durable barrier, preserving the exact previous watermark and retained
+entry list. A codec input claiming activation is not authority. Independent
+guard tests cover absent, zero, older and unsupported floors, positive ordered
+activation, and both single-operation and batched checks with no row effects.
+
+`zig build history-control-entry-test history-control-projection-test -j2` passes
+22 tests: 17 codec/legacy envelope checks and five projection, snapshot-barrier
+and native source-control regressions. These tests are included in the normal
+unit/data-storage gates. Log:
+`zig/history-control-projection-contract-qualification.log`.
+
+The advertised maximum remains 29, below the reserved retention protocol 30.
+Native state-machine handling must use the tagged applying decoder and complete
+the compiled-owner mutation before shared applied publication. That dispatch,
+all-member activation, submission and linearizable history reads remain pending;
+this projection gate cannot advertise a working distributed feed on its own.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

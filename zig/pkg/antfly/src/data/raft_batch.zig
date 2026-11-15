@@ -68,6 +68,20 @@ pub const OwnedReplicatedBatch = struct {
     }
 };
 
+/// A retention command has no document batch, including an empty one. Callers
+/// must select its ordered control path explicitly before accessing row work.
+pub const OwnedApplyEntry = union(enum) {
+    batch: OwnedReplicatedBatch,
+    history_control: @import("history_control_entry.zig").Owned,
+    pub fn deinit(self: *OwnedApplyEntry, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .batch => |*value| value.deinit(alloc),
+            .history_control => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
 /// Encodes an irreversible Raft log-format activation point. `batch` is
 /// intentionally null: binaries that predate protocol barriers reject the
 /// entry and stop applying instead of silently continuing past a format they
@@ -149,10 +163,26 @@ fn cloneStorageOwnerDescriptor(
 pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBatch {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always });
     defer parsed.deinit();
+    return decodeBatchValue(alloc, parsed.value);
+}
+
+/// Applying owners must handle history_control before considering row work.
+/// Ordinary callers retain the fail-closed decoder above.
+pub fn decodeForApply(alloc: std.mem.Allocator, payload: []const u8) !OwnedApplyEntry {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidReplicatedBatch;
-    const root = parsed.value.object;
-    // Retention has a separate ordered apply/result contract. Until its owner
-    // dispatch is selected, never reinterpret a future envelope as row work.
+    if (parsed.value.object.contains("history_control")) {
+        const history = @import("history_control_entry.zig");
+        if (payload.len > history.max_bytes) return error.InvalidReplicatedBatch;
+        return .{ .history_control = try history.decodeValue(alloc, parsed.value) };
+    }
+    return .{ .batch = try decodeBatchValue(alloc, parsed.value) };
+}
+
+fn decodeBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedReplicatedBatch {
+    if (value != .object) return error.InvalidReplicatedBatch;
+    const root = value.object;
     if (root.contains("history_control")) return error.UnsupportedRaftBatchProtocolVersion;
     const table_value = root.get("table") orelse return error.InvalidReplicatedBatch;
     if (table_value != .string) return error.InvalidReplicatedBatch;

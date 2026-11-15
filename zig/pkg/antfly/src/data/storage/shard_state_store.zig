@@ -97,6 +97,9 @@ pub const DataOperation = union(enum) {
     /// Internal apply boundary. Split deltas use the committed Raft index as
     /// their stable cursor, independent of each replica's apply batching.
     flush_split_delta: u64,
+    /// Minimum durable decoder barrier for a native-only control entry.
+    /// Appended to preserve existing operation tag values.
+    require_batch_protocol: u16,
 };
 
 pub const SplitTransition = struct {
@@ -2753,6 +2756,10 @@ pub fn appendOperationEffects(
             try appendRaftBatchProtocolEffect(store, alloc, group_id, version, writes, deletes);
             return;
         },
+        .require_batch_protocol => |minimum| {
+            if (minimum == 0 or minimum > data_raft_protocol.batch_protocol_version or try currentRaftBatchProtocolVersion(store, alloc, group_id) < minimum) return error.UnsupportedBatchProtocolVersion;
+            return;
+        },
         else => {},
     };
     var byte_range = try currentRange(store, alloc, group_id);
@@ -2795,7 +2802,7 @@ pub fn appendOperationEffects(
     defer if (merge_receiver_state) |*state| state.deinit(alloc);
     var needs_raft_batch_protocol = false;
     for (operations) |op| switch (op) {
-        .set_raft_batch_protocol, .require_source_pin_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence, .merge_page_fence => needs_raft_batch_protocol = true,
+        .set_raft_batch_protocol, .require_source_pin_protocol, .require_batch_protocol, .merge_source_transition, .merge_receiver_checkpoint, .merge_copy_fence, .merge_page_fence => needs_raft_batch_protocol = true,
         else => {},
     };
     var raft_batch_protocol_version: u16 = if (needs_raft_batch_protocol)
@@ -2862,6 +2869,7 @@ pub fn appendOperationEffects(
                 }
             },
             .require_source_pin_protocol => if (raft_batch_protocol_version < data_raft_protocol.batch_source_pin_protocol_version) return error.UnsupportedBatchProtocolVersion,
+            .require_batch_protocol => |minimum| if (minimum == 0 or minimum > data_raft_protocol.batch_protocol_version or raft_batch_protocol_version < minimum) return error.UnsupportedBatchProtocolVersion,
             .merge_page_fence => |encoded| {
                 var parsed = try std.json.parseFromSlice(db_types.BatchRequest, alloc, encoded, .{});
                 defer parsed.deinit();
@@ -4049,6 +4057,38 @@ fn appendSplitDeltaClears(
     const seq_key = try groupSplitDeltaSeqKeyAlloc(alloc, group_id);
     defer alloc.free(seq_key);
     try deletes.append(alloc, try alloc.dupe(u8, seq_key));
+}
+
+test "data raft history control protocol guard follows ordered activation without row effects" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/history-protocol-guard", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore.DocStore.open(a, path.ptr, .{});
+    defer store.close();
+    {
+        var writes: std.ArrayListUnmanaged(docstore.OwnedKVPair) = .empty;
+        defer freeOwnedWrites(a, &writes);
+        var deletes: std.ArrayListUnmanaged([]u8) = .empty;
+        defer deletes.deinit(a);
+        try std.testing.expectError(error.UnsupportedBatchProtocolVersion, appendOperationEffects(&store, a, 601, &.{.{ .require_batch_protocol = 1 }}, &writes, &deletes));
+        try appendOperationEffects(&store, a, 601, &.{ .{ .set_raft_batch_protocol = 1 }, .{ .require_batch_protocol = 1 } }, &writes, &deletes);
+        try std.testing.expectEqual(@as(usize, 1), writes.items.len);
+        try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
+        try putOwnedBatch(&store, a, writes.items, deletes.items);
+    }
+    {
+        var writes: std.ArrayListUnmanaged(docstore.OwnedKVPair) = .empty;
+        defer freeOwnedWrites(a, &writes);
+        var deletes: std.ArrayListUnmanaged([]u8) = .empty;
+        defer deletes.deinit(a);
+        try appendOperationEffects(&store, a, 601, &.{.{ .require_batch_protocol = 1 }}, &writes, &deletes);
+        try appendOperationEffects(&store, a, 601, &.{ .{ .require_batch_protocol = 1 }, .{ .require_batch_protocol = 1 } }, &writes, &deletes);
+        for ([_]u16{ 0, 2, data_raft_protocol.batch_protocol_version + 1 }) |minimum| try std.testing.expectError(error.UnsupportedBatchProtocolVersion, appendOperationEffects(&store, a, 601, &.{.{ .require_batch_protocol = minimum }}, &writes, &deletes));
+        try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+        try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
+    }
 }
 
 test "shard state store persists ranges and document state" {
