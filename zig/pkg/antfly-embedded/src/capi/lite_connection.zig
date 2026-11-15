@@ -2226,10 +2226,40 @@ pub const Owner = struct {
         return demand;
     }
 
+    /// `registeredDemand()` can only read the catalog off an established
+    /// `self.current`; with none yet (the opportunistic lock attempt in
+    /// `open()`'s `!create` path lost its race and deferred establishing
+    /// one -- "initialize this runtime lazily", that call site's own doc
+    /// comment), it answers `.none`. That is a true "unknown", not a true
+    /// "nothing to do": a foreground call still establishes `self.current`
+    /// the first time it needs one (`Connection.refresh()`/`Owner.refresh()`),
+    /// but does so without ever calling `notifyMutation()`/`notifyDemand()`,
+    /// so nothing wakes a maintenance loop that already decided "no demand,
+    /// park indefinitely" from this same unknown state. Both of
+    /// `maintenanceLoop`'s own scheduling decisions (the initial wait and
+    /// `maintenanceWaitMillis`'s idle-turn fallback) must treat an
+    /// unestablished `self.current` as "recheck soon", never as "nothing
+    /// registered, wait forever" -- the next bounded wait's own
+    /// `maintenanceTurn()` call establishes `self.current` via its own
+    /// `self.refresh()` and learns the real answer.
+    fn registeredDemandOrUnknown(self: *Owner) bool {
+        return self.current == null or self.registeredDemand().any();
+    }
+
     fn tableDemand(database: *h.db_mod.DB) Demand {
         return .{
             .index = database.core.hasManagedIndexes(),
-            .enrichment = database.core.index_manager.enrichments.items.len != 0,
+            // `index_manager.enrichments` only ever holds a *standalone*
+            // enrichment (chunk/asset, or one listed for symmetry). A
+            // dense/sparse index's own embedded `generator` config carries
+            // no entry there at all (see `liteEnrichmentCatalogEntryJsonAlloc`'s
+            // own doc comment on `capi/db.zig`) -- `hasGeneratedEnrichmentTargets()`
+            // is the one check that already walks every index kind for
+            // either shape (`computeGeneratedEnrichmentTargetCacheExcluding`),
+            // so without it a durable embedding backlog on a plain
+            // `dense_vector`/`sparse_vector` index never registers any
+            // demand at all.
+            .enrichment = database.core.index_manager.enrichments.items.len != 0 or database.core.hasGeneratedEnrichmentTargets(),
             .group_source = database.core.index_manager.hasGroupSources(),
             .ttl = database.ttl_runtime != null,
             .resolver = database.core.index_manager.resolvers.items.len != 0,
@@ -2952,6 +2982,18 @@ pub const Owner = struct {
         // sources and publish lease metadata, so yield before even capturing
         // a runtime. The gate protects this flag through the capture boundary.
         if (self.allocator_verification_active) return true;
+        // A turn reached with no established `self.current` yet (the
+        // opportunistic lock attempt in `open()`'s `!create` path lost its
+        // race -- "initialize this runtime lazily", that call site's own
+        // doc comment -- and `registeredDemandOrUnknown()` now schedules a
+        // prompt recheck instead of parking the loop forever on that
+        // unknown state) must establish one before touching it: every
+        // step below, starting with `acquireMaintenancePathLeaseAssumeLocked`'s
+        // own `self.current.?`, assumes it already exists. `self.gate.mutex`
+        // is already held here (`acquireMaintenanceCapture` above), the
+        // same precondition the later, ordinary `self.refresh()` call
+        // below relies on.
+        if (self.current == null) _ = try self.refresh();
         var lease = try self.acquireMaintenancePathLeaseAssumeLocked();
         const turn_held_from = nowNs();
         var clock: StepClock = .{ .last = turn_held_from };
@@ -3421,7 +3463,7 @@ pub const Owner = struct {
         // No durable consumer is known yet at spawn, so start parked; the
         // first notifyMutation()/notifyDemand() with a non-zero mask (or an
         // explicit stop) wakes this immediately.
-        var next_wait_ms: i64 = if (self.registeredDemand().any()) 1000 else no_scheduled_wait;
+        var next_wait_ms: i64 = if (self.registeredDemandOrUnknown()) 1000 else no_scheduled_wait;
         var earliest_turn_ns: i96 = 0;
         while (!self.stopping.load(.acquire)) {
             // Bound the wait while `WriterLane.checkin` still has a lease
@@ -3483,7 +3525,9 @@ pub const Owner = struct {
         // at all, a fixed-interval poll could only ever rediscover the same
         // "nothing to do" answer that a future notifyDemand() wake already
         // delivers, so idle turns stop polling instead of repeating every second.
-        return if (self.registeredDemand().any()) 1000 else no_scheduled_wait;
+        // (`registeredDemandOrUnknown`'s own doc comment: an unestablished
+        // `self.current` must recheck soon, never park indefinitely.)
+        return if (self.registeredDemandOrUnknown()) 1000 else no_scheduled_wait;
     }
 
     pub fn maintenanceWaitMillisForTest(self: *Owner, pending: bool) i64 {
@@ -7149,6 +7193,65 @@ test "capi native two genuinely separate writer processes do not lose each other
     for (child_pids) |pid| _ = std.c.kill(pid, std.c.SIG.KILL);
     for (child_pids) |pid| try xprocReapBounded(pid, xproc_fork_reap_timeout_ms);
     children_reaped = true;
+}
+
+// perf/lwa-xproc-writers item 4: a cold-opened writer whose opportunistic
+// lock attempt in `open()`'s `!create` path loses its race leaves
+// `self.current` null when `Owner.maintenanceLoop` spawns. Before this fix,
+// `registeredDemand()`'s `self.current orelse return .none` made that
+// unknown state look like "nothing registered", parking the loop's own
+// wake `Io.Event` forever (`no_scheduled_wait`) with nothing left to ever
+// wake it -- not even the durable dense-index generator backlog seeded
+// below. No foreground call on `wrapper`/`connection` ever runs here: the
+// background loop alone must discover and drain it.
+test "capi native cold-opened owner drains durable enrichment backlog with no foreground call" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("cold-owner-enrichment-drain");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+
+    // Seed durable state and close cleanly: an index with an embedded
+    // generator and one document needing it, committed, with no owner
+    // left registered on this path afterward -- the same durable shape a
+    // genuinely separate process (perf/lwa-xproc-writers's own motivating
+    // scenario) leaves behind once it exits.
+    {
+        const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+        const id = try api.publishHandle(wrapper);
+        defer api.antfly_db_close(id);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(
+            "{\"name\":\"semantic\",\"kind\":\"dense_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"dims\\\":3,\\\"metric\\\":\\\"l2_squared\\\",\\\"generator\\\":{\\\"kind\\\":\\\"dense_embedding\\\",\\\"source_field\\\":\\\"body\\\",\\\"embedding_name\\\":\\\"dense_v1\\\"}}\"}",
+        )));
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(
+            "{\"inserts\":{\"doc\":{\"body\":\"durable generated work\"}},\"sync_level\":\"write\"}",
+        ), &out));
+    }
+
+    // Cold reopen: a brand new Owner/maintenanceLoop. No foreground call
+    // on this connection follows -- only the background thread can make
+    // the enrichment runtime's `applied_sequence` reach `target_sequence`.
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+    defer h.closeHandle(wrapper);
+    const owner = wrapper.lite_connection.?.owner;
+
+    const deadline_ns = std.Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
+    while (true) {
+        const applied = blk: {
+            const root = owner.current orelse break :blk 0;
+            const runtime = root.db.enrichment_runtime orelse break :blk 0;
+            break :blk runtime.stats().applied_sequence;
+        };
+        if (applied >= 1) break;
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline_ns) return error.EnrichmentNeverDrained;
+        var no_fds: [0]std.c.pollfd = .{};
+        _ = std.c.poll(&no_fds, 0, 20);
+    }
 }
 
 test "capi native recovery agenda clean opens avoid unrelated table runtimes" {
