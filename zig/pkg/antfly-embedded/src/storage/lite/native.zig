@@ -20836,6 +20836,41 @@ pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, wr
 /// calling `plainWriterLockUntil` directly, with no ticket taken at
 /// all, since a lease it returns already blocks on the real sidecar
 /// lock the same way a ticket-won lease's own second half does.
+/// §8.4's "existing code reused, not new recovery logic" recovery
+/// callback for `fairWriterLockWithIo`'s dead-writer handling: validates
+/// (and, where a rejected candidate needs it, truncates) the on-disk
+/// checkpoint state at `path` exactly the way a fresh writer-mode
+/// `NativeFile.open` already does (`recoverActiveCheckpoint`'s own
+/// doc comment), but run proactively, before `shared_lock_region.zig`
+/// clears the dead holder's stale `writer_holder` word, per §8.4: "a
+/// holder that died mid-commit may have left the data file in a state
+/// only that recovery path already knows how to validate." Opens its
+/// own fd rather than reusing any already-open `NativeFile` -- there is
+/// none yet at this point in `fairWriterLockWithIo`, which hands back a
+/// bare lease for the caller to open a `NativeFile` against afterward --
+/// and `openDataFile`'s own `.writer` mode takes no kernel lock on the
+/// data file at all (only `.reader` does), so this cannot self-conflict
+/// with any lock a concurrent reader or this same process's own already-
+/// open `NativeFile` might hold.
+fn recoverCrashedWriterDataFile(io: std.Io, path: []const u8) !void {
+    const opened = try openDataFile(io, path, .writer, true);
+    const file = opened.file;
+    defer file.close(io);
+    var header_bytes: [header_size]u8 = undefined;
+    try readHeaderExactAt(file, io, &header_bytes);
+    var header = try decodeHeader(&header_bytes);
+    const file_size = (try file.stat(io)).size;
+    header.checkpoints = loadCheckpointSlots(file, io, header.page_size, file_size);
+    _ = try recoverActiveCheckpoint(file, io, header, file_size, true);
+}
+
+const FairLockRecoveryCtx = struct { io: std.Io, path: []const u8 };
+
+fn fairLockRecoverDeadWriter(ctx_ptr: ?*anyopaque) anyerror!void {
+    const ctx: *const FairLockRecoveryCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    try recoverCrashedWriterDataFile(ctx.io, ctx.path);
+}
+
 pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
     const pid = antfly_platform.process.currentId() orelse 0;
     // A read-only or otherwise uncooperative filesystem, proven
@@ -20851,9 +20886,19 @@ pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, p
         return err;
     };
     errdefer region.close();
-    const contended = region.acquireWriterFairBounded(wait_io, pid, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
+    // §8.4: a dead writer's own `writer_holder` word never clears itself
+    // (it only called `releaseWriter` -- which it never reached -- or
+    // relied on `recoverDeadWriter` below). Without this, every writer
+    // after the dead one queues behind a holder that never releases,
+    // paying out its own full `deadline_ns` budget on every single
+    // attempt forever. `recovery_ctx` must outlive this call (it does:
+    // both live in this function's own frame, and `acquireWriterFairBounded`
+    // never retains the pointer past its own return).
+    var recovery_ctx = FairLockRecoveryCtx{ .io = io, .path = path };
+    const contended = region.acquireWriterFairBounded(wait_io, pid, .{ .nanoseconds = deadline_ns }, .{ .ctx = &recovery_ctx, .run = fairLockRecoverDeadWriter }) catch |err| switch (err) {
         error.Timeout => return error.FileBusy,
         error.Canceled => return error.Canceled,
+        else => |e| return e,
     };
     errdefer region.releaseWriter();
 
@@ -23770,6 +23815,99 @@ test "lite fair writer lock bounds every writer's wait under sustained contentio
     // Each turn is ~0.5 ms, so a FIFO wait is a few turns. Leave wide slack
     // for loaded CI hosts while still catching starvation.
     try std.testing.expect(probe.max_wait_ns < 2 * std.time.ns_per_s);
+}
+
+// §8.4/§8.9 step 3, wired into the production acquisition path
+// (`fairWriterLockWithIo`, not just `shared_lock_region.zig`'s own
+// isolated primitives): a writer that dies mid-commit (a real `fork` +
+// `_exit` with no `releaseWriter`, dropping only the kernel-level
+// liveness fcntl and sidecar flock automatically -- the region's own
+// in-memory `writer_holder` word has no kernel primitive behind it and
+// stays stamped forever without explicit recovery) must not wedge every
+// later writer for its own full busy-timeout budget, repeatedly. The
+// next writer's own `fairWriterLockWithIo` call must detect the dead
+// holder (`Region.writerHolderDead`), run recovery (`recoverActiveCheckpoint`
+// via `recoverCrashedWriterDataFile`), clear the word, and acquire --
+// promptly, not only once its own deadline has fully expired.
+test "lite fair writer lock recovers promptly from a killed writer's stale lease" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "dead-writer-recovery.aflite");
+    defer a.free(path);
+
+    {
+        var seed = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        defer seed.close();
+        try seed.putDocument("doc", "seeded before the crash");
+    }
+
+    var pipe_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&pipe_fds));
+
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(pipe_fds[0]);
+        var threaded = std.Io.Threaded.init(a, .{});
+        const child_io = threaded.io();
+        // Genuinely uncontended: nothing else holds the lease yet, so
+        // this wins the ticketless fast path -- no ticket, no queue entry,
+        // just the raw `writer_holder` CAS this crash leaves stamped.
+        var lease = fairWriterLockWithIo(a, child_io, child_io, path, std.Io.Clock.awake.now(child_io).nanoseconds + 10 * std.time.ns_per_s) catch crossProcessParkForever();
+        _ = &lease;
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(pipe_fds[1], @ptrCast(&sig), 1);
+        // The crash: no `lease.close()`, ever. `_exit`, not a cooperative
+        // `std.process.exit`, so nothing this process's own atexit/defer
+        // chain would run gets a chance to -- only the kernel's automatic
+        // per-process cleanup (closing every fd, dropping every flock and
+        // fcntl lock it held) actually happens.
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(pipe_fds[1]);
+    defer _ = std.posix.system.close(pipe_fds[0]);
+    var sig: [1]u8 = undefined;
+    try crossProcessReadBounded(pipe_fds[0], &sig, cross_process_fork_read_timeout_ms);
+    try std.testing.expectEqual(@as(c_int, 0), try crossProcessReapBounded(child_pid, cross_process_fork_read_timeout_ms));
+
+    var threaded = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(2) });
+    defer threaded.deinit();
+    const wait_io = threaded.io();
+
+    // Each attempt below opens its own fresh `Region` (`fairWriterLockWithIo`
+    // never reuses one across calls), so each independently draws its own
+    // liveness-slot claim (`claimLivenessSlot`'s own doc comment) rather
+    // than being stuck, for this whole test, with whatever the very first
+    // attempt happened to land on -- the same shape the real capi admission
+    // retry loop (`db.zig`'s `enterBeforeDeadline`) already has in
+    // production: a bounded short attempt that, on `FileBusy`, simply
+    // tries again. Short per-attempt deadlines so a genuine regression
+    // (recovery never happening at all) fails this test in well under a
+    // second total, not by hanging.
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    var recovered_lease: ?PathWriterLock = null;
+    var attempt: usize = 0;
+    while (recovered_lease == null and attempt < 20) : (attempt += 1) {
+        const attempt_deadline = std.Io.Clock.awake.now(io).nanoseconds + 200 * std.time.ns_per_ms;
+        recovered_lease = fairWriterLockWithIo(a, io, wait_io, path, attempt_deadline) catch |err| switch (err) {
+            error.FileBusy => null,
+            else => return err,
+        };
+    }
+    var lease = recovered_lease orelse return error.TestUnexpectedResult;
+    defer lease.close();
+    const elapsed_ns = std.Io.Clock.awake.now(io).nanoseconds - started;
+    // The whole point: prompt recovery, not "wait out the dead holder's
+    // own full deadline, every single time, forever." A regression back
+    // to "never recovers" would exhaust all 20 attempts (each paying out
+    // its own 200ms) and fail the `orelse` above well before this bound
+    // -- generous slack over that worst case for a loaded CI host.
+    try std.testing.expect(elapsed_ns < 4 * std.time.ns_per_s);
+
+    const report = try inspect(a, io, path);
+    try std.testing.expect(report.valid);
 }
 
 test "lite native file canonicalizes writer lock path spellings" {
