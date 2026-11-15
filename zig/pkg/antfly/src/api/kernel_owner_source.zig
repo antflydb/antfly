@@ -1788,9 +1788,25 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
-    /// Private retained-history read. Never weaken a failed quorum barrier to
-    /// stale consistency, and never return bytes after route/leader replacement.
-    pub fn orderedHistoryPageRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.Request) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_page.Page {
+    const HistoryReadKind = enum { page, outcome };
+    fn HistoryReadInput(comptime kind: HistoryReadKind) type {
+        return if (kind == .page) table_write_source.history_page.Request else table_write_source.history_ordered.Lookup;
+    }
+    fn HistoryReadResult(comptime kind: HistoryReadKind) type {
+        return if (kind == .page) table_write_source.history_page.Page else table_write_source.history_ordered.Outcome;
+    }
+
+    /// Private retained-history reads never fall back to stale consistency.
+    pub fn orderedHistoryPageRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: table_write_source.history_page.Request) !table_write_source.history_page.Page {
+        return self.historyReadRouted(alloc, fence, table_name, .page, request);
+    }
+
+    /// Exact receipt recovery has the same route and leader fences as pages.
+    pub fn orderedHistoryOutcomeRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: table_write_source.history_ordered.Lookup) !table_write_source.history_ordered.Outcome {
+        return self.historyReadRouted(alloc, fence, table_name, .outcome, request);
+    }
+
+    fn historyReadRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, comptime kind: HistoryReadKind, request: HistoryReadInput(kind)) !HistoryReadResult(kind) {
         if (self.online_source_authority != .raft) return error.ChangefeedCapabilityUnsupported;
         const barrier = self.read_safety_barrier;
         const capture = barrier.vtable.capture_frozen orelse return error.ChangefeedCapabilityUnsupported;
@@ -1802,22 +1818,34 @@ pub const ProvisionedKernelOwnerSource = struct {
         std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
         std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
         std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
-        if (!std.mem.eql(u8, &namespace, &request.reference.namespace)) return error.HistoryResynchronizationRequired;
+        const requested_namespace = if (comptime kind == .page) request.reference.namespace else request.command.namespace();
+        if (!std.mem.eql(u8, &namespace, &requested_namespace)) return error.HistoryResynchronizationRequired;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
         const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
         try self.prepareRetainedScanRead(group, "", "", opts, .read_index);
         const proof = try capture(barrier.ptr, group);
         if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
+        if (comptime kind == .outcome) {
+            if (request.entry.term == 0 or request.entry.index == 0) return error.InvalidOrderedApplyReceipt;
+            if (request.minimum_applied_index < request.entry.index) return error.InvalidHistoryAdmission;
+            if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
+        }
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         var lease = try self.acquireWithControls(group, table_name, .from(opts));
         defer lease.deinit();
         if (lease.entry.identity.table_id != identity.table_id or lease.entry.identity.shard_id != identity.shard_id or lease.entry.identity.range_id != identity.range_id) return error.HistoryResynchronizationRequired;
         try self.validateRoutedRead(alloc, fence, group, table_name);
-        var page = try lease.owner().orderedHistoryPage(alloc, table_name, request, proof.applied_index);
-        errdefer page.deinit();
+        var result = if (comptime kind == .page)
+            try lease.owner().orderedHistoryPage(alloc, table_name, request, proof.applied_index)
+        else blk: {
+            var recovery = request;
+            recovery.minimum_applied_index = proof.applied_index;
+            break :blk try lease.owner().orderedHistoryOutcome(alloc, table_name, recovery);
+        };
+        errdefer if (comptime kind == .page) result.deinit();
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         try self.validateRoutedRead(alloc, fence, group, table_name);
-        return page;
+        return result;
     }
 
     pub fn waitForCurrentSyncGroupLocal(

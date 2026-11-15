@@ -4006,6 +4006,8 @@ const DataRaftProtocolActivationEntry = struct {
 const DataRaftBatchProtocolPreflight = struct {
     conf_state_fingerprint: u64 = 0,
     activatable_version: u16 = 0,
+    /// Unknown capability is retryable, not confirmed decoder incompatibility.
+    failure: enum { none, unavailable, unsupported } = .none,
 };
 
 const DataRaftProtocolPeer = struct {
@@ -13311,19 +13313,20 @@ pub const DataServer = struct {
         deadline_ns: u64,
         cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
     ) DataRaftBatchProtocolPreflight {
-        if (!plan.routes_complete) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+        if (!plan.routes_complete) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint, .failure = .unavailable };
         const minimum_peer_version = if (required_version >= data_raft_batch.merge_transition_protocol_version)
             required_version
         else
             data_raft_batch.activation_barrier_protocol_version;
         for (plan.peers) |peer| {
-            if (self.probeDataRaftBatchProtocolVersion(
+            const version = self.probeDataRaftBatchProtocolVersion(
                 alloc,
                 peer.node_id,
                 peer.raft_url,
                 deadline_ns,
                 cancellation,
-            ) < minimum_peer_version) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+            );
+            if (version < minimum_peer_version) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint, .failure = if (version == 0) .unavailable else .unsupported };
         }
         return .{
             .conf_state_fingerprint = plan.conf_state_fingerprint,
@@ -42834,6 +42837,57 @@ fn consumerTests() type {
                 invalid.writes = &.{.{ .key = "ordinary", .value = "{}" }};
                 try std.testing.expectError(error.InvalidBatchRequest, antfly.db.types.validateGraphEndpointCleanupCommand(invalid));
             }
+        }
+
+        test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {
+            const a = std.testing.allocator;
+            const required = @import("history_control_entry.zig").required_protocol_version;
+            const Fake = struct {
+                versions: [3]u16 = .{ required, required - 1, required },
+                probes: [3]usize = @splat(0),
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    const index: usize = if (std.mem.startsWith(u8, request.uri, "http://peer-2/")) 0 else if (std.mem.startsWith(u8, request.uri, "http://peer-3/")) 1 else 2;
+                    self.probes[index] += 1;
+                    return .{ .status = 200, .body = try std.fmt.allocPrint(alloc, "{{\"data_raft_batch_protocol_version\":{d}}}", .{self.versions[index]}) };
+                }
+            };
+            var fake: Fake = .{};
+            var http_host: antfly.raft.HttpHost = undefined;
+            http_host.request_executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } };
+            var raft: antfly.raft.ManagedHttpHostService = undefined;
+            raft.host.http_host = &http_host;
+            var server: DataServer = undefined;
+            server.alloc = a;
+            server.backend_runtime = null;
+            server.data_raft = &raft;
+            server.api_server_cfg = .{};
+            server.data_raft_protocol_capability_mutex = .unlocked;
+            server.data_raft_protocol_capabilities = .empty;
+            defer {
+                var it = server.data_raft_protocol_capabilities.valueIterator();
+                while (it.next()) |entry| a.destroy(entry.*);
+                server.data_raft_protocol_capabilities.deinit(a);
+            }
+            var plan: DataRaftProtocolProbePlan = .{ .routes_complete = true, .conf_state_fingerprint = 123, .peers = &.{ .{ .node_id = 2, .raft_url = "http://peer-2" }, .{ .node_id = 3, .raft_url = "http://peer-3" }, .{ .node_id = 4, .raft_url = "http://peer-4" } } };
+            const mixed = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+            try std.testing.expectEqual(@as(u16, 0), mixed.activatable_version);
+            try std.testing.expectEqual(.unsupported, mixed.failure);
+            try std.testing.expectEqual(@as(u64, 123), mixed.conf_state_fingerprint);
+            try std.testing.expectEqualSlices(usize, &.{ 1, 1, 0 }, &fake.probes);
+            fake.versions[1] = required;
+            const upgraded = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+            try std.testing.expectEqual(required, upgraded.activatable_version);
+            try std.testing.expectEqual(.none, upgraded.failure);
+            try std.testing.expectEqualSlices(usize, &.{ 2, 2, 1 }, &fake.probes);
+            fake.versions[2] = 0;
+            const unknown = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+            try std.testing.expectEqual(@as(u16, 0), unknown.activatable_version);
+            try std.testing.expectEqual(.unavailable, unknown.failure);
+            plan.routes_complete = false;
+            const missing = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+            try std.testing.expectEqual(.unavailable, missing.failure);
+            try std.testing.expectEqualSlices(usize, &.{ 3, 3, 2 }, &fake.probes);
         }
 
         test "raft cleanup protocol preflight rejects mixed decoders and rechecks upgraded peers" {

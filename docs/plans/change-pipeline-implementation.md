@@ -1292,6 +1292,44 @@ original route/descriptor admission, exact proposal outcome waiting and fenced
 read-only result recovery. Public feed registration remains pending; this
 lookup is private and does not turn an unknown result into permission to ACK.
 
+## In progress: routed exact receipt recovery
+
+`orderedHistoryOutcomeRouted` now recovers receipts through the same fenced
+native group-local read path as retained pages. Both operations share one
+adapter for route/namespace checks, deadline translation, strict ReadIndex,
+leader incarnation/term validation, owner identity and final route validation.
+Recovery additionally requires the captured applied cut to cover the original
+entry and requested minimum, then passes that captured cut to the read-only
+native lookup. It never weakens a lagging proof to a local marker observation.
+
+The compiled-owner qualification recovers an actual enrollment receipt after a
+retained row write, and injects final leader loss and route replacement for both
+pages and receipt recovery. Both operations reject the invalidated result. A
+future receipt cut fails before native result access. Log:
+`zig/ordered-history-routed-outcome-qualification.log`.
+
+Owner-routed proposal submission, activation across all applying members and
+binding these operations into production feed roots remain pending.
+
+## In progress: retention protocol admission evidence
+
+Data-Raft protocol preflight now distinguishes confirmed older decoders from
+unavailable capability/route evidence while preserving the existing activation
+version and exact applying-membership fingerprint. A zero/unknown peer version
+or incomplete routes are retryable unavailable evidence; a positively observed
+older decoder is incompatible. Neither case permits activation.
+
+The protocol-30 qualification rejects a mixed 30/29/30 applying set, reprobes
+upgraded processes at the same endpoints, activates only after all three support
+30, and rejects unknown capability/incomplete routing separately. The same gate
+reruns the native history apply/reply-loss/rejection ordering test. Log:
+`zig/ordered-history-protocol-preflight-qualification.log`.
+
+The proposer must still recheck the captured leader term and membership under
+proposal ordering, and retain the original accepted entry identity through
+outcome recovery. Capability advertisement must reflect the actual native apply
+profile. This evidence classification is not a completed control proposer.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
