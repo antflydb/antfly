@@ -154,8 +154,17 @@ pub const PjrtExecutor = struct {
         const matching_half = (dtype == .f16 or dtype == .bf16) and
             (try backend.tensorDType(value)) == expected;
         if ((dtype == .f32 or dtype == .f16 or dtype == .bf16) and !matching_half) {
-            const data = try backend.toFloat32(value, allocator);
-            defer allocator.free(data);
+            // Contiguous host operands already have the transfer's required
+            // representation. PJRT's upload completes its host-buffer lease
+            // before returning, so neither F32 upload nor narrowing needs an
+            // additional full-size F32 staging allocation. Device tensors and
+            // strided/quantized views retain the backend materialization path.
+            var owned: ?[]f32 = null;
+            defer if (owned) |data| allocator.free(data);
+            const data = (try backend.hostFloat32Read(value)) orelse materialize: {
+                owned = try backend.toFloat32(value, allocator);
+                break :materialize owned.?;
+            };
             const shape = try resolveUploadShapeFromTensor(allocator, backend, value, self.input_shapes_[index], data.len);
             defer allocator.free(shape);
             if (dtype == .f32) return self.client.bufferFromHostFloat32(data, shape);
@@ -2256,6 +2265,64 @@ test "PJRT runtime capabilities keep decode enabled for host-assisted package ph
     const caps = PjrtModelRuntime.capabilities(&runtime);
     try std.testing.expect(caps.supports_decode);
     try std.testing.expectEqual(model_runtime.RuntimeStateOwnership.host_assisted_inputs, caps.state_ownership);
+}
+
+test "PJRT host uploads borrow contiguous F32 and materialize unsupported views" {
+    const a = std.testing.allocator;
+    var client = pjrt_lib.pjrt.Client.initFromEnv(a) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var input: [4096]f32 = undefined;
+    for (&input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 129)) - 64)) / 127.0;
+    const tensor = try cb.fromBorrowedFloat32Shape(&input, &.{4096});
+    defer cb.free(tensor);
+    var shape = [_]i64{4096};
+    var shapes = [_][]i64{&shape};
+    var dtypes = [_]ml.graph.DType{.f32};
+    var executor: PjrtExecutor = undefined;
+    executor.client = &client;
+    executor.input_shapes_ = &shapes;
+    executor.input_dtypes = &dtypes;
+    // Enough for the narrow payload and shape, never a second F32 payload.
+    // Failure here detects accidental reintroduction of full-size staging.
+    var scratch: [input.len * 2 + 64]u8 = undefined;
+    for ([_]ml.graph.DType{ .f32, .bf16, .f16 }) |dtype| {
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        dtypes[0] = dtype;
+        var buffer = try executor.uploadTensor(&cb, tensor, 0, fixed.allocator());
+        defer buffer.deinit();
+        if (dtype == .f32) {
+            const actual = try buffer.toFloat32WithShape(a, &shape);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, &input, actual);
+        } else {
+            const actual = try buffer.toTypedWithShapeAndScratch(u16, bufferType(dtype), a, a, &shape);
+            defer a.free(actual);
+            for (input, actual) |value, bits| {
+                const expected: u16 = if (dtype == .bf16) @truncate(@as(u32, @bitCast(@import("antfly_tile").fexpr.roundBf16Value(value))) >> 16) else @bitCast(@as(f16, @floatCast(value)));
+                try std.testing.expectEqual(expected, bits);
+            }
+        }
+    }
+    // Backends without a contiguous host read still materialize through their
+    // own conversion, preserving the existing device/strided/quantized path.
+    var fallback_vtable = cb.vtable.*;
+    fallback_vtable.hostFloat32Read = null;
+    var fallback = cb;
+    fallback.vtable = &fallback_vtable;
+    dtypes[0] = .f32;
+    var buffer = try executor.uploadTensor(&fallback, tensor, 0, a);
+    defer buffer.deinit();
+    const actual = try buffer.toFloat32WithShape(a, &shape);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &input, actual);
 }
 
 test "PJRT upload shape resolver fills one dynamic dimension from element count" {
