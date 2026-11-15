@@ -43244,7 +43244,9 @@ fn consumerTests() type {
             managed.host.owned_data_store = &projection;
             managed.host.owned_wal_replica_provider = null;
             managed.host.owned_file_replica_provider = null;
-            var server: DataServer = .{ .alloc = a, .data_raft = &managed, .data_raft_apply = &sm, .backend_runtime = runtime.ptr(), .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{}, .query_async_limit = .nothing, .listener_cfg = undefined };
+            const server = try a.create(DataServer);
+            defer a.destroy(server);
+            server.* = .{ .alloc = a, .data_raft = &managed, .data_raft_apply = &sm, .backend_runtime = runtime.ptr(), .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{}, .query_async_limit = .nothing, .listener_cfg = undefined };
             defer server.provisioned_storage.deinit();
             defer {
                 var it = server.data_raft_protocol_activations.valueIterator();
@@ -43269,7 +43271,7 @@ fn consumerTests() type {
                     }
                 }
             };
-            var progress: Progress = .{ .server = &server, .host = &host };
+            var progress: Progress = .{ .server = server, .host = &host };
             var worker = try std.testing.io.concurrent(Progress.run, .{&progress});
             defer {
                 progress.stopped.store(true, .release);
@@ -43336,7 +43338,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = &server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = &server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = &server, .read_fn = DataServer.historyGrantOperation } }, .{ .ptr = &server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation } }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -43354,7 +43356,7 @@ fn consumerTests() type {
                 }
                 const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.boundAddress().?.ip4.port});
                 defer a.free(base);
-                var metadata_source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.invalid"}, &.{.{ .ptr = &server, .vtable = &.{ .execute = Status.noFetch } }}, std.testing.io);
+                var metadata_source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.invalid"}, &.{.{ .ptr = server, .vtable = &.{ .execute = Status.noFetch } }}, std.testing.io);
                 defer metadata_source.deinit();
                 const peers = try a.create(ControlReadGeneration);
                 peers.* = .{ .alloc = a };
@@ -43367,7 +43369,9 @@ fn consumerTests() type {
                 try peers.groups.put(a, 601, .{ .leader = 1 });
                 try peers.groups.getPtr(601).?.nodes.append(a, 1);
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
-                var origin: DataServer = .{ .alloc = a, .backend_runtime = runtime.ptr(), .remote_metadata = &metadata_source, .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{ .internal_service_secret = secret, .internal_service_issuer = "history-runtime" }, .query_async_limit = .nothing, .listener_cfg = undefined };
+                const origin = try a.create(DataServer);
+                defer a.destroy(origin);
+                origin.* = .{ .alloc = a, .backend_runtime = runtime.ptr(), .remote_metadata = &metadata_source, .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{ .internal_service_secret = secret, .internal_service_issuer = "history-runtime" }, .query_async_limit = .nothing, .listener_cfg = undefined };
                 defer origin.provisioned_storage.deinit();
                 const before_remote = blk: {
                     lockAtomic(&server.data_raft_mutex);
@@ -43419,7 +43423,7 @@ fn consumerTests() type {
                     }
                 };
                 const unknown_remote = blk: {
-                    server.data_request_lifecycle_hook = .{ .ptr = &server, .reach_fn = Loss.reach };
+                    server.data_request_lifecycle_hook = .{ .ptr = server, .reach_fn = Loss.reach };
                     defer server.data_request_lifecycle_hook = null;
                     metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     break :blk try ingress.execute(origin.historyControlPort(), a, 601, "docs", submit_body, .{ .catalog_route_fence_json = encoded_fence });
@@ -43521,6 +43525,116 @@ fn consumerTests() type {
                     break :blk host.raftStatus(601).?.last_index;
                 };
                 try std.testing.expectEqual(driver_receipt.index, final_driver_index);
+                const RecoveryMode = enum { lost_receipt, superseded, not_sent };
+                const DropReply = struct {
+                    target: ingress.Port,
+                    mode: RecoveryMode,
+                    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, frozen: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: ingress.wire.Request, context: antfly.public_api.operation.RequestContext) !ingress.wire.Response {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        if (input.operation == .submit and self.mode == .not_sent) return error.ReadUnavailable;
+                        var result = try self.target.execute(alloc, frozen, table, input, context);
+                        if (input.operation == .submit) switch (self.mode) {
+                            .lost_receipt => return error.ReadUnavailable,
+                            .superseded => result.outcome = null,
+                            .not_sent => unreachable,
+                        };
+                        return result;
+                    }
+                };
+                for ([_]RecoveryMode{ .lost_receipt, .superseded, .not_sent }, 0..) |mode, case_index| {
+                    const recovery_id: feed_control.Id = @splat(@intCast(7 + case_index));
+                    var recovery_svc: feed_fixture.Service = .{ .store = meta_store, .id = recovery_id, .authority = grant.authority };
+                    try recovery_svc.mutate(a, .{ .create = .{ .id = recovery_id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = feed_control.tableBinding(feed_table), .policy_revision = 1, .contract = .native_document }} }, .now = 100, .expires_at = 1000 } });
+                    try recovery_svc.mutate(a, .{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} });
+                    {
+                        var recovery_state = try recovery_svc.load(a);
+                        defer recovery_state.deinit();
+                        const input: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .enroll = .{ .namespace = namespace, .authority = recovery_state.value.authority, .consumer = recovery_state.value.consumerId(), .definition = recovery_state.value.definition.?.identity(), .sequence = recovery_state.value.roots[0].grant_sequence, .expires_at_seconds = 1000, .policy_revision = 1 } } };
+                        const body = try std.json.Stringify.valueAlloc(a, input, .{});
+                        defer a.free(body);
+                        try feed_driver.prepare(&recovery_svc, &driver_policy, a, recovery_id, namespace, .{ .command = body, .fence = encoded_fence, .table = "docs" }, feed_fixture.Request{});
+                    }
+                    var drop: DropReply = .{ .target = origin.historyControlPort(), .mode = mode };
+                    const attempted = try feed_driver.drive(&recovery_svc, &driver_policy, .{ .ptr = &drop, .execute_fn = DropReply.execute }, a, recovery_id, namespace, feed_fixture.Request{});
+                    try std.testing.expectEqual(@as(@FieldType(feed_driver.Result, "status"), if (mode == .superseded) .accepted else .ambiguous), attempted.status);
+                    if (mode == .superseded) {
+                        // A different legitimate control replaces the one-slot
+                        // native result record, but not the original lease.
+                        _ = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect = ref });
+                        {
+                            var pending_state = try recovery_svc.load(a);
+                            defer pending_state.deinit();
+                            const original = try ingress.wire.decodeRequest(a, pending_state.value.roots[0].pending_control.?.payload.command, namespace);
+                            const entry = attempted.acceptance.?.receipt;
+                            const native_outcome = try server.recoverHistoryControlLocal(a, route.fence().?, "docs", original.command, .{ .term = entry.term, .index = entry.index });
+                            try std.testing.expect(native_outcome == .superseded);
+                        }
+                        const superseded = try feed_driver.drive(&recovery_svc, &driver_policy, origin.historyControlPort(), a, recovery_id, namespace, feed_fixture.Request{});
+                        // The HTTP ambiguity marker deliberately withholds the
+                        // superseded body as confirmation, preserving receipt.
+                        try std.testing.expectEqual(.accepted, superseded.status);
+                        try std.testing.expectEqualDeep(attempted.acceptance.?, superseded.acceptance.?);
+                    }
+                    const before_observation = blk: {
+                        lockAtomic(&server.data_raft_mutex);
+                        defer server.data_raft_mutex.unlock();
+                        break :blk host.raftStatus(601).?.last_index;
+                    };
+                    if (mode == .lost_receipt) {
+                        recovery_svc.lose_ack_at = recovery_svc.proposals + 1;
+                        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, feed_driver.reconcile(&recovery_svc, &driver_policy, origin.historyGrantPort(), a, recovery_id, namespace, feed_fixture.Request{}));
+                        recovery_svc.lose_ack_at = null;
+                        meta_store.deinit();
+                        meta_store.* = try FeedStore.init(a, .{ .root_dir = meta_path });
+                    }
+                    const recovered = try feed_driver.reconcile(&recovery_svc, &driver_policy, origin.historyGrantPort(), a, recovery_id, namespace, feed_fixture.Request{});
+                    try std.testing.expectEqual(@as(@FieldType(feed_driver.Result, "status"), if (mode == .not_sent) .unproven else if (mode == .lost_receipt) .idle else .reconciled), recovered.status);
+                    {
+                        var recovery_state = try recovery_svc.load(a);
+                        defer recovery_state.deinit();
+                        const item = recovery_state.value.roots[0];
+                        try std.testing.expect(item.last_control == null);
+                        if (mode == .not_sent) {
+                            try std.testing.expect(item.pending_control != null);
+                            try std.testing.expectEqual(@as(u64, 0), item.consumer_epoch);
+                            try std.testing.expect(item.last_reconciliation == null);
+                        } else {
+                            try std.testing.expect(item.pending_control == null);
+                            try std.testing.expectEqual(@as(u64, 3 + case_index), item.consumer_epoch);
+                            try std.testing.expectEqual(@as(u64, 2), item.start);
+                            try std.testing.expectEqualDeep(recovered.reconciliation.?, item.last_reconciliation.?);
+                            if (mode == .lost_receipt) try std.testing.expect(item.last_reconciliation.?.original_receipt == null);
+                            if (mode == .superseded) try std.testing.expectEqualDeep(attempted.acceptance.?.receipt, item.last_reconciliation.?.original_receipt.?);
+                        }
+                    }
+                    const after_observation = blk: {
+                        lockAtomic(&server.data_raft_mutex);
+                        defer server.data_raft_mutex.unlock();
+                        break :blk host.raftStatus(601).?.last_index;
+                    };
+                    try std.testing.expectEqual(before_observation, after_observation);
+                }
+                // Closing must dispatch retirement cleanup rather than cancel
+                // every prepared command solely because the feed is closed.
+                try feed_svc.mutate(a, .close);
+                {
+                    var closing = try feed_svc.load(a);
+                    defer closing.deinit();
+                    const retire: ingress.wire.Request = .{ .version = 1, .operation = .submit, .command = .{ .retire = .{ .namespace = namespace, .authority = closing.value.authority, .consumer = closing.value.consumerId(), .definition = closing.value.definition.?.identity(), .sequence = closing.value.authority_sequence, .grant = closing.value.roots[0].grant_sequence } } };
+                    const body = try std.json.Stringify.valueAlloc(a, retire, .{});
+                    defer a.free(body);
+                    try feed_driver.prepare(&feed_svc, &driver_policy, a, feed_svc.id, namespace, .{ .command = body, .fence = encoded_fence, .table = "docs" }, feed_fixture.Request{});
+                }
+                const retired_driver = try feed_driver.drive(&feed_svc, &driver_policy, origin.historyControlPort(), a, feed_svc.id, namespace, feed_fixture.Request{});
+                try std.testing.expectEqual(.settled, retired_driver.status);
+                try std.testing.expect(retired_driver.settlement.?.effect == .retired);
+                try feed_svc.mutate(a, .finish_close);
+                {
+                    var deleted = try feed_svc.load(a);
+                    defer deleted.deinit();
+                    try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
+                    try std.testing.expect(deleted.value.roots[0].released);
+                }
             }
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
             try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);

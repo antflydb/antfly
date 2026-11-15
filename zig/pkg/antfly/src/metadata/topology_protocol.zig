@@ -129,7 +129,8 @@ const std = @import("std");
 /// Version 97 binds publication sets and atomically renews confirmed slot feedback.
 /// Version 98 retains exact pending root-control attempts and their receipts.
 /// Version 99 atomically settles accepted root controls with their metadata effects.
-pub const current_version: u16 = 99;
+/// Version 100 reconciles monotonic root effects without inventing command receipts.
+pub const current_version: u16 = 100;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;

@@ -120,10 +120,10 @@ pub fn settle(a: std.mem.Allocator, state: control.State, namespace: control.Nam
 }
 
 pub const test_support = if (@import("builtin").is_test) struct {
-    fn apply(a: std.mem.Allocator, state: control.State, mutation: control.Mutation) !control.State {
+    pub fn apply(a: std.mem.Allocator, state: control.State, mutation: control.Mutation) !control.State {
         return mutation.apply(a, state, .{ .incarnation = @splat(9), .sequence = state.authority_sequence + 1 });
     }
-    fn make(a: std.mem.Allocator, bad_authority: bool) !control.State {
+    pub fn make(a: std.mem.Allocator, bad_authority: bool) !control.State {
         const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
         var namespace: [24]u8 = undefined;
         std.mem.writeInt(u64, namespace[0..8], 7, .big);

@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 99;
+pub const protocol_version: u16 = 100;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -158,6 +158,7 @@ pub const Root = struct {
     released: bool = false,
     pending_control: ?root_intent.State = null,
     last_control: ?root_intent.Settlement = null,
+    last_reconciliation: ?root_intent.Reconciliation = null,
 };
 pub const RootPlan = struct { namespace: Namespace, ownership_epoch: u64 };
 pub const Advance = struct { namespace: Namespace, position: Position, snapshot: ?BootstrapPosition = null };
@@ -263,6 +264,10 @@ pub const State = struct {
             (self.bootstrap_expires_at != 0 and (self.bootstrap_expires_at <= self.created_at or self.bootstrap_expires_at > self.expires_at))) return error.InvalidChangefeed;
         if ((self.phase == .reset_required) != (self.reset_reason != .none)) return error.InvalidChangefeed;
         for (self.roots, 0..) |root, index| {
+            if (root.last_reconciliation) |observed| {
+                try observed.validate();
+                if (observed.sequence > self.authority_sequence or root.last_control != null) return error.InvalidChangefeed;
+            }
             if (root.last_control) |settlement| {
                 try settlement.validate();
                 if (settlement.sequence > self.authority_sequence) return error.InvalidChangefeed;
@@ -350,6 +355,7 @@ pub const RootControlMutation = union(enum) {
     begin: struct { sequence: u64, actor: root_intent.Actor },
     accepted: struct { sequence: u64, actor: root_intent.Actor, receipt: root_intent.Receipt },
     settled: root_intent.Settlement,
+    reconciled: root_intent.Reconciliation,
     cancel_prepared: u64,
     pub fn validate(self: RootControlMutation) !void {
         switch (self) {
@@ -363,6 +369,7 @@ pub const RootControlMutation = union(enum) {
                 try v.receipt.validate();
             },
             .settled => |v| try v.validate(),
+            .reconciled => |v| try v.validate(),
             .cancel_prepared => |sequence| if (sequence == 0) return error.InvalidChangefeed,
         }
     }
@@ -461,6 +468,10 @@ pub const Mutation = union(enum) {
                     if (root.last_control) |last| if (std.meta.eql(last, value.operation.settled)) return state;
                     return error.ChangefeedConflict;
                 }
+                if (value.operation == .reconciled and root.pending_control == null) {
+                    if (root.last_reconciliation) |last| if (std.meta.eql(last, value.operation.reconciled)) return state;
+                    return error.ChangefeedConflict;
+                }
                 if (state.phase == .deleted or root.released) return error.ChangefeedConflict;
                 const roots = try a.dupe(Root, state.roots);
                 switch (value.operation) {
@@ -483,37 +494,25 @@ pub const Mutation = union(enum) {
                     .settled => |settlement| {
                         const pending = root.pending_control orelse return error.ChangefeedConflict;
                         try pending.verifySettlement(settlement);
-                        switch (settlement.effect) {
-                            .enrolled => |v| {
-                                // Grant refresh may recover an existing epoch
-                                // without replacing its progress or snapshot.
-                                if (state.definition.?.start != .now and root.consumer_epoch == 0) return error.ChangefeedCapabilityUnsupported;
-                                if (root.consumer_epoch != 0) {
-                                    if (root.consumer_epoch != v.consumer_epoch or root.start != v.start) return error.ChangefeedConflict;
-                                } else {
-                                    roots[index].consumer_epoch = v.consumer_epoch;
-                                    roots[index].start = v.start;
-                                    roots[index].delivered = .{ .sequence = v.start };
-                                    roots[index].acknowledged = .{ .sequence = v.start };
-                                    roots[index].reclaimed_through = v.start;
-                                }
-                            },
-                            .acknowledged => |v| {
-                                if (root.consumer_epoch != v.consumer_epoch or root.reclaimed_through != v.previous or v.next > root.acknowledged.sequence) return error.ChangefeedConflict;
-                                roots[index].reclaimed_through = v.next;
-                            },
-                            .renewed => |v| {
-                                if (root.consumer_epoch != v.consumer_epoch or v.expires_at > state.expires_at) return error.ChangefeedConflict;
-                            },
-                            .retired => |v| {
-                                if ((state.phase != .closing and state.phase != .reset_required) or v.sequence <= root.grant_sequence or v.sequence >= pending.sequence) return error.ChangefeedConflict;
-                                roots[index].released = true;
-                            },
-                            .maintenance, .rejected => {},
-                        }
+                        try applyRootControlEffect(state, &roots[index], pending, settlement.effect);
                         // The result receipt and corresponding metadata effect
                         // become durable in the same metadata transaction.
                         roots[index].last_control = settlement;
+                        roots[index].last_reconciliation = null;
+                        roots[index].pending_control = null;
+                    },
+                    .reconciled => |observed| {
+                        const pending = root.pending_control orelse return error.ChangefeedConflict;
+                        try pending.verifyReconciliation(observed);
+                        switch (observed.effect) {
+                            .progress => |effect| try applyRootControlEffect(state, &roots[index], pending, effect),
+                            .released => {
+                                if (state.phase != .closing and state.phase != .reset_required) return error.ChangefeedConflict;
+                                roots[index].released = true;
+                            },
+                        }
+                        roots[index].last_reconciliation = observed;
+                        roots[index].last_control = null;
                         roots[index].pending_control = null;
                     },
                     .cancel_prepared => |sequence| {
@@ -800,6 +799,37 @@ pub const Mutation = union(enum) {
         return next;
     }
 };
+fn applyRootControlEffect(state: State, target: *Root, pending: root_intent.State, effect: root_intent.Effect) !void {
+    const before = target.*;
+    switch (effect) {
+        .enrolled => |v| {
+            // Grant refresh may recover an existing epoch
+            // without replacing its progress or snapshot.
+            if (state.definition.?.start != .now and before.consumer_epoch == 0) return error.ChangefeedCapabilityUnsupported;
+            if (before.consumer_epoch != 0) {
+                if (before.consumer_epoch != v.consumer_epoch or before.start != v.start) return error.ChangefeedConflict;
+            } else {
+                target.consumer_epoch = v.consumer_epoch;
+                target.start = v.start;
+                target.delivered = .{ .sequence = v.start };
+                target.acknowledged = .{ .sequence = v.start };
+                target.reclaimed_through = v.start;
+            }
+        },
+        .acknowledged => |v| {
+            if (before.consumer_epoch != v.consumer_epoch or before.reclaimed_through != v.previous or v.next > before.acknowledged.sequence) return error.ChangefeedConflict;
+            target.reclaimed_through = v.next;
+        },
+        .renewed => |v| {
+            if (before.consumer_epoch != v.consumer_epoch or v.expires_at > state.expires_at) return error.ChangefeedConflict;
+        },
+        .retired => |v| {
+            if ((state.phase != .closing and state.phase != .reset_required) or v.sequence <= before.grant_sequence or v.sequence >= pending.sequence) return error.ChangefeedConflict;
+            target.released = true;
+        },
+        .maintenance, .rejected => {},
+    }
+}
 fn acknowledge(a: A, state: State, next: *State, cursor: Digest) !void {
     if (state.phase != .streaming and state.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
     if (equal(cursor, state.acknowledged_cursor)) return;
@@ -1310,6 +1340,7 @@ test "changefeed control reads legacy envelopes without rebinding cursor identit
     for (record.object.getPtr("roots").?.array.items) |*root| {
         _ = root.object.orderedRemove("pending_control");
         _ = root.object.orderedRemove("last_control");
+        _ = root.object.orderedRemove("last_reconciliation");
     }
     _ = record.object.orderedRemove("latest_provider_context");
     _ = record.object.orderedRemove("acknowledged_provider_context");

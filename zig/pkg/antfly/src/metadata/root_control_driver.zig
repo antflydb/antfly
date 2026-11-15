@@ -23,6 +23,8 @@ const outcome = @import("root_control_outcome.zig");
 const intent = control.root_intent;
 const operations = @import("../api/history_control_operations.zig");
 const wire = operations.wire;
+const grants = @import("../api/history_grant_operations.zig");
+const observation = @import("root_control_observation.zig");
 const metadata = @import("api.zig");
 const A = std.mem.Allocator;
 pub const Acceptance = struct {
@@ -32,9 +34,10 @@ pub const Acceptance = struct {
     receipt: intent.Receipt,
 };
 pub const Result = struct {
-    status: enum { idle, ambiguous, accepted, settled, superseded, cancelled_prepared },
+    status: enum { idle, prepared, ambiguous, accepted, settled, superseded, cancelled_prepared, unproven, reconciled },
     acceptance: ?Acceptance = null,
     settlement: ?intent.Settlement = null,
+    reconciliation: ?intent.Reconciliation = null,
     deferred_error: ?anyerror = null,
 };
 fn same(a: anytype, b: @TypeOf(a)) bool {
@@ -85,6 +88,7 @@ pub fn recordAcceptance(svc: anytype, policy: anytype, a: A, id: control.Id, nam
     const item = state.roots[try state.rootIndex(namespace)];
     const pending = item.pending_control orelse {
         if (item.last_control) |last| if (last.sequence == accepted.sequence and same(last.actor, accepted.actor) and same(last.request_digest, accepted.request_digest) and std.meta.eql(last.receipt, accepted.receipt)) return;
+        if (item.last_reconciliation) |last| if (last.sequence == accepted.sequence and same(last.actor, accepted.actor) and same(last.request_digest, accepted.request_digest) and (last.original_receipt == null or std.meta.eql(last.original_receipt.?, accepted.receipt))) return;
         return error.ChangefeedConflict;
     };
     if (pending.sequence != accepted.sequence or !same(pending.actor, accepted.actor) or !same(pending.digest, accepted.request_digest)) return error.ChangefeedConflict;
@@ -96,16 +100,17 @@ pub fn drive(svc: anytype, policy: anytype, port: operations.Port, a: A, id: con
     const state = current.value;
     try policy.authorizeRoot(state, namespace, request);
     const item = state.roots[try state.rootIndex(namespace)];
-    const pending = item.pending_control orelse return .{ .status = .idle, .settlement = item.last_control };
+    const pending = item.pending_control orelse return .{ .status = .idle, .settlement = item.last_control, .reconciliation = item.last_reconciliation };
     switch (pending.stage) {
         .dispatching => return .{ .status = .ambiguous },
         .accepted => return perform(svc, policy, port, a, state, namespace, false, request),
         .prepared => {
-            if (state.phase == .closing or state.phase == .reset_required) {
+            const validated = try outcome.validateRequest(a, state, namespace, pending.payload);
+            const cleanup = validated.input.command == .retire or validated.input.command == .collect or validated.input.command == .reclaim;
+            if ((state.phase == .closing or state.phase == .reset_required) and !cleanup) {
                 try mutate(svc, a, state, namespace, .{ .cancel_prepared = pending.sequence }, request);
                 return .{ .status = .cancelled_prepared };
             }
-            _ = try outcome.validateRequest(a, state, namespace, pending.payload);
             var route = try fence(a, pending.payload);
             defer route.deinit();
             try policy.validateRoot(state, namespace, route.value, pending.payload.table, request);
@@ -122,6 +127,34 @@ pub fn drive(svc: anytype, policy: anytype, port: operations.Port, a: A, id: con
             return perform(svc, policy, port, a, begun.value, namespace, true, request);
         },
     }
+}
+/// Read-only semantic recovery. No path through this function submits a
+/// control or promotes an observation into the original command's receipt.
+pub fn reconcile(svc: anytype, policy: anytype, port: grants.Port, a: A, id: control.Id, namespace: control.Namespace, request_context: anytype) !Result {
+    var current = try load(svc, a, id, request_context);
+    defer current.deinit();
+    try policy.authorizeRoot(current.value, namespace, request_context);
+    const item = current.value.roots[try current.value.rootIndex(namespace)];
+    const pending = item.pending_control orelse return .{ .status = .idle, .settlement = item.last_control, .reconciliation = item.last_reconciliation };
+    if (pending.stage == .prepared) return .{ .status = .prepared };
+    const input = try observation.request(a, current.value, namespace);
+    var route = try fence(a, pending.payload);
+    defer route.deinit();
+    try policy.validateRoot(current.value, namespace, route.value, pending.payload.table, request_context);
+    const context = try policy.context(request_context);
+    try context.ensureActive();
+    const observed = try port.read(a, route.value, pending.payload.table, input, context);
+    try context.ensureActive();
+    var latest = try load(svc, a, id, request_context);
+    defer latest.deinit();
+    try policy.authorizeRoot(latest.value, namespace, request_context);
+    const latest_item = latest.value.roots[try latest.value.rootIndex(namespace)];
+    const latest_pending = latest_item.pending_control orelse return .{ .status = .idle, .settlement = latest_item.last_control, .reconciliation = latest_item.last_reconciliation };
+    if (latest_pending.sequence != pending.sequence or !same(latest_pending.actor, pending.actor) or !same(latest_pending.digest, pending.digest)) return error.ChangefeedConflict;
+    try policy.validateRoot(latest.value, namespace, route.value, pending.payload.table, request_context);
+    const proof = (try observation.resolve(a, latest.value, namespace, observed)) orelse return .{ .status = .unproven };
+    try mutate(svc, a, latest.value, namespace, .{ .reconciled = proof }, request_context);
+    return .{ .status = .reconciled, .reconciliation = proof };
 }
 fn perform(svc: anytype, policy: anytype, port: operations.Port, a: A, state: control.State, namespace: control.Namespace, submit: bool, request: anytype) !Result {
     const pending = state.roots[try state.rootIndex(namespace)].pending_control.?;

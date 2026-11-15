@@ -28,3 +28,7 @@ test "history root control outcome verifies exact accepted scope before metadata
 test "history root control driver recovers physical metadata without duplicate submission" {
     try @import("metadata/root_control_driver_test.zig").run();
 }
+
+test "history root control observation reconciles only stable scoped predicates" {
+    try @import("metadata/root_control_observation.zig").test_support.contracts();
+}

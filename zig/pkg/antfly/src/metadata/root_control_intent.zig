@@ -83,6 +83,27 @@ pub const Settlement = struct {
         if (self.sequence == 0 or std.mem.allEqual(u8, &self.actor, 0) or std.mem.allEqual(u8, &self.request_digest, 0) or std.mem.allEqual(u8, &self.proof, 0)) return error.InvalidChangefeed;
     }
 };
+/// A current-state proof of the authorized effect, not the outcome or receipt
+/// of the original command. Delayed CAS controls cannot undo these predicates.
+pub const Reconciliation = struct {
+    sequence: u64,
+    actor: Actor,
+    request_digest: Digest,
+    original_receipt: ?Receipt = null,
+    proof: Digest,
+    effect: union(enum) { progress: Effect, released },
+    pub fn validate(self: Reconciliation) !void {
+        if (self.sequence == 0 or std.mem.allEqual(u8, &self.actor, 0) or std.mem.allEqual(u8, &self.request_digest, 0) or std.mem.allEqual(u8, &self.proof, 0)) return error.InvalidChangefeed;
+        if (self.original_receipt) |receipt| try receipt.validate();
+        switch (self.effect) {
+            .progress => |effect| {
+                try effect.validate();
+                if (effect == .retired or effect == .rejected) return error.InvalidChangefeed;
+            },
+            .released => {},
+        }
+    }
+};
 pub const State = struct {
     sequence: u64,
     ownership_epoch: u64,
@@ -109,6 +130,11 @@ pub const State = struct {
                 try (self.receipt orelse return error.InvalidChangefeed).validate();
             },
         }
+    }
+    pub fn verifyReconciliation(self: State, observed: Reconciliation) !void {
+        try self.validate();
+        try observed.validate();
+        if (self.stage == .prepared or self.sequence != observed.sequence or !std.mem.eql(u8, &self.actor, &observed.actor) or !std.mem.eql(u8, &self.digest, &observed.request_digest) or !std.meta.eql(self.receipt, observed.original_receipt)) return error.ChangefeedConflict;
     }
     pub fn verifySettlement(self: State, settlement: Settlement) !void {
         try self.validate();

@@ -1756,6 +1756,50 @@ native controls need their qualified observation/receipt path, and discovery,
 retired-root ownership, coherent cuts, public feeds, destination integration and
 existing-client qualification remain required by the full issues.
 
+## In progress: reconciliation from current grant state
+
+Metadata decoder protocol 100 adds an explicitly distinct current-state
+reconciliation record. It has no invented original outcome or receipt. A known
+original receipt is retained only when it was already in the pending intent.
+Reconciliation atomically folds the authorized metadata effect and removes the
+pending attempt, retaining one bounded proof for lost metadata replies. Exact
+replays remain no-ops after close/delete; settlement and observation records
+cannot both occupy the latest-result slot.
+
+The typed observer validates the original submit request, immutable root scope,
+request-bound grant reply, exact grant, consumer epoch/start, policy, quota and
+lease bounds. ACK requires observed progress at least to the authorized target;
+renewal requires the actual lease to reach its requested extension. A delayed
+original CAS cannot reverse those predicates. Enrollment recovers the actual
+unchanged epoch/start. Older grants remain unproven; newer grants require
+resynchronization. Unbound/absent observations cannot authorize a replay. During
+close/reset, absent consumer plus an irrevocable retirement floor at or above
+the old grant proves release even if the original control's outcome is unknown.
+No-effect bounded maintenance can be abandoned without inventing its work count.
+
+The driver performs a current grant read through the same frozen fence, checks
+current policy/root binding before and after I/O, then uses a revision-fenced
+metadata mutation. No control submission occurs on this path. It preserves a
+semantic reconciliation separately from accepted-command settlement, including
+when a late known receipt is presented after reconciliation.
+
+Predicate contracts, allocation-failure cleanup, legacy state parsing and the
+existing metadata/native suites pass. Real signed native-Raft qualification also
+passes for lost replies, superseded receipts and an absent never-sent grant.
+A deliberately lost reconciliation metadata ACK survives physical reopen and
+returns the recorded semantic result without a new control proposal. The test
+checks native supersession directly; remote HTTP correctly preserves the receipt
+while withholding confirmation via its ambiguity marker. Closing cleanup now
+allows retirement/collection/reclamation through the prepared driver instead of
+cancelling every prepared command, and actual retirement through deletion passes.
+Large data-server fixtures join the HTTP and metadata stores on the heap.
+Authoritative logs: `root-observation-contract-test.log` and
+`root-observation-live-heap-test.log` (all five native-Raft checks, no leaks).
+Negative reconciliation still needs a durable retirement-fence attempt when an
+old grant is unbound/absent without such a floor; production factory registration,
+standalone native outcomes, topology/bootstrap and the complete issue contracts
+remain required.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
