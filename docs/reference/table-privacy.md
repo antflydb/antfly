@@ -412,7 +412,11 @@ Publication preflight and traversal share a 512-visit, 2 MiB budget, including
 policy/configuration bytes, readiness nodes, index checks and empty unit heads.
 The five-second deadline starts at capture entry and is checked throughout.
 Ordered global readiness verifies one durable catalog authority and each
-producer counter once, without rebuilding per-producer dependency closures. Fixed payload or traversal limits
+producer counter once, without rebuilding per-producer dependency closures.
+Standalone vector readiness reads its index-generation coverage once and does
+not compute source scopes. Full-text scope traversal is linear in the dependency
+graph and charges the same budget during edge discovery, traversal and hashing;
+its existing v2 receipt identity is preserved. Fixed payload or traversal limits
 return HTTP 413 with code `inspection_limit_exceeded`, `retryable: false`, and
 the configured limits; deadline or publication contention remains retryable.
 No response is truncated. Capture excludes primary and replay publication using
