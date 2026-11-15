@@ -200,7 +200,9 @@ test "json host adapter round trips pages and lookups" {
                 },
                 .is_leader => a.dupe(u8, "1"),
                 .lookup => if (std.mem.indexOf(u8, req, "\"k1\"") != null) a.dupe(u8, "{\"value\":\"{\\\"x\\\":1}\"}") else a.dupe(u8, "{\"value\":null}"),
-                .query, .request => encodePageAlloc(a, &.{.{ .key = @constCast("r1"), .value = @constCast("{\"t\":\"a\"}") }}, true),
+                .query, .request, .scan => encodePageAlloc(a, &.{.{ .key = @constCast("r1"), .value = @constCast("{\"t\":\"a\"}") }}, true),
+                .edges => a.dupe(u8, "[{\"edge_type\":\"cites\",\"neighbor\":\"n2\",\"outgoing\":true}]"),
+                .artifacts => a.dupe(u8, "{\"tag\":\"x\"}"),
                 .topology => a.dupe(u8, "{\"table_id\":\"srv:1\",\"inbound\":[]}"),
                 .deliver => a.dupe(u8, ""),
             };
@@ -219,6 +221,15 @@ test "json host adapter round trips pages and lookups" {
     var page = try source.query_fn(source.ptr, alloc, "srv:2", "{}", 0, 10);
     defer page.deinit(alloc);
     try std.testing.expectEqualStrings("r1", page.rows[0].key);
+    var scanned = try source.scan_fn(source.ptr, alloc, "srv:2", "{}", "r0", 10);
+    defer scanned.deinit(alloc);
+    try std.testing.expectEqualStrings("r1", scanned.rows[0].key);
+    const edges = try source.edges_fn(source.ptr, alloc, "srv:2", "refs", "n1", &.{}, .out, .{ .limit = 10 });
+    defer resolution.freeEdges(alloc, edges);
+    try std.testing.expectEqualStrings("n2", edges[0].neighbor);
+    const values = try source.artifacts_fn(source.ptr, alloc, "srv:2", "n1", &.{"tag"});
+    defer alloc.free(values);
+    try std.testing.expectEqualStrings("{\"tag\":\"x\"}", values);
     const topo = try host.topology().fetch(alloc);
     defer alloc.free(topo);
     try std.testing.expect(std.mem.indexOf(u8, topo, "srv:1") != null);
