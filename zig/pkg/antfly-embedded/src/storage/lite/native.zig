@@ -15149,6 +15149,36 @@ pub const NativeFile = struct {
     pub fn finishPublicationSequence(self: *NativeFile, sequence: u64, selected: CheckpointSlot) !void {
         var checkpoint = selected;
         checkpoint.commit_sequence = sequence;
+        // perf/lwa-read-audit: `redo_folded_through` must advance to this
+        // same final `sequence`, not stay at whatever `selected` already
+        // carried. `selected` (`image.prepared.activeCheckpoint()`) was
+        // last stamped by `prepareVacuum`'s own construction
+        // (`redo_folded_through = previous.commit_sequence + 1`, taken
+        // from the *initial* snapshot `Store.performVacuum` captured
+        // before any catch-up round ran) -- correct only when `sequence`
+        // here still equals that same initial value, i.e. no concurrent
+        // commit landed on the live store during the whole copy. Every
+        // catch-up round in between (`applyCapturedChanges`) writes
+        // directly into this generation's real tree -- `image.prepared`
+        // has no redo attached at all until `replaceWithPreparedGeneration`
+        // runs, well after this call, so there is nowhere for those
+        // writes to divert to -- so by the time this function runs,
+        // `sequence` (whatever catch-up advanced `commit_sequence` to,
+        // residual included) is exactly as truthfully folded as
+        // `prepareVacuum`'s own original stamp was for its own, earlier
+        // value. Leaving the stale, too-low value here durably published
+        // the wrong fold boundary to both slots: confirmed live as
+        // `error.NativeRedoLogCorrupt` on the next reopen under
+        // concurrent group-commit load during "lite online vacuum
+        // publishes while group-commit mutations keep landing" -- the
+        // live generation kept committing correctly past the stale
+        // boundary (ordinary diverted commits never touch this field,
+        // by design), but a fresh recovery's own `redo_log.replay`,
+        // pinned to the stale, far-too-low boundary from the slot it
+        // actually read, found the log's first *genuinely new* record
+        // nowhere near `stale + 1` and refused it as corrupt, even
+        // though nothing was actually malformed on disk.
+        checkpoint.redo_folded_through = sequence;
         // Catch-up can replay keys from failed/no-op foreground mutations, so
         // its private sequence may exceed the live store's publication sequence.
         // Both recovery slots must identify the final image; a newer private
@@ -26342,6 +26372,84 @@ test "lite compaction catches final mutations across all roots and streams large
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(report.live_file_count, image.report.live_file_count);
     try std.testing.expectEqual(report.live_bytes, image.report.live_bytes);
+}
+
+// perf/lwa-read-audit: `Store.performVacuum` (docstore.zig) calls
+// `preparePublicationSequence` *early* -- right after `prepareVacuum`,
+// before any catch-up round has run -- then, after however many rounds
+// of `applyCapturedChanges` have folded in concurrent commits, calls
+// `finishPublicationSequence` with the *final*, caught-up sequence.
+// `finishPublicationSequence` used to leave `redo_folded_through` at
+// whatever `selected` (the image's own checkpoint) already carried --
+// `preparePublicationSequence`'s own early stamp, or further back,
+// `prepareVacuum`'s own `previous.commit_sequence + 1` -- never advancing
+// it to match the later, caught-up `sequence` it was just handed. Every
+// mutation up through that final sequence was, by construction, written
+// directly into this generation's real tree (catch-up copies have no
+// redo attached to divert into until `replaceWithPreparedGeneration` runs,
+// well after this call), so the stale value was always too low, not
+// merely imprecise -- and, published durably to both slots here, it
+// stayed wrong until the next real fold. A fresh, by-path reopen after
+// such a publish (or, as this bug surfaced live under contention,
+// `Store.checkWithCancel`'s own fresh snapshot open) then replays the
+// redo log pinned to that stale boundary and refuses the first
+// genuinely-new record as `error.NativeRedoLogCorrupt`, even though
+// nothing on disk was actually malformed -- see "lite online vacuum
+// publishes while group-commit mutations keep landing" (docstore.zig),
+// which reproduces this under real concurrency; this test reproduces the
+// same root cause deterministically, with no threads at all, by calling
+// `Store.performVacuum`'s own two-call sequence directly.
+test "lite vacuum's late finishPublicationSequence call advances redo_folded_through past an earlier catch-up round" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "vacuum-finish-publication-fold-boundary.aflite");
+    defer alloc.free(path);
+    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    try file.putDocument("seed", "value");
+
+    var source = try NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true, .no_sync = true });
+    defer source.close();
+    var capture = ChangeCapture{};
+    defer capture.deinit(alloc);
+    file.change_capture = &capture;
+    defer file.change_capture = null;
+    var image = try source.prepareVacuum(null);
+    defer image.deinit();
+
+    // Mirrors `Store.performVacuum`'s own early call, right after
+    // `prepareVacuum`, before any catch-up round: at this point
+    // `image.prepared`'s checkpoint is correctly fully folded (nothing
+    // has diverged yet), so `redo_folded_through` already equals
+    // `commit_sequence` here -- this call must be a no-op for that
+    // reason, not because it skips the field.
+    const initial_sequence = file.activeCheckpoint().commit_sequence + 1;
+    try image.prepared.preparePublicationSequence(initial_sequence);
+    try std.testing.expectEqual(image.prepared.activeCheckpoint().commit_sequence, image.prepared.activeCheckpoint().redo_folded_through);
+
+    // Concurrent commits landing on the live file during the copy --
+    // exactly what a hammering foreground writer does during a real
+    // online vacuum's own catch-up window.
+    var round: usize = 0;
+    while (round < 10) : (round += 1) {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "oob:{d}", .{round});
+        try file.putDocument(key, "landed");
+    }
+    try file.applyCapturedChanges(&image.prepared, &capture, &image.report, null);
+
+    // The final round's own publish: a strictly higher sequence than
+    // `initial_sequence`, same as `Store.performVacuum`'s own
+    // `self.file.activeCheckpoint().commit_sequence + 1` at this later
+    // point.
+    const final_sequence = file.activeCheckpoint().commit_sequence + 1;
+    try std.testing.expect(final_sequence > initial_sequence);
+    try image.prepared.finishPublicationSequence(final_sequence, image.prepared.activeCheckpoint());
+
+    const published = image.prepared.activeCheckpoint();
+    try std.testing.expectEqual(final_sequence, published.commit_sequence);
+    try std.testing.expectEqual(final_sequence, published.redo_folded_through);
 }
 
 test "lite unpacked v3 remains readable and vacuum explicitly adopts packed signature" {
