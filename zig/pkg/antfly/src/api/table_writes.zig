@@ -44224,6 +44224,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(u64, 2000), found.expires_at_seconds);
             var page = try source.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101, .max_events = 1 });
             defer page.deinit();
+            try std.testing.expectEqual(.root_local, page.header.?.transaction_scope);
             try std.testing.expectEqual(@as(usize, 1), page.events.len);
             try std.testing.expectEqual(@as(u64, 0), page.next.sequence);
             try std.testing.expectEqual(@as(u32, 1), page.next.event);

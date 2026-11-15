@@ -3802,6 +3802,7 @@ test "docstore committed history captures initial and final images atomically ac
         defer source.deinit();
         var reader: committed_history.frame.Reader = .{ .descriptor = descriptor, .source = source.source() };
         const header = try reader.header(scratch);
+        try std.testing.expectEqual(committed_history.frame.TransactionScope.root_local, header.value.transaction_scope);
         try std.testing.expectEqual(@as(u32, 2), header.count);
         try std.testing.expectEqualStrings("schema-one", header.value.schema_before.?);
         try std.testing.expectEqualStrings(if (sequence == 1) "schema-one" else "schema-two", header.value.schema_after.?);

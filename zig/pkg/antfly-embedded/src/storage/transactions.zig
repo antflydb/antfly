@@ -3394,6 +3394,7 @@ test "committed history transaction reservations survive reopen and committed re
         defer source.deinit();
         var reader: history.frame.Reader = .{ .descriptor = descriptor, .source = source.source() };
         const header = try reader.header(scratch);
+        try std.testing.expectEqual(history.frame.TransactionScope.coordinated, header.value.transaction_scope);
         try std.testing.expectEqualSlices(u8, &id, &header.value.transaction_id);
         const effect = (try reader.next(scratch)).?;
         try std.testing.expectEqualStrings("before", effect.before.?);

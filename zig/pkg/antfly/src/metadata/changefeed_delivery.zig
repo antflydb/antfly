@@ -38,6 +38,7 @@ pub const Prepared = struct {
     events: u32,
     proof: control.Digest,
     advances: []const control.Advance,
+    provider_context: []const u8 = "",
 };
 pub const Result = struct {
     arena: std.heap.ArenaAllocator,
@@ -88,9 +89,11 @@ fn following(state: control.State, cursor: control.Digest) !?control.Delivery {
     return error.ChangefeedCursorExpired;
 }
 fn receiptProof(state: control.State, page: Prepared) control.Digest {
+    if (page.provider_context.len != 0) return control.hash(.{ .domain = "antfly:feed-delivery-proof:v2", .consumer = state.consumerId(), .definition = state.definition.?.identity(), .payload = control.hash(page.body), .events = page.events, .provider = page.proof, .advances = page.advances, .provider_context = page.provider_context });
     return control.hash(.{ .domain = "antfly:feed-delivery-proof:v1", .consumer = state.consumerId(), .definition = state.definition.?.identity(), .payload = control.hash(page.body), .events = page.events, .provider = page.proof, .advances = page.advances });
 }
 fn validatePage(page: Prepared, limits: Limits) !void {
+    if (!control.validProviderContext(page.provider_context)) return error.InvalidChangefeed;
     if (page.body.len > limits.bytes or page.events > limits.events) return error.ChangefeedBackpressure;
     if (std.mem.allEqual(u8, &page.proof, 0) or page.advances.len > control.max_advances) return error.InvalidChangefeed;
 }
@@ -122,8 +125,10 @@ pub fn pull(svc: anytype, adapter: anytype, a: A, id: control.Id, before: contro
         .authority = receiptProof(state, page),
         .issued_at = now,
         .advances = page.advances,
+        .provider_context = page.provider_context,
     };
     if (original != null) {
+        if (!std.mem.eql(u8, receipt.provider_context, page.provider_context)) return error.ChangefeedResynchronizationRequired;
         if (!equal(receipt.authority, receiptProof(state, page)) or !equal(control.hash(receipt.advances), control.hash(page.advances))) return error.ChangefeedResynchronizationRequired;
     } else {
         receipt.cursor = receipt.identity(state.id, state.epoch);
@@ -207,6 +212,7 @@ const TestAdapter = struct {
     replays: usize = 0,
     authorizations: usize = 0,
     tamper: bool = false,
+    provider_context: []const u8 = "",
     revoke_on_prepare: bool = false,
     now: u64 = 200,
     pub fn authorize(self: *@This(), state: control.State, _: TestRequest) !void {
@@ -218,7 +224,7 @@ const TestAdapter = struct {
         return self.now;
     }
     fn page(self: *@This(), a: A, namespace: control.Namespace, sequence: u64) !Prepared {
-        return .{ .body = try std.fmt.allocPrint(a, "{{\"events\":[{{\"id\":{d}}}]}}", .{sequence + @as(u64, if (self.tamper) 1 else 0)}), .events = 1, .proof = control.hash(.{ .sequence = sequence }), .advances = try a.dupe(control.Advance, &.{.{ .namespace = namespace, .position = .{ .sequence = sequence } }}) };
+        return .{ .body = try std.fmt.allocPrint(a, "{{\"events\":[{{\"id\":{d}}}]}}", .{sequence + @as(u64, if (self.tamper) 1 else 0)}), .events = 1, .provider_context = self.provider_context, .proof = control.hash(.{ .sequence = sequence }), .advances = try a.dupe(control.Advance, &.{.{ .namespace = namespace, .position = .{ .sequence = sequence } }}) };
     }
     pub fn prepare(self: *@This(), a: A, state: control.State, _: control.Digest, _: Limits, _: TestRequest) !Prepared {
         self.prepares += 1;
@@ -337,4 +343,29 @@ test "feed delivery rejects a valid state envelope stored under a different feed
     try std.testing.expectError(error.ChangefeedCorrupt, pull(&svc, &adapter, a, @splat(99), @splat(1), .{}, TestRequest{}));
     try std.testing.expectEqual(@as(u64, 0), svc.proposals);
     try std.testing.expectEqual(@as(usize, 0), adapter.prepares);
+}
+
+test "feed delivery persists private continuation across replay ACK and context tampering" {
+    const a = std.testing.allocator;
+    var svc = try testService(a);
+    defer a.free(svc.bytes);
+    var adapter: TestAdapter = .{ .provider_context = "YQ" };
+    var initial = try control.parse(a, svc.bytes);
+    defer initial.deinit();
+    var issued = try pull(&svc, &adapter, a, initial.value.id, initial.value.latest_cursor, .{}, TestRequest{});
+    defer issued.deinit();
+    var saved = try control.parse(a, svc.bytes);
+    defer saved.deinit();
+    try std.testing.expectEqualStrings("YQ", try saved.value.contextAt(issued.cursor));
+    try std.testing.expectEqualStrings("", try saved.value.contextAt(initial.value.latest_cursor));
+    adapter.provider_context = "Yg";
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, pull(&svc, &adapter, a, initial.value.id, initial.value.latest_cursor, .{}, TestRequest{}));
+    adapter.provider_context = "YQ";
+    var replayed = try pull(&svc, &adapter, a, initial.value.id, initial.value.latest_cursor, .{}, TestRequest{});
+    defer replayed.deinit();
+    try std.testing.expectEqualSlices(u8, &issued.cursor, &replayed.cursor);
+    var acknowledged = try acknowledge(&svc, &adapter, a, initial.value.id, issued.cursor, TestRequest{});
+    defer acknowledged.deinit();
+    try std.testing.expectEqualStrings("YQ", try acknowledged.value.contextAt(issued.cursor));
+    try std.testing.expectEqual(@as(usize, 0), acknowledged.value.cursors.len);
 }

@@ -449,6 +449,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"feed projection"},
     });
     const run_changefeed_projection_tests = b.addRunArtifact(changefeed_projection_tests);
+    const changefeed_projection_cursor_tests = b.addTest(.{
+        .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/metadata/changefeed_projection_cursor.zig"), .target = target, .optimize = optimize }),
+        .filters = &.{"projection continuation"},
+    });
+    const run_changefeed_projection_cursor_tests = b.addRunArtifact(changefeed_projection_cursor_tests);
     const changefeed_storage_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "metadata changefeed control", "metadata raft apply store snapshot key registry covers every durable projection class" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const run_changefeed_storage_tests = b.addRunArtifact(changefeed_storage_tests);
     const changefeed_service_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"changefeed control requires its coordinated decoder floor"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
@@ -457,6 +462,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     changefeed_control_step.dependOn(&run_changefeed_control_tests.step);
     changefeed_control_step.dependOn(&run_changefeed_delivery_tests.step);
     changefeed_control_step.dependOn(&run_changefeed_projection_tests.step);
+    changefeed_control_step.dependOn(&run_changefeed_projection_cursor_tests.step);
     changefeed_control_step.dependOn(&run_changefeed_storage_tests.step);
     changefeed_control_step.dependOn(&run_changefeed_service_tests.step);
     const source_control_step = b.step("source-control-test", "Verify durable source reservations, receipt frontiers and metadata recovery");
@@ -3256,6 +3262,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_changefeed_control_tests.step);
     unit_test_step.dependOn(&run_changefeed_delivery_tests.step);
     unit_test_step.dependOn(&run_changefeed_projection_tests.step);
+    unit_test_step.dependOn(&run_changefeed_projection_cursor_tests.step);
     unit_test_step.dependOn(&run_changefeed_storage_tests.step);
     unit_test_step.dependOn(&run_changefeed_service_tests.step);
     unit_test_step.dependOn(&remote_content_adapter_run.step);

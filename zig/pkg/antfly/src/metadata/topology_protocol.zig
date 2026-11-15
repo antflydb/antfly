@@ -121,8 +121,8 @@ const std = @import("std");
 /// Version 87 admits bootstrap selectors in reader protocol 100 publications.
 /// Version 88 admits bounded inline map navigation in reader protocol 101.
 /// Version 90 adds source-control reservations and separate accepted/committed frontiers.
-/// Version 91 persists outbound feed authority, ACK windows and bootstrap cleanup.
-pub const current_version: u16 = 91;
+/// Version 92 binds private provider continuations to outbound delivery/ACK cursors.
+pub const current_version: u16 = 92;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;

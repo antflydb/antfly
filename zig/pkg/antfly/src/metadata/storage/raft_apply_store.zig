@@ -45563,7 +45563,7 @@ test "metadata changefeed control persists cursor debt fences bindings and survi
     defer a.free(before_bytes);
     var before = try changefeed_control.parse(a, before_bytes);
     defer before.deinit();
-    var delivery: changefeed_control.Delivery = .{ .sequence = 1, .before = before.value.latest_cursor, .cursor = @splat(0), .authority = @splat(8), .issued_at = 200, .advances = &.{.{ .namespace = namespace, .position = .{ .sequence = 10, .event = 3 } }} };
+    var delivery: changefeed_control.Delivery = .{ .sequence = 1, .before = before.value.latest_cursor, .cursor = @splat(0), .authority = @splat(8), .issued_at = 200, .provider_context = "AQ", .advances = &.{.{ .namespace = namespace, .position = .{ .sequence = 10, .event = 3 } }} };
     delivery.cursor = delivery.identity(write.id, 1);
     write.expected_revision = 4;
     write.mutation = .{ .issue = delivery };
@@ -45594,6 +45594,7 @@ test "metadata changefeed control persists cursor debt fences bindings and survi
     var acknowledged = try changefeed_control.parse(a, acknowledged_bytes);
     defer acknowledged.deinit();
     try std.testing.expectEqual(@as(u32, 3), acknowledged.value.roots[0].acknowledged.event);
+    try std.testing.expectEqualStrings("AQ", try acknowledged.value.contextAt(delivery.cursor));
     try std.testing.expectEqual(@as(u64, 10), acknowledged.value.roots[0].reclaimed_through);
     try std.testing.expectEqual(@as(usize, 0), acknowledged.value.cursors.len);
 }
@@ -45624,16 +45625,35 @@ test "metadata changefeed control snapshot preserves enrollment authority and pe
     write.mutation = .{ .plan_roots = &.{.{ .namespace = .{ 0, 0, 0, 0, 0, 0, 0, 7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, .ownership_epoch = 1 }} };
     const plan_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
     write.expected_revision = 2;
+    const namespace: changefeed_control.Namespace = .{ 0, 0, 0, 0, 0, 0, 0, 7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    write.mutation = .{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 1, .start = 0 } };
+    const enroll_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 3;
+    write.mutation = .{ .seal = .{ .cut = @splat(7) } };
+    const seal_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    var staged = try (changefeed_control.Mutation{ .create = .{ .id = write.id, .definition = definition, .now = 100, .expires_at = 1000 } }).apply(scratch, .{}, .{ .incarnation = write.authority, .sequence = 1 });
+    staged = try (changefeed_control.Mutation{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} }).apply(scratch, staged, .{ .incarnation = write.authority, .sequence = 2 });
+    staged = try (changefeed_control.Mutation{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 1, .start = 0 } }).apply(scratch, staged, .{ .incarnation = write.authority, .sequence = 3 });
+    staged = try (changefeed_control.Mutation{ .seal = .{ .cut = @splat(7) } }).apply(scratch, staged, .{ .incarnation = write.authority, .sequence = 4 });
+    var delivery: changefeed_control.Delivery = .{ .sequence = 1, .before = staged.latest_cursor, .cursor = @splat(0), .authority = @splat(8), .issued_at = 200, .provider_context = "AQ", .advances = &.{.{ .namespace = namespace, .position = .{ .event = 1 } }} };
+    delivery.cursor = delivery.identity(write.id, 1);
+    write.expected_revision = 4;
+    write.mutation = .{ .issue = delivery };
+    const issue_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
+    write.expected_revision = 5;
     write.mutation = .close;
     const close_command = try encodeTransitionCommand(scratch, .{ .apply_changefeed_control = try changefeed_control.encodeWrite(scratch, write) });
     const entries = try raft_state_machine.encodeCommittedEntries(scratch, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_command },
         .{ .term = 1, .index = 2, .entry_type = .normal, .data = create_command },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = plan_command },
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = close_command },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = enroll_command },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = seal_command },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = issue_command },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = close_command },
     });
-    try source.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 4, .entries_bytes = entries });
-    var prepared = (try source.snapshotBuilder().prepareSnapshot(group, 4)) orelse return error.TestUnexpectedResult;
+    try source.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 7, .entries_bytes = entries });
+    var prepared = (try source.snapshotBuilder().prepareSnapshot(group, 7)) orelse return error.TestUnexpectedResult;
     defer prepared.deinit();
     var materialized = try prepared.materialize(a);
     defer materialized.deinit(a);
@@ -45641,7 +45661,7 @@ test "metadata changefeed control snapshot preserves enrollment authority and pe
         .bytes => |bytes| bytes,
         .artifact => return error.TestUnexpectedResult,
     };
-    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group, 4, snapshot));
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group, 7, snapshot));
     const expected = try source.getChangefeedControl(a, group, write.id);
     defer a.free(expected);
     const installed = try target.getChangefeedControl(a, group, write.id);
@@ -45653,5 +45673,7 @@ test "metadata changefeed control snapshot preserves enrollment authority and pe
     try std.testing.expectEqual(changefeed_control.Phase.closing, parsed.value.phase);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.roots.len);
     try std.testing.expect(!parsed.value.roots[0].released);
+    try std.testing.expectEqualStrings("AQ", parsed.value.latest_provider_context);
+    try std.testing.expectEqualStrings("AQ", parsed.value.cursors[0].provider_context);
     try std.testing.expectEqual(@as(u64, 2), parsed.value.roots[0].grant_sequence);
 }

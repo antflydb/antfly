@@ -21,10 +21,11 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 91;
+pub const protocol_version: u16 = 92;
 pub const max_tables = 64;
 pub const max_roots = 4096;
 pub const max_cursors = 128;
+pub const max_provider_context_bytes = 64 * 1024;
 pub const max_advances = 128;
 pub const max_definition_bytes = 128 * 1024;
 pub const max_cursor_bytes = 1024 * 1024;
@@ -67,6 +68,11 @@ fn validNumber(value: []const u8) bool {
     defer scanner.deinit();
     if ((scanner.next() catch return false) != .number) return false;
     return (scanner.next() catch return false) == .end_of_document;
+}
+pub fn validProviderContext(value: []const u8) bool {
+    if (value.len > max_provider_context_bytes) return false;
+    for (value) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_') return false;
+    return true;
 }
 pub const Start = enum { now, snapshot_then_changes };
 pub const Projection = enum { keys_and_versions, rows };
@@ -158,7 +164,11 @@ pub const Delivery = struct {
     authority: Digest,
     issued_at: u64,
     advances: []const Advance,
+    /// Private versioned base64url continuation, never a public credential or
+    /// tuple WAL. Bound to this receipt and retained with its ACK checkpoint.
+    provider_context: []const u8 = "",
     pub fn identity(self: Delivery, id: Id, epoch: u64) Digest {
+        if (self.provider_context.len != 0) return hash(.{ .domain = "antfly:changefeed-cursor:v2", .id = id, .epoch = epoch, .sequence = self.sequence, .before = self.before, .authority = self.authority, .issued_at = self.issued_at, .advances = self.advances, .provider_context = self.provider_context });
         return hash(.{ .domain = "antfly:changefeed-cursor:v1", .id = id, .epoch = epoch, .sequence = self.sequence, .before = self.before, .authority = self.authority, .issued_at = self.issued_at, .advances = self.advances });
     }
 };
@@ -183,6 +193,8 @@ pub const State = struct {
     acknowledged_delivery: u64 = 0,
     latest_cursor: Digest = @splat(0),
     acknowledged_cursor: Digest = @splat(0),
+    latest_provider_context: []const u8 = "",
+    acknowledged_provider_context: []const u8 = "",
     cursors: []const Delivery = &.{},
     reset_reason: Reset = .none,
     pub fn rootIndex(self: State, namespace: Namespace) !usize {
@@ -222,15 +234,22 @@ pub const State = struct {
         };
         return roots;
     }
+    pub fn contextAt(self: State, cursor: Digest) ![]const u8 {
+        if (self.phase != .streaming and self.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
+        if (equal(cursor, self.acknowledged_cursor)) return self.acknowledged_provider_context;
+        for (self.cursors) |receipt| if (equal(cursor, receipt.cursor)) return receipt.provider_context;
+        return error.ChangefeedCursorExpired;
+    }
     pub fn validate(self: State) !void {
         if (self.version != 1 or self.roots.len > max_roots or self.cursors.len > max_cursors) return error.InvalidChangefeed;
         if (self.phase == .empty) {
             if (self.revision != 0 or self.epoch != 0 or nz(self.id) or nz(self.authority) or self.authority_sequence != 0 or self.definition != null or
                 self.created_at != 0 or self.expires_at != 0 or self.bootstrap_expires_at != 0 or nz(self.cut) or self.roots.len != 0 or self.cursors.len != 0 or
-                self.latest_delivery != 0 or self.acknowledged_delivery != 0 or nz(self.latest_cursor) or nz(self.acknowledged_cursor) or self.reset_reason != .none) return error.InvalidChangefeed;
+                self.latest_delivery != 0 or self.acknowledged_delivery != 0 or nz(self.latest_cursor) or nz(self.acknowledged_cursor) or self.reset_reason != .none or self.latest_provider_context.len != 0 or self.acknowledged_provider_context.len != 0) return error.InvalidChangefeed;
             return;
         }
         const definition = self.definition orelse return error.InvalidChangefeed;
+        if (!validProviderContext(self.latest_provider_context) or !validProviderContext(self.acknowledged_provider_context)) return error.InvalidChangefeed;
         try definition.validate();
         if (self.revision == 0 or !nz(self.id) or self.epoch == 0 or !nz(self.authority) or self.authority_sequence == 0 or
             self.created_at == 0 or self.expires_at <= self.created_at or self.acknowledged_delivery > self.latest_delivery or
@@ -260,11 +279,13 @@ pub const State = struct {
         var previous = self.acknowledged_cursor;
         for (self.cursors, 0..) |cursor, i| {
             if (cursor.sequence != self.acknowledged_delivery + i + 1 or !equal(cursor.before, previous) or !nz(cursor.authority) or cursor.issued_at == 0 or
-                !equal(cursor.cursor, cursor.identity(self.id, self.epoch))) return error.InvalidChangefeed;
+                (!validProviderContext(cursor.provider_context) or !equal(cursor.cursor, cursor.identity(self.id, self.epoch)))) return error.InvalidChangefeed;
             try validateAdvances(self, cursor.advances);
             previous = cursor.cursor;
         }
         if (self.cursors.len != 0 and !equal(previous, self.latest_cursor)) return error.InvalidChangefeed;
+        if (self.cursors.len != 0 and !std.mem.eql(u8, self.latest_provider_context, self.cursors[self.cursors.len - 1].provider_context)) return error.InvalidChangefeed;
+        if (self.cursors.len == 0 and !std.mem.eql(u8, self.latest_provider_context, self.acknowledged_provider_context)) return error.InvalidChangefeed;
         if (self.cursors.len == 0 and !equal(self.latest_cursor, self.acknowledged_cursor)) return error.InvalidChangefeed;
     }
 };
@@ -315,6 +336,7 @@ pub const Mutation = union(enum) {
             .rebind => |value| if (!nz(value.namespace) or value.previous == 0 or value.next <= value.previous or !nz(value.proof)) return error.InvalidChangefeed,
             .seal => |value| if (!nz(value.cut)) return error.InvalidChangefeed,
             .issue => |value| {
+                if (!validProviderContext(value.provider_context)) return error.InvalidChangefeed;
                 if (value.sequence == 0 or !nz(value.before) or !nz(value.cursor) or !nz(value.authority) or value.issued_at == 0 or value.advances.len > max_advances) return error.InvalidChangefeed;
                 for (value.advances, 0..) |advance, index| {
                     if (!nz(advance.namespace) or advance.position.event >= 65536 or (index != 0 and std.mem.order(u8, &value.advances[index - 1].namespace, &advance.namespace) != .lt)) return error.InvalidChangefeed;
@@ -437,6 +459,7 @@ pub const Mutation = union(enum) {
                 next.cursors = cursors;
                 next.latest_delivery = delivery.sequence;
                 next.latest_cursor = delivery.cursor;
+                next.latest_provider_context = delivery.provider_context;
             },
             .acknowledge => |cursor| {
                 if (state.phase != .streaming and state.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
@@ -453,6 +476,7 @@ pub const Mutation = union(enum) {
                 next.roots = roots;
                 next.acknowledged_delivery = state.cursors[selected].sequence;
                 next.acknowledged_cursor = cursor;
+                next.acknowledged_provider_context = state.cursors[selected].provider_context;
                 next.cursors = try a.dupe(Delivery, state.cursors[selected + 1 ..]);
             },
             .reclaimed => |progress| {
@@ -567,10 +591,13 @@ pub const Write = struct {
     }
 };
 const Envelope = struct { state: State, digest: Digest };
+const RawEnvelope = struct { state: std.json.Value, digest: Digest };
 pub const Parsed = struct {
     value: State,
-    envelope: std.json.Parsed(Envelope),
+    envelope: std.json.Parsed(RawEnvelope),
+    typed: std.json.Parsed(State),
     pub fn deinit(self: *@This()) void {
+        self.typed.deinit();
         self.envelope.deinit();
         self.* = undefined;
     }
@@ -584,14 +611,22 @@ pub fn encode(a: A, state: State) ![]u8 {
 }
 pub fn parse(a: A, bytes: []const u8) !Parsed {
     if (bytes.len == 0 or bytes.len > max_state_bytes) return error.ChangefeedCorrupt;
-    var envelope = std.json.parseFromSlice(Envelope, a, bytes, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| switch (err) {
+    var envelope = std.json.parseFromSlice(RawEnvelope, a, bytes, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.ChangefeedCorrupt,
     };
     errdefer envelope.deinit();
-    envelope.value.state.validate() catch return error.ChangefeedCorrupt;
+    var typed = std.json.parseFromValue(State, a, envelope.value.state, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.ChangefeedCorrupt,
+    };
+    errdefer typed.deinit();
+    typed.value.validate() catch return error.ChangefeedCorrupt;
+    // Reject unknown/deep values through the bounded typed contract before
+    // traversing JSON for its digest. Hash the stored representation so missing
+    // optional legacy fields do not change existing cursor identities.
     if (!equal(envelope.value.digest, hash(envelope.value.state))) return error.ChangefeedCorrupt;
-    return .{ .value = envelope.value.state, .envelope = envelope };
+    return .{ .value = typed.value, .envelope = envelope, .typed = typed };
 }
 pub fn encodeWrite(a: A, write: Write) ![]u8 {
     try write.validate();
@@ -974,4 +1009,67 @@ test "changefeed closing owner relocation preserves the retired enrollment grant
     try std.testing.expectEqual(grant, state.roots[0].grant_sequence);
     try std.testing.expect(state.authority_sequence > grant);
     try std.testing.expectEqual(@as(u64, 2), state.roots[0].ownership_epoch);
+}
+
+test "changefeed control preserves private continuation at each cursor across ACK and reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testState(a, .now);
+    const initial = state.latest_cursor;
+    var first: Delivery = .{ .sequence = 1, .before = initial, .cursor = @splat(0), .authority = @splat(1), .issued_at = 101, .provider_context = "YQ", .advances = &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 10, .event = 3 } }} };
+    first.cursor = first.identity(state.id, state.epoch);
+    state = try step(a, state, .{ .issue = first });
+    try std.testing.expectEqualStrings("", try state.contextAt(initial));
+    try std.testing.expectEqualStrings("YQ", try state.contextAt(first.cursor));
+    state = try step(a, state, .{ .acknowledge = first.cursor });
+    const bytes = try encode(a, state);
+    var reopened = try parse(std.testing.allocator, bytes);
+    defer reopened.deinit();
+    try std.testing.expectEqualStrings("YQ", try reopened.value.contextAt(first.cursor));
+    try std.testing.expectError(error.ChangefeedCursorExpired, reopened.value.contextAt(initial));
+    var second: Delivery = .{ .sequence = 2, .before = first.cursor, .cursor = @splat(0), .authority = @splat(2), .issued_at = 102, .provider_context = "Yg", .advances = &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 10, .event = 5 } }} };
+    second.cursor = second.identity(state.id, state.epoch);
+    state = try step(a, reopened.value, .{ .issue = second });
+    try std.testing.expectEqualStrings("YQ", try state.contextAt(first.cursor));
+    try std.testing.expectEqualStrings("Yg", try state.contextAt(second.cursor));
+    try std.testing.expect(!validProviderContext("not-json:{}"));
+}
+
+test "changefeed control reads legacy envelopes without rebinding cursor identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testState(a, .now);
+    var delivery: Delivery = .{ .sequence = 1, .before = state.latest_cursor, .cursor = @splat(0), .authority = @splat(1), .issued_at = 101, .advances = &.{} };
+    delivery.cursor = delivery.identity(state.id, state.epoch);
+    state = try step(a, state, .{ .issue = delivery });
+    var raw = try std.json.parseFromSlice(std.json.Value, a, try encode(a, state), .{ .parse_numbers = false });
+    defer raw.deinit();
+    const record = raw.value.object.getPtr("state").?;
+    _ = record.object.orderedRemove("latest_provider_context");
+    _ = record.object.orderedRemove("acknowledged_provider_context");
+    for (record.object.getPtr("cursors").?.array.items) |*receipt| _ = receipt.object.orderedRemove("provider_context");
+    const checksum = try std.json.Stringify.valueAlloc(a, hash(record.*), .{});
+    raw.value.object.getPtr("digest").?.* = try std.json.parseFromSliceLeaky(std.json.Value, a, checksum, .{ .parse_numbers = false });
+    const legacy = try std.json.Stringify.valueAlloc(a, raw.value, .{});
+    var parsed = try parse(std.testing.allocator, legacy);
+    defer parsed.deinit();
+    try std.testing.expectEqual(delivery.cursor, parsed.value.latest_cursor);
+    try std.testing.expectEqualStrings("", try parsed.value.contextAt(delivery.cursor));
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.cursors.len);
+}
+
+test "changefeed control rejects deeply nested unknown state before digest traversal" {
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try bytes.appendSlice(a, "{\"state\":{\"unknown\":");
+    for (0..10000) |_| try bytes.append(a, '[');
+    try bytes.appendSlice(a, "null");
+    for (0..10000) |_| try bytes.append(a, ']');
+    try bytes.appendSlice(a, "},\"digest\":[");
+    for (0..32) |i| try bytes.appendSlice(a, if (i == 0) "0" else ",0");
+    try bytes.appendSlice(a, "]}");
+    try std.testing.expectError(error.ChangefeedCorrupt, parse(a, bytes.items));
 }

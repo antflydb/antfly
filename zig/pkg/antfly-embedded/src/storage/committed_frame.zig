@@ -41,10 +41,14 @@ pub const Event = struct {
         return if (self.before == null) .insert else if (self.after == null) .delete else .update;
     }
 };
+/// Unknown preserves legacy frames without manufacturing a completion proof.
+/// Coordinated frames require an independently retained participant outcome.
+pub const TransactionScope = enum(u8) { unknown = 0, root_local = 1, coordinated = 2 };
 pub const Header = struct {
     namespace: Namespace,
     sequence: u64,
     transaction_id: [16]u8,
+    transaction_scope: TransactionScope = .unknown,
     /// Opaque authoritative source position, never a PostgreSQL LSN.
     source_position: [32]u8 = @splat(0),
     committed_at_ns: i64 = 0,
@@ -76,6 +80,7 @@ pub fn encode(a: A, header: Header, events: []const Event) ![]u8 {
     errdefer a.free(out);
     @memset(out[0..header_bytes], 0);
     @memcpy(out[0..4], "CHF1");
+    out[4] = @backingInt(header.transaction_scope);
     @memcpy(out[8..32], &header.namespace);
     std.mem.writeInt(u64, out[32..40], header.sequence, .little);
     @memcpy(out[40..56], &header.transaction_id);
@@ -210,11 +215,12 @@ pub const Reader = struct {
     pub fn header(self: *Reader, a: A) !struct { value: Header, count: u32 } {
         if (self.offset != 0) return error.InvalidCommittedFrame;
         const raw = try self.take(a, header_bytes);
-        if (!std.mem.eql(u8, raw[0..4], "CHF1") or !std.mem.allEqual(u8, raw[4..8], 0) or !std.mem.allEqual(u8, raw[108..112], 0) or
+        if (!std.mem.eql(u8, raw[0..4], "CHF1") or !std.mem.allEqual(u8, raw[5..8], 0) or !std.mem.allEqual(u8, raw[108..112], 0) or
             !std.mem.eql(u8, raw[8..32], &self.descriptor.namespace) or std.mem.readInt(u64, raw[32..40], .little) != self.descriptor.sequence) return error.InvalidCommittedFrame;
+        const scope = std.enums.fromInt(TransactionScope, raw[4]) orelse return error.InvalidCommittedFrame;
         const count = std.mem.readInt(u32, raw[96..100], .little);
         if (count != self.descriptor.events) return error.InvalidCommittedFrame;
-        var result: Header = .{ .namespace = raw[8..32].*, .sequence = self.descriptor.sequence, .transaction_id = raw[40..56].*, .source_position = raw[56..88].*, .committed_at_ns = std.mem.readInt(i64, raw[88..96], .little) };
+        var result: Header = .{ .namespace = raw[8..32].*, .sequence = self.descriptor.sequence, .transaction_id = raw[40..56].*, .transaction_scope = scope, .source_position = raw[56..88].*, .committed_at_ns = std.mem.readInt(i64, raw[88..96], .little) };
         const before = std.mem.readInt(u32, raw[100..104], .little);
         const after = std.mem.readInt(u32, raw[104..108], .little);
         if ((before != absent and before > max_schema_bytes) or (after != absent and after > max_schema_bytes)) return error.InvalidCommittedFrame;
@@ -294,4 +300,31 @@ test "committed frame pages preserve binary tuple images and reject damaged chun
     _ = try reader.header(scratch);
     try std.testing.expectError(error.InvalidCommittedFrame, reader.next(scratch));
     try std.testing.expectError(error.InvalidCommittedFrame, Descriptor.decode(descriptor_raw, @splat(3), 9));
+}
+
+test "committed frame scopes distinguish native root effects from coordinated and legacy transactions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Store = struct {
+        bytes: []u8,
+        fn read(ptr: *anyopaque, ordinal: u32) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (ordinal != 0) return error.InvalidCommittedFrame;
+            return self.bytes;
+        }
+    };
+    // Identical caller transaction IDs cannot change the captured scope fact.
+    for ([_]TransactionScope{ .unknown, .root_local, .coordinated }) |scope| {
+        const header: Header = .{ .namespace = @splat(1), .sequence = 1, .transaction_id = @splat(2), .transaction_scope = scope };
+        const bytes = try encode(a, header, &.{.{ .key = "doc", .after = "{}", .before = null }});
+        var store: Store = .{ .bytes = bytes };
+        var descriptor = try Descriptor.decode(try Descriptor.encode(a, header.namespace, 1, bytes), header.namespace, 1);
+        var reader: Reader = .{ .descriptor = descriptor, .source = .{ .context = &store, .read = Store.read } };
+        try std.testing.expectEqual(scope, (try reader.header(a)).value.transaction_scope);
+        bytes[4] = 255;
+        descriptor = try Descriptor.decode(try Descriptor.encode(a, header.namespace, 1, bytes), header.namespace, 1);
+        reader = .{ .descriptor = descriptor, .source = .{ .context = &store, .read = Store.read } };
+        try std.testing.expectError(error.InvalidCommittedFrame, reader.header(a));
+    }
 }

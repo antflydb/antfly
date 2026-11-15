@@ -312,7 +312,7 @@ advertise a public ingestion/changefeed capability.
 The private `metadata/changefeed_control.zig` contract now persists immutable
 owner/authorization and table-incarnation bindings, root enrollment grants,
 consumer epochs, delivery cursors, ACK positions and cleanup obligations through
-metadata Raft. Transition tag 84 requires coordinated decoder floor 91. A
+metadata Raft. Transition tag 84 requires coordinated decoder floor 92. A
 checksummed authority counter and feed state are updated atomically and included
 in metadata snapshots. Names and index/schema publication do not change a table
 incarnation binding.
@@ -424,6 +424,38 @@ production provider still must authenticate against real current policy,
 produce canonical authorized images, certify distributed completion, and bind
 its prepare/replay implementation to retained root history. Public HTTP/SQL,
 bootstrap, lifecycle categories and pgoutput remain unfinished.
+
+## Transaction scope and private projection continuation
+
+Retained frame headers now record an explicit transaction scope in a previously
+reserved byte. Direct root commits are `root_local`; intent-resolution commits
+are `coordinated`; legacy headers remain `unknown`. Readers reject unknown
+scope tags, and transaction IDs cannot stand in for this completion evidence.
+A coordinated frame still requires a retained participant/outcome qualification
+before it can produce a completed public transaction.
+
+Private provider continuation is now part of delivery identity, replay proof,
+latest position and the ACK checkpoint. Its canonical base64url representation is
+bounded to 64 KiB and shares the existing bounded receipt ledger. Nonempty
+continuations use version-2 cursor/proof identities; empty-context identities
+remain unchanged. Decoder floor 92 gates the writes. State parsing authenticates
+the stored JSON representation while admitting optional legacy defaults, without
+rebinding old cursor identities; typed validation precedes digest traversal of
+untrusted nested values.
+
+The root-local projection continuation codec carries whether earlier pages
+exposed an authorized row. It uses at most 819 bytes for all 4096 roots, binds
+consumer/definition scope and exact root positions, tolerates owner/grant movement,
+and clears completed-frame visibility. An entirely hidden partial transaction
+retains explicit private state rather than emitting a visible completion marker.
+A legacy partial cursor without that state requires resynchronization. The native
+provider still needs to consume these facts; this codec alone does not certify
+distributed completion or expose a public feed.
+
+Qualification includes frame scope across native batch/transaction recovery,
+legacy envelopes/cursor identity, continuation replay and tampering, ACK/reopen,
+Raft snapshot installation with pending continuation/cleanup, maximum root fanout,
+and rejection of deeply nested unknown metadata before digest traversal.
 
 ## Remaining implementation phases
 
