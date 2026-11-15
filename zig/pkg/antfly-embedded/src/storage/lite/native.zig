@@ -7698,6 +7698,46 @@ pub const NativeFile = struct {
     }
 
     pub fn checkpointRedoLog(self: *NativeFile) anyerror!void {
+        return self.checkpointRedoLogWithDurability(true);
+    }
+
+    /// perf/lwa-wamp-regress: `durable=false` lets a caller fold the
+    /// overlay into real pages without forcing its own standalone fsync.
+    /// This transaction stays exactly as isolated as the always-durable
+    /// case -- nothing else's writes are ever staged into it, only this
+    /// function's own fold-build below -- so every retain/ownership-
+    /// accounting invariant in that fold is untouched; only whether THIS
+    /// transaction's own commit forces a sync right now, or defers,
+    /// changes, via the same `deferred_publication` branch of
+    /// `commitTransactionWithDurability` every ordinary ride-along commit
+    /// on this file already relies on. A deferred fold's pages are
+    /// already durable the moment any later commit on this file actually
+    /// syncs (`self.header` already reflects them, and that later sync's
+    /// own `publishCheckpoint` covers everything since the last durable
+    /// checkpoint, this fold included) -- nothing here is lost, just not
+    /// yet synced; `wal_trace.recordCommit()`/`recordSync()` never fire
+    /// for a deferred commit (they live inside `publishCheckpoint`'s own
+    /// durable-publish branches), so a deferred fold costs nothing in the
+    /// write-amplification bench either, matching its real cost.
+    ///
+    /// The epilogue below splits in two. The writer's own logical-sequence
+    /// advance and the in-memory overlay reclaim (`redo.shared.reclaim`/
+    /// `maybeClearPages`) run regardless of `durable`: the pages they
+    /// govern are physically written either way, so the overlay genuinely
+    /// no longer needs those entries whether or not this commit has
+    /// synced yet (a crash before it becomes durable just replays the log
+    /// from the last truly durable checkpoint). Only the *physical*
+    /// log-space reclaim (zeroing the now-superseded tail, shrinking
+    /// capacity) and the cross-process publish are skipped for a deferred
+    /// commit, because those specifically need the commit to already be
+    /// durable: zeroing a log range this commit hasn't actually synced
+    /// yet would lose data on a crash, and publishing the advanced
+    /// checkpoint sequence to `shared_lock_region.zig` would tell other
+    /// processes about state that is not actually safe yet. A later,
+    /// genuinely durable fold (explicit API, the 25%-remaining
+    /// backpressure, or this same idle path once byte pressure makes it
+    /// durable) runs that part of the epilogue then.
+    pub fn checkpointRedoLogWithDurability(self: *NativeFile, durable: bool) anyerror!void {
         if (comptime builtin.is_test) if (self.test_fail_checkpoint_redo_log) |err| {
             self.test_fail_checkpoint_redo_log = null;
             return err;
@@ -8059,9 +8099,9 @@ pub const NativeFile = struct {
         const previous_maintenance = self.maintenance_publication;
         self.maintenance_publication = true;
         defer self.maintenance_publication = previous_maintenance;
-        try self.commitTransactionWithDurability(true, null);
+        try self.commitTransactionWithDurability(durable, null);
 
-        // Everything above is durable now; only space reclamation is
+        // Everything above is durable now (if `durable`); only space reclamation is
         // left. `redo.writer` was never touched by the commit just above
         // (every diversion point was disabled), so its `tail` still names
         // exactly the log bytes every diverted commit before this call
@@ -8115,6 +8155,31 @@ pub const NativeFile = struct {
         // stale rather than silently misread ("re-open semantics",
         // §9.3b).
         redo.checkpoint_sequence = new_checkpoint_sequence;
+        // perf/lwa-wamp-regress: everything above this point (the writer's
+        // own logical-sequence advance, `redo.shared.reclaim`/`maybeClearPages`,
+        // `redo.checkpoint_sequence`) is safe regardless of `durable` --
+        // the pages these govern were physically written by
+        // `flushTransactionWrites` above no matter what, so the in-memory
+        // overlay genuinely no longer needs them, durable or not (a crash
+        // before this commit becomes durable just replays the log from
+        // the last truly durable checkpoint, same as any other deferred
+        // commit). Only what follows -- physically zeroing/reclaiming log
+        // bytes and publishing to the cross-process shared region -- needs
+        // real durability: zeroing a log range this commit's own publish
+        // hasn't actually synced yet would lose data on a crash, and
+        // `publishRedoLogState` specifically advertises a *durable*
+        // sequence to other processes. Mirror the `pinned_below` branch's
+        // own "defer the physical reclaim, still advance the logical
+        // writer past `new_checkpoint_sequence`" shape below (same
+        // reason, different cause: a live cross-process reader there, no
+        // durability yet here) -- `old_tail`'s bytes stay exactly as they
+        // are, still valid, until a later, genuinely durable fold (byte
+        // pressure, the explicit API, or this same idle path once pressure
+        // makes it durable) retries this and actually reclaims them.
+        if (!durable) {
+            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, old_tail, new_checkpoint_sequence);
+            return;
+        }
         if (builtin.is_test and self.test_skip_redo_log_zero) {
             self.publishRedoLogState();
             return;

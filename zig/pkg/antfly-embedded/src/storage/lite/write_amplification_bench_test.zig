@@ -468,20 +468,30 @@ const ModeReport = struct {
         return total;
     }
 
-    fn totalCommitsExcluding(self: ModeReport, excluded: wal_trace.Stage) u64 {
+    /// Both `rideAlongFlushLoop`-driven idle-flush stages: `.ride_along_flush`
+    /// (forcing a genuinely-queued ride-along `MutationPlan` member through)
+    /// and `.redo_checkpoint_fold` (`maybeCheckpointRedoLogOnIdleTurn`'s own
+    /// opportunistic redo-log overlay fold) -- the same background loop, the
+    /// same wake, two different things it can fold. Kept as two Stage tags
+    /// so a report can tell them apart, but treated as one kind of cost
+    /// (the documented safety-net idle-flush backstop, not foreground
+    /// amplification) everywhere that distinction matters below.
+    const redo_checkpoint_fold_stages = [_]wal_trace.Stage{ .ride_along_flush, .redo_checkpoint_fold };
+
+    fn totalCommitsExcluding(self: ModeReport, excluded: []const wal_trace.Stage) u64 {
         var total: u64 = 0;
         for (std.meta.tags(wal_trace.Stage)) |s| {
-            if (s == excluded) continue;
+            if (std.mem.indexOfScalar(wal_trace.Stage, excluded, s) != null) continue;
             const counts = self.report.stage(s);
             total += counts.commits_calling_thread + counts.commits_background;
         }
         return total;
     }
 
-    fn totalSyncsExcluding(self: ModeReport, lane: wal_trace.Lane, excluded: wal_trace.Stage) u64 {
+    fn totalSyncsExcluding(self: ModeReport, lane: wal_trace.Lane, excluded: []const wal_trace.Stage) u64 {
         var total: u64 = 0;
         for (std.meta.tags(wal_trace.Stage)) |s| {
-            if (s == excluded) continue;
+            if (std.mem.indexOfScalar(wal_trace.Stage, excluded, s) != null) continue;
             const counts = self.report.stage(s);
             total += switch (lane) {
                 .calling_thread => counts.sync_calling_thread,
@@ -492,20 +502,20 @@ const ModeReport = struct {
     }
 
     /// Durable commits/write, excluding any commit `rideAlongFlushLoop`'s
-    /// idle-flush timer itself led (`.ride_along_flush`). A production
-    /// commit the idle timer leads is still a real, useful commit (it makes
-    /// otherwise-stranded ride-along work durable when no foreground writer
-    /// follows) -- it just isn't the single-commit write path's own
-    /// per-write amplification, so it gets its own separate bound
-    /// (`idleFlushDrains`) instead of tripping this one.
+    /// idle-flush timer itself led (`redo_checkpoint_fold_stages`). A
+    /// production commit the idle timer leads is still a real, useful
+    /// commit (it makes otherwise-stranded ride-along work durable when no
+    /// foreground writer follows) -- it just isn't the single-commit write
+    /// path's own per-write amplification, so it gets its own separate
+    /// bound (`idleFlushDrains`) instead of tripping this one.
     fn durableCommitsPerWriteExcludingIdleFlush(self: ModeReport) f64 {
-        return @as(f64, @floatFromInt(self.totalCommitsExcluding(.ride_along_flush))) / @as(f64, @floatFromInt(self.updates));
+        return @as(f64, @floatFromInt(self.totalCommitsExcluding(&redo_checkpoint_fold_stages))) / @as(f64, @floatFromInt(self.updates));
     }
 
     /// Background syncs/update, excluding the idle-flush timer's own
     /// syncs. See `durableCommitsPerWriteExcludingIdleFlush`.
     fn backgroundSyncsPerUpdateExcludingIdleFlush(self: ModeReport) f64 {
-        return @as(f64, @floatFromInt(self.totalSyncsExcluding(.background, .ride_along_flush))) / @as(f64, @floatFromInt(self.updates));
+        return @as(f64, @floatFromInt(self.totalSyncsExcluding(.background, &redo_checkpoint_fold_stages))) / @as(f64, @floatFromInt(self.updates));
     }
 
     /// How many times `rideAlongFlushLoop`'s idle-flush timer itself led a
@@ -516,7 +526,9 @@ const ModeReport = struct {
     /// traffic, so the gate on this is `ceil(elapsed_ns / idle_window) + 1`
     /// rather than zero.
     fn idleFlushDrains(self: ModeReport) u64 {
-        return self.report.stage(.ride_along_flush).commits_background;
+        var total: u64 = 0;
+        for (redo_checkpoint_fold_stages) |s| total += self.report.stage(s).commits_background;
+        return total;
     }
 
     /// Every durable fsync this run issued, calling-thread and background

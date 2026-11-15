@@ -172,6 +172,18 @@ pub const Stage = enum(u8) {
     // rather than tolerating it unbounded -- see
     // `write_amplification_bench_test.zig`'s `idleFlushDrains`.
     ride_along_flush,
+    // perf/lwa-wamp-regress: `docstore.zig`'s `maybeCheckpointRedoLogOnIdleTurn`
+    // own opportunistic redo-checkpoint fold, distinct from
+    // `rideAlongFlushLoop`'s `forceDrainDurable()` call above (both run
+    // from the same background loop, on the same wake, but fold
+    // different things: a genuinely-queued ride-along `MutationPlan`
+    // member there, this file's own redo-log overlay here). Split into
+    // its own tag so the two can be told apart in a report instead of
+    // both landing in `.ride_along_flush` -- see
+    // `write_amplification_bench_test.zig`'s `redoCheckpointFoldStages`
+    // for where both still count as the same kind of idle-flush cost for
+    // ceiling-exclusion purposes.
+    redo_checkpoint_fold,
     other,
 };
 const stage_count = std.meta.tags(Stage).len;

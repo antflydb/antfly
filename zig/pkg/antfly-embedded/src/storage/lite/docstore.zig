@@ -5414,18 +5414,30 @@ pub const Store = struct {
         // AssumeLocked: this whole function runs under `lockStoreExclusive`
         // above, which locks the same `self.mutex` `recordMaintenanceError`
         // itself would try to lock -- see that function's own comment.
-        // Tagged `.ride_along_flush` (write_amplification_trace.zig), the
-        // same bucket `rideAlongFlushLoop`'s own forced drain already
-        // uses: both are the documented safety-net cost of bounding how
-        // long background work may sit unfolded/undurable when nothing
-        // else drives it, not foreground amplification. See that Stage's
-        // own doc comment and `write_amplification_bench_test.zig`'s
-        // `idleFlushDrains`/`...ExcludingIdleFlush` gates, bounded by how
-        // many times this can fire over a run's wall-clock duration, not
-        // by write volume.
-        const flush_scope = wal_trace.scope(.ride_along_flush);
+        // Tagged `.redo_checkpoint_fold` (write_amplification_trace.zig),
+        // not `.ride_along_flush`: this is this file's own redo-log
+        // overlay fold, not `rideAlongFlushLoop`'s own forced drain of a
+        // genuinely-queued ride-along `MutationPlan` member (the
+        // `ride_along:` block above) -- splitting the two makes it
+        // possible to tell, per mode, which one a residual background
+        // commit/sync actually came from, instead of both landing in the
+        // same bucket. Both are still the same *kind* of cost for
+        // ceiling-exclusion purposes -- see
+        // `write_amplification_bench_test.zig`'s `redoCheckpointFoldStages`
+        // and `idleFlushDrains`/`...ExcludingIdleFlush` gates, bounded by
+        // how many times this can fire over a run's wall-clock duration,
+        // not by write volume.
+        const flush_scope = wal_trace.scope(.redo_checkpoint_fold);
         defer flush_scope.end();
-        self.file.checkpointRedoLog() catch |err| self.recordMaintenanceErrorAssumeLocked(err);
+        // §3.2a (ride-along): a pure idle/entry-ceiling fold (no byte
+        // pressure) has no foreground caller waiting on it and nothing
+        // that needs the log's physical space back *right now* -- see
+        // `NativeFile.checkpointRedoLogWithDurability`'s own doc comment
+        // for why `durable=false` is safe here (the fold's pages ride
+        // whatever commit on this file syncs next) and why it is NOT
+        // safe for `threshold_due` (the real space-reclaim epilogue only
+        // ever runs for a durable commit).
+        self.file.checkpointRedoLogWithDurability(threshold_due) catch |err| self.recordMaintenanceErrorAssumeLocked(err);
         self.last_redo_fold_ns = now;
     }
 
