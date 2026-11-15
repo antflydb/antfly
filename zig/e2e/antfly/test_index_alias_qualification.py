@@ -273,7 +273,7 @@ def test_index_alias_object_runtime_cutover_and_cold_restart(tmp_path, monkeypat
                 text=True,
                 timeout=30,
             )
-            assert json.loads(listing.stdout).get("KeyCount", 0) > 0
+            assert json.loads(listing.stdout).get("Contents"), listing.stdout
     finally:
         if server is not None:
             failed = sys.exc_info()[0] is not None
