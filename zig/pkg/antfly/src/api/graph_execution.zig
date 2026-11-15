@@ -63,7 +63,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     const bytes = try server.source.systemCatalog(scratch, context, .{ .read = .{ .kind = .graph, .name = name } });
     const state = try std.json.parseFromSliceLeaky(domain.State, scratch, bytes, .{ .allocate = .alloc_always });
     const record = state.find(.graph, 0, name) orelse return error.CatalogNotFound;
-    const graph = try domain.graphForExecution(scratch, record);
+    var graph = try domain.graphForExecution(scratch, record);
     var sql: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = identity, .context = context };
     var tables: std.ArrayList(port.GraphTable) = .empty;
     var targets: std.ArrayList(domain.Target) = .empty;
@@ -81,6 +81,8 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
         };
     }
     const resolved = try sql.resolveMany(scratch, targets.items, if (writes and !compiled.query.explain) .read_write else .read);
+    const resolved_record = try @import("../system_catalog/graph_bindings.zig").resolveAliases(scratch, record, resolved);
+    graph = try domain.graphForExecution(scratch, resolved_record);
     for (@constCast(graph.labels), positions) |*physical, position| {
         const target = targets.items[position];
         const table = resolved[position];
@@ -103,7 +105,8 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     var read: ?port.GraphRead = null;
     defer if (read) |value| value.deinit();
     var client: cypher.rpc.Client = undefined;
-    var channel: AuthorityChannel = .{ .read_owner = &read, .server = server, .identity = identity, .context = context, .name = name, .record_id = record.id, .tables = tables.items, .writes = writes and !compiled.query.explain, .role_revision = role_revision };
+    var channel: AuthorityChannel = .{ .read_owner = &read, .server = server, .identity = identity, .context = context, .name = name, .record_id = record.id, .index_catalogs = resolved, .tables = tables.items, .writes = writes and !compiled.query.explain, .role_revision = role_revision };
+    channel.attribution_allocator = scratch;
     const needed = try cypher.dependencies.required(scratch, compiled.query, graph);
     const domains = try readDomains(scratch, graph, compiled.query, request.parameters, context);
     var read_tables: std.ArrayList(port.GraphTable) = .empty;
@@ -125,11 +128,12 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
             const write_source = server.table_writes orelse return error.CypherMutationsUnavailable;
             for (read_tables.items) |table| try write_source.activateRangeTracking(scratch, table.name, context);
         }
-        read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, record, .{}), .tables = read_tables.items, .partial_graph = needed != null, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
+        read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, resolved_record, .{}), .tables = read_tables.items, .partial_graph = needed != null, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
         channel.read = &read.?;
         client = .{ .channel = channel.rpcChannel(), .incarnation = graph.incarnation, .revision = graph.revision };
         provider = client.backend();
     }
+    provider.index_attribution = .{ .ptr = &channel, .snapshot = AuthorityChannel.indexSnapshot };
     var writer: @import("graph_write_execution.zig").Provider = .{ .server = server, .context = context, .identity = identity, .request_id = request.write_request_id, .graph = graph, .tables = read_tables.items, .release_read = AuthorityChannel.releaseRead, .channel = channel.rpcChannel() };
     errdefer if (writer.receipt) |receipt| {
         write_outcome.* = switch (receipt.status) {
@@ -170,6 +174,10 @@ pub const AuthorityChannel = struct {
     name: []const u8,
     record_id: u64,
     tables: []const port.GraphTable,
+    index_catalogs: []const local.sql_catalog.Table = &.{},
+    resolved_search_indexes: std.StringHashMapUnmanaged(void) = .empty,
+    attribution_allocator: ?std.mem.Allocator = null,
+    attribution_sink: ?cypher.backend.IndexObserver = null,
     writes: bool,
     read: ?*port.GraphRead = null,
     read_owner: ?*?port.GraphRead = null,
@@ -179,6 +187,21 @@ pub const AuthorityChannel = struct {
     /// Internal RPCs share that boundary; long operations still refresh guards.
     guarded_operation: bool = false,
     role_revision: ?u64 = null,
+    fn indexSnapshot(ptr: *anyopaque, a: std.mem.Allocator) ![]const []const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const result = try a.alloc([]const u8, self.resolved_search_indexes.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |name| a.free(name);
+            a.free(result);
+        }
+        var names = self.resolved_search_indexes.keyIterator();
+        for (result) |*name| {
+            name.* = try a.dupe(u8, names.next().?.*);
+            initialized += 1;
+        }
+        return result;
+    }
     fn releaseRead(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.read = null;
@@ -278,12 +301,21 @@ pub const AuthorityChannel = struct {
         }
         const scope = server_mod.ApiHttpServer.queryEmbeddingSecurityScope(self.identity.*);
         var resolver = self.server.semanticStatusResolver(scope.domain, scope.value);
+        resolver.statement_indexes_json = for (self.index_catalogs) |table| {
+            if (std.mem.eql(u8, table.physical_name, request.table)) break table.index_catalog_json;
+        } else return error.CatalogGenerationChanged;
         const normalized = try self.context.platformDeadline();
         resolver.query_embedding_deadline_ns = normalized.deadline_ns;
         resolver.query_cancellation = normalized.cancellation;
         var parsed = try local.api_query.parsePublicQueryRequestWithDeadline(owned, resolver.iface(), request.table, try std.json.Stringify.valueAlloc(owned, json, .{}), normalized.deadline_ns);
         defer parsed.deinit(owned);
         request.prepared_search_json = try local.api_local_query_contract.encodeQueryRequest(owned, parsed.req);
+        for (try local.api_query.resolvedIndexNames(owned, parsed.req) orelse &.{}) |name| {
+            if (self.attribution_sink) |sink| try sink.record(sink.ptr, name) else {
+                const attribution = self.attribution_allocator orelse return error.CypherSearchPreparationRequired;
+                if (!self.resolved_search_indexes.contains(name)) try self.resolved_search_indexes.put(attribution, try attribution.dupe(u8, name), {});
+            }
+        }
     }
 };
 const Metadata = struct {

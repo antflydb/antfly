@@ -116,7 +116,8 @@ pub const DenseEmbedder = struct {
     computation_key_fn: ?*const fn (*anyopaque, []const u8, []const u8, u32) anyerror!?[32]u8 = null,
     dense_embed_batch_fn: ?DenseEmbedBatchFn = null,
     /// Execute against the supplied immutable model generation/route, or reject
-    /// it as stale. Legacy callbacks are fenced by revision checks instead.
+    /// it as stale. Revision-bearing generations reject legacy execution;
+    /// before/after alias checks cannot detect an ABA during inference.
     dense_embed_parts_planned_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const template_mod.ContentPart, u32, ?RequestContext, inference_work.CapabilityLease) anyerror![]f32 = null,
     dense_embed_batch_planned_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const []const u8, u32, ?RequestContext, inference_work.CapabilityLease) anyerror![]const []const f32 = null,
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
@@ -208,7 +209,14 @@ pub const DenseEmbedder = struct {
         return self.dense_embed_batch_planned_fn.?(self.ptr, a, name, texts, dims, self.part_request_context, self.part_lease.?);
     }
 
+    fn usesPinnedTextExecution(self: DenseEmbedder) bool {
+        const lease = self.part_lease orelse return false;
+        return self.dense_embed_batch_planned_fn != null or
+            (if (lease.capabilities) |caps| caps.model_revision != null else false);
+    }
+
     pub fn embedDense(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
+        if (self.usesPinnedTextExecution()) return takeSingleDenseVector(alloc, try self.embedDenseBatch(alloc, embedding_name, &.{text}, dims));
         if (self.part_request_context) |context| return self.embedDenseWithContext(alloc, embedding_name, text, dims, context);
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
         defer sanitized.deinit(alloc);
@@ -236,6 +244,7 @@ pub const DenseEmbedder = struct {
         context: RequestContext,
     ) ![]f32 {
         try context.check();
+        if (self.usesPinnedTextExecution()) return takeSingleDenseVector(alloc, try self.embedDenseBatchWithContext(alloc, embedding_name, &.{text}, dims, context));
         const embed = self.dense_embed_with_context_fn orelse return error.UncancellableInferenceProvider;
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
         defer sanitized.deinit(alloc);
@@ -304,15 +313,12 @@ pub const DenseEmbedder = struct {
         return vectors;
     }
 
-    fn dispatchGenerationTexts(self: DenseEmbedder, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, generation: TextGeneration, allow_synchronous: bool) ![]const []const f32 {
-        const vectors = try self.dispatchTexts(a, name, texts, dims, allow_synchronous);
-        errdefer freeDenseEmbeddingBatch(a, vectors);
-        // A legacy callback cannot consume the lease. Fence each completed
-        // partition (including the unsplit case) before exposing any vectors
-        // or starting another invocation against a possibly replaced model.
-        if (self.dense_embed_batch_planned_fn == null and generation.revision != null)
-            try self.requireTextGeneration(a, name, generation);
-        return vectors;
+    fn dispatchGenerationTexts(self: DenseEmbedder, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, generation: TextGeneration, allow_synchronous: bool) anyerror![]const []const f32 {
+        // Alias observations before/after execution cannot detect A -> B -> A.
+        // A revision-bearing result requires the executor to consume its lease.
+        if (generation.revision != null and self.dense_embed_batch_planned_fn == null)
+            return error.CommitRequirementUnavailable;
+        return self.dispatchTexts(a, name, texts, dims, allow_synchronous);
     }
 
     fn accountedTextDispatch(self: DenseEmbedder, callback: anytype, args: anytype) @TypeOf(@call(.auto, callback, args)) {
@@ -489,7 +495,7 @@ pub const DenseEmbedder = struct {
         defer sanitized.deinit(alloc);
         if (context) |value| try value.check();
         if (self.dense_embed_parts_planned_fn == null and generation.revision != null)
-            try controlled.requireTextGeneration(alloc, name, generation);
+            return error.CommitRequirementUnavailable;
         const vector = if (generation.lease != null and self.dense_embed_parts_planned_fn != null)
             try self.dense_embed_parts_planned_fn.?(self.ptr, alloc, name, sanitized.partsSlice(), dims, context, generation.lease.?)
         else if (context != null and self.dense_embed_parts_with_context_fn != null)
@@ -500,7 +506,6 @@ pub const DenseEmbedder = struct {
             return error.UncancellableInferenceProvider;
         errdefer alloc.free(vector);
         if (context) |value| try value.check();
-        if (self.dense_embed_parts_planned_fn == null and generation.revision != null) try controlled.requireTextGeneration(alloc, name, generation);
         return vector;
     }
 
@@ -1151,7 +1156,11 @@ fn fallbackDenseBatch(
         alloc.free(batch);
     }
     for (texts, 0..) |text, i| {
-        batch[i] = try self.accountedTextDispatch(DenseEmbedder.embedDense, .{ self, alloc, embedding_name, text, dims });
+        // Texts were sanitized by the batch boundary. This path explicitly
+        // permits synchronous background execution; retain request checks
+        // without routing back into the foreground-only scalar adapter.
+        if (self.part_request_context) |context| try context.check();
+        batch[i] = try self.accountedTextDispatch(self.dense_embed_fn, .{ self.ptr, alloc, embedding_name, text, dims });
         initialized += 1;
     }
     return batch;
@@ -1844,7 +1853,7 @@ test "dense text planning retains metadata-only custom provider compatibility" {
     try std.testing.expectEqual(@as(usize, 2), rows.len);
 }
 
-test "dense text planning fences legacy model revisions before returning results" {
+test "commit requirements dense text rejects revision-bearing legacy execution before dispatch" {
     const P = struct {
         revision: u8 = 1,
         calls: usize = 0,
@@ -1878,7 +1887,7 @@ test "dense text planning fences legacy model revisions before returning results
         }
     };
     const a = std.testing.allocator;
-    // Legacy execution cannot consume a pinned lease. Revalidate both simple
+    // Legacy execution cannot consume a pinned lease. Reject both simple
     // metadata snapshots and controlled resolvers, for split and unsplit calls.
     for ([_]bool{ false, true }) |resolve_lease| {
         for (0..3) |mode| {
@@ -1894,9 +1903,9 @@ test "dense text planning fences legacy model revisions before returning results
                 if (result) |rows| {
                     freeDenseEmbeddingBatch(a, rows);
                     return error.ExpectedGenerationFence;
-                } else |err| try std.testing.expectEqual(error.EnrichmentSourceChanged, err);
-                try std.testing.expectEqual(@as(usize, 1), p.calls);
-                try std.testing.expectEqual(@as(usize, if (resolve_lease) 2 else 0), p.resolutions);
+                } else |err| try std.testing.expectEqual(error.CommitRequirementUnavailable, err);
+                try std.testing.expectEqual(@as(usize, 0), p.calls);
+                try std.testing.expectEqual(@as(usize, if (resolve_lease) 1 else 0), p.resolutions);
             }
         }
     }
@@ -1947,7 +1956,7 @@ test "dense capability snapshots prefer controlled leases over legacy discovery"
     try std.testing.expectEqual(@as(usize, 1), p.calls);
 }
 
-test "dense grouped parts fence revisions and consume the captured lease" {
+test "commit requirements dense grouped parts require and consume the captured lease" {
     const P = struct {
         revision: u8 = 1,
         planned: bool = false,
@@ -1992,7 +2001,7 @@ test "dense grouped parts fence revisions and consume the captured lease" {
                 const vector = try result;
                 std.testing.allocator.free(vector);
                 try std.testing.expectError(error.EnrichmentSourceChanged, provider.requireTextGeneration(std.testing.allocator, "model", .{ .revision = @splat(1) }));
-            } else try std.testing.expectError(error.EnrichmentSourceChanged, result);
+            } else try std.testing.expectError(error.CommitRequirementUnavailable, result);
             try std.testing.expectEqual(planned, state.planned);
         }
     }
@@ -2072,4 +2081,95 @@ test "commit requirements sparse execution pins one generation across partitions
     var unqualified = pinned;
     unqualified.sparse_embed_batch_planned_fn = null;
     try std.testing.expectError(error.CommitRequirementUnavailable, unqualified.embedSparse(a, "sparse", "reject"));
+}
+
+test "commit requirements dense execution consumes one revision across scalar batch and grouped ABA" {
+    const Probe = struct {
+        revision: u8 = 1,
+        calls: usize = 0,
+        fn legacy(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedAliasExecution;
+        }
+        fn resolve(ptr: *anyopaque, _: Allocator, _: []const u8, context: ?RequestContext) !inference_work.CapabilityLease {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .capabilities = .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .output = .embedding, .batch = .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, .model_revision = @splat(self.revision) } };
+        }
+        fn batch(ptr: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8, _: u32, context: ?RequestContext, lease: inference_work.CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(texts.len <= 2);
+            try std.testing.expectEqual(@as(u8, 1), lease.capabilities.?.model_revision.?[0]);
+            self.calls += 1;
+            self.revision = 2;
+            const out = try a.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |vector| a.free(vector);
+                a.free(out);
+            }
+            for (out) |*vector| {
+                vector.* = try a.dupe(f32, &.{@floatFromInt(lease.capabilities.?.model_revision.?[0])});
+                initialized += 1;
+            }
+            // Returning the alias to A cannot relabel a B result: execution
+            // above used A's captured lease rather than the live alias.
+            self.revision = 1;
+            return out;
+        }
+        fn parts(ptr: *anyopaque, a: Allocator, name: []const u8, _: []const template_mod.ContentPart, dims: u32, context: ?RequestContext, lease: inference_work.CapabilityLease) ![]f32 {
+            return takeSingleDenseVector(a, try batch(ptr, a, name, &.{"group"}, dims, context, lease));
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |controlled| {
+        var probe = Probe{};
+        const provider = (DenseEmbedder{ .ptr = &probe, .dense_embed_fn = Probe.legacy, .resolve_part_lease_fn = Probe.resolve, .dense_embed_batch_planned_fn = Probe.batch, .dense_embed_parts_planned_fn = Probe.parts }).withRequestContext(if (controlled) .{ .io = std.testing.io, .deadline_ns = null } else null);
+        const generation = try provider.captureTextGeneration(a, "dense");
+        const pinned = provider.withTextGeneration(generation);
+        const vectors = try pinned.embedDenseBatch(a, "dense", &.{ "a", "b", "c", "d", "e" }, 1);
+        defer freeDenseEmbeddingBatch(a, vectors);
+        for (vectors) |vector| try std.testing.expectEqual(@as(f32, 1), vector[0]);
+        const scalar = try pinned.embedDense(a, "dense", "scalar", 1);
+        defer a.free(scalar);
+        try std.testing.expectEqual(@as(f32, 1), scalar[0]);
+        const grouped = try pinned.embedDenseParts(a, "dense", &.{ .{ .text = "first" }, .{ .text = "second" } }, 1);
+        defer a.free(grouped);
+        try std.testing.expectEqual(@as(f32, 1), grouped[0]);
+        try std.testing.expectEqual(@as(usize, 5), probe.calls);
+        var unqualified = pinned;
+        unqualified.dense_embed_batch_planned_fn = null;
+        try std.testing.expectError(error.CommitRequirementUnavailable, unqualified.embedDense(a, "dense", "reject", 1));
+        unqualified.dense_embed_parts_planned_fn = null;
+        try std.testing.expectError(error.CommitRequirementUnavailable, unqualified.embedDenseParts(a, "dense", &.{ .{ .text = "first" }, .{ .text = "second" } }, 1));
+        try std.testing.expectEqual(@as(usize, 5), probe.calls);
+    }
+}
+
+test "commit requirements background legacy dense fallback retains cancellation boundaries" {
+    const Probe = struct {
+        calls: usize = 0,
+        cancel: bool = false,
+        canceled: std.atomic.Value(bool) = .init(false),
+        fn embed(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.cancel) self.canceled.store(true, .release);
+            return a.dupe(f32, &.{1});
+        }
+    };
+    const a = std.testing.allocator;
+    var probe = Probe{};
+    const provider = DenseEmbedder{ .ptr = &probe, .dense_embed_fn = Probe.embed };
+    const context: RequestContext = .{ .io = std.testing.io, .deadline_ns = null, .cancellation = CancellationToken.fromAtomic(&probe.canceled) };
+    const rows = try provider.embedDenseBatchBackgroundWithContext(a, "legacy", &.{ "one", "two" }, 1, context);
+    defer freeDenseEmbeddingBatch(a, rows);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    probe.calls = 0;
+    probe.cancel = true;
+    try std.testing.expectError(error.Cancelled, provider.embedDenseBatchBackgroundWithContext(a, "legacy", &.{ "one", "two" }, 1, context));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    probe.canceled.store(false, .release);
+    try std.testing.expectError(error.UncancellableInferenceProvider, provider.embedDenseBatchWithContext(a, "legacy", &.{"one"}, 1, context));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }

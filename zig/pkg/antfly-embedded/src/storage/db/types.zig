@@ -1947,6 +1947,7 @@ pub const GraphQueryDiagnosticSink = struct {
     record_fn: *const fn (*anyopaque, []const u8, []const u8, []const u8) void,
 };
 
+pub const IndexAliasFence = struct { name: []const u8, incarnation: u64 };
 pub const SearchRequest = struct {
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
@@ -1954,6 +1955,7 @@ pub const SearchRequest = struct {
 
     /// Private authoritative metadata assertion. Zero means no active masking;
     /// a nonzero value must match the installed policy before reading data.
+    index_alias_fences: []const IndexAliasFence = &.{},
     privacy_policy_version: ?[64]u8 = null,
     /// Trusted graph admission workspace; never part of the public wire DSL.
     graph_work_budget: ?*@import("../../graph/work_budget.zig").WorkBudget = null,
@@ -2177,6 +2179,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "index_alias_fences",
     "privacy_policy_version",
     "graph_work_budget",
     // Conditional delivery runs after child authorization and retrieval.

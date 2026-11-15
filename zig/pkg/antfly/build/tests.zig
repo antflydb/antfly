@@ -440,6 +440,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-store-observer-test", "Run store report admission, fencing, and ownership regressions").dependOn(&b.addRunArtifact(store_observer_tests).step);
 
+    // Committed alias tests use the metadata persistence owner, including its
+    // kernel-owned WAL; the lean coordinator target has no such provider.
+    const alias_raft_tests = b.addTest(.{
+        .name = "index-alias-raft-tests",
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"metadata alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-raft-test", "Verify committed alias rejection and durable store-admission indexes")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_raft_tests, &.{"metadata alias"}).step);
+    const alias_metadata_http_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"index alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-metadata-http-test", "Verify alias preflight conflicts across metadata HTTP routes and forwarding")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_metadata_http_tests, &.{"index alias"}).step);
     const system_catalog_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
@@ -3409,6 +3426,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
         .dependOn(&addFilteredTestRunArtifact(b, text_frontier_tests).step);
+    const native_source_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_native_source_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, native_source_mod, true, true);
+    const native_source_filters = selectTestFilters(b, &.{"external lake execution"});
+    const native_source_tests = b.addTest(.{
+        .root_module = native_source_mod,
+        .filters = native_source_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-native-source-test", "Verify native source memory bounds, immutable receipts and reopen")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, native_source_tests, native_source_filters).step);
     const recent_native_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_recent_native_test_root.zig"),
         .target = target,
@@ -5587,6 +5618,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     memory_metadata_step.dependOn(&b.addRunArtifact(memory_standalone_tests).step);
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
+    const standalone_alias_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"index alias standalone"},
+    });
+    b.step("antfly-index-alias-catalog-test", "Verify index alias CAS, deletion guards, rollback and restart").dependOn(&b.addRunArtifact(standalone_alias_tests).step);
     const standalone_ddl_tests = b.addTest(.{
         .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"system catalog standalone relation coordinator"},
@@ -5636,6 +5672,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = lib_standalone_runtime_test_mod,
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
+            "index alias standalone",
             "privacy standalone progress retains routing and join planning generations",
             "privacy standalone compact bindings refresh on policy publication and survive progress",
             "standalone metadata admission observes cancellation",
@@ -7514,6 +7551,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_merge_cutover_step = b.step("antfly-storage-db-merge-cutover-test", "Run the merge cutover enrichment reopen DB test");
     db_merge_cutover_step.dependOn(&run_db_merge_cutover_tests.step);
 
+    const alias_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"index alias storage fences"} });
+    b.step("antfly-index-alias-storage-test", "Verify alias generation assertions under real storage read leases").dependOn(&addFilteredTestRunArtifact(b, alias_storage_tests).step);
     const index_document_native_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"index document checkpoint native storage"} });
     b.step("antfly-index-document-native-test", "Verify indexed document source guards, cleanup and native lease takeover").dependOn(&addFilteredTestRunArtifact(b, index_document_native_tests).step);
     const db_shared_embedding_tests = b.addTest(.{

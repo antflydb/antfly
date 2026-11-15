@@ -601,9 +601,9 @@ pub const ObjectStore = struct {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return self.indexed.?.completeCatalogUpdate(ns, epoch);
     }
-    fn erasedPrepared(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, fence: wal_types.CatalogFence) !wal_types.BatchResult {
+    fn erasedPrepared(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, fence: wal_types.CatalogFence, documents: []const []const u8) !wal_types.BatchResult {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
-        return self.indexed.?.appendPrepared(ns, timestamp, payloads, id, fence);
+        return self.indexed.?.appendPreparedWithReadSet(ns, timestamp, payloads, id, fence, documents);
     }
     fn erasedMaterialize(ptr: *anyopaque, ns: []const u8, cancellation: ?objectstore.CancellationToken) !bool {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));

@@ -46,11 +46,13 @@ const Entry = struct {
     stack: bootstrap.OwnedStack,
     schema: []u8,
     indexes: []u8,
+    storage_identity: [32]u8,
     fn init(self: *Entry, a: A, io: std.Io, table: metadata.TableRecord, options: Options, context: local.api_operation.RequestContext) !void {
         try context.ensureActive();
+        self.storage_identity = table.object_storage_identity;
         self.schema = try a.dupe(u8, table.schema_json);
         errdefer a.free(self.schema);
-        self.indexes = try a.dupe(u8, table.indexes_json);
+        self.indexes = try local.api_index_metadata.aliases.physicalProjection(a, table.indexes_json);
         errdefer a.free(self.indexes);
         self.store = try Store.openNative(a, options.config, options.secrets, false, options.deployment, options.local_base_dir);
         errdefer self.store.deinit();
@@ -76,11 +78,11 @@ const Entry = struct {
         }, io);
         errdefer self.stack.deinit();
         try context.ensureActive();
-        _ = try self.stack.catalog.ensureTableWithDefinition("data", 0, .{}, table.schema_json, table.read_schema_json, table.indexes_json);
+        _ = try self.stack.catalog.ensureTableWithDefinition("data", 0, .{}, table.schema_json, table.read_schema_json, self.indexes);
         try context.ensureActive();
         var recorded = (try self.stack.catalog.getTableAlloc(a, "data")) orelse return error.ObjectTableDefinitionConflict;
         defer recorded.deinit(a);
-        if (!std.mem.eql(u8, recorded.schema_json, table.schema_json) or !std.mem.eql(u8, recorded.indexes_json, table.indexes_json)) return error.ObjectTableDefinitionConflict;
+        if (!std.mem.eql(u8, recorded.schema_json, table.schema_json) or !try local.api_index_metadata.aliases.configurationEqual(a, recorded.indexes_json, self.indexes)) return error.ObjectTableDefinitionConflict;
         try context.ensureActive();
         try self.stack.runtime.start();
     }
@@ -114,7 +116,14 @@ pub const Manager = struct {
         try context.ensureActive();
         const key = [2]u64{ table.table_id, table.object_storage_generation };
         if (self.entries.get(key)) |entry| {
-            if (!std.mem.eql(u8, entry.schema, table.schema_json) or !std.mem.eql(u8, entry.indexes, table.indexes_json)) return error.ObjectTableDefinitionConflict;
+            // Only authoritative native bindings enter this manager. Metadata
+            // publication rejects every physical recipe change within an object
+            // generation (validateObjectTableMutation), before replication and
+            // projection. Routing/receipt updates cannot change this runtime.
+            // Use that immutable identity rather than reparsing a catalog while
+            // holding the manager-wide lock on every request.
+            if (!std.mem.eql(u8, &entry.storage_identity, &table.object_storage_identity)) return error.ObjectTableStorageBindingChanged;
+            if (!std.mem.eql(u8, entry.schema, table.schema_json)) return error.ObjectTableDefinitionConflict;
             return entry;
         }
         if (self.entries.count() >= max_tables) return error.ObjectTableRuntimeCapacityExceeded;
@@ -165,7 +174,10 @@ pub const Manager = struct {
         }
         const path = try std.fmt.allocPrint(a, "/tables/data/{s}", .{suffix});
         defer a.free(path);
-        var response = entry.stack.handler.handle(.{ .method = method, .path = path, .body = body, .cancellation = context.cancellation, .deadline_ns = guard.context.deadline_ns }) catch |err| {
+        var bound_body: ?[]u8 = null;
+        defer if (bound_body) |bytes| a.free(bytes);
+        if (std.mem.eql(u8, suffix, "query")) bound_body = try stripAliasFences(a, body, entry.indexes);
+        var response = entry.stack.handler.handle(.{ .method = method, .path = path, .body = bound_body orelse body, .cancellation = context.cancellation, .deadline_ns = guard.context.deadline_ns }) catch |err| {
             // Transport-only cancellation adapters may report Canceled when
             // the request deadline expired. Preserve the native error kind.
             if (method == .get or std.mem.eql(u8, suffix, "query")) try guard.context.ensureActive();
@@ -179,3 +191,69 @@ pub const Manager = struct {
         return response;
     }
 };
+
+/// Only the admitted internal envelope may contain fences. Still decode it
+/// defensively: malformed control state is an error, never a union-tag trap.
+fn stripAliasFences(a: A, body: []const u8, physical_indexes: []const u8) !?[]u8 {
+    if (std.mem.indexOf(u8, body, "_index_alias_fences") == null and std.mem.indexOfScalar(u8, body, '\\') == null) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, body, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const raw = parsed.value.object.get("_index_alias_fences") orelse return null;
+    var fences = std.json.parseFromValue([]const local.storage_db_types.IndexAliasFence, a, raw, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest;
+    defer fences.deinit();
+    if (fences.value.len == 0 or fences.value.len > local.api_index_metadata.aliases.max_aliases_per_table) return error.InvalidQueryRequest;
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, physical_indexes, .{});
+    defer catalog.deinit();
+    if (catalog.value != .object) return error.InvalidTableIndexMetadata;
+    for (fences.value) |fence| {
+        if (fence.name.len == 0 or fence.name.len > 256 or fence.incarnation == 0) return error.InvalidQueryRequest;
+        const config = catalog.value.object.get(fence.name) orelse return error.TableGenerationChanged;
+        const identity = (try @import("indexes.zig").indexRuntimeIdentity(a, fence.name, config)) orelse return error.TableGenerationChanged;
+        if (identity.incarnation != fence.incarnation) return error.TableGenerationChanged;
+    }
+    _ = parsed.value.object.orderedRemove("_index_alias_fences");
+    return try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+}
+
+test "index alias object internal fences validate malformed and replaced identities" {
+    const a = std.testing.allocator;
+    const indexes = "{\"text\":{\"type\":\"full_text\",\"_index_incarnation\":41}}";
+    for ([_][]const u8{
+        "{\"_index_alias_fences\":1}",
+        "{\"_index_alias_fences\":{}}",
+        "{\"_index_alias_fences\":[null]}",
+        "{\"_index_alias_fences\":[{}]}",
+        "{\"_index_alias_fences\":[{\"name\":1,\"incarnation\":41}]}",
+        "{\"_index_alias_fences\":[{\"name\":\"text\",\"incarnation\":-1}]}",
+        "{\"_index_alias_fences\":[{\"name\":\"text\",\"incarnation\":0}]}",
+    }) |body| try std.testing.expectError(error.InvalidQueryRequest, stripAliasFences(a, body, indexes));
+    try std.testing.expectError(error.TableGenerationChanged, stripAliasFences(a, "{\"_index_alias_fences\":[{\"name\":\"text\",\"incarnation\":42}]}", indexes));
+    const body = (try stripAliasFences(a, "{\"indexes\":[\"text\"],\"_index_alias_fences\":[{\"name\":\"text\",\"incarnation\":41}]}", indexes)).?;
+    defer a.free(body);
+    try std.testing.expectEqualStrings("{\"indexes\":[\"text\"]}", body);
+}
+
+test "index alias object runtime reuse relies on publication immutable recipe without allocations" {
+    const a = std.testing.allocator;
+    const before: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .storage = .{ .engine = .object }, .object_storage_generation = 1, .object_storage_identity = @splat(1), .schema_json = "{}", .indexes_json = "{\"text\":{\"type\":\"full_text\",\"_index_incarnation\":41}}", .desired_replica_count = 0, .min_ranges = 0 };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"complete\":true}", .{});
+    var after = before;
+    after.indexes_json = try local.api_index_metadata.aliases.put(arena.allocator(), before.indexes_json, "live", .{ .index = "text", .idempotency_key = "1" }, ready, 1);
+    try metadata.validateObjectTableMutation(a, before, after);
+    var invalid = after;
+    invalid.indexes_json = "{\"other\":{\"type\":\"full_text\"}}";
+    try std.testing.expectError(error.ObjectTableDefinitionConflict, metadata.validateObjectTableMutation(a, before, invalid));
+    var entry: Entry = .{ .store = undefined, .stack = undefined, .schema = @constCast(before.schema_json), .indexes = @constCast(before.indexes_json), .storage_identity = before.object_storage_identity };
+    var manager: Manager = .{};
+    defer manager.entries.deinit(a);
+    try manager.entries.put(a, .{ before.table_id, before.object_storage_generation }, &entry);
+    // An already-published incarnation must need no allocation or JSON parse.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectEqual(&entry, try manager.acquire(failing.allocator(), std.testing.io, after, .{ .deployment = .standalone }, .{}));
+    invalid = after;
+    invalid.object_storage_identity = @splat(2);
+    try std.testing.expectError(error.ObjectTableStorageBindingChanged, manager.acquire(failing.allocator(), std.testing.io, invalid, .{ .deployment = .standalone }, .{}));
+}

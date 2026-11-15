@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -28,6 +28,8 @@ class QueryResultBase:
     Attributes:
         took (int): Duration of the query in milliseconds.
         status (int): HTTP status code of the query operation.
+        resolved_indexes (list[str] | Unset): Concrete index names selected for this query before embedding and
+            execution.
         source_ranking (QueryResultBaseSourceRanking | Unset): Ranking contract for a composed result.
         next_source_cursor (str | Unset): Opaque continuation for composed queries. Pass as source_cursor with the same
             query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication
@@ -55,6 +57,7 @@ class QueryResultBase:
 
     took: int
     status: int
+    resolved_indexes: list[str] | Unset = UNSET
     source_ranking: QueryResultBaseSourceRanking | Unset = UNSET
     next_source_cursor: str | Unset = UNSET
     remote_snapshot: str | Unset = UNSET
@@ -73,6 +76,10 @@ class QueryResultBase:
         took = self.took
 
         status = self.status
+
+        resolved_indexes: list[str] | Unset = UNSET
+        if not isinstance(self.resolved_indexes, Unset):
+            resolved_indexes = self.resolved_indexes
 
         source_ranking: str | Unset = UNSET
         if not isinstance(self.source_ranking, Unset):
@@ -120,6 +127,8 @@ class QueryResultBase:
                 "status": status,
             }
         )
+        if resolved_indexes is not UNSET:
+            field_dict["resolved_indexes"] = resolved_indexes
         if source_ranking is not UNSET:
             field_dict["source_ranking"] = source_ranking
         if next_source_cursor is not UNSET:
@@ -160,6 +169,8 @@ class QueryResultBase:
         took = d.pop("took")
 
         status = d.pop("status")
+
+        resolved_indexes = cast(list[str], d.pop("resolved_indexes", UNSET))
 
         _source_ranking = d.pop("source_ranking", UNSET)
         source_ranking: QueryResultBaseSourceRanking | Unset
@@ -223,6 +234,7 @@ class QueryResultBase:
         query_result_base = cls(
             took=took,
             status=status,
+            resolved_indexes=resolved_indexes,
             source_ranking=source_ranking,
             next_source_cursor=next_source_cursor,
             remote_snapshot=remote_snapshot,

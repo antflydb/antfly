@@ -44674,6 +44674,12 @@ pub const DB = struct {
 
     pub fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) !types.SearchRequest {
         if (comptime storage_engine.enabled) return storage_engine.call("searchRequestAtCurrentIdentityGeneration", .{ self, req });
+        // Caller owns apply-shared or a published catalog lease. Validation
+        // and lookup therefore observe the same incarnation as execution.
+        for (req.index_alias_fences) |fence| {
+            const incarnation = self.core.index_manager.coverageGenerationForIndex(fence.name) orelse return error.CatalogGenerationChanged;
+            if (incarnation != fence.incarnation) return error.CatalogGenerationChanged;
+        }
         var snapshot_req = req;
         snapshot_req.identity_read_generation = try self.currentIdentityReadGenerationForRequest(snapshot_req.identity_read_generation);
         try self.validateResolvedDocFilterWireContext(snapshot_req);
@@ -48486,7 +48492,7 @@ pub const DB = struct {
         // composed queries keep their existing synchronization.
         var remaining = req;
         const defaults: types.SearchRequest = .{};
-        inline for (.{ "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation", "document_authority_mode", "document_authority_group" }) |field| {
+        inline for (.{ "index_alias_fences", "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation", "document_authority_mode", "document_authority_group" }) |field| {
             @field(remaining, field) = @field(defaults, field);
         }
         // Empty slices from a decoded wire envelope need not share the
@@ -95073,6 +95079,22 @@ test "leann synchronous document provenance pins revisions and tolerates inferen
             if (self.flip) self.revision += 1;
             return vector;
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
         fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.revision) };
@@ -95080,7 +95102,7 @@ test "leann synchronous document provenance pins revisions and tolerates inferen
         fn append(_: Allocator, _: *usize, _: []const u8, _: ?[]const u8, _: []const u8, _: []const f32, _: []const []const u8) !void {}
     };
     var fake = Fake{};
-    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .capabilities_fn = Fake.caps };
+    const provider = embedder_mod.DenseEmbedder{ .ptr = &fake, .dense_embed_fn = Fake.embed, .dense_embed_batch_planned_fn = Fake.planned, .capabilities_fn = Fake.caps };
     var directory = try TestDirectory.init("leann-sync-generation");
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .enrichment = .{ .owner_id = "sync", .dense_embedder = provider }, .ttl_cleanup = .{ .enabled = false } });
@@ -101123,6 +101145,12 @@ fn testDenseRevisionReuse(sync_level: types.SyncLevel, with_parts: bool) !void {
             }
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(revision), .batch = .{ .mode = .native, .max_items = 32 } };
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            return batch(raw, result_alloc, name, texts, dims);
+        }
         fn batch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8, _: u32) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const rows = try alloc.alloc([]const f32, texts.len);
@@ -101142,7 +101170,7 @@ fn testDenseRevisionReuse(sync_level: types.SyncLevel, with_parts: bool) !void {
     var probe = Probe{};
     var directory = try TestDirectory.init("model-revision-reuse");
     defer directory.cleanup();
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "revision-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = if (with_parts) Probe.parts else null, .text_parts_equivalent_fn = Probe.equivalent, .dense_embed_batch_fn = Probe.batch, .capabilities_fn = Probe.caps } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "revision-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = if (with_parts) Probe.parts else null, .text_parts_equivalent_fn = Probe.equivalent, .dense_embed_batch_fn = Probe.batch, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps } } });
     defer db.close();
     try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"passage: {{body}}\",\"embedding_name\":\"model\"}}" });
     for (0..3) |version| {
@@ -101183,6 +101211,22 @@ test "db paper evaluation producer upgrades require explicit reprocess and async
             self.calls += 1;
             if (self.fail) return error.PermanentPromptFailure;
             return alloc.dupe(f32, &.{ if (self.revision == 1) 1 else 0, if (self.revision == 2) 1 else 0, if (std.mem.eql(u8, text, "changed")) 2 else 1 });
+        }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
         }
         fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -101253,7 +101297,7 @@ test "db paper evaluation producer upgrades require explicit reprocess and async
     var directory = try TestDirectory.init("paper-evaluation-contracts");
     defer directory.cleanup();
     var probe = Probe{};
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "paper-contract", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "paper-contract", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps } } });
     defer db.close();
     try db.addEnrichment(Probe.config(1));
     try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"vectors\"}],\"publication_policy\":\"atomic\"}" });
@@ -101324,6 +101368,36 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
         fn caps(_: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(1) };
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(@as(u8, 1)))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
+        fn sparsePlanned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, context: ?@import("antfly_inference_execution_context").RequestContext, generation: embedder_mod.SparseEmbedder.Generation) ![]embedder_mod.SparseEmbedding {
+            if (context) |control| try control.check();
+            if (!std.meta.eql(generation.revision, @as(?[32]u8, @as([32]u8, @splat(1))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc(embedder_mod.SparseEmbedding, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |*row| row.deinit(result_alloc);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embedSparse(raw, result_alloc, name, text);
+                initialized += 1;
+            }
+            return rows;
+        }
         fn revision(_: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
             return @as([32]u8, @splat(1));
         }
@@ -101378,7 +101452,7 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
     var directory = try TestDirectory.init("late-A-generation");
     defer directory.cleanup();
     var probe = Probe{ .hold_at = initial_reprocesses + 1, .rollback = rollback, .sparse = sparse, .recreate = recreate };
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-A", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.embedSparse, .cache_revision_fn = Probe.revision } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-A", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.embedSparse, .sparse_embed_batch_planned_fn = Probe.sparsePlanned, .cache_revision_fn = Probe.revision } } });
     defer db.close();
     probe.db = &db;
     if (relational) try db.setSchemaJson(a,
@@ -154882,6 +154956,21 @@ fn testProducerDefinitionPublication(replace_definition: bool) !void {
         fn caps(_: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(1) };
         }
+        fn planned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(1))))) return error.EnrichmentSourceChanged;
+            const rows = try result_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (rows[0..initialized]) |row| result_alloc.free(row);
+                result_alloc.free(rows);
+            }
+            for (texts, rows) |text, *row| {
+                row.* = try embed(raw, result_alloc, name, text, dims);
+                initialized += 1;
+            }
+            return rows;
+        }
         fn requireFresh(self: *@This(), alloc: Allocator) !void {
             const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "vectors");
             defer alloc.free(key);
@@ -154913,7 +155002,7 @@ fn testProducerDefinitionPublication(replace_definition: bool) !void {
     var directory = try TestDirectory.init("late-definition");
     defer directory.cleanup();
     var probe = Probe{ .replace_definition = replace_definition };
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-definition", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-definition", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .dense_embed_batch_planned_fn = Probe.planned, .capabilities_fn = Probe.caps } } });
     defer db.close();
     probe.db = &db;
     try db.addEnrichment(Probe.config(false));
@@ -154999,6 +155088,18 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
             }
             return rows;
         }
+        fn densePlanned(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: ?@import("antfly_inference_execution_context").RequestContext, lease: @import("antfly_inference_work").CapabilityLease) ![]const []const f32 {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(lease.capabilities.?.model_revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            return denseBatch(raw, a, name, texts, dims);
+        }
+        fn sparsePlanned(raw: *anyopaque, result_alloc: Allocator, name: []const u8, texts: []const []const u8, context: ?@import("antfly_inference_execution_context").RequestContext, generation: embedder_mod.SparseEmbedder.Generation) ![]embedder_mod.SparseEmbedding {
+            if (context) |control| try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.meta.eql(generation.revision, @as(?[32]u8, @as([32]u8, @splat(self.revision))))) return error.EnrichmentSourceChanged;
+            return sparseBatch(raw, result_alloc, name, texts);
+        }
         fn denseControlled(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: @import("antfly_inference_execution_context").RequestContext) ![]const []const f32 {
             try context.check();
             return denseBatch(raw, a, name, texts, dims);
@@ -155043,17 +155144,22 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
     var directory = try TestDirectory.init("document-generation-preparation");
     defer directory.cleanup();
     const batch_boundary = mode == .between_batches or shape == .extracted;
-    var probe = Probe{ .change_after_checks = if (sparse)
-        (if (batch_boundary) @as(usize, 1) else 2)
-    else switch (shape) {
-        .extracted => 2,
-        .inline_chunks => if (batch_boundary) @as(usize, 2) else 3,
-        .materialized_chunks => if (batch_boundary) @as(usize, 3) else 4,
-    }, .change = mode != .stable };
+    var probe = Probe{
+        .change_after_checks = if (sparse)
+            (if (batch_boundary) @as(usize, 1) else 2)
+        else switch (shape) {
+            // Leased execution no longer performs the legacy post-call alias
+            // observation; the materializer still fences every completed batch.
+            .extracted => 1,
+            .inline_chunks => if (batch_boundary) @as(usize, 1) else 2,
+            .materialized_chunks => if (batch_boundary) @as(usize, 2) else 3,
+        },
+        .change = mode != .stable,
+    };
     var db = try DB.open(alloc, directory.path(), .{
         .start_optional_runtime_workers = false,
         .start_index_workers = false,
-        .enrichment = .{ .owner_id = "document-generation", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.dense, .dense_embed_batch_fn = Probe.denseBatch, .dense_embed_batch_with_context_fn = Probe.denseControlled, .capabilities_fn = Probe.caps, .foreground_bounded = true }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseOne, .sparse_embed_batch_fn = Probe.sparseBatch, .sparse_embed_batch_with_context_fn = Probe.sparseControlled, .cache_revision_fn = Probe.revisionFn, .foreground_bounded = true } },
+        .enrichment = .{ .owner_id = "document-generation", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.dense, .dense_embed_batch_fn = Probe.denseBatch, .dense_embed_batch_planned_fn = Probe.densePlanned, .dense_embed_batch_with_context_fn = Probe.denseControlled, .capabilities_fn = Probe.caps, .foreground_bounded = true }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseOne, .sparse_embed_batch_fn = Probe.sparseBatch, .sparse_embed_batch_planned_fn = Probe.sparsePlanned, .sparse_embed_batch_with_context_fn = Probe.sparseControlled, .cache_revision_fn = Probe.revisionFn, .foreground_bounded = true } },
     });
     defer db.close();
     const chunk_size: u32 = if (mode == .between_batches or mode == .stable) 256 else 4096;
@@ -155818,6 +155924,30 @@ test "db context sources consume generated artifacts downstream and reject artif
     );
     defer alloc.free(via_echo);
     try std.testing.expectError(error.ContextSourceFeedbackCycle, db.upsertEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = generator, .context_sources_json = via_echo }));
+}
+
+test "index alias storage fences reject same-name replacement and survive query leases" {
+    const a = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("alias-fence");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{ .primary_backend = .{ .mem = .{} } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 41 });
+    const request: types.SearchRequest = .{ .index_alias_fences = &.{.{ .name = "text", .incarnation = 41 }} };
+    var lease = try db.beginQueryReadLease();
+    _ = try db.searchRequestAtCurrentIdentityGeneration(request);
+    lease.release();
+    _ = try db.deleteIndex("text");
+    // Retirement owns the physical name until asynchronous artifact cleanup
+    // completes; replacement must exercise the post-cleanup incarnation fence.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 42 });
+    lease = try db.beginQueryReadLease();
+    defer lease.release();
+    try std.testing.expectError(error.CatalogGenerationChanged, db.searchRequestAtCurrentIdentityGeneration(request));
+    _ = try db.searchRequestAtCurrentIdentityGeneration(.{ .index_alias_fences = &.{.{ .name = "text", .incarnation = 42 }} });
 }
 
 test "db commit requirements reserves existing artifact retirement before a prepared vote" {

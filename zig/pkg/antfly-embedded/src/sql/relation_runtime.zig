@@ -68,6 +68,15 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
                 const request = if (expression.request == .parameter) parameters[expression.request.parameter - 1] else try describe.bindLiteral(a, expression.request, .string);
                 if (request != .string) return error.InvalidSqlParameters;
                 search.request_text = request.string;
+                if (std.mem.indexOf(u8, scan.table.index_catalog_json, "_index_aliases") != null and
+                    std.mem.startsWith(u8, std.mem.trimStart(u8, request.string, " \t\r\n"), "{"))
+                {
+                    const aliases = @import("../api/index_aliases.zig");
+                    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, scan.table.index_catalog_json, .{});
+                    var body = try std.json.parseFromSliceLeaky(std.json.Value, a, request.string, .{});
+                    try aliases.bindQuery(a, root, &body);
+                    search.request_text = try std.json.Stringify.valueAlloc(a, body, .{});
+                }
                 if (expression.limit) |input| {
                     const limit = if (input == .parameter) parameters[input.parameter - 1] else try describe.bindLiteral(a, input, .integer);
                     const number = if (limit == .integer) limit.integer else if (limit == .string) std.fmt.parseInt(i64, limit.string, 10) catch return error.InvalidSqlParameters else return error.InvalidSqlParameters;
