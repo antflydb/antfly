@@ -1736,6 +1736,9 @@ pub const PrecomputedCoverageCandidate = struct {
 
 pub const GeneratedBatchWritePlan = struct {
     alloc: Allocator,
+    // Borrowed from the request's pinned write-plan lease. Direct preparation
+    // expands only one window, never the full document/producer cross product.
+    catalog: ?index_manager_mod.IndexManager.WritePlanSnapshot = null,
     rows: []index_manager_mod.IndexManager.WritePlanSnapshot.BorrowedGeneratedRowPlan,
     /// Admission capability captured from the same pinned catalog as the rows.
     direct_gate_supported: bool = true,

@@ -7694,6 +7694,7 @@ pub const DB = struct {
     pub fn prepareDirectEnrichmentsWithContext(self: *DB, alloc: Allocator, req: types.BatchRequest, context: ?@import("antfly_inference_execution_context").RequestContext) ![]u8 {
         if (context) |control| try control.check();
         if (req.commit_requires != .direct_enrichments or req.prepared_enrichments_json != null) return error.InvalidBatchRequest;
+        try @import("commit_requirements.zig").validateRequestBounds(req);
         const digest = try execution_resources.PreparedEnrichments.requestDigest(alloc, req);
         if (req.transaction) |control| if (control == .prepare) {
             var manager = try self.core.initTxnManager();
@@ -154521,4 +154522,85 @@ test "db commit requirements reject row policy before producer dispatch" {
         try std.testing.expect(capture.json == null);
         try std.testing.expectEqual(@as(usize, 0), provider.calls);
     }
+}
+
+test "db commit requirements source and planning bounds precede allocation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-planning-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const writes = try a.alloc(types.BatchWrite, @import("commit_requirements.zig").max_output_rows + 1);
+    defer a.free(writes);
+    @memset(writes, .{ .key = "a", .value = "{}" });
+    var failed = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.prepareDirectEnrichments(failed.allocator(), .{ .writes = writes, .commit_requires = .direct_enrichments }));
+    try std.testing.expect(!failed.has_induced_failure);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.batch(.{ .writes = writes, .commit_requires = .direct_enrichments }));
+    const operations = try a.alloc(types.TransformOp, @import("commit_requirements.zig").max_output_rows + 1);
+    defer a.free(operations);
+    @memset(operations, .{ .op = .set, .path = "body", .value_json = "1" });
+    const transforms = [_]types.DocumentTransform{.{ .key = "a", .operations = operations, .upsert = true }};
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.prepareDirectEnrichments(failed.allocator(), .{ .transforms = &transforms, .commit_requires = .direct_enrichments }));
+    try std.testing.expect(!failed.has_induced_failure);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.batch(.{ .transforms = &transforms, .commit_requires = .direct_enrichments }));
+    try db.addEnrichment(.{ .name = "asset", .kind = .asset, .field = "body", .content_type = "application/json" });
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    var row = try mapper.extractWrite(a, "a", "{\"body\":\"source words\"}");
+    defer row.deinit(a);
+    var budget: @import("commit_requirements.zig").OutputBudget = .{ .rows = @import("commit_requirements.zig").max_output_rows };
+    try std.testing.expectError(error.CommitRequirementTooLarge, plan.plan().planGeneratedEnrichmentsForRowBounded(failed.allocator(), "a", row, &budget, null));
+    try std.testing.expect(!failed.has_induced_failure);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, plan.plan().planGeneratedEnrichmentsForRowBounded(failed.allocator(), "a", row, null, .{ .io = std.testing.io, .deadline_ns = null, .cancellation = types.CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expect(!failed.has_induced_failure);
+}
+
+test "db commit requirements preserve provider batches across bounded planning windows" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        items: usize = 0,
+        max_items: usize = 0,
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedScalarInference;
+        }
+        fn batch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.items += texts.len;
+            self.max_items = @max(self.max_items, texts.len);
+            const result = try alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (result[0..initialized]) |vector| alloc.free(vector);
+                alloc.free(result);
+            }
+            for (result) |*vector| {
+                const values = try alloc.alloc(f32, dims);
+                @memset(values, 1);
+                vector.* = values;
+                initialized += 1;
+            }
+            return result;
+        }
+    };
+    var directory = try TestDirectory.init("direct-planning-windows");
+    defer directory.cleanup();
+    var probe = Probe{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "window-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch } } });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense\"}}" });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const writes = try alloc.alloc(types.BatchWrite, 40);
+    for (writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(alloc, "doc-{d}", .{i}), .value = try std.fmt.allocPrint(alloc, "{{\"body\":\"unique source {d}\"}}", .{i}) };
+    try db.batch(.{ .writes = writes, .commit_requires = .direct_enrichments });
+    try std.testing.expectEqual(@as(usize, 40), probe.items);
+    try std.testing.expect(probe.calls > 1 and probe.calls < 40);
+    try std.testing.expect(probe.max_items > 1 and probe.max_items <= @import("commit_requirements.zig").max_window_documents);
+    const last = (try db.get(a, "doc-39")) orelse return error.TestUnexpectedResult;
+    defer a.free(last);
 }

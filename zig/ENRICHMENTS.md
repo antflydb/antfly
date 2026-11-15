@@ -144,6 +144,12 @@ by foreign-key cascade expansion. The coordinator retains that default through
 session cloning, persistence and expansion; explicit table-level `none` remains
 an override. Statement coalescing retains the strongest prerequisite selected
 for each table and the strongest default needed by later cascade expansion.
+Session state stores the explicit table override separately from a monotonic
+floor recording previously selected requirements. Strengthening a root default
+also strengthens retained implicit tables; a later `none` cannot erase a prior
+direct floor. Trusted persistence uses the versioned
+`commit-requirements-request-v1` envelope so older readers reject this state
+rather than silently discarding its provenance. Public JSON remains unchanged.
 Single-shard fast paths and grouped forwarding preserve the optional field.
 Requests with explicit requirements bypass the local write coalescer so each
 request retains its own preparation and source fences.
@@ -159,7 +165,13 @@ partitions, and revalidates the current generation before admission.
 
 Preparation dispatches bounded windows of at most 32 documents and 256 KiB of
 source bytes, preserving native dense/sparse and asset provider batching. The
-submitted source envelope is checked before inference. Source mutations,
+submitted source envelope is checked before digest allocation, coalescing and
+plan expansion, including raw transform operations and graph mutations, then
+checked again after transforms. A direct plan borrows the
+pinned catalog and expands only the current window. Cancellation and monotonic
+bookkeeping budgets are checked per producer and consumer before cloning;
+target generations are read once per window before batched inference. Receiver
+validation uses the same bounded temporary plans. Source mutations,
 artifacts, deletes, metadata and replay have an 8 MiB / 16,384-row physical budget.
 Provider result contracts and incremental output accounting stop oversized work.
 Transaction preparation additionally reserves a conservative bound for commit
@@ -228,8 +240,13 @@ It is limited to 1,024 mutations and 8 MiB including framing. Legacy backends
 without atomic source/catalog fencing reject before inference or source admission.
 Each document uses a 64 MiB scratch allocation quota; remaining output limits are
 checked between stages and predictable vector amplification is rejected before
-inference. Preparation removes old derived chunk inputs before transforming a
-source. Empty gated requests still reach catalog capability validation.
+inference. Direct stages preserve the complete submitted source postimage and
+overlay only the outputs owned by active eligible producers. A separate text
+projection excludes active derived inputs, including old chunk previews, without
+removing unrelated source fields such as transcripts or user-authored vectors.
+Source numeric tokens retain their original precision. Vector preflight counts
+the retained postimage, not just the smaller producer input projection. An empty
+pipeline preserves scalar source values too. Empty gated requests still reach catalog capability validation.
 Request-owned provider handles avoid the background runtime's configuration and
 publication locks. Media/model-source stages requiring artifact context remain
 asynchronous. Prepared completion markers bind the canonical producer catalog;

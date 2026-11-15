@@ -873,6 +873,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             write_plan: index_manager_mod.IndexManager.WritePlanSnapshot,
         ) !GeneratedBatchWritePlan {
             if (req.writes.len != extracted.len) return error.InvalidArgument;
+            if (req.commit_requires == .direct_enrichments) return .{
+                .alloc = alloc,
+                .rows = &.{},
+                .catalog = write_plan,
+                .direct_gate_supported = @import("commit_requirements.zig").catalogSupported(write_plan),
+            };
+            return planGeneratedWindow(alloc, req, extracted, write_plan, null, null);
+        }
+
+        fn planGeneratedWindow(
+            alloc: Allocator,
+            req: types.BatchRequest,
+            extracted: []const mapper.ExtractedWrite,
+            write_plan: index_manager_mod.IndexManager.WritePlanSnapshot,
+            budget: ?*@import("commit_requirements.zig").OutputBudget,
+            context: ?@import("antfly_inference_execution_context").RequestContext,
+        ) !GeneratedBatchWritePlan {
             const rows = try alloc.alloc(
                 index_manager_mod.IndexManager.WritePlanSnapshot.BorrowedGeneratedRowPlan,
                 req.writes.len,
@@ -880,15 +897,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var plan = GeneratedBatchWritePlan{ .alloc = alloc, .rows = rows, .direct_gate_supported = @import("commit_requirements.zig").catalogSupported(write_plan) };
             errdefer plan.deinit();
             for (req.writes, extracted) |write, row| {
+                if (context) |control| try control.check();
                 if (!row.hasDocument()) {
                     rows[plan.initialized] = .{ .alloc = alloc, .requests = &.{} };
                     plan.initialized += 1;
                     continue;
                 }
-                rows[plan.initialized] = try write_plan.planGeneratedEnrichmentsForRowBorrowed(
+                rows[plan.initialized] = try write_plan.planGeneratedEnrichmentsForRowBounded(
                     alloc,
                     write.key,
                     row,
+                    budget,
+                    context,
                 );
                 plan.initialized += 1;
             }
@@ -989,19 +1009,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn restorePreparedEnrichmentsForRows(self: anytype, a: Allocator, req: types.BatchRequest, extracted: []const mapper.ExtractedWrite, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, packet: execution_resources.PreparedEnrichments) !PrecomputedGeneratedBatch {
             if (packet.version != 1 or !std.mem.eql(u8, &packet.catalog_digest, &(plan.artifact_catalogs orelse return error.VersionConflict).digest())) return error.VersionConflict;
-            var expected = try planGeneratedEnrichmentsForRows(a, req, extracted, plan.*);
-            defer expected.deinit();
-            if (!expected.direct_gate_supported) return error.InvalidBatchRequest;
+            if (!@import("commit_requirements.zig").catalogSupported(plan.*)) return error.InvalidBatchRequest;
+            var budget = try @import("commit_requirements.zig").sourceBudget(req.writes, req.deletes);
             var supplied: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
             defer supplied.deinit(a);
             for (packet.producers) |producer| {
                 const identity = producer.identity();
                 if ((try supplied.getOrPut(a, identity)).found_existing) return error.InvalidBatchRequest;
             }
-            for (expected.rows) |row| for (row.requests) |producer| {
-                if (!try shouldPrecomputeGeneratedRequest(self, .direct, producer)) continue;
-                if (!supplied.remove(producerIdentity(producer))) return error.InvalidBatchRequest;
-            };
+            var start: usize = 0;
+            while (start < req.writes.len) {
+                const end = @import("commit_requirements.zig").windowEnd(req.writes, start);
+                var window_req = req;
+                window_req.writes = req.writes[start..end];
+                var expected = try planGeneratedWindow(a, window_req, extracted[start..end], plan.*, &budget, null);
+                defer expected.deinit();
+                for (expected.rows) |row| for (row.requests) |producer| {
+                    if (!try shouldPrecomputeGeneratedRequest(self, .direct, producer)) continue;
+                    if (!supplied.remove(producerIdentity(producer))) return error.InvalidBatchRequest;
+                };
+                start = end;
+            }
             if (supplied.count() != 0) return error.InvalidBatchRequest;
             try validatePreparedKeys(a, plan, packet);
             try @import("commit_requirements.zig").validateOutputBounds(packet.artifact_writes, packet.artifact_deletes);
@@ -1127,8 +1155,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preplanned: ?*const GeneratedBatchWritePlan,
             generated_memo: ?*GeneratedEmbeddingMemo,
         ) !PrecomputedGeneratedBatch {
+            if (generated_memo) |memo| if (memo.context) |context| try context.check();
+            if (precompute_mode == .direct) _ = try @import("commit_requirements.zig").sourceBudget(req.writes, req.deletes);
             if (precompute_mode != .direct and preplanned == null and !S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets()) return .{};
-            if (preplanned) |plan| if (plan.rows.len != req.writes.len) return error.InvalidArgument;
+            if (preplanned) |plan| if (plan.catalog == null and plan.rows.len != req.writes.len) return error.InvalidArgument;
             var fallback_write_plan = if (preplanned == null)
                 try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot()
             else
@@ -1143,7 +1173,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Bind every prewarmed result to the target resolved before any
             // provider call. The same memo survives optimistic retries, while
             // epochs may advance during the preceding attempt.
-            if (resolved_plan) |plan| for (plan.rows) |row| {
+            if (precompute_mode != .direct) if (resolved_plan) |plan| for (plan.rows) |row| {
                 for (row.requests) |*request| {
                     if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
                     request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
@@ -1170,17 +1200,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 prepared_producers.deinit(alloc);
             }
             var pending_child_work = false;
-            var output_budget = @import("commit_requirements.zig").OutputBudget{};
-            if (precompute_mode == .direct) {
-                // Reject a source envelope that alone exceeds the admission
-                // budget before any provider calls. Final physical accounting
-                // also covers encoded rows and metadata amplification.
-                for (req.writes) |write| {
-                    try output_budget.reserve(write.key.len, 1);
-                    try output_budget.reserve(write.value.len, 0);
-                }
-                for (req.deletes) |key| try output_budget.reserve(key.len, 1);
-            }
+            var output_budget = if (precompute_mode == .direct)
+                try @import("commit_requirements.zig").sourceBudget(req.writes, req.deletes)
+            else
+                @import("commit_requirements.zig").OutputBudget{};
             var artifact_writes = execution_resources.PreparedArtifactWrites{ .context = preparation_memo.context, .budget = if (precompute_mode == .direct) &output_budget else null };
             errdefer {
                 for (artifact_writes.items) |write| {
@@ -1240,6 +1263,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             var window_end: usize = 0;
+            var window_start: usize = 0;
+            var owned_window_plan: ?GeneratedBatchWritePlan = null;
+            defer if (owned_window_plan) |*plan| plan.deinit();
             for (req.writes, 0..) |_, i| {
                 if (preparation_memo.context) |context| try context.check();
                 if (precompute_mode == .direct and i == window_end) {
@@ -1248,20 +1274,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return err;
                     };
                     try output_budget.checkpoint(artifact_writes.items, artifact_delete_keys.items);
+                    if (owned_window_plan) |*plan| plan.deinit();
+                    owned_window_plan = null;
+                    window_start = i;
                     window_end = @import("commit_requirements.zig").windowEnd(req.writes, i);
-                    if (resolved_plan) |plan| {
-                        const window_plan = GeneratedBatchWritePlan{ .alloc = alloc, .rows = plan.rows[i..window_end], .direct_gate_supported = plan.direct_gate_supported };
-                        for (window_plan.rows) |row| for (row.requests) |request| {
-                            if (@import("commit_requirements.zig").directEligibility(request) != .eligible) continue;
-                            // Reserve the closed-result identity and coverage
-                            // before provider batching or per-document clones.
-                            try output_budget.reserve(request.doc_key.len + request.index_name.len + request.artifact_name.len + request.embedding_name.len + 128, 1);
-                        };
-                        var window_req = req;
-                        window_req.writes = req.writes[i..window_end];
-                        try prewarmGeneratedDenseMemo(self, window_req, extracted[i..window_end], precompute_mode, &window_plan, preparation_memo, force_generated_artifact_names);
-                        try prewarmGeneratedSparseMemo(self, window_req, extracted[i..window_end], precompute_mode, &window_plan, preparation_memo, force_generated_artifact_names);
-                    }
+                    var window_req = req;
+                    window_req.writes = req.writes[i..window_end];
+                    const catalog = if (resolved_plan) |plan| plan.catalog orelse return error.InvalidArgument else fallback_write_plan.?.plan().*;
+                    owned_window_plan = try planGeneratedWindow(alloc, window_req, extracted[i..window_end], catalog, &output_budget, preparation_memo.context);
+                    const window_plan = &owned_window_plan.?;
+                    // Pin target generations once, after accounting the window
+                    // and before any provider dispatch or memo prewarming.
+                    for (window_plan.rows) |row| for (row.requests) |*request| {
+                        if (preparation_memo.context) |context| try context.check();
+                        if (request.kind == .dense_embedding or request.kind == .sparse_embedding)
+                            request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
+                    };
+                    try prewarmGeneratedDenseMemo(self, window_req, extracted[i..window_end], precompute_mode, window_plan, preparation_memo, force_generated_artifact_names);
+                    try prewarmGeneratedSparseMemo(self, window_req, extracted[i..window_end], precompute_mode, window_plan, preparation_memo, force_generated_artifact_names);
                 }
                 if (!extracted[i].hasDocument()) {
                     if (precompute_mode == .direct and i + 1 == window_end)
@@ -1273,7 +1303,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 var owned_row_plan: ?GeneratedBatchWritePlan = null;
                 defer if (owned_row_plan) |*plan| plan.deinit();
-                const generated_templates = if (resolved_plan) |plan|
+                const generated_templates = if (precompute_mode == .direct)
+                    owned_window_plan.?.rows[i - window_start].requests
+                else if (resolved_plan) |plan|
                     plan.rows[i].requests
                 else blk: {
                     owned_row_plan = try planGeneratedEnrichmentsForRows(
@@ -1285,10 +1317,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk owned_row_plan.?.rows[0].requests;
                 };
                 if (generated_templates.len == 0) continue;
-                if (precompute_mode == .direct and resolved_plan == null) for (generated_templates) |request| {
-                    if (@import("commit_requirements.zig").directEligibility(request) != .eligible) continue;
-                    try output_budget.reserve(request.doc_key.len + request.index_name.len + request.artifact_name.len + request.embedding_name.len + 128, 1);
-                };
                 const privacy_protected = for (generated_templates) |template| {
                     if (@import("../../privacy/document.zig").isProtectedArtifactName(template.artifact_name)) break true;
                 } else false;
@@ -1300,7 +1328,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const intent = @import("artifact_reprocess_intent.zig");
                     const key = try intent.embeddingKeyAlloc(alloc, request.doc_key, requestEmbeddingName(request.*));
                     defer alloc.free(key);
-                    if (preplanned == null) request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
+                    if (precompute_mode != .direct and preplanned == null) request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
                     if (containsName(force_generated_artifact_names, requestEmbeddingName(request.*))) {
                         const encoded = intent.encode(request.producer_json, request.reprocess_generation);
                         const owned_key = try alloc.dupe(u8, key);

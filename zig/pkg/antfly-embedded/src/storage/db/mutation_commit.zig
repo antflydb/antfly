@@ -471,6 +471,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &transform_snapshot,
             );
             defer effective_ops.deinit(preparation_alloc);
+            if (req.commit_requires == .direct_enrichments)
+                _ = try @import("commit_requirements.zig").sourceBudget(effective_ops.writes, effective_ops.deletes);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
 
             if (req.reject_graph_transform_projections and
@@ -3536,6 +3538,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             opts: BatchExecutionOptions,
             allocator_guard: *PreparedRowAllocator,
         ) anyerror!void {
+            if (req.commit_requires == .direct_enrichments)
+                try @import("commit_requirements.zig").validateRequestBounds(req);
             if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null and opts.preparation_capture == null and
                 (opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null or
                     opts.bypass_replication_write_gate or opts.transaction_resolution != null or

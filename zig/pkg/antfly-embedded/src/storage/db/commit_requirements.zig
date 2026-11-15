@@ -123,6 +123,31 @@ pub fn validateTransactionReservation(packet: anytype, intents: anytype, predica
     for (packet.producers) |producer| try budget.reserve(4096 + 8 * producer.doc_key.len, 16);
 }
 
+pub fn sourceBudget(writes: anytype, deletes: []const []const u8) !OutputBudget {
+    var budget = OutputBudget{};
+    for (writes) |write| {
+        try budget.reserve(write.key.len, 1);
+        try budget.reserve(write.value.len, 0);
+    }
+    for (deletes) |key| try budget.reserve(key.len, 1);
+    return budget;
+}
+
+/// Bound raw source work before coalescing or request-digest serialization.
+/// Each transform operation consumes one work slot even if it is later elided.
+pub fn validateRequestBounds(req: anytype) !void {
+    var budget = try sourceBudget(req.writes, req.deletes);
+    for (req.transforms) |transform| {
+        try budget.reserve(transform.key.len, 1);
+        for (transform.operations) |operation| {
+            try budget.reserve(operation.path.len, 1);
+            if (operation.value_json) |value| try budget.reserve(value.len, 0);
+        }
+    }
+    for (req.graph_writes) |edge| try budget.reserve(edge.retainedBytes(), 1);
+    for (req.graph_deletes) |edge| try budget.reserve(edge.retainedBytes(), 1);
+}
+
 pub fn validateOutputBounds(writes: anytype, deletes: []const []const u8) !void {
     var budget = OutputBudget{};
     try budget.checkpoint(writes, deletes);
