@@ -758,7 +758,7 @@ fn clonePointRoutingTable(alloc: std.mem.Allocator, table: metadata_table_manage
     return metadata_table_manager.cloneTable(alloc, point);
 }
 
-test "index alias catalog point projection omits receipt copies" {
+test "index alias catalog projection omits receipt copies on point routing" {
     const a = std.testing.allocator;
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 7,

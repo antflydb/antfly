@@ -1920,7 +1920,12 @@ pub const HttpHandler = struct {
             .profile = execution.profile_requested,
             .aggregations_json = aggregations_json orelse "",
         };
-        var meta: query_api.QueryResponseMeta = .{};
+        // The native request adapter below intentionally omits execution
+        // operators. Attribute the result from this pinned, resolved plan.
+        var selected: [3][]const u8 = undefined;
+        const sources = execution.plan.sources.asSlice();
+        for (sources, 0..) |source, i| selected[i] = source.indexName();
+        var meta: query_api.QueryResponseMeta = .{ .resolved_indexes = selected[0..sources.len] };
         defer meta.deinit(self.alloc);
         var total_hits_u32: u32 = @intCast(@min(execution.hits.len, std.math.maxInt(u32)));
 

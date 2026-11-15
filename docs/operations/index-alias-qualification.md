@@ -14,7 +14,7 @@ the native alias planning tests.
 ## Scenarios
 
 - Three metadata nodes and three data nodes, with three replicated shards:
-  sixteen A/B/A cutovers overlap independent query and full-index ingestion
+  seed with a full-index barrier, then sixteen A/B/A cutovers overlap independent query and full-index ingestion
   loops. Kill the metadata leader during the workload, query every data gateway
   while it is absent, restart it, then replay an earlier idempotent operation
   after rollback and verify the replay does not reactivate its old target.
@@ -82,3 +82,8 @@ cloud account, IAM policy, network topology or model's retrieval quality.
   compared the lifecycle epoch. Exclude that control field too while retaining
   rejection of real recipe changes. Preserve typed descriptor/definition errors
   across independent runtime error domains.
+- Object search responses discarded their selected sources when adapting the
+  serverless plan to the shared response encoder. Pass borrowed concrete names
+  from the pinned execution plan through response metadata; the encoder copies
+  and deduplicates them. This avoids another catalog lookup and gives native,
+  object and standalone serverless responses the same attribution contract.

@@ -83,7 +83,9 @@ def test_index_alias_cutovers_during_ingestion_and_metadata_failover(
         assert wait_until(
             lambda: cluster.fully_replicated_topology(table), timeout_s=90
         ), cluster.debug_logs()
-        _seed_cluster_docs_when_writable(cluster, session, table, SEED)
+        _seed_cluster_docs_when_writable(
+            cluster, session, table, SEED, sync_level="full_index", timeout_s=60
+        )
         base = cluster.data_api_urls[0]
         for name in INDEXES:
             wait_for_target(session, base, table, name)
