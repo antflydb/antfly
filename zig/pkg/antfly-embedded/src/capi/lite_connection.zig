@@ -1903,6 +1903,34 @@ pub const Owner = struct {
                 if (std.meta.eql(probe.header, captured.header) and
                     (try probe.file.stat(probe.runtime())).inode == (try captured.file.stat(captured.runtime())).inode) known_maintenance = snapshot;
             }
+            // perf/lwa-xproc-refresh: neither fast path above fired, so a
+            // reopen is already decided -- `file` (this Owner's own,
+            // possibly long-idle serving instance) is about to be
+            // discarded for `replacement`, a brand-new `NativeFile` on the
+            // same inode. That reopen's own `recoverRedoLog` trusts an
+            // already-populated, same-pid `SharedRedoOverlay` verbatim and
+            // never re-populates it (`inode_lock.ensureRedoOverlay`'s own
+            // doc comment): correct for a same-process sibling, whose own
+            // commits already wrote straight into that one shared
+            // instance, but not for a commit made by a genuinely different
+            // process -- that overlay is this process's own, and nothing
+            // in this process ever applied a foreign process's logical
+            // mutations to it, so `replacement` would silently inherit the
+            // exact same, still-incomplete instance and gain nothing from
+            // reopening. Calling the one primitive that actually walks the
+            // log past this process's own last-applied sequence (via the
+            // shared lock region's published watermark, §9.3b) and decodes
+            // whatever is new directly into that shared overlay closes
+            // that gap -- called here, on the *old* `file`, while its own
+            // bound is still genuinely behind (this is the only place
+            // where that is true: `replacement`'s own cold open would
+            // already have advanced a fresh instance's bound via its
+            // independent physical log scan before any caller could
+            // intervene, making this same call on `replacement` itself a
+            // guaranteed no-op). A cheap no-op here too whenever nothing
+            // new was actually published since this process's own overlay
+            // was last caught up.
+            if (file.redo != null) try file.refreshCrossProcessRedoOverlay();
         }
         var options = self.options;
         options.externally_locked = true;
@@ -6806,6 +6834,145 @@ test "capi native sibling connection's refresh sees a redo-only commit without a
     const value = try after.owned_lite_backend.?.native_docstore.?.file.getDocumentAlloc(a, "sibling-redo");
     defer if (value) |bytes| a.free(bytes);
     try std.testing.expect(value != null);
+}
+
+/// Every fork-based test below waits on a real second OS process across
+/// these bounds, same generous reasoning as `native.zig`'s own
+/// `cross_process_fork_read_timeout_ms`/`cross_process_fork_reap_timeout_ms`
+/// (duplicated here, private to this file, rather than exported: the first
+/// fork-based test in this file to need it).
+const xproc_fork_read_timeout_ms: i32 = 30_000;
+const xproc_fork_reap_timeout_ms: i64 = 10_000;
+
+fn xprocReadBounded(fd: std.c.fd_t, buf: []u8, timeout_ms: i32) !void {
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        var fds = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+        const ready = std.c.poll(&fds, 1, timeout_ms);
+        if (ready <= 0) return error.Timeout;
+        const n = std.c.read(fd, buf[filled..].ptr, buf.len - filled);
+        if (n <= 0) return error.PipeClosed;
+        filled += @intCast(n);
+    }
+}
+
+fn xprocReapBounded(pid: std.c.pid_t, timeout_ms: i64) !void {
+    var status: c_int = 0;
+    var waited_ms: i64 = 0;
+    const poll_ms = 5;
+    while (true) {
+        const got = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+        if (got == pid) return;
+        if (got < 0) return error.WaitFailed;
+        if (waited_ms >= timeout_ms) {
+            _ = std.c.kill(pid, std.c.SIG.KILL);
+            while (std.c.waitpid(pid, &status, 0) < 0) {}
+            return error.ChildTimedOut;
+        }
+        var no_fds: [0]std.c.pollfd = .{};
+        _ = std.c.poll(&no_fds, 0, poll_ms);
+        waited_ms += poll_ms;
+    }
+}
+
+fn xprocParkForever() noreturn {
+    while (true) {
+        var no_fds: [0]std.c.pollfd = .{};
+        _ = std.c.poll(&no_fds, 0, 20);
+    }
+}
+
+// perf/lwa-xproc-refresh: the sibling test right above
+// (`perf/lwa-change-detect`) proves `Owner.refresh()` sees a redo-only
+// commit from a second, *same-process* `NativeFile` on this inode. That is
+// not the same claim as "sees a commit from a different process": a
+// same-process sibling commits straight into the one in-memory
+// `SharedRedoOverlay` this inode's `file` and every sibling already share
+// (`inode_lock.ensureRedoOverlay`'s own doc comment -- one overlay per
+// inode, per process), so a stale `file` only ever needs its *bound*
+// (`committedSequence()`) bumped to see it, which a reopen's own
+// independent physical log scan already did correctly even before this
+// fix. A genuinely different process never reaches that shared instance at
+// all: `ensureRedoOverlay` trusts an already-populated, same-pid overlay
+// verbatim and never re-populates it on a reopen, so -- before this fix --
+// `Owner.refresh()`'s slow reopen path advanced the replacement's bound
+// (its own fresh physical log scan found the truth) while silently
+// inheriting this process's existing, still-incomplete overlay instance:
+// a lookup for a key that exists only in the forked child's logical
+// mutations kept resolving not-found no matter how many times `refresh()`
+// ran. Forked here, not simulated in-process, specifically to defeat that
+// shortcut the same way a real second process would -- matching the
+// reported bug (a long-lived connection in one process never sees a
+// commit a different process made under the logical redo log).
+test "capi native owner refresh observes a redo-diverted commit from a genuinely separate process" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("xproc-owner-refresh");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    const before = owner.current.?;
+    const before_file = &before.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expect(before_file.header.redo_log_capacity != 0);
+    try std.testing.expect(try before_file.getDocumentAlloc(a, "xproc-redo") == null);
+
+    var result_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&result_fds));
+
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(result_fds[0]);
+        var lease = native.lockWriterPathWithIo(a, io, path) catch xprocParkForever();
+        var writer = native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true }) catch xprocParkForever();
+        writer.putDocument("xproc-redo", "{\"text\":\"written-by-child-process\"}") catch xprocParkForever();
+        // Confirmed redo-only, exactly like the same-process sibling test
+        // above: the logical sequence moved past the real, on-disk fold
+        // boundary this checkpoint slot still reflects.
+        if (writer.redo == null) xprocParkForever();
+        if (!(writer.activeCheckpoint().redo_folded_through < writer.committedSequence())) xprocParkForever();
+        writer.close();
+        lease.close();
+        const report: [1]u8 = .{1};
+        _ = std.c.write(result_fds[1], &report, report.len);
+        xprocParkForever();
+    }
+    _ = std.posix.system.close(result_fds[1]);
+    var child_reaped = false;
+    defer if (!child_reaped) {
+        _ = std.c.kill(child_pid, std.c.SIG.KILL);
+        _ = std.c.waitpid(child_pid, null, 0);
+    };
+    defer _ = std.posix.system.close(result_fds[0]);
+
+    var report: [1]u8 = undefined;
+    try xprocReadBounded(result_fds[0], &report, xproc_fork_read_timeout_ms);
+    try std.testing.expectEqual(@as(u8, 1), report[0]);
+
+    var lease = try connection.acquire();
+    defer {
+        lease.close();
+        connection.gate.mutex.unlock(io);
+    }
+    const after = try owner.refresh();
+    const value = try after.owned_lite_backend.?.native_docstore.?.file.getDocumentAlloc(a, "xproc-redo");
+    defer if (value) |bytes| a.free(bytes);
+    try std.testing.expect(value != null);
+    try std.testing.expectEqualStrings("{\"text\":\"written-by-child-process\"}", value.?);
+
+    _ = std.c.kill(child_pid, std.c.SIG.KILL);
+    try xprocReapBounded(child_pid, xproc_fork_reap_timeout_ms);
+    child_reaped = true;
 }
 
 test "capi native recovery agenda clean opens avoid unrelated table runtimes" {
