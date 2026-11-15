@@ -13,10 +13,66 @@ servers:
   - url: /internal/v1
     description: Node-local internal API
 tags:
+  - name: retained-history
+    description: Private native retained-history ownership and receipt recovery.
   - name: standby-replication
     x-displayName: Hot Standby Replication
     description: Runtime-to-runtime hot-standby replication protocol.
 paths:
+  /groups/{group_id}/tables/{table_name}/history/control-v1:
+    post:
+      tags: [retained-history]
+      operationId: controlNativeRetainedHistory
+      summary: Submit a native retention control or recover its exact result
+      description: |
+        Trusted node-to-node operation, bounded to 4096 request and response bytes.
+        Requires a service principal and an immutable catalog route fence. Submit
+        and recovery are distinct; recovery never proposes the command again.
+        A 200 response is not permission to ACK: null or superseded outcomes are
+        unconfirmed, and a known rejection is not a successful mutation. A lost
+        response is ambiguous and must not cause automatic re-proposal.
+        These private Raft receipts are not public feed cursors or PostgreSQL LSNs.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          description: Serialized immutable catalog route fence, including metadata and table incarnation and exact group/range identity. The receiver validates it against current authoritative routing.
+          schema: {type: string, minLength: 1, maxLength: 16384}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryControlRequest'}
+      responses:
+        '200':
+          description: Bounded typed result; inspect receipt and outcome before advancing any progress.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryControlResponse'}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing or invalid internal service authority.
+        '403':
+          description: The authenticated principal is not an internal service.
+        '409':
+          description: Route, table incarnation, history scope or original receipt conflicts.
+        '413':
+          description: Request exceeds the private control byte limit.
+        '501':
+          description: This serving profile does not support native retained-history controls.
+        '503':
+          description: Leader, routing or storage admission is temporarily unavailable; admission outcome headers distinguish known not-proposed from ambiguous outcomes.
   /standby/replication/identify:
     get:
       tags: [standby-replication]
@@ -102,6 +158,12 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
 components:
+  securitySchemes:
+    InternalServicePrincipal:
+      type: apiKey
+      in: header
+      name: X-Antfly-Trusted-Principal
+      description: Deployment-scoped authenticated service-principal envelope; an ordinary user credential cannot authorize this operation.
   responses:
     BadRequest:
       description: Invalid internal replication request.
@@ -122,6 +184,569 @@ components:
           schema:
             type: string
   schemas:
+    NativeHistoryNamespace:
+      {
+        "type": "array",
+        "minItems": 24,
+        "maxItems": 24,
+        "items": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      }
+    NativeHistoryDigest:
+      {
+        "type": "array",
+        "minItems": 32,
+        "maxItems": 32,
+        "items": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      }
+    NativeHistoryConsumerId:
+      {
+        "type": "array",
+        "minItems": 16,
+        "maxItems": 16,
+        "items": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      }
+    NativeHistoryReceipt:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "term",
+          "index"
+        ],
+        "properties": {
+          "term": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "index": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        }
+      }
+    NativeHistoryReference:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority",
+          "consumer",
+          "definition",
+          "epoch",
+          "grant"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "consumer": {
+            "$ref": "#/components/schemas/NativeHistoryConsumerId"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "epoch": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "grant": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        }
+      }
+    NativeHistoryGrant:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority",
+          "consumer",
+          "definition",
+          "sequence",
+          "expires_at_seconds",
+          "policy_revision"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "consumer": {
+            "$ref": "#/components/schemas/NativeHistoryConsumerId"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "expires_at_seconds": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "policy_revision": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "limit": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "default": 268435456
+          }
+        }
+      }
+    NativeHistoryRetirement:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority",
+          "consumer",
+          "definition",
+          "sequence",
+          "grant"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "consumer": {
+            "$ref": "#/components/schemas/NativeHistoryConsumerId"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "grant": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        }
+      }
+    NativeHistoryAcknowledge:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reference",
+          "previous",
+          "next"
+        ],
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/NativeHistoryReference"
+          },
+          "previous": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "next": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        }
+      }
+    NativeHistoryRenew:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reference",
+          "previous",
+          "next"
+        ],
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/NativeHistoryReference"
+          },
+          "previous": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "next": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        }
+      }
+    NativeHistoryReclaim:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reference"
+        ],
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/NativeHistoryReference"
+          },
+          "max_frames": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32,
+            "default": 1
+          }
+        }
+      }
+    NativeHistoryCollect:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "max_frames": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32,
+            "default": 1
+          }
+        }
+      }
+    NativeHistoryControlCommand:
+      {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "enroll"
+            ],
+            "properties": {
+              "enroll": {
+                "$ref": "#/components/schemas/NativeHistoryGrant"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "inspect"
+            ],
+            "properties": {
+              "inspect": {
+                "$ref": "#/components/schemas/NativeHistoryReference"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "acknowledge"
+            ],
+            "properties": {
+              "acknowledge": {
+                "$ref": "#/components/schemas/NativeHistoryAcknowledge"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "renew"
+            ],
+            "properties": {
+              "renew": {
+                "$ref": "#/components/schemas/NativeHistoryRenew"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "retire"
+            ],
+            "properties": {
+              "retire": {
+                "$ref": "#/components/schemas/NativeHistoryRetirement"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "reclaim"
+            ],
+            "properties": {
+              "reclaim": {
+                "$ref": "#/components/schemas/NativeHistoryReclaim"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "collect"
+            ],
+            "properties": {
+              "collect": {
+                "$ref": "#/components/schemas/NativeHistoryCollect"
+              }
+            }
+          }
+        ]
+      }
+    NativeHistoryConsumer:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "epoch",
+          "start",
+          "acknowledged",
+          "expires_at_seconds",
+          "policy_revision"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/NativeHistoryConsumerId"
+          },
+          "epoch": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "start": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "acknowledged": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "expires_at_seconds": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "policy_revision": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        }
+      }
+    NativeHistoryApplied:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [],
+        "properties": {
+          "consumer": {
+            "$ref": "#/components/schemas/NativeHistoryConsumer",
+            "nullable": true
+          },
+          "reclaimed_frames": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 32,
+            "default": 0
+          }
+        }
+      }
+    NativeHistoryOutcome:
+      {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "applied"
+            ],
+            "properties": {
+              "applied": {
+                "$ref": "#/components/schemas/NativeHistoryApplied"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "rejected"
+            ],
+            "properties": {
+              "rejected": {
+                "type": "string",
+                "enum": [
+                  "invalid",
+                  "resynchronization",
+                  "consumer_conflict",
+                  "consumer_limit",
+                  "checkpoint_conflict",
+                  "full",
+                  "prepared_transactions"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "superseded"
+            ],
+            "properties": {
+              "superseded": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [],
+                "properties": {}
+              }
+            }
+          }
+        ]
+      }
+    NativeHistoryControlRequest:
+      {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "operation",
+              "command"
+            ],
+            "properties": {
+              "version": {
+                "type": "integer",
+                "enum": [
+                  1
+                ]
+              },
+              "command": {
+                "$ref": "#/components/schemas/NativeHistoryControlCommand"
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "submit"
+                ]
+              },
+              "receipt": {
+                "$ref": "#/components/schemas/NativeHistoryReceipt",
+                "nullable": true
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "version",
+              "command",
+              "operation",
+              "receipt"
+            ],
+            "properties": {
+              "version": {
+                "type": "integer",
+                "enum": [
+                  1
+                ]
+              },
+              "command": {
+                "$ref": "#/components/schemas/NativeHistoryControlCommand"
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "recover"
+                ]
+              },
+              "receipt": {
+                "$ref": "#/components/schemas/NativeHistoryReceipt"
+              }
+            }
+          }
+        ],
+        "description": "Version is mandatory. Submit requires a null or omitted receipt. Recover requires the original receipt. Namespace must match the authenticated route. Unknown and duplicate fields are rejected."
+      }
+    NativeHistoryControlResponse:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/NativeHistoryReceipt",
+            "nullable": true
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/NativeHistoryOutcome",
+            "nullable": true
+          }
+        },
+        "description": "Outcome requires a receipt. Recovery echoes the original receipt. Null outcome or superseded means unconfirmed; applied and rejected are resolved results, not equivalent success. Applied consumer identity/epoch and ACK/renew/reclamation bounds must match the request."
+      }
     StandbyIdentifier:
       type: string
       description: Stable hot-standby node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.

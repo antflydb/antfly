@@ -472,7 +472,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("antfly-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
-    const history_capability_filters = &.{ "internal capabilities advertise only the serving history apply profile", "internal namespace requires a service principal except hot standby" };
+    const history_capability_filters = &.{ "internal capabilities advertise only the serving history apply profile", "internal namespace requires a service principal except hot standby", "history control ingress" };
     const history_capability_tests = b.addTest(.{
         .root_module = options.api_http_runtime_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api HTTP runtime discovery"}, history_capability_filters),

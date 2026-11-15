@@ -7064,6 +7064,7 @@ pub const DataServer = struct {
             self.routedRaftBatchWriter()
         else
             null;
+        api_server_cfg.native_history_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = historyControlOperation } else null;
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.restore_owner = .{ .ptr = self, .execute_fn = restoreOwnerControl };
         api_server_cfg.restore_parent_activation = .{ .ptr = self, .execute_fn = restoreParentActivationControl };
@@ -13331,6 +13332,18 @@ pub const DataServer = struct {
         return .{
             .conf_state_fingerprint = plan.conf_state_fingerprint,
             .activatable_version = required_version,
+        };
+    }
+
+    fn historyControlOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: @import("../api/history_control_operations.zig").wire.Request, context: antfly.public_api.operation.RequestContext) !@import("../api/history_control_operations.zig").wire.Response {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        return switch (input.operation) {
+            .submit => blk: {
+                const submitted = try self.submitHistoryControlLocal(alloc, fence, table, input.command);
+                break :blk .{ .version = 1, .receipt = submitted.entry, .outcome = submitted.outcome };
+            },
+            .recover => .{ .version = 1, .receipt = input.receipt, .outcome = try self.recoverHistoryControlLocal(alloc, fence, table, input.command, input.receipt.?) },
         };
     }
 
@@ -43122,6 +43135,16 @@ fn consumerTests() type {
             try std.testing.expect(submitted.entry.index > 1);
             try std.testing.expectEqual(@import("history_control_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             const ref: control.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = 1, .grant = 1, .definition = grant.definition };
+            const ingress = @import("../api/history_control_operations.zig");
+            const encoded_fence = try std.json.Stringify.valueAlloc(a, route.fence().?, .{});
+            defer a.free(encoded_fence);
+            const ingress_request: ingress.wire.Request = .{ .version = 1, .operation = .recover, .command = .{ .enroll = grant }, .receipt = submitted.entry };
+            const ingress_body = try std.json.Stringify.valueAlloc(a, ingress_request, .{});
+            defer a.free(ingress_body);
+            const ingress_result = try ingress.execute(.{ .ptr = &server, .execute_fn = DataServer.historyControlOperation }, a, 601, "docs", ingress_body, .{ .catalog_route_fence_json = encoded_fence });
+            try std.testing.expect(ingress_result.confirmed());
+            try std.testing.expectEqualDeep(submitted.entry, ingress_result.receipt.?);
+            try std.testing.expectEqual(@as(u64, 1), ingress_result.outcome.?.applied.consumer.?.epoch);
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
             try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);
             const Interrupted = struct {

@@ -1418,6 +1418,33 @@ The HTTP surface must be specified/generated before registration, require servic
 authority and catalog fencing, and preserve unknown outcomes without automatic
 re-proposal. Remote routing and feed-root registration remain pending.
 
+## In progress: specified private history control ingress
+
+The internal OpenAPI contract now describes the bounded node-to-node
+`POST /groups/{group_id}/tables/{table_name}/history/control-v1` operation.
+Generated internal types and server declarations accompany the specification.
+Submission and exact receipt recovery remain distinct operations; a 200 response
+can carry a known rejection or an unconfirmed result and is never itself ACK
+permission. These receipts are private Raft coordinates, not public cursors.
+
+A transport-neutral operation validates the immutable catalog fence, path group,
+request namespace, version, byte limit, and returned receipt/result binding.
+The data runtime registers a callback only for a linked native owner with Raft.
+That callback uses the existing local-leader proposal path or read-only exact
+receipt lookup. It cannot turn recovery into a fresh proposal. Callback failures
+remain ambiguous because HTTP status alone cannot prove proposal rejection.
+Native and linked route registrars share the 4096-byte prebuffering limit.
+
+The focused ingress checks cover wrong routes/namespaces before dispatch,
+unsupported profiles, known rejections, lost confirmations with original receipt,
+invalid callback results, and temporary storage failures. Production runtime
+qualification extends the real Raft/native-owner test through this operation
+boundary. Signed service authority is required even in legacy migration
+mode; unsigned requests fail before invoking the owner. The five focused HTTP
+checks and four real Raft/native-owner checks pass without leaks. Full
+`make generate` also passed. This does not yet register a production feed root, route controls remotely,
+implement a remote retained-page API, or satisfy the public feed/client contracts.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

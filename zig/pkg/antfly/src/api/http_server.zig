@@ -1712,6 +1712,7 @@ pub const ApiHttpServerConfig = struct {
     shard_ops: ?raft_mod.ShardOperationAdapter = null,
     shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
     routed_raft_batch_writer: ?internal_group_operations.RoutedRaftBatchWriter = null,
+    native_history_control: ?@import("history_control_operations.zig").Port = null,
     /// Borrowed metadata receipt/topology notification generation. It affects
     /// only scheduling; every resumed owner operation revalidates its fences.
     restore_owner_progress_generation: ?*const std.atomic.Value(u64) = null,

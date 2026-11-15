@@ -20,6 +20,7 @@ pub const sql_max_request_body_bytes: usize = 4 << 20;
 /// Transport admission shared by native and linked-kernel registrars. Resolve
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
+    if (isInternalHistoryControlPath(path)) return 4096;
     if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
     if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
     if (privacyMutationBodyLimit(path)) |limit| return limit;
@@ -68,6 +69,17 @@ pub const DocumentReadRequest = struct {
         return decoded;
     }
 };
+pub fn isInternalHistoryControlPath(path: []const u8) bool {
+    const prefix = "/internal/v1/groups/";
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    var pieces = std.mem.splitScalar(u8, path[prefix.len..], '/');
+    if ((pieces.next() orelse return false).len == 0) return false;
+    if (!std.mem.eql(u8, pieces.next() orelse return false, "tables")) return false;
+    if ((pieces.next() orelse return false).len == 0) return false;
+    return std.mem.eql(u8, pieces.next() orelse return false, "history") and
+        std.mem.eql(u8, pieces.next() orelse return false, "control-v1") and pieces.next() == null;
+}
+
 pub fn isInternalDocumentReadPath(path: []const u8) bool {
     const prefix = "/internal/v1/groups/";
     if (!std.mem.startsWith(u8, path, prefix)) return false;
@@ -198,6 +210,7 @@ pub const Routes = struct {
     pub const internal_capabilities = "/internal/v1/capabilities";
     pub const batch_suffix = "/batch";
     pub const routed_batch_suffix = "/batch-routed-v1";
+    pub const history_control_suffix = "/history/control-v1";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const backup_shard_suffix = "/backup-shard";

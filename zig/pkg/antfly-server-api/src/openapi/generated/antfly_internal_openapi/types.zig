@@ -3,6 +3,250 @@
 
 const std = @import("std");
 
+pub const NativeHistoryAcknowledge = struct {
+    reference: NativeHistoryReference,
+    previous: u64,
+    next: u64,
+};
+
+pub const NativeHistoryApplied = struct {
+    consumer: ?NativeHistoryConsumer = null,
+    reclaimed_frames: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "consumer", "consumer", true },
+        .{ "reclaimed_frames", "reclaimed_frames", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.consumer) |value| {
+            try jw.objectField("consumer");
+            try jw.write(value);
+        }
+        if (self.reclaimed_frames) |value| {
+            try jw.objectField("reclaimed_frames");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryCollect = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    max_frames: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "namespace", "namespace", false },
+        .{ "authority", "authority", false },
+        .{ "max_frames", "max_frames", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("namespace");
+        try jw.write(self.namespace);
+        try jw.objectField("authority");
+        try jw.write(self.authority);
+        if (self.max_frames) |value| {
+            try jw.objectField("max_frames");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryConsumer = struct {
+    id: NativeHistoryConsumerId,
+    epoch: u64,
+    start: u64,
+    acknowledged: u64,
+    expires_at_seconds: u64,
+    policy_revision: u64,
+};
+
+pub const NativeHistoryConsumerId = []const i64;
+
+pub const NativeHistoryControlCommand = std.json.Value;
+
+/// Version is mandatory. Submit requires a null or omitted receipt. Recover requires the original receipt. Namespace must match the authenticated route. Unknown and duplicate fields are rejected.
+pub const NativeHistoryControlRequest = std.json.Value;
+
+/// Outcome requires a receipt. Recovery echoes the original receipt. Null outcome or superseded means unconfirmed; applied and rejected are resolved results, not equivalent success. Applied consumer identity/epoch and ACK/renew/reclamation bounds must match the request.
+pub const NativeHistoryControlResponse = struct {
+    version: i64,
+    receipt: ?NativeHistoryReceipt = null,
+    outcome: ?NativeHistoryOutcome = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "receipt", "receipt", true },
+        .{ "outcome", "outcome", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        if (self.receipt) |value| {
+            try jw.objectField("receipt");
+            try jw.write(value);
+        }
+        if (self.outcome) |value| {
+            try jw.objectField("outcome");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryDigest = []const i64;
+
+pub const NativeHistoryGrant = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    consumer: NativeHistoryConsumerId,
+    definition: NativeHistoryDigest,
+    sequence: u64,
+    expires_at_seconds: u64,
+    policy_revision: u64,
+    limit: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "namespace", "namespace", false },
+        .{ "authority", "authority", false },
+        .{ "consumer", "consumer", false },
+        .{ "definition", "definition", false },
+        .{ "sequence", "sequence", false },
+        .{ "expires_at_seconds", "expires_at_seconds", false },
+        .{ "policy_revision", "policy_revision", false },
+        .{ "limit", "limit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("namespace");
+        try jw.write(self.namespace);
+        try jw.objectField("authority");
+        try jw.write(self.authority);
+        try jw.objectField("consumer");
+        try jw.write(self.consumer);
+        try jw.objectField("definition");
+        try jw.write(self.definition);
+        try jw.objectField("sequence");
+        try jw.write(self.sequence);
+        try jw.objectField("expires_at_seconds");
+        try jw.write(self.expires_at_seconds);
+        try jw.objectField("policy_revision");
+        try jw.write(self.policy_revision);
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryNamespace = []const i64;
+
+pub const NativeHistoryOutcome = std.json.Value;
+
+pub const NativeHistoryReceipt = struct {
+    term: u64,
+    index: u64,
+};
+
+pub const NativeHistoryReclaim = struct {
+    reference: NativeHistoryReference,
+    max_frames: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "reference", "reference", false },
+        .{ "max_frames", "max_frames", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("reference");
+        try jw.write(self.reference);
+        if (self.max_frames) |value| {
+            try jw.objectField("max_frames");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryReference = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    consumer: NativeHistoryConsumerId,
+    definition: NativeHistoryDigest,
+    epoch: u64,
+    grant: u64,
+};
+
+pub const NativeHistoryRenew = struct {
+    reference: NativeHistoryReference,
+    previous: u64,
+    next: u64,
+};
+
+pub const NativeHistoryRetirement = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    consumer: NativeHistoryConsumerId,
+    definition: NativeHistoryDigest,
+    sequence: u64,
+    grant: u64,
+};
+
 pub const StandbyCreateReplicationSlotRequest = struct {
     slot_name: StandbySlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
