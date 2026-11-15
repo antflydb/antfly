@@ -279,6 +279,7 @@ pub const Mutation = union(enum) {
     plan_roots: []const RootPlan,
     enroll: struct { namespace: Namespace, ownership_epoch: u64, grant_sequence: u64, consumer_epoch: u64, start: u64, snapshot: ?Snapshot = null },
     rebind: struct { namespace: Namespace, previous: u64, next: u64, proof: Digest },
+    refresh_grant: struct { namespace: Namespace, previous: u64 },
     seal: struct { cut: Digest },
     issue: Delivery,
     acknowledge: Digest,
@@ -308,6 +309,7 @@ pub const Mutation = union(enum) {
                 if (!nz(value.namespace) or value.ownership_epoch == 0 or value.grant_sequence == 0 or value.consumer_epoch == 0) return error.InvalidChangefeed;
                 if (value.snapshot) |pin| if (!nz(pin.id) or !nz(pin.digest) or pin.expires_at == 0) return error.InvalidChangefeed;
             },
+            .refresh_grant => |value| if (!nz(value.namespace) or value.previous == 0) return error.InvalidChangefeed,
             .rebind => |value| if (!nz(value.namespace) or value.previous == 0 or value.next <= value.previous or !nz(value.proof)) return error.InvalidChangefeed,
             .seal => |value| if (!nz(value.cut)) return error.InvalidChangefeed,
             .issue => |value| {
@@ -378,6 +380,14 @@ pub const Mutation = union(enum) {
                 if (state.roots[index].ownership_epoch != binding.previous) return error.ChangefeedConflict;
                 const roots = try a.dupe(Root, state.roots);
                 roots[index].ownership_epoch = binding.next;
+                roots[index].grant_sequence = stamp.sequence;
+                next.roots = roots;
+            },
+            .refresh_grant => |refresh| {
+                if (state.phase != .enrolling and state.phase != .bootstrap and state.phase != .streaming) return error.ChangefeedConflict;
+                const index = try state.rootIndex(refresh.namespace);
+                if (state.roots[index].grant_sequence != refresh.previous or stamp.sequence <= refresh.previous or state.roots[index].released) return error.ChangefeedConflict;
+                const roots = try a.dupe(Root, state.roots);
                 roots[index].grant_sequence = stamp.sequence;
                 next.roots = roots;
             },
@@ -930,4 +940,21 @@ test "changefeed cursor reconstruction preserves each retained partial frame pos
     var enrolling = try step(scratch, .{}, .{ .create = .{ .id = @splat(4), .definition = testDefinition(.snapshot_then_changes), .now = 100, .expires_at = 1000, .bootstrap_expires_at = 500 } });
     enrolling = try step(scratch, enrolling, .{ .expire = 500 });
     try std.testing.expectEqual(Reset.bootstrap_expired, enrolling.reset_reason);
+}
+
+test "changefeed control refreshes old grants without changing root owner or read position" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testState(a, .now);
+    const root = state.roots[0];
+    state = try step(a, state, .{ .refresh_grant = .{ .namespace = root.namespace, .previous = root.grant_sequence } });
+    try std.testing.expect(state.roots[0].grant_sequence > root.grant_sequence);
+    try std.testing.expectEqual(root.ownership_epoch, state.roots[0].ownership_epoch);
+    try std.testing.expectEqual(root.consumer_epoch, state.roots[0].consumer_epoch);
+    try std.testing.expectEqual(root.acknowledged, state.roots[0].acknowledged);
+    try std.testing.expectEqual(root.delivered, state.roots[0].delivered);
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .refresh_grant = .{ .namespace = root.namespace, .previous = root.grant_sequence } }));
+    state = try step(a, state, .close);
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .refresh_grant = .{ .namespace = root.namespace, .previous = state.roots[0].grant_sequence } }));
 }

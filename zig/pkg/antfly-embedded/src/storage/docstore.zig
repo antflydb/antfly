@@ -6846,3 +6846,166 @@ test "docstore scoped owned batches pin one generation and release external payl
     try std.testing.expectEqual(@as(u64, 384), after.get_many_sorted_keys - before.get_many_sorted_keys);
     try std.testing.expect(budget.live < baseline + 64 * 1024);
 }
+
+test "docstore committed history metadata grants fence late enrollment without per consumer tombstones" {
+    const control = @import("history_consumer.zig");
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(a, path, .{});
+    var open = true;
+    defer if (open) store.close();
+    const namespace: control.Namespace = @splat(7);
+    const incarnation: control.Digest = @splat(9);
+    const first: control.Grant = .{ .namespace = namespace, .authority = incarnation, .sequence = 1, .consumer = @splat(1), .definition = @splat(4), .expires_at_seconds = 1000, .policy_revision = 1 };
+    var second = first;
+    second.sequence = 2;
+    second.consumer = @splat(2);
+    var first_native: committed_history.Consumer = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        first_native = try control.enroll(&txn, first);
+        // Simulate a lost enrollment reply: the metadata owner will retire the
+        // original grant without knowing its allocated native consumer epoch.
+        _ = try control.enroll(&txn, second);
+        try txn.commit();
+    }
+    const row = try internal_keys.documentKeyAlloc(a, "retained");
+    defer a.free(row);
+    try store.put(row, "one committed frame");
+    var ref: control.Reference = .{ .namespace = namespace, .authority = incarnation, .consumer = first.consumer, .epoch = first_native.epoch, .grant = first.sequence, .definition = first.definition };
+    const closed_second: control.Retirement = .{ .namespace = namespace, .authority = incarnation, .consumer = second.consumer, .definition = second.definition, .grant = second.sequence, .sequence = 3 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try control.acknowledge(&txn, ref, 0, 1);
+        // Lost ACK response is idempotent; the other consumer still pins frame 1.
+        try control.acknowledge(&txn, ref, 0, 1);
+        _ = try committed_history.reclaim(&txn, namespace);
+        try std.testing.expectEqual(@as(u64, 0), (try committed_history.load(&txn)).?.reclaimed);
+        try control.retire(&txn, closed_second);
+        try control.retire(&txn, closed_second);
+        _ = try committed_history.reclaim(&txn, namespace);
+        try std.testing.expectEqual(@as(u64, 1), (try committed_history.load(&txn)).?.reclaimed);
+        try control.renew(&txn, ref, 1000, 2000);
+        try control.renew(&txn, ref, 1000, 2000);
+        const retried = try control.enroll(&txn, first);
+        try std.testing.expectEqual(@as(u64, 2000), retried.expires_at_seconds);
+        try std.testing.expectEqual(first_native.epoch, retried.epoch);
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, second));
+        var unknown = second;
+        unknown.consumer = @splat(3);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, unknown));
+        try std.testing.expectEqual(@as(u64, 3), (try control.load(&txn)).?.floor);
+        try std.testing.expectEqual(@as(u64, 2000), (try control.inspect(&txn, ref)).expires_at_seconds);
+    }
+    // An older surviving consumer is not invalidated by another feed's cleanup.
+    var refreshed = first;
+    refreshed.sequence = 4;
+    refreshed.expires_at_seconds = 2000;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const native = try control.enroll(&txn, refreshed);
+        try std.testing.expectEqual(first_native.epoch, native.epoch);
+        try std.testing.expectEqual(@as(u64, 0), native.start);
+        try std.testing.expectEqual(@as(u64, 1), native.acknowledged);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryConsumerConflict, control.inspect(&txn, ref));
+        var old_close = closed_second;
+        old_close.consumer = first.consumer;
+        old_close.grant = first.sequence;
+        old_close.sequence = 5;
+        try std.testing.expectError(error.HistoryConsumerConflict, control.retire(&txn, old_close));
+    }
+    ref.grant = refreshed.sequence;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try control.retire(&txn, .{ .namespace = namespace, .authority = incarnation, .consumer = ref.consumer, .definition = ref.definition, .grant = ref.grant, .sequence = 5 });
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 5), (try control.load(&txn)).?.floor);
+        try std.testing.expect(!(try committed_history.load(&txn)).?.active());
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, refreshed));
+    }
+}
+
+test "docstore committed history consumer retirement before enrollment and rollback preserve fencing" {
+    const control = @import("history_consumer.zig");
+    const a = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const namespace: control.Namespace = @splat(7);
+    const grant: control.Grant = .{ .namespace = namespace, .authority = @splat(9), .sequence = 1, .consumer = @splat(1), .definition = @splat(4), .expires_at_seconds = 1000, .policy_revision = 1 };
+    const closed: control.Retirement = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .grant = 1, .sequence = 2 };
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&txn, .native, namespace);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        _ = try control.enroll(&txn, grant);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(?control.State, null), try control.load(&txn));
+        try std.testing.expectEqual(@as(?committed_history.State, null), try committed_history.load(&txn));
+        try control.retire(&txn, closed);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, grant));
+        var newer = grant;
+        newer.sequence = 3;
+        newer.consumer = @splat(2);
+        _ = try control.enroll(&txn, newer);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const persisted = (try control.load(&txn)).?;
+        try std.testing.expectEqual(@as(u64, 2), persisted.floor);
+        try std.testing.expectEqual(@as(?committed_history.State, null), try committed_history.load(&txn));
+        var corrupt = persisted.encode();
+        corrupt[60] ^= 1;
+        try std.testing.expectError(error.HistoryCorrupt, control.State.decode(&corrupt));
+        var wrong = grant;
+        wrong.sequence = 3;
+        wrong.authority = @splat(8);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, control.enroll(&txn, wrong));
+        const row = try internal_keys.documentKeyAlloc(a, "must rollback");
+        defer a.free(row);
+        try txn.put(row, "value");
+        try std.testing.expectError(error.HistoryMixedControl, control.retire(&txn, closed));
+    }
+}

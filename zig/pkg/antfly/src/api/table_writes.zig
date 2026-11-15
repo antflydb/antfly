@@ -44197,6 +44197,72 @@ fn implementationTests() type {
             try std.testing.expectError(error.SourceBindingConflict, adapter.inner.validateScope(wrong));
         }
 
+        test "native history consumer control persists leases and rejects Raft and foreign roots" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-history-control", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native };
+            var db = try db_mod.DB.open(a, path, options);
+            var open = true;
+            defer if (open) db.close();
+            const namespace = try db.nativeSourceAdmissionNamespace();
+            const grant: db_mod.DB.HistoryConsumerGrant = .{ .namespace = namespace, .authority = @splat(9), .sequence = 1, .consumer = @splat(1), .definition = @splat(2), .expires_at_seconds = 1000, .policy_revision = 1 };
+            const enrolled = (try db.nativeHistoryConsumerControl(.{ .enroll = grant })).consumer.?;
+            try db.batch(.{ .writes = &.{ .{ .key = "one", .value = "{\"value\":1}" }, .{ .key = "two", .value = "{\"value\":2}" } } });
+            const ref: db_mod.DB.HistoryConsumerReference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.epoch, .grant = grant.sequence, .definition = grant.definition };
+            _ = try db.nativeHistoryConsumerControl(.{ .renew = .{ .reference = ref, .previous = 1000, .next = 2000 } });
+            db.close();
+            open = false;
+            db = try db_mod.DB.open(a, path, options);
+            open = true;
+            const found = (try db.nativeHistoryConsumerControl(.{ .inspect = ref })).consumer.?;
+            try std.testing.expectEqual(enrolled.epoch, found.epoch);
+            try std.testing.expectEqual(@as(u64, 2000), found.expires_at_seconds);
+            var page = try db.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101, .max_events = 1 });
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.events.len);
+            try std.testing.expectEqual(@as(u64, 0), page.next.sequence);
+            try std.testing.expectEqual(@as(u32, 1), page.next.event);
+            try std.testing.expect(!page.caught_up);
+            try std.testing.expectEqual(@as(u64, 0), (try db.nativeHistoryConsumerControl(.{ .inspect = ref })).consumer.?.acknowledged);
+            var retry = try db.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101, .max_events = 1 });
+            defer retry.deinit();
+            try std.testing.expectEqualSlices(u8, page.events[0].key, retry.events[0].key);
+            try std.testing.expectEqualSlices(u8, page.events[0].after.?, retry.events[0].after.?);
+            var tail = try db.nativeHistoryPage(a, .{ .reference = ref, .after = page.next, .now_seconds = 101, .max_events = 1 });
+            defer tail.deinit();
+            try std.testing.expectEqual(@as(u64, 1), tail.next.sequence);
+            try std.testing.expectEqual(@as(u32, 0), tail.next.event);
+            try std.testing.expect(tail.caught_up);
+            try std.testing.expectError(error.HistoryTooLarge, db.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101, .max_bytes = 1 }));
+            try std.testing.expectError(error.HistoryCheckpointConflict, db.nativeHistoryPage(a, .{ .reference = ref, .after = .{ .event = 2 }, .now_seconds = 101 }));
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 2000 }));
+            _ = try db.nativeHistoryConsumerControl(.{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 1 } });
+            _ = try db.nativeHistoryConsumerControl(.{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 1 } });
+            const reclaimed = try db.nativeHistoryConsumerControl(.{ .reclaim = .{ .reference = ref, .max_frames = 2 } });
+            try std.testing.expectEqual(@as(u8, 1), reclaimed.reclaimed_frames);
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.nativeHistoryPage(a, .{ .reference = ref, .after = .{}, .now_seconds = 101 }));
+            var empty = try db.nativeHistoryPage(a, .{ .reference = ref, .after = tail.next, .now_seconds = 101 });
+            defer empty.deinit();
+            try std.testing.expect(empty.header == null and empty.events.len == 0 and empty.caught_up);
+            // Previously returned page bytes survive transaction teardown and GC.
+            try std.testing.expectEqualSlices(u8, page.events[0].after.?, retry.events[0].after.?);
+            _ = try db.nativeHistoryConsumerControl(.{ .retire = .{ .namespace = namespace, .authority = grant.authority, .sequence = 2, .consumer = grant.consumer, .definition = grant.definition, .grant = grant.sequence } });
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.nativeHistoryConsumerControl(.{ .enroll = grant }));
+            var wrong = grant;
+            wrong.namespace = @splat(3);
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.nativeHistoryConsumerControl(.{ .enroll = wrong }));
+            const raft_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/raft-history-control", .{tmp.sub_path});
+            defer a.free(raft_path);
+            var raft_options = options;
+            raft_options.online_source_authority = .raft;
+            var raft_db = try db_mod.DB.open(a, raft_path, raft_options);
+            defer raft_db.close();
+            try std.testing.expectError(error.OnlineSourceScopeChanged, raft_db.nativeHistoryConsumerControl(.{ .enroll = grant }));
+        }
+
         test "bound source admission capability rejects unscoped and Raft-owned roots" {
             const native = @import("../metadata/native_source_delivery.zig");
             const a = std.testing.allocator;

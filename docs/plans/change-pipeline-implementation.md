@@ -334,6 +334,36 @@ debt. Runtime root enrollment/read/bootstrap, live authorization, public HTTP/SQ
 feeds and pgwire are still outstanding; this private control layer advertises no
 public changefeed capability.
 
+## Root consumer fencing and bounded reads
+
+`storage/history_consumer.zig` binds retained consumers to a metadata authority,
+immutable definition and monotonic enrollment grant. Cleanup advances a single
+checksummed root floor, including when enrollment never arrived or its reply was
+lost. Delayed unknown grants at or below that floor cannot recreate pins.
+Existing consumers survive unrelated cleanup; refreshed grants preserve their
+consumer epoch, start and ACK. Lease renewal remains a separate conditional
+operation, and metadata close/reset must precede root release. Expiry alone never
+silently deletes a retention obligation.
+
+`DB.nativeHistoryConsumerControl` serializes these transitions under the native
+apply owner and persists an empty root's trusted identity during enrollment.
+`DB.nativeHistoryPage` returns page-owned authenticated before/after images from
+one committed frame, directly seeking the retained event ordinal. The reader
+checks encoded event size before allocation, distinguishes a partial frame from
+whole-frame completion, and does not ACK on read. These private native methods
+reject foreign and Raft-owned roots. Raft command/RPC wiring, coordinated
+snapshot pins, feed reconciliation and global transaction completion still need
+implementation; a root page alone is not a public changefeed or proof of global
+commit completion.
+
+Qualified with `zig build native-history-consumer-test docstore-history-test
+changefeed-control-test -j2`: real native DB enrollment before the first write,
+reopen, partial-frame paging and replay, byte-budget/expiry rejection, ACK versus
+GC separation, page ownership after GC, Raft/foreign-root rejection, fixed-space
+retirement-before-enrollment fencing, rolled-back control changes, lost replies
+across renewal, and metadata grant refresh preserving read position. The normal
+changefeed control and unit targets now include the native integration check.
+
 ## Remaining implementation phases
 
 1. Finish root history tests, prepared credit accounting and native integration.

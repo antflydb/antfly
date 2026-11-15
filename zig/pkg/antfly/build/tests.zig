@@ -3617,6 +3617,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_algebraic_dynamic_template_tests = api_tests_addTests_result.run_algebraic_dynamic_template_tests;
     const run_lib_api_connections_tests = api_tests_addTests_result.run_lib_api_connections_tests;
     const run_lib_api_storage_authority_tests = api_tests_addTests_result.run_lib_api_storage_authority_tests;
+    changefeed_control_step.dependOn(&b.top_level_steps.get("native-history-consumer-test").?.step);
+    unit_test_step.dependOn(&b.top_level_steps.get("native-history-consumer-test").?.step);
     const api_table_writes_docid_test_mod = api_tests_addTests_result.api_table_writes_docid_test_mod;
     const api_table_reads_docid_test_mod = api_tests_addTests_result.api_table_reads_docid_test_mod;
     const run_lib_api_docid_tests = api_tests_addTests_result.run_lib_api_docid_tests;

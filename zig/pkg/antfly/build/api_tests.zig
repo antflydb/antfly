@@ -2083,6 +2083,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("source-admission-test", "Verify durable source receipts through native transaction admission").dependOn(&source_admission_tests.run(b).step);
+    const native_history_consumer_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "native-history-consumer-tests",
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"native history consumer control"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }, write_implementation_tests);
+    b.step("native-history-consumer-test", "Verify durable root consumer control through the native engine boundary")
+        .dependOn(&native_history_consumer_tests.run(b).step);
     const restore_provisioning_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-restore-provisioning-tests",
         .root_module = api_table_writes_docid_test_mod,

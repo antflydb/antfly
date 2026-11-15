@@ -23,6 +23,7 @@ pub const frame = @import("committed_frame.zig");
 const intent_value = @import("transaction_intent_value.zig");
 const A = std.mem.Allocator;
 pub const state_key = "\x00\x00__committed_history__:state";
+pub const consumer_authority_key = "\x00\x00__committed_history__:consumer_authority";
 const record_prefix = "\x00\x00__committed_history__:record:";
 const chunk_prefix = "\x00\x00__committed_history__:chunk:";
 const member_prefix = "\x00\x00__committed_history__:member:";
@@ -161,6 +162,17 @@ pub fn acknowledge(txn: anytype, namespace: frame.Namespace, id: [16]u8, epoch: 
     consumer.acknowledged = next;
     try save(txn, state);
 }
+/// Private metadata-authorized lease extension. Expiry and release are separate
+/// decisions; an expired lease remains a retention obligation until fenced close.
+pub fn renew(txn: anytype, namespace: frame.Namespace, id: [16]u8, epoch: u64, previous: u64, next: u64) !void {
+    if (next <= previous) return error.InvalidHistoryAdmission;
+    var state = (try load(txn)) orelse return error.HistoryResynchronizationRequired;
+    try requireNamespace(txn, state, namespace);
+    const consumer = try state.findConsumer(id, epoch);
+    if (consumer.expires_at_seconds != previous) return error.HistoryConsumerConflict;
+    consumer.expires_at_seconds = next;
+    try save(txn, state);
+}
 pub fn release(txn: anytype, namespace: frame.Namespace, id: [16]u8, epoch: u64) !void {
     var state = (try load(txn)) orelse return error.HistoryResynchronizationRequired;
     try requireNamespace(txn, state, namespace);
@@ -258,7 +270,7 @@ pub const Capture = struct {
     pub fn touch(self: *Capture, a: A, txn: anytype, key: []const u8, value: ?[]const u8, cache: ?*std.atomic.Value(u8)) !void {
         if (self.staging) return;
         errdefer self.poisoned = true;
-        if (std.mem.eql(u8, key, state_key)) {
+        if (std.mem.eql(u8, key, state_key) or std.mem.eql(u8, key, consumer_authority_key)) {
             if (self.touched_primary or self.rows.count() != 0 or self.reservations.count() != 0) return error.HistoryMixedControl;
             self.control = true;
             if (cache) |known| known.store(2, .release);

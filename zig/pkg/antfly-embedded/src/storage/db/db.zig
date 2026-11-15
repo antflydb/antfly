@@ -25875,6 +25875,56 @@ pub const DB = struct {
         return bytes;
     }
 
+    pub const HistoryConsumerGrant = @import("../history_consumer.zig").Grant;
+    pub const HistoryConsumerReference = @import("../history_consumer.zig").Reference;
+
+    /// Private single-root consumer control. Raft-owned roots must use their
+    /// ordered apply path; a local DB handle cannot mutate their retention pins.
+    pub fn nativeHistoryConsumerControl(self: *DB, command: @import("../history_consumer.zig").Command) !@import("../history_consumer.zig").Result {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeHistoryConsumerControl", .{ self, command });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var mutation = self.core.snapshot_admission.acquireMutation();
+        defer mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &command.namespace())) return error.HistoryResynchronizationRequired;
+        _ = try @import("../source_authority.zig").require(&txn, .native, namespace);
+        if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &txn, null);
+        // Native DBs initialize the persisted identity lazily on their first
+        // primary write. Empty-table enrollment must publish that same trusted
+        // identity atomically, rather than requiring a synthetic document.
+        if (try doc_identity.loadNamespaceTxn(&txn)) |stored| {
+            if (!stored.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        } else try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
+        const result = try @import("../history_consumer.zig").apply(&txn, command);
+        try txn.commit();
+        return result;
+    }
+
+    pub const HistoryPageRequest = @import("../history_page.zig").Request;
+    pub const HistoryPage = @import("../history_page.zig").Page;
+    /// Private committed-history read with an authenticated persisted lease.
+    /// Returned bytes belong to the page and survive read-transaction teardown.
+    pub fn nativeHistoryPage(self: *DB, allocator: std.mem.Allocator, request: HistoryPageRequest) !HistoryPage {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeHistoryPage", .{ self, allocator, request });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.reference.namespace)) return error.HistoryResynchronizationRequired;
+        _ = try @import("../source_authority.zig").require(&txn, .native, namespace);
+        return @import("../history_page.zig").read(allocator, &txn, request);
+    }
+
     /// Capability probe for the single-root native destination adapter. Raft
     /// roots must use their ordered owner; a local handle cannot bypass it.
     pub fn nativeSourceAdmissionNamespace(self: *DB) ![24]u8 {

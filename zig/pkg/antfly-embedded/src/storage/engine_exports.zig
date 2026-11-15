@@ -1144,6 +1144,12 @@ fn retireSourceAttempt(self: *DB, command: @import("source_admission.zig").Comma
 fn beginSourceTransaction(self: *DB, command: @import("source_admission.zig").Command, created_at_ns: u64, participants: []const []const u8) engine.Outcome(types.TxnId) {
     return .{ .value = self.beginSourceTransaction(command, created_at_ns, participants) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn nativeHistoryConsumerControl(self: *DB, command: @import("history_consumer.zig").Command) engine.Outcome(@import("history_consumer.zig").Result) {
+    return .{ .value = self.nativeHistoryConsumerControl(command) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn nativeHistoryPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request) engine.Outcome(@import("history_page.zig").Page) {
+    return .{ .value = self.nativeHistoryPage(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn nativeSourceAdmissionNamespace(self: *DB) engine.Outcome([24]u8) {
     return .{ .value = self.nativeSourceAdmissionNamespace() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
