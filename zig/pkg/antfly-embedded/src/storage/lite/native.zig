@@ -345,6 +345,64 @@ test "lite allocator v4 clean certificate carries checked ownership across proce
     }
 }
 
+// perf/lwa-peer-cert: every other certificate test in this file builds its
+// `NativeFile` with `createWithIo`/`CreateOptions`, which never attaches a
+// redo log (`self.redo` stays null) unless `createWithRedoLog`/
+// `enableRedoLog` is called explicitly -- so `stageAllocatorCertificate`'s
+// `self.redo == null or self.redo.?.checkpointing` check was always true
+// for them, and the certificate it sealed always matched the real
+// publish's unconditional slot flip. The redo log is the *default* one
+// layer up (`docstore.zig`'s `opts.use_redo_log orelse true`), so a real
+// writer's own `certifyAllocator()` call almost always has `self.redo`
+// active and not mid-checkpoint -- the one case none of those tests ever
+// exercised. There, the real commit diverts into an in-place redo-log
+// append (`publishCheckpoint`'s ride-along/fresh-append branches: `self
+// .header.checkpoints[self.header.active_checkpoint]` is overwritten,
+// `active_checkpoint` never moves), while `stageAllocatorCertificate`
+// still fingerprinted a header that assumed the v8/v9 flip -- sealing the
+// certificate against a slot arrangement the real publish never produced,
+// so every later `inheritAllocatorCertificate` replay of the identical
+// formula disagreed with it.
+test "lite native allocator certificate seals against the slot a redo-diverted commit actually publishes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-certificate-inherit.aflite");
+    defer a.free(path);
+    const active_before_seal, const sequence_before_seal = blk: {
+        var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+        defer file.close();
+        try file.beginTransaction();
+        try file.putCatalogRecord("seed", "value");
+        try file.commitTransaction();
+        try std.testing.expect(file.free_pages_verified);
+        // Exactly the common, previously-untested case: an active redo
+        // log, not mid-checkpoint, so the imminent certifying commit
+        // below diverts into an in-place append rather than a real
+        // v8/v9 slot write.
+        try std.testing.expect(file.redo != null and !file.redo.?.checkpointing);
+        const before = file.activeCheckpoint();
+        try std.testing.expect(try file.certifyAllocator());
+        const after = file.activeCheckpoint();
+        // Confirms the divert actually happened as expected: the commit
+        // advanced but never flipped which physical slot is active.
+        try std.testing.expect(after.commit_sequence != before.commit_sequence);
+        break :blk .{ file.header.active_checkpoint, after.commit_sequence };
+    };
+    // A fresh handle on the same file -- recovers the redo log from disk,
+    // exactly like a peer process (or, within one process, a post-refresh
+    // reopen) opening after a certifying peer closed. Before this fix,
+    // the certificate `certifyAllocator` just sealed disagreed with this
+    // handle's own, correctly-recovered header, and this returned `false`.
+    var peer = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer peer.close();
+    try std.testing.expectEqual(active_before_seal, peer.header.active_checkpoint);
+    try std.testing.expectEqual(sequence_before_seal, peer.activeCheckpoint().commit_sequence);
+    try std.testing.expect(!peer.free_pages_verified);
+    try std.testing.expect(try peer.inheritAllocatorCertificate());
+    try std.testing.expect(peer.free_pages_verified);
+}
+
 test "lite allocator v4 live certificates share the caller transaction and reject unchecked writers" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
