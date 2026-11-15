@@ -37,6 +37,8 @@ const tracing = @import("../tracing/antfly_trace_writer.zig");
 const stderr_writer = @import("../tracing/stderr_writer.zig");
 const ttl = @import("ttl.zig");
 const retained_effects = @import("retained_effects.zig");
+pub const completion = @import("transaction_completion.zig");
+const completion_admission_prefix = "\x00\x00__txn_completion_admission__:";
 
 // ============================================================================
 // Key prefixes
@@ -541,6 +543,64 @@ pub const TxnManager = struct {
         try self.initTransactionWithParticipantsCreatedAt(txn_id, timestamp, timestamp, participants);
     }
 
+    /// Trusted coordinator admission. The original physical plan and BEGIN
+    /// commit in one native batch, including the caller's Raft replay marker.
+    /// This does not enable outbound completion until retention credits,
+    /// participant resolution and certificate propagation are qualified.
+    pub fn initTransactionWithCompletionAdmission(self: *TxnManager, admission: completion.Admission, timestamp: u64, created_at: u64, retain_terminal: bool, extra: MutationExtraBatch) !void {
+        try admission.validate();
+        const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
+        defer self.alloc.free(namespace);
+        if (!std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return TxnError.DecisionConflict;
+        const key = makeSidecarKey(completion_admission_prefix, admission.transaction_id);
+        for (extra.writes) |write| if (std.mem.eql(u8, write.key, &key)) return error.InvalidTxnRecord;
+        for (extra.deletes) |deleted| if (std.mem.eql(u8, deleted, &key)) return error.InvalidTxnRecord;
+        const existing_record = self.loadTransactionRecord(admission.transaction_id) catch |err| switch (err) {
+            TxnError.TxnNotFound => null,
+            else => return err,
+        };
+        if (try self.getCompletionAdmission(self.alloc, admission.transaction_id)) |saved| {
+            var owned = saved;
+            defer owned.deinit();
+            if (existing_record == null or !std.mem.eql(u8, &owned.value.digest, &admission.digest())) return TxnError.DecisionConflict;
+        } else if (existing_record != null) return TxnError.DecisionConflict;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var members: std.ArrayList([]const u8) = .empty;
+        var unique: std.StringHashMapUnmanaged(void) = .empty;
+        for (admission.participants) |participant| {
+            const member = try unique.getOrPut(scratch, participant.locator);
+            if (member.found_existing) return error.InvalidParticipant;
+            try members.append(scratch, participant.locator);
+        }
+        const encoded = try completion.encodeAdmission(scratch, admission);
+        var writes: std.ArrayList(docstore.KVPair) = .empty;
+        try writes.appendSlice(scratch, extra.writes);
+        try writes.append(scratch, .{ .key = &key, .value = encoded });
+        var with_admission = extra;
+        with_admission.writes = writes.items;
+        try self.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(admission.transaction_id, timestamp, created_at, members.items, true, retain_terminal, with_admission);
+    }
+
+    pub fn getCompletionAdmission(self: *TxnManager, a: Allocator, txn_id: TxnId) !?std.json.Parsed(completion.AdmissionEnvelope) {
+        const key = makeSidecarKey(completion_admission_prefix, txn_id);
+        const bytes = self.getAlloc(a, &key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer a.free(bytes);
+        var parsed = try completion.parseAdmission(a, bytes);
+        errdefer parsed.deinit();
+        if (!std.mem.eql(u8, &parsed.value.admission.transaction_id, &txn_id)) return error.InvalidTxnRecord;
+        const record = try self.loadTransactionRecord(txn_id);
+        if (!record.coordinator_known or !record.coordinator) return error.InvalidTxnRecord;
+        const namespace = try self.getAlloc(a, &internal_keys.identity_namespace_key);
+        defer a.free(namespace);
+        if (!std.mem.eql(u8, namespace, &parsed.value.admission.coordinator_namespace)) return TxnError.DecisionConflict;
+        return parsed;
+    }
+
     pub fn initTransactionWithParticipantsCreatedAt(
         self: *TxnManager,
         txn_id: TxnId,
@@ -606,6 +666,21 @@ pub const TxnManager = struct {
             else => return err,
         };
         if (existing) |record| {
+            const completion_key = makeSidecarKey(completion_admission_prefix, txn_id);
+            const frozen = self.getAlloc(self.alloc, &completion_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (frozen) |bytes| self.alloc.free(bytes);
+            if (frozen) |bytes| {
+                var supplied = false;
+                for (extra_batch.writes) |write| if (std.mem.eql(u8, write.key, &completion_key)) {
+                    if (supplied or !std.mem.eql(u8, write.value, bytes)) return TxnError.DecisionConflict;
+                    supplied = true;
+                };
+                if (!supplied) return TxnError.DecisionConflict;
+                for (extra_batch.deletes) |deleted| if (std.mem.eql(u8, deleted, &completion_key)) return TxnError.DecisionConflict;
+            }
             if (!samePurpose(record.source_purpose, extra_batch.source_purpose)) return error.SourceTransactionIdentityConflict;
             if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
             if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
@@ -2467,6 +2542,16 @@ pub const TxnManager = struct {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
+        if (record.status == .committed) {
+            if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+                var frozen = saved;
+                defer frozen.deinit();
+                // Publication/retention handoff must explicitly retire this
+                // debt. Ordinary terminal-record age is not completion proof.
+                try self.applyMutationExtraBatch(extra_batch);
+                return false;
+            }
+        }
         const cutoff = if (record.retain_terminal) retained_cutoff_timestamp else cutoff_timestamp;
         if (retired_source == null and record.finalized_at >= cutoff) {
             try self.applyMutationExtraBatch(extra_batch);
@@ -2640,6 +2725,11 @@ pub const TxnManager = struct {
         txn_id: TxnId,
         extra_batch: MutationExtraBatch,
     ) !void {
+        if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+            var frozen = saved;
+            defer frozen.deinit();
+            if ((try self.loadTransactionRecord(txn_id)).status != .aborted) return TxnError.DecisionConflict;
+        }
         const record_key = makeRecordKey(txn_id);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
@@ -2651,6 +2741,8 @@ pub const TxnManager = struct {
         defer deletes.deinit(self.alloc);
         const admission_key = makeSidecarKey(intent_admission_prefix, txn_id);
         try deletes.append(self.alloc, &admission_key);
+        const completion_admission_key = makeSidecarKey(completion_admission_prefix, txn_id);
+        try deletes.append(self.alloc, &completion_admission_key);
         try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &hot_standby_batch_key, &hot_standby_replay_key, &intent_keys_key, &schema_lease_key });
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         const member_prefix = makeSidecarKey(participant_index_prefix, txn_id);
@@ -3329,6 +3421,79 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "committed history completion admission freezes the coordinator plan with begin and survives reopen" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "completion-admission");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    const namespace: completion.Namespace = @splat(1);
+    const members = [_]completion.Participant{
+        .{ .namespace = namespace, .owner_fence = @splat(2), .roles = completion.Roles.effects, .locator = "original-writer" },
+        .{ .namespace = @splat(3), .owner_fence = @splat(4), .roles = completion.Roles.guards, .locator = "original-guard" },
+    };
+    const admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = @splat(2), .participants = &members };
+    const marker_key = "\x00\x00__completion_test_marker";
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        try store.put(&internal_keys.identity_namespace_key, &namespace);
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{ .writes = &.{.{ .key = marker_key, .value = "first-begin" }} });
+        try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{ .writes = &.{.{ .key = marker_key, .value = "confirmed-retry" }} });
+    }
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        var saved = (try manager.getCompletionAdmission(a, admission.transaction_id)).?;
+        defer saved.deinit();
+        try std.testing.expectEqual(admission.digest(), saved.value.digest);
+        const marker = try manager.getAlloc(a, marker_key);
+        defer a.free(marker);
+        try std.testing.expectEqualStrings("confirmed-retry", marker);
+        const record = try manager.loadTransactionRecord(admission.transaction_id);
+        try std.testing.expect(record.coordinator and record.retain_terminal);
+        try std.testing.expectEqual(@as(u64, 10), record.begin_timestamp);
+        const plan_members = try manager.getParticipants(a, admission.transaction_id);
+        defer freeParticipantList(a, plan_members);
+        try std.testing.expectEqual(@as(usize, 2), plan_members.len);
+        try std.testing.expectError(TxnError.DecisionConflict, manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(admission.transaction_id, 10, 11, &.{ "original-writer", "original-guard" }, true, true));
+        var changed = admission;
+        changed.admission_digest[0] ^= 1;
+        try std.testing.expectError(TxnError.DecisionConflict, manager.initTransactionWithCompletionAdmission(changed, 10, 11, true, .{}));
+        changed = admission;
+        changed.coordinator_namespace[0] ^= 1;
+        try std.testing.expectError(TxnError.DecisionConflict, manager.initTransactionWithCompletionAdmission(changed, 10, 11, true, .{}));
+        const legacy_id: TxnId = @splat(8);
+        try manager.initTransaction(legacy_id, 10);
+        changed = admission;
+        changed.transaction_id = legacy_id;
+        try std.testing.expectError(TxnError.DecisionConflict, manager.initTransactionWithCompletionAdmission(changed, 10, 11, true, .{}));
+        try manager.resolveIntents(admission.transaction_id, .committed, 20);
+        try manager.markParticipantsResolvedExtraBatch(admission.transaction_id, &.{ "original-writer", "original-guard" }, .{});
+        try std.testing.expect(!(try manager.cleanupTransactionMetadataIfEligible(admission.transaction_id, std.math.maxInt(u64), std.math.maxInt(u64))));
+        var retained = (try manager.getCompletionAdmission(a, admission.transaction_id)).?;
+        defer retained.deinit();
+        try std.testing.expectEqual(admission.digest(), retained.value.digest);
+        const committed_manifest = try retained.value.admission.manifest(20);
+        try std.testing.expectEqual(@as(u64, 20), committed_manifest.commit_version);
+        try std.testing.expectError(error.InvalidTxnRecord, retained.value.admission.manifest(0));
+        var aborted = admission;
+        aborted.transaction_id = @splat(9);
+        try manager.initTransactionWithCompletionAdmission(aborted, 30, 31, true, .{});
+        try manager.resolveIntents(aborted.transaction_id, .aborted, 0);
+        try manager.markParticipantsResolvedExtraBatch(aborted.transaction_id, &.{ "original-writer", "original-guard" }, .{});
+        try std.testing.expect(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, std.math.maxInt(u64), std.math.maxInt(u64)));
+        try std.testing.expect((try manager.getCompletionAdmission(a, aborted.transaction_id)) == null);
+    }
+}
 
 test "committed history transaction reservations survive reopen and committed recovery emits one original transaction" {
     const history = @import("committed_history.zig");

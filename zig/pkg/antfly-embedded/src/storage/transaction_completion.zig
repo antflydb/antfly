@@ -54,6 +54,65 @@ pub const Participant = struct {
         if (!nonzero(self.namespace) or !nonzero(self.owner_fence) or self.roles == 0 or self.roles & ~@as(u8, 7) != 0 or self.locator.len == 0 or self.locator.len > max_locator_bytes or !std.unicode.utf8ValidateSlice(self.locator)) return error.InvalidTxnRecord;
     }
 };
+/// Frozen before prepare. The final commit version is chosen only after votes;
+/// it must not be guessed or folded into the source admission fingerprint.
+pub const Admission = struct {
+    version: u16 = 1,
+    transaction_id: [16]u8,
+    admission_digest: Digest,
+    coordinator_namespace: Namespace,
+    coordinator_fence: Digest,
+    participants: []const Participant,
+    pub fn validate(self: Admission) !void {
+        if (self.version != 1 or !nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.coordinator_namespace) or !nonzero(self.coordinator_fence) or self.participants.len == 0 or self.participants.len > max_participants) return error.InvalidTxnRecord;
+        for (self.participants, 0..) |participant, i| {
+            try participant.validate();
+            if (i != 0 and std.mem.order(u8, &self.participants[i - 1].namespace, &participant.namespace) != .lt) return error.InvalidTxnRecord;
+        }
+    }
+    pub fn manifest(self: Admission, commit_version: u64) !Manifest {
+        const result: Manifest = .{ .version = self.version, .transaction_id = self.transaction_id, .admission_digest = self.admission_digest, .coordinator_namespace = self.coordinator_namespace, .coordinator_fence = self.coordinator_fence, .commit_version = commit_version, .participants = self.participants };
+        try result.validate();
+        return result;
+    }
+    pub fn digest(self: Admission) Digest {
+        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        sha.update("antfly:transaction-completion-admission:v1");
+        number(&sha, self.version);
+        sha.update(&self.transaction_id);
+        sha.update(&self.admission_digest);
+        sha.update(&self.coordinator_namespace);
+        sha.update(&self.coordinator_fence);
+        number(&sha, self.participants.len);
+        for (self.participants) |participant| {
+            sha.update(&participant.namespace);
+            sha.update(&participant.owner_fence);
+            sha.update(&.{participant.roles});
+            number(&sha, participant.locator.len);
+            sha.update(participant.locator);
+        }
+        return sha.finalResult();
+    }
+};
+pub const AdmissionEnvelope = struct { admission: Admission, digest: Digest };
+pub fn encodeAdmission(a: A, admission: Admission) ![]u8 {
+    try admission.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, AdmissionEnvelope{ .admission = admission, .digest = admission.digest() }, .{});
+    errdefer a.free(bytes);
+    if (bytes.len > max_bytes) return error.HistoryTooLarge;
+    return bytes;
+}
+pub fn parseAdmission(a: A, bytes: []const u8) !std.json.Parsed(AdmissionEnvelope) {
+    if (bytes.len == 0 or bytes.len > max_bytes) return error.InvalidTxnRecord;
+    var parsed = std.json.parseFromSlice(AdmissionEnvelope, a, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidTxnRecord,
+    };
+    errdefer parsed.deinit();
+    try parsed.value.admission.validate();
+    if (!same(parsed.value.digest, parsed.value.admission.digest())) return error.InvalidTxnRecord;
+    return parsed;
+}
 pub const Manifest = struct {
     version: u16 = 1,
     transaction_id: [16]u8,
@@ -62,12 +121,12 @@ pub const Manifest = struct {
     coordinator_fence: Digest,
     commit_version: u64,
     participants: []const Participant,
+    pub fn admission(self: Manifest) Admission {
+        return .{ .version = self.version, .transaction_id = self.transaction_id, .admission_digest = self.admission_digest, .coordinator_namespace = self.coordinator_namespace, .coordinator_fence = self.coordinator_fence, .participants = self.participants };
+    }
     pub fn validate(self: Manifest) !void {
-        if (self.version != 1 or !nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.coordinator_namespace) or !nonzero(self.coordinator_fence) or self.commit_version == 0 or self.participants.len == 0 or self.participants.len > max_participants) return error.InvalidTxnRecord;
-        for (self.participants, 0..) |participant, i| {
-            try participant.validate();
-            if (i != 0 and std.mem.order(u8, &self.participants[i - 1].namespace, &participant.namespace) != .lt) return error.InvalidTxnRecord;
-        }
+        try self.admission().validate();
+        if (self.commit_version == 0) return error.InvalidTxnRecord;
     }
     pub fn digest(self: Manifest) Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});

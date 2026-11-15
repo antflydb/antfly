@@ -1963,6 +1963,39 @@ the authorized delivery owner verify it before exposing completion. Existing
 coordinated frames remain rejected by the public-projection provider until those
 production invariants and failure/recovery tests are implemented.
 
+## In progress: atomic coordinator completion admission
+
+The frozen pre-prepare `completion.Admission` is separate from the final
+`Manifest`, whose commit version is selected only after voting. Its checksummed
+envelope binds the original transaction, source/admission digest, coordinator
+namespace/fence and exact participant roles/owners/locators. Converting admission
+to a final manifest requires a positive committed version.
+
+`TxnManager.initTransactionWithCompletionAdmission` verifies the physical
+coordinator namespace and writes that envelope in the existing native BEGIN
+batch with participant membership and any caller replay marker. Retries require
+the exact frozen plan. Changed plans, legacy BEGIN without the frozen envelope,
+and adopting an existing ordinary transaction are rejected. Reads verify the
+transaction ID, coordinator role and current physical namespace. Ordinary
+committed-record cleanup cannot erase completion admission before the explicit
+retention/publication handoff. Fully resolved aborted transactions remove the
+plan with their terminal metadata.
+
+The physical LSM test covers store reopen, repeated BEGIN, durable replay marker,
+changed input/namespace, legacy retry/adoption rejection, committed cleanup
+protection, and aborted cleanup. Seven history tests and the standalone completion
+gate passed in `completion-admission-qualified-test.log`. All 131 broader docstore
+and transaction tests passed with no failures or leaks in
+`completion-admission-docstore-test.log`.
+
+This is a trusted storage-owner primitive. It is not yet called by production
+coordinator admission and does not advertise distributed feed support. The next
+integration must activate a compatible Raft protocol, reserve participant
+completion credits before prepare votes, capture atomic effect/zero-effect
+receipts, and complete the retained certificate handoff before releasing the
+committed plan. Until that handoff exists, committed plans deliberately remain
+pinned; the new primitive must not be enabled as a production serving capability.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
