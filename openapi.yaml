@@ -7844,6 +7844,29 @@ paths:
         text field. The route is shard-aware; hosted deployments route the
 
         request to the data group that owns the source document key.
+
+
+        On a privacy-protected table, a dense index name without a same-named
+
+        asset also selects its stored text-chunk vectors for administrator
+
+        inspection. The response uses route_type `dense_index_inspection` and
+
+        manifest_version 1; raw manifest_json carries the versioned
+
+        `antfly.dense-index-inspection.v1` snapshot. Its current flag, policy,
+
+        index recipe, sanitized source and vector publication evidence belong
+
+        to one apply-fenced storage cut. The top-level artifact_id is empty;
+
+        member artifact IDs are included in the raw snapshot. This bounded
+
+        inspection does not re-embed missing vectors and does not alter normal
+
+        protected search projection permissions. See the table privacy guide
+
+        for the raw payload and supported recipe limits.
       parameters:
         - name: detail
           in: query

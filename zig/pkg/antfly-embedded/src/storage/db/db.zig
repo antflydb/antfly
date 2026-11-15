@@ -10400,7 +10400,15 @@ pub const DB = struct {
 
         const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
         defer alloc.free(manifest_key);
-        const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse return null;
+        const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse {
+            var inspection = @import("dense_index_inspection.zig").inspect(self, alloc, doc_key, artifact_name) catch |err| {
+                if (@import("privacy_read.zig").pending(err) or err == error.IndexRebuilding or err == error.ResourceBudgetExceeded) return error.StorageReadTemporarilyUnavailable;
+                return err;
+            };
+            errdefer if (inspection) |*result| result.deinit(alloc);
+            try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            return inspection;
+        };
         var manifest_owned = true;
         errdefer if (manifest_owned) alloc.free(manifest);
 
@@ -154916,4 +154924,80 @@ test "db pending producer replay never ages missing full text input into complet
     try db.core.store.putBatch(&.{.{ .key = stored, .value = "{\"body\":\"arrived\"}" }}, &.{});
     try db.runDerivedUntil(sequence);
     try std.testing.expectEqual(sequence, try db.core.loadAppliedSequence(alloc, "text"));
+}
+
+test "db dense index inspection does not expose unprotected or missing artifacts" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("dense-index-inspection");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, "missing", "dense")) == null);
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, "missing", "absent")) == null);
+}
+
+test "db dense index inspection never certifies a missing protected vector" {
+    const a = std.testing.allocator;
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("dense-index-inspection-pending");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+    try addPrivacyAbsentFieldProducer(a, &db, "inspection");
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"safe\",\"version\":5}" }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    var result = (try db.getDocumentArtifactManifest(a, "doc", "dense")) orelse return error.TestUnexpectedResult;
+    defer result.deinit(a);
+    const parsed = try std.json.parseFromSlice(struct { current: bool, vectors: []const std.json.Value, document_json: []const u8 }, a, result.manifest_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.current);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.vectors.len);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.document_json, "safe") != null);
+}
+
+test "db dense index inspection binds current chunk vectors and never invokes inference" {
+    const a = std.testing.allocator;
+    const catalog = @import("../../privacy/catalog.zig");
+    const document = @import("../../privacy/document.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy = document.contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = "inspection" }} };
+    const version = try policy.identity(scratch);
+    const root = try document.protectedArtifactName(scratch, version);
+    const embedding = try catalog.managedName(scratch, version, "dense");
+    const chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embedding});
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var embedder: CountingDenseEmbedder = .{};
+    var directory = try TestDirectory.init("dense-index-inspection-current");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface(), .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "inspection");
+    try db.addEnrichment(.{ .name = chunks, .kind = .chunk, .field = "body", .source_artifact_name = root, .chunk_size = 1024 });
+    try db.addEnrichment(.{ .name = embedding, .kind = .embedding, .field = "text", .source_artifact_name = chunks, .expected_dims = 3, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model-B\"}" });
+    const config = try std.fmt.allocPrint(scratch, "{{\"field\":\"embedding\",\"dims\":3,\"sources\":[{{\"artifact\":\"{s}\"}}]}}", .{embedding});
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = config, .coverage_generation = 7 });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Orchard guidance.\",\"version\":5}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    const calls_before_inspection = embedder.calls;
+    var result = (try db.getDocumentArtifactManifest(a, "doc", "dense")) orelse return error.TestUnexpectedResult;
+    defer result.deinit(a);
+    const View = struct { current: bool, index_generation: u64, vectors: []const struct { model: []const u8, source_text: []const u8, values: []const f32 } };
+    const parsed = try std.json.parseFromSlice(View, a, result.manifest_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.current);
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.index_generation);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.vectors.len);
+    try std.testing.expectEqualStrings("model-B", parsed.value.vectors[0].model);
+    try std.testing.expectEqualStrings("Orchard guidance.", parsed.value.vectors[0].source_text);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.vectors[0].values.len);
+    try std.testing.expectEqual(calls_before_inspection, embedder.calls);
+    const expected = try embedder_mod.DeterministicDenseEmbedder.embedDense(&embedder.deterministic, a, embedding, "Orchard guidance.", 3);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(f32, expected, parsed.value.vectors[0].values);
+    try db.batch(.{ .deletes = &.{"doc"}, .sync_level = .write });
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, "doc", "dense")) == null);
 }
