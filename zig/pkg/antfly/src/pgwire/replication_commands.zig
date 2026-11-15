@@ -401,3 +401,7 @@ test "replication commands bound publication sets and normalize supported startu
     defer valid.deinit();
     try std.testing.expectEqual(@as(usize, 1), valid.command.start.publications.len);
 }
+
+test {
+    _ = @import("replication_input.zig");
+}

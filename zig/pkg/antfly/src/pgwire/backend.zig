@@ -18,6 +18,7 @@
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
 pub const replication_commands = @import("replication_commands.zig");
+pub const pgoutput = @import("pgoutput.zig");
 
 pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
@@ -265,4 +266,34 @@ pub const ReplicationSession = struct {
     authorize: *const fn (*anyopaque, std.mem.Allocator, Request, ?replication_commands.Command) anyerror!void,
     command: *const fn (*anyopaque, std.mem.Allocator, Request, replication_commands.Command) anyerror!Result,
     close: *const fn (*anyopaque) void,
+    /// Absent until the owner can retain/spool complete projected transactions
+    /// and map their serialized positions durably. Never opens a SQL cursor.
+    open_stream: ?*const fn (*anyopaque, std.mem.Allocator, Request, replication_commands.Start) anyerror!ReplicationStream = null,
+};
+
+/// All methods run serially on the connection coordinator. poll returns at
+/// most one complete pgoutput message from durable committed spooling at the
+/// exact requested byte frontier; it must not retain an entire transaction in
+/// connection RAM or advance an acknowledgement. No-data returns immediately.
+/// feedback validates the slot fence and maps only complete issued intervals
+/// to durable acknowledgement. close runs after all reader/writer tasks join.
+pub const ReplicationStream = struct {
+    context: *anyopaque,
+    initial_lsn: pgoutput.Lsn,
+    /// Validated reconnect position; it can exceed initial_lsn when replay
+    /// rewinds an interior requested LSN to the transaction's Begin.
+    resume_lsn: pgoutput.Lsn,
+    initial_end_lsn: pgoutput.Lsn,
+    poll: *const fn (*anyopaque, std.mem.Allocator, Request, pgoutput.Lsn, u32) anyerror!ReplicationPoll,
+    feedback: *const fn (*anyopaque, std.mem.Allocator, Request, pgoutput.Feedback) anyerror!void,
+    close: *const fn (*anyopaque) void,
+};
+pub const ReplicationPoll = struct {
+    end_lsn: pgoutput.Lsn,
+    chunk: ?struct { start_lsn: pgoutput.Lsn, bytes: []const u8 } = null,
+    owner: ?struct { context: *anyopaque, release: *const fn (*anyopaque) void } = null,
+    pub fn deinit(self: *@This()) void {
+        if (self.owner) |owner| owner.release(owner.context);
+        self.* = undefined;
+    }
 };

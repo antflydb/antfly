@@ -618,9 +618,10 @@ checked. Owner resources close before credentials are released. Known committed
 or uncertain slot mutations report completion uncertainty without fabricating
 SQL transaction reconciliation work.
 
-The production native adapter still has no factory. START remains explicitly
-unsupported until its duplex CopyBoth lifecycle and durable transaction spool
-are implemented. This boundary does not qualify any existing CDC client.
+The production native adapter still has no factory. START requires the separate
+stream owner described below; a missing callback fails explicitly. Durable
+spooling and native integration remain unfinished. This boundary does not
+qualify any existing CDC client.
 
 Qualification: `zig build pgwire-test pgoutput-test -j2` passes with local
 listeners permitted. It covers the full existing wire/session/lifecycle suite,
@@ -638,6 +639,43 @@ slot's durable publication/projection binding must also fence changed replay
 serialization; a different publication list cannot reuse an existing LSN mapping
 with different bytes. Database-wide cut ownership and this binding are still
 required integration work.
+
+## In progress: duplex CopyBoth transport
+
+`ReplicationSession.open_stream` supplies a connection-owned committed stream.
+The coordinator serializes bounded polling, feedback and authorization; a
+separate single-message reader runs concurrently. It never cancels/restarts
+that reader between polling ticks, which could lose partially consumed frames.
+Stream exit joins and drains tasks before releasing payloads/leases/credentials.
+Renewal buffers are securely released on success, error and queued cancellation.
+
+Provider calls and writes have bounded deadlines. Only valid, accepted feedback
+extends the consumer deadline; keepalives and outgoing data do not. Keepalive
+requests and direct replies use PostgreSQL epoch timestamps. CopyDone emits COPY
+and START completion boundaries and leaves following query bytes untouched.
+Errors after COPY begins disconnect instead of resuming an uncertain input frame.
+
+Polling accepts the exact caller-maintained byte frontier and at most one
+bounded complete pgoutput message from retained spooling. The provider's end
+cannot regress or authorize acknowledgement of unsent bytes. Feedback is capped
+by the sent frontier or a backend-validated reconnect position, including rewind
+from an interior LSN to Begin. Sending/closing a stream never acknowledges its
+history. Durable slot confirmation still belongs to the metadata authority.
+
+`zig build pgwire-test pgoutput-test -j2` passes the full suite with local
+listeners enabled. Live-socket cases cover delivery, feedback, renewal, following
+commands, future acknowledgement rejection, revocation before payload,
+idle keepalive/timeout, cancellation/shutdown and validated reconnect rewind.
+Bounded frontend frame/renewal allocation-failure tests pass as well. Logs:
+`zig/copyboth-complete-qualification.log`, `zig/copyboth-lifecycle-qualification.log`
+and `zig/replication-input-codec-test.log`.
+
+No production stream factory, durable committed spool or existing-client
+qualification is supplied by these transport checks. Subsequent integration
+must also advance over irrelevant retained events without inventing visible
+empty PostgreSQL transactions/LSN increments or leaking hidden participant
+counts. That needs a certified checkpoint-only native progress operation,
+separate from delivery/confirmation of serialized PostgreSQL transactions.
 
 ## Working constraints
 

@@ -22,6 +22,8 @@ const values = @import("values.zig");
 const formatting = @import("formatting.zig");
 const commands = @import("session_commands.zig");
 const replication_commands = backend.replication_commands;
+const replication_input = @import("replication_input.zig");
+const pgoutput = backend.pgoutput;
 const settings_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const Spool = @import("cursor_spool.zig").Store;
 const Budget = @import("budget.zig").Budget;
@@ -39,6 +41,11 @@ pub const Limits = struct {
     startup_timeout_ms: u32 = 5000,
     idle_timeout_ms: u32 = 60000,
     statement_timeout_ms: u32 = 30000,
+    replication_timeout_ms: u32 = 60000,
+    replication_keepalive_ms: u32 = 10000,
+    replication_poll_ms: u32 = 50,
+    replication_callback_ms: u32 = 500,
+    replication_write_ms: u32 = 5000,
 };
 
 pub const CancelHooks = struct {
@@ -138,6 +145,7 @@ pub const Session = struct {
     diagnostic: backend.Diagnostic = .{},
     mutation_ack_pending: bool = false,
     replication_administration: bool = false,
+    replication_copy_active: bool = false,
     discard_after_reply: bool = false,
     completion_safe: bool = true,
     completion: @import("completion.zig").Completion = .{},
@@ -231,6 +239,16 @@ pub const Session = struct {
             self.mutation_ack_pending = false;
             self.replication_administration = false;
             self.dispatch(tag, payload) catch |err| {
+                if (self.replication_copy_active) {
+                    // Cancelled reads may have consumed a partial frontend
+                    // frame. Close after the error, never resume SQL framing
+                    // from an unknown byte boundary or acknowledge delivery.
+                    if (err != error.Canceled and err != error.EndOfStream) {
+                        self.sendError(sqlstate(err), @errorName(err)) catch {};
+                        self.writer.flush() catch {};
+                    }
+                    return err;
+                }
                 const completion_code: []const u8 = if (self.diagnostic.code) |*code| code else sqlstate(err);
                 if (std.mem.eql(u8, completion_code, "40003") and !self.mutation_ack_pending and !self.replication_administration) {
                     self.completion_safe = false;
@@ -886,12 +904,153 @@ pub const Session = struct {
         self.clearPrepared();
     }
 
+    fn replicationNow(self: *Session) i64 {
+        return @intCast(std.Io.Clock.awake.now(self.io).nanoseconds);
+    }
+    fn replicationDeadline(self: *Session, deadline: i64) void {
+        self.deadline_ns.store(deadline, .release);
+        self.deadline_changed.set(self.io);
+    }
+    fn replicationRequest(self: *Session, statement: []const u8, deadline: i64) backend.Request {
+        var request_value = self.request(statement, &.{}, &.{});
+        request_value.deadline.raw.nanoseconds = @min(deadline, self.replicationNow() +| @as(i64, self.limits.replication_callback_ms) * std.time.ns_per_ms);
+        return request_value;
+    }
+    fn replicationTick(io: std.Io, ms: u32) std.Io.Cancelable!void {
+        try io.sleep(.fromMilliseconds(ms), .awake);
+    }
+    fn replicationWrite(self: *Session, bytes: []const u8, deadline: i64) !void {
+        self.replicationDeadline(@min(deadline, self.replicationNow() +| @as(i64, self.limits.replication_write_ms) * std.time.ns_per_ms));
+        try self.writer.writeAll(bytes);
+        try self.writer.flush();
+        self.replicationDeadline(deadline);
+    }
+    fn replicationKeepalive(self: *Session, a: std.mem.Allocator, end: pgoutput.Lsn, reply: bool, deadline: i64) !void {
+        const bytes = try pgoutput.copyData(a, .{ .keepalive = .{ .end = end, .server_time = try pgoutput.postgresTime(std.Io.Clock.real.now(self.io).nanoseconds), .request_reply = reply } }, self.limits.frame_bytes);
+        defer a.free(bytes);
+        try self.replicationWrite(bytes, deadline);
+    }
+    fn replicationCopy(self: *Session, a: std.mem.Allocator, statement: []const u8, owner: backend.ReplicationSession, command_value: replication_commands.Command) !void {
+        const open = owner.open_stream orelse return error.UnsupportedReplicationMode;
+        const limits = self.limits;
+        if (limits.replication_timeout_ms == 0 or limits.replication_keepalive_ms == 0 or limits.replication_keepalive_ms >= limits.replication_timeout_ms or limits.replication_poll_ms == 0 or limits.replication_callback_ms == 0 or limits.replication_write_ms == 0 or limits.frame_bytes < 31 or limits.frame_bytes > pgoutput.max_message_bytes + 30) return error.InvalidParameter;
+        var deadline = self.replicationNow() +| @as(i64, limits.replication_timeout_ms) * std.time.ns_per_ms;
+        var request_value = self.replicationRequest(statement, deadline);
+        const stream = try open(owner.context, a, request_value, command_value.start);
+        defer stream.close(stream.context);
+        if (@backingInt(stream.initial_lsn) == 0 or @backingInt(stream.resume_lsn) < @backingInt(stream.initial_lsn) or @backingInt(stream.resume_lsn) > @backingInt(stream.initial_end_lsn)) return error.InvalidResult;
+        try owner.authorize(owner.context, a, request_value, command_value);
+        var sent = stream.initial_lsn;
+        var observed_end = stream.initial_end_lsn;
+        var feedback_ceiling = stream.resume_lsn;
+        var last_keepalive = self.replicationNow();
+        const Outcome = union(enum) { input: anyerror!replication_input.Input, tick: std.Io.Cancelable!void };
+        var outcomes: [2]Outcome = undefined;
+        var select = std.Io.Select(Outcome).init(self.io, &outcomes);
+        defer while (select.cancel()) |remaining| switch (remaining) {
+            .input => |result| {
+                var value = result catch continue;
+                value.deinit(self.alloc);
+            },
+            .tick => {},
+        };
+        self.replication_copy_active = true;
+        try select.concurrent(.input, replication_input.read, .{ self.alloc, self.reader, self.identity.?.renewable });
+        try select.concurrent(.tick, replicationTick, .{ self.io, @as(u32, 0) });
+        self.replicationDeadline(deadline);
+        // Text format, no ordinary COPY column descriptors.
+        try self.message('W', &.{ 0, 0, 0 });
+        try self.writer.flush();
+        while (true) {
+            request_value = self.replicationRequest(statement, deadline);
+            try request_value.check();
+            const outcome = try select.await();
+            request_value = self.replicationRequest(statement, deadline);
+            try request_value.check();
+            switch (outcome) {
+                .input => |result| {
+                    var input_value = try result;
+                    defer input_value.deinit(self.alloc);
+                    switch (input_value) {
+                        .done => break,
+                        .terminate => return error.EndOfStream,
+                        .abort => return error.QueryCanceled,
+                        .renew => |bytes| {
+                            const renew = self.source.vtable.refresh orelse return error.Unauthorized;
+                            try renew(self.source.context, self.alloc, self.identity.?, bytes[0 .. bytes.len - 1]);
+                            try owner.authorize(owner.context, a, request_value, command_value);
+                        },
+                        .feedback => |feedback| {
+                            // LSNs are untrusted peer claims. Do not pass a
+                            // future position to a slot which may already have
+                            // reserved a larger, still-unsent transaction.
+                            if (@backingInt(feedback.flushed) > @backingInt(feedback_ceiling) or @backingInt(feedback.written) > @backingInt(feedback_ceiling) or @backingInt(feedback.applied) > @backingInt(feedback_ceiling)) return error.ProtocolViolation;
+                            var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                            defer scratch.deinit();
+                            self.replicationDeadline(@intCast(request_value.deadline.raw.nanoseconds));
+                            try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
+                            try stream.feedback(stream.context, scratch.allocator(), request_value, feedback);
+                            try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
+                            deadline = self.replicationNow() +| @as(i64, limits.replication_timeout_ms) * std.time.ns_per_ms;
+                            self.replicationDeadline(deadline);
+                            if (feedback.request_reply) {
+                                try self.replicationKeepalive(scratch.allocator(), observed_end, false, deadline);
+                                last_keepalive = self.replicationNow();
+                            }
+                        },
+                    }
+                    try select.concurrent(.input, replication_input.read, .{ self.alloc, self.reader, self.identity.?.renewable });
+                },
+                .tick => |result| {
+                    try result;
+                    var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                    defer scratch.deinit();
+                    self.replicationDeadline(@intCast(request_value.deadline.raw.nanoseconds));
+                    try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
+                    var poll = try stream.poll(stream.context, scratch.allocator(), request_value, sent, limits.frame_bytes - 30);
+                    defer poll.deinit();
+                    if (@backingInt(poll.end_lsn) < @backingInt(observed_end)) return error.InvalidResult;
+                    observed_end = poll.end_lsn;
+                    try owner.authorize(owner.context, scratch.allocator(), request_value, command_value);
+                    self.replicationDeadline(deadline);
+                    if (poll.chunk) |chunk| {
+                        if (@backingInt(chunk.start_lsn) != @backingInt(sent) or chunk.bytes.len == 0 or chunk.bytes.len > limits.frame_bytes - 30) return error.InvalidResult;
+                        const next = std.math.add(u64, @backingInt(sent), chunk.bytes.len) catch return error.InvalidResult;
+                        if (next > @backingInt(observed_end)) return error.InvalidResult;
+                        const bytes = try pgoutput.copyData(scratch.allocator(), .{ .wal = .{ .start = chunk.start_lsn, .end = observed_end, .server_time = try pgoutput.postgresTime(std.Io.Clock.real.now(self.io).nanoseconds), .payload = chunk.bytes } }, limits.frame_bytes);
+                        try self.replicationWrite(bytes, deadline);
+                        sent = @fromBackingInt(next);
+                        if (next > @backingInt(feedback_ceiling)) feedback_ceiling = sent;
+                    }
+                    if (self.replicationNow() - last_keepalive >= @as(i64, limits.replication_keepalive_ms) * std.time.ns_per_ms) {
+                        try self.replicationKeepalive(scratch.allocator(), observed_end, true, deadline);
+                        last_keepalive = self.replicationNow();
+                    }
+                    const elapsed_ms: u32 = @intCast(@min(@as(i64, limits.replication_keepalive_ms), @divTrunc(@max(0, self.replicationNow() - last_keepalive), std.time.ns_per_ms)));
+                    const delay: u32 = if (poll.chunk != null) 0 else @min(limits.replication_poll_ms, @max(1, limits.replication_keepalive_ms - elapsed_ms));
+                    try select.concurrent(.tick, replicationTick, .{ self.io, delay });
+                },
+            }
+        }
+        // The input task returned exactly at CopyDone, so no next-command
+        // bytes were consumed. Cancellation joins only the outstanding timer.
+        while (select.cancel()) |remaining| switch (remaining) {
+            .input => |result| {
+                var value = result catch continue;
+                value.deinit(self.alloc);
+            },
+            .tick => {},
+        };
+        self.replicationDeadline(@min(deadline, self.replicationNow() +| @as(i64, limits.replication_write_ms) * std.time.ns_per_ms));
+        try self.message('c', "");
+        try self.command("COPY 0");
+        try self.command("START_REPLICATION");
+        try self.writer.flush();
+        self.replication_copy_active = false;
+    }
+
     fn replicationCommand(self: *Session, a: std.mem.Allocator, statement: []const u8, command_value: replication_commands.Command) !void {
         const owner = self.replication orelse return error.UnsupportedReplicationMode;
-        // CopyBoth needs its own duplex lifecycle and retained spool owner.
-        // A START must never be answered as an ordinary SQL result or routed
-        // through a management callback which cannot establish that lifecycle.
-        if (command_value == .start) return error.UnsupportedReplicationMode;
         if (self.status != .idle or self.session_id != null) return error.ActiveSqlTransaction;
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
@@ -900,6 +1059,10 @@ pub const Session = struct {
         const request_value = self.request(statement, &.{}, &.{});
         try request_value.check();
         try owner.authorize(owner.context, a, request_value, command_value);
+        if (command_value == .start) {
+            try self.replicationCopy(a, statement, owner, command_value);
+            return;
+        }
         const mutates = command_value != .identify_system;
         // Logical slot administration does not create a SQL transaction
         // completion receipt. The replication owner handles uncertain outcomes.
@@ -2012,6 +2175,8 @@ fn sqlstate(err: anyerror) []const u8 {
         error.DuplicateCursorName => "42P03",
         error.ProtocolViolation => "08P01",
         error.MetadataMutationOutcomeUnknown => "40003",
+        error.ChangefeedResynchronizationRequired, error.ChangefeedLeaseExpired => "55000",
+        error.ChangefeedBackpressure => "53300",
         error.ActiveSqlTransaction => "25001",
         error.OutOfMemory, error.ProgramLimitExceeded => "54000",
         error.SyntaxError, error.PgReplicationSyntax => "42601",
