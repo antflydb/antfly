@@ -38603,6 +38603,11 @@ pub const DB = struct {
 
     /// Same-cut standalone producer counters; never usable by ordered owners.
     pub fn privacyLocalIndexSourcesComplete(self: *DB, alloc: Allocator, read: *docstore_mod.DocStore.Txn, index: []const u8, kind: @FieldType(types.IndexConfig, "kind"), plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !bool {
+        return self.privacyLocalIndexSourcesCompleteWithBudget(alloc, read, index, kind, plan, null);
+    }
+
+    pub fn privacyLocalIndexSourcesCompleteWithBudget(self: *DB, alloc: Allocator, read: *docstore_mod.DocStore.Txn, index: []const u8, kind: @FieldType(types.IndexConfig, "kind"), plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, budget: ?*@import("artifact_scan_budget.zig").Budget) !bool {
+        if (budget) |b| try b.check();
         if (try @import("../source_authority.zig").maintenanceMode(read) != .local) return false;
         const generation = self.core.index_manager.coverageGenerationForIndex(index) orelse return false;
         const sources = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index);
@@ -38611,6 +38616,7 @@ pub const DB = struct {
             alloc.free(sources);
         }
         for (sources) |source| {
+            if (budget) |b| try b.consume(source.len);
             const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index, source, plan);
             defer alloc.free(scope);
             const counts = try DerivedCoverageCounters.load(alloc, read, if (kind == .dense_vector or kind == .sparse_vector) index else scope, generation);
@@ -38618,6 +38624,7 @@ pub const DB = struct {
             if (total == 0) continue;
             if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or counts.produced.? +| counts.skipped.? != total) return false;
         }
+        if (budget) |b| try b.check();
         return true;
     }
 
@@ -155024,6 +155031,13 @@ test "db dense index inspection binds current chunk vectors and never invokes in
     try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = config, .coverage_generation = 7 });
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Orchard guidance.\",\"version\":5}" }}, .sync_level = .write });
     try db.runUntilIdle();
+    const inspection_budget = @import("artifact_scan_budget.zig");
+    var preflight_limited: inspection_budget.Budget = .{ .max_visits = 1, .max_bytes = 2 * 1024 * 1024 };
+    try std.testing.expectError(error.ResourceBudgetExceeded, @import("privacy_read.zig").requirePublishedWithBudget(&db, a, .{}, &preflight_limited));
+    var preflight_expired: inspection_budget.Budget = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, @import("privacy_read.zig").requirePublishedWithBudget(&db, a, .{}, &preflight_expired));
+    var policy_limited: inspection_budget.Budget = .{ .max_bytes = 1 };
+    try std.testing.expectError(error.ResourceBudgetExceeded, @import("privacy_read.zig").captureWithBudget(&db, a, &policy_limited));
     var replay_busy = db.core.snapshot_replay_admission.acquireMutation();
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.getDocumentArtifactManifest(a, "doc", "dense"));
     replay_busy.release();

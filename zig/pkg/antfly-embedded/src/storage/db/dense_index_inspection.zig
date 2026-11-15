@@ -74,6 +74,12 @@ const Snapshot = struct {
 /// Existing asset names take precedence. A dense index name otherwise selects
 /// this versioned raw inspection; summary responses never serialize vectors.
 pub fn capture(db: anytype, output: A, document: []const u8, name: []const u8) !?Captured {
+    var scan_budget: @import("artifact_scan_budget.zig").Budget = .{
+        .max_visits = limits.scan_visits,
+        .max_bytes = limits.scan_bytes,
+        .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s,
+    };
+    try scan_budget.check();
     if (document.len > limits.identity_bytes or name.len > limits.identity_bytes) return error.ResourceBudgetExceeded;
     const entry = db.core.index_manager.denseIndex(name) orelse return null;
     const backing = scratchAllocator(output);
@@ -86,7 +92,7 @@ pub fn capture(db: anytype, output: A, document: []const u8, name: []const u8) !
         asset.deinit(a);
         return null;
     }
-    const policy = (try privacy.capture(db, a)) orelse return null;
+    const policy = (try privacy.captureWithBudget(db, a, &scan_budget)) orelse return null;
     if (policy.prepared.policy.mode != .redact_for_search_and_ai) return null;
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
@@ -120,7 +126,7 @@ pub fn capture(db: anytype, output: A, document: []const u8, name: []const u8) !
         .replay_target_sequence = target,
         .current = true,
     };
-    _ = privacy.requirePublished(db, a, .{}) catch |err| switch (err) {
+    _ = privacy.requirePublishedWithBudget(db, a, .{}, &scan_budget) catch |err| switch (err) {
         error.IndexRebuilding => {
             snapshot.current = false;
             snapshot.incomplete_reason = "IndexRebuilding";
@@ -134,12 +140,8 @@ pub fn capture(db: anytype, output: A, document: []const u8, name: []const u8) !
     var vectors: std.ArrayList(Vector) = .empty;
     var values: usize = 0;
     var source_bytes: usize = safe.len;
-    var scan_budget: @import("artifact_scan_budget.zig").Budget = .{
-        .max_visits = limits.scan_visits,
-        .max_bytes = limits.scan_bytes,
-        .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s,
-    };
     if (snapshot.current) {
+        try scan_budget.consume(entry.config.config_json.len);
         const producers = try manager.denseConfigArtifactNamesAlloc(a, entry.config);
         if (producers.len > limits.producers) return error.ResourceBudgetExceeded;
         for (producers) |producer| {
@@ -150,6 +152,7 @@ pub fn capture(db: anytype, output: A, document: []const u8, name: []const u8) !
             defer cfg.deinit(producer_alloc);
             if (cfg.source_artifact_name.len == 0 or cfg.embedding_input != .text or cfg.template.len != 0 or cfg.source != null or cfg.prior_context != null or cfg.neighbor_context != null or !std.mem.eql(u8, cfg.field, "text")) return null;
             if (producer.len > limits.identity_bytes or cfg.source_artifact_name.len > limits.identity_bytes or cfg.producer_json.len > limits.producer_config_bytes) return error.ResourceBudgetExceeded;
+            try scan_budget.consume(cfg.producer_json.len);
             const config = try std.json.parseFromSlice(std.json.Value, producer_alloc, cfg.producer_json, .{});
             const provider_value = string(config.value, "provider");
             const model_value = string(config.value, "model");
@@ -218,6 +221,7 @@ pub fn capture(db: anytype, output: A, document: []const u8, name: []const u8) !
             snapshot.incomplete_reason = "NoEmbeddingArtifacts";
         }
     }
+    try scan_budget.check();
     owned = false;
     return .{ .arena = arena, .snapshot = snapshot };
 }

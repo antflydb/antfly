@@ -408,8 +408,11 @@ The operation never calls an embedding provider to reconstruct missing values.
 It seeks only the selected producers for this document and bounds inspection
 to 16 producers, 128 vectors, 65,536 float values and 1 MiB of source payloads.
 Identities are limited to 4 KiB and each producer configuration to 1 MiB.
-Traversal also shares a 512-visit, 2 MiB budget across all producers, including
-empty unit heads, with a five-second deadline. Fixed payload or traversal limits
+Publication preflight and traversal share a 512-visit, 2 MiB budget, including
+policy/configuration bytes, readiness nodes, index checks and empty unit heads.
+The five-second deadline starts at capture entry and is checked throughout.
+Ordered global readiness verifies one durable catalog authority and each
+producer counter once, without rebuilding per-producer dependency closures. Fixed payload or traversal limits
 return HTTP 413 with code `inspection_limit_exceeded`, `retryable: false`, and
 the configured limits; deadline or publication contention remains retryable.
 No response is truncated. Capture excludes primary and replay publication using
