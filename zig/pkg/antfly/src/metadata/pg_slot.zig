@@ -50,6 +50,7 @@ pub const Mutation = union(enum) {
     issue: struct { session: Session, now: u64, transaction: Prepared },
     confirm: struct { session: Session, now: u64, flushed: u64 },
     reserve_spool: struct { session: Session, now: u64, id: u64, scope: spool_control.Scope, spec: spool_control.Spec },
+    begin_spool: struct { session: Session, now: u64, id: u64, token: Id },
     publish_spool: struct { session: Session, now: u64, id: u64, manifest: Digest, content: Digest },
     abandon_spool: struct { session: Session, now: u64, id: u64 },
     reclaim_spool: struct { id: u64, storage: Digest, proof: Digest },
@@ -69,6 +70,10 @@ pub const Mutation = union(enum) {
                 try v.scope.validate();
                 try v.spec.validate();
                 if (v.id == 0) return error.InvalidChangefeed;
+            },
+            .begin_spool => |v| {
+                try validSession(v.session, v.now);
+                if (v.id == 0 or !nz(v.token)) return error.InvalidChangefeed;
             },
             .publish_spool => |v| {
                 try validSession(v.session, v.now);
@@ -217,6 +222,11 @@ pub const State = struct {
         if (!equal(current.actor, session.actor) or current.fence != session.fence) return error.ChangefeedConflict;
         if (now == 0 or now < self.observed_at or now >= self.session_expires_at) return error.ChangefeedLeaseExpired;
     }
+    pub fn verifySession(self: State, session: Session, now: u64) !void {
+        try self.validate();
+        try self.check(session, now);
+        if (self.spool_retired) return error.ChangefeedResynchronizationRequired;
+    }
     pub fn release(self: State, session: Session, now: u64) !State {
         try self.validate();
         try self.check(session, now);
@@ -290,6 +300,13 @@ pub const State = struct {
         var next = self;
         next.spool = try self.spool.reserve(a, id, scope, spec);
         next.spool_epoch = spec.epoch;
+        next.observed_at = now;
+        return next;
+    }
+    pub fn beginSpool(self: State, a: A, session: Session, now: u64, id: u64, token: Id) !State {
+        try self.verifySession(session, now);
+        var next = self;
+        next.spool = try self.spool.begin(a, id, token);
         next.observed_at = now;
         return next;
     }
@@ -545,7 +562,9 @@ fn spoolAllocationProbe(a: A) !void {
     const spec = testSpoolSpec(state, 1, 100);
     const reserved = try state.reserveSpool(a, session, 101, 1, testSpoolScope(state, 1), spec);
     defer a.free(reserved.spool.records);
-    const published = try reserved.publishSpool(a, session, 102, 1, @splat(6), @splat(7));
+    const begun = try reserved.beginSpool(a, session, 102, 1, @splat(8));
+    defer a.free(begun.spool.records);
+    const published = try begun.publishSpool(a, session, 102, 1, @splat(6), @splat(7));
     defer a.free(published.spool.records);
     defer a.free(published.entries);
     const confirmed = try published.confirm(a, session, 103, 101);
@@ -617,4 +636,25 @@ test "logical slot cleanup checkpoints fence opaque progress and require the rec
     state = try state.reclaimSpool(a, 1, spec.storage, @splat(9));
     try state.validate();
     try std.testing.expectEqual(@as(u64, 0), state.spool.charged_bytes);
+}
+
+test "logical slot strict wire plans require a single immutable build grant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try State.initialize(@splat(1), "slot", @splat(1), 1024);
+    state = try state.acquire(@splat(2), 0, 100, 150);
+    const session = state.session.?;
+    var spec = testSpoolSpec(state, 1, 100);
+    spec.wire = @splat(8);
+    spec.messages = 5;
+    state = try state.reserveSpool(a, session, 101, 1, testSpoolScope(state, 1), spec);
+    try std.testing.expectError(error.ChangefeedConflict, state.publishSpool(a, session, 102, 1, @splat(6), @splat(7)));
+    state = try state.beginSpool(a, session, 102, 1, @splat(3));
+    const retry = try state.beginSpool(a, session, 102, 1, @splat(3));
+    try std.testing.expectEqual(state.spool.records.ptr, retry.spool.records.ptr);
+    try std.testing.expectError(error.ChangefeedConflict, state.beginSpool(a, session, 102, 1, @splat(4)));
+    state = try state.publishSpool(a, session, 103, 1, @splat(6), @splat(7));
+    try state.validate();
+    try std.testing.expectEqual(@as(Id, @splat(3)), state.spool.records[0].build.?);
 }

@@ -198,3 +198,19 @@ test "pg spool artifact durable retirement drains writers and rejects corrupt fl
 test "pg spool artifact cleanup worker resumes durable cursors across reopen and unknown outcomes" {
     try @import("pg_spool_cleanup_test.zig").run();
 }
+
+test "pg spool artifact upload worker fences retries and publishes only frozen historical bytes" {
+    try @import("pg_spool_upload_test.zig").run();
+}
+
+test "pg spool artifact preflight identity distinguishes message boundaries" {
+    const upload = @import("metadata/pg_spool_upload.zig");
+    var first = upload.WireHasher.init();
+    try first.add("R");
+    try first.add("IUD");
+    var second = upload.WireHasher.init();
+    try second.add("RI");
+    try second.add("UD");
+    try std.testing.expect(!std.mem.eql(u8, &first.final(), &second.final()));
+    try std.testing.expectError(error.InvalidPgSpool, second.add(""));
+}

@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 95;
+pub const protocol_version: u16 = 96;
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
 pub const max_roots = 4096;
@@ -444,6 +444,11 @@ pub const Mutation = union(enum) {
                         defer a.free(roots);
                         for (roots) |root| if (root.delivered.event != 0) return error.ChangefeedConflict;
                         next.slot = try (state.slot orelse return error.ChangefeedConflict).reserveSpool(a, reservation.session, reservation.now, reservation.id, reservation.scope, reservation.spec);
+                    },
+                    .begin_spool => |build| {
+                        if (state.phase != .streaming) return error.ChangefeedConflict;
+                        if (build.now >= state.expires_at) return error.ChangefeedLeaseExpired;
+                        next.slot = try (state.slot orelse return error.ChangefeedConflict).beginSpool(a, build.session, build.now, build.id, build.token);
                     },
                     .publish_spool => |publication| {
                         if (state.phase != .streaming) return error.ChangefeedConflict;

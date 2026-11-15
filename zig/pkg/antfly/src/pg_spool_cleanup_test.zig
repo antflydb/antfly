@@ -25,18 +25,19 @@ const FsStore = @import("serverless/artifacts/fs_store.zig").FsStore;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
 const A = std.mem.Allocator;
-const Request = struct {
+pub const Request = struct {
     canceled: ?*const bool = null,
     pub fn ensureActive(self: @This()) !void {
         if (self.canceled) |value| if (value.*) return error.Canceled;
     }
 };
-const Service = struct {
+pub const Service = struct {
     store: *Store,
     id: control.Id,
     metadata_group_id: u64 = group,
     proposals: u64 = 0,
     lose_ack: bool = false,
+    lose_ack_at: ?u64 = null,
     pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Request, version: u16) !void {
         try std.testing.expectEqual(control.protocol_version, version);
     }
@@ -50,14 +51,14 @@ const Service = struct {
         return self.proposals;
     }
     pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: Request) !void {
-        if (self.lose_ack) return error.TestLostAcknowledgment;
+        if (self.lose_ack or self.lose_ack_at == self.proposals) return error.TestLostAcknowledgment;
     }
-    fn load(self: *@This(), a: A) !control.Parsed {
+    pub fn load(self: *@This(), a: A) !control.Parsed {
         const bytes = try self.store.getChangefeedControl(a, group, self.id);
         defer a.free(bytes);
         return control.parse(a, bytes);
     }
-    fn mutate(self: *@This(), a: A, mutation: control.Mutation) !void {
+    pub fn mutate(self: *@This(), a: A, mutation: control.Mutation) !void {
         var before = try self.load(a);
         defer before.deinit();
         try control.mutateOnService(self, a, .{ .id = self.id, .authority = @splat(9), .owner = @splat(1), .authorization = @splat(2), .expected_revision = before.value.revision, .expected_epoch = before.value.epoch, .mutation = mutation }, Request{});

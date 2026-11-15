@@ -45740,7 +45740,7 @@ test "metadata changefeed control logical slot survives reopen snapshot failover
     try h.mutate(.{ .issue = delivery });
     var scope: slot.spool_control.Scope = .{ .namespace = @splat(9), .domain = slot.spool_control.Scope.domainFor(id, 1), .attempt = @splat(7) };
     std.mem.writeInt(u64, scope.attempt[0..8], 1, .big);
-    const spec: slot.spool_control.Spec = .{ .feed = id, .epoch = 1, .definition = definition.identity(), .projection = @splat(8), .storage = scope.storageIdentity(), .before = delivery.before, .after = delivery.cursor, .completion = @splat(4), .start_lsn = 1, .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1 };
+    const spec: slot.spool_control.Spec = .{ .feed = id, .epoch = 1, .definition = definition.identity(), .projection = @splat(8), .storage = scope.storageIdentity(), .before = delivery.before, .after = delivery.cursor, .completion = @splat(4), .start_lsn = 1, .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1, .wire = @splat(8), .messages = 5 };
     try h.mutate(.{ .slot = .{ .reserve_spool = .{ .session = session, .now = 102, .id = 1, .scope = scope, .spec = spec } } });
     // A crash after admission but before any verified manifest publication must
     // retain the charge and frozen scope without advancing the wire frontier.
@@ -45752,6 +45752,7 @@ test "metadata changefeed control logical slot survives reopen snapshot failover
     try std.testing.expectEqual(.uploading, reserved.value.slot.?.spool.records[0].phase);
     const charge = reserved.value.slot.?.spool.charged_bytes;
     try std.testing.expect(charge > 100);
+    try h.mutate(.{ .slot = .{ .begin_spool = .{ .session = session, .now = 102, .id = 1, .token = @splat(7) } } });
     try h.mutate(.{ .slot = .{ .publish_spool = .{ .session = session, .now = 102, .id = 1, .manifest = @splat(6), .content = @splat(3) } } });
     store.deinit();
     store = try RaftApplyStore.init(a, .{ .root_dir = path });
@@ -45779,6 +45780,8 @@ test "metadata changefeed control logical slot survives reopen snapshot failover
     var transferred = try h.read();
     defer transferred.deinit();
     try std.testing.expectEqual(@as(u64, 2), transferred.value.slot.?.session.?.fence);
+    try std.testing.expectEqual(@as(slot.Digest, @splat(8)), transferred.value.slot.?.spool.records[0].spec.wire);
+    try std.testing.expectEqual(@as(slot.Id, @splat(7)), transferred.value.slot.?.spool.records[0].build.?);
     const fenced_revision = transferred.value.revision;
     try h.mutate(.{ .slot = .{ .confirm = .{ .session = session, .now = 151, .flushed = 101 } } });
     var fenced = try h.read();

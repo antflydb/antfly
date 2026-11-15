@@ -69,10 +69,21 @@ pub const Spec = struct {
     commit_offset: u64,
     xid: u32,
     commit_time: i64,
+    /// Frozen preflight identity of the exact length-framed pgoutput messages.
+    /// Zero together admits legacy private reservations; runtime upload rejects it.
+    wire: Digest = @splat(0),
+    messages: u32 = 0,
     pub fn fromPlan(plan: anytype) Spec {
         return .{ .feed = plan.binding.feed, .epoch = plan.binding.epoch, .definition = plan.binding.definition, .projection = plan.binding.projection, .storage = plan.binding.storage, .before = plan.before, .after = plan.after, .completion = plan.completion, .start_lsn = plan.start_lsn, .bytes = plan.bytes, .commit_offset = plan.commit_offset, .xid = plan.xid, .commit_time = plan.commit_time };
     }
+    pub fn matchesPlan(self: Spec, plan: anytype) bool {
+        var expected = fromPlan(plan);
+        expected.wire = self.wire;
+        expected.messages = self.messages;
+        return std.meta.eql(self, expected);
+    }
     pub fn validate(self: Spec) !void {
+        if (nz(self.wire) != (self.messages != 0) or (self.messages != 0 and (self.messages < 2 or self.messages > 65536))) return error.InvalidChangefeed;
         if (!nz(self.feed) or self.epoch == 0 or !nz(self.definition) or !nz(self.projection) or !nz(self.storage) or !nz(self.before) or !nz(self.after) or same(self.before, self.after) or !nz(self.completion) or self.start_lsn == 0 or self.bytes < 47 or self.bytes > 1024 * 1024 * 1024 or self.commit_offset != self.bytes - 26 or self.xid == 0) return error.InvalidChangefeed;
         _ = std.math.add(u64, self.start_lsn, self.bytes) catch return error.InvalidChangefeed;
     }
@@ -124,10 +135,13 @@ pub const Record = struct {
     manifest: Digest = @splat(0),
     content: Digest = @splat(0),
     cleanup: Cleanup = .{},
+    build: ?[16]u8 = null,
     pub fn validate(self: Record) !void {
         try self.scope.validate();
         try self.spec.validate();
         try self.cleanup.validate();
+        if (self.build) |token| if (!nz(token)) return error.InvalidChangefeed;
+        if (self.phase == .live and nz(self.spec.wire) and self.build == null) return error.InvalidChangefeed;
         if (self.phase != .garbage and self.cleanup.revision != 0) return error.InvalidChangefeed;
         if (self.id == 0 or std.mem.readInt(u64, self.scope.attempt[0..8], .big) != self.id or !same(self.scope.domain, Scope.domainFor(self.spec.feed, self.spec.epoch)) or !same(self.spec.storage, self.scope.storageIdentity()) or self.charged != try reservationBytes(self.spec.bytes)) return error.InvalidChangefeed;
         if (nz(self.manifest) != nz(self.content) or (self.phase == .uploading and nz(self.manifest)) or (self.phase == .live and !nz(self.manifest))) return error.InvalidChangefeed;
@@ -183,10 +197,25 @@ pub const Ledger = struct {
         next.definition = spec.definition;
         return next;
     }
+    pub fn begin(self: Ledger, a: A, id: u64, token: [16]u8) !Ledger {
+        try self.validate();
+        if (!nz(token)) return error.InvalidChangefeed;
+        const old = self.find(id) orelse return error.ChangefeedConflict;
+        if (old.phase != .uploading) return error.ChangefeedConflict;
+        if (old.build) |owner| {
+            if (!same(owner, token)) return error.ChangefeedConflict;
+            return self;
+        }
+        const records = try a.dupe(Record, self.records);
+        records[@intCast(id - self.collected_through - 1)].build = token;
+        var next = self;
+        next.records = records;
+        return next;
+    }
     pub fn publish(self: Ledger, a: A, id: u64, manifest: Digest, content: Digest) !Ledger {
         try self.validate();
         const old = self.find(id) orelse return error.ChangefeedConflict;
-        if (!nz(manifest) or !nz(content) or old.phase == .garbage) return error.ChangefeedConflict;
+        if (!nz(manifest) or !nz(content) or old.phase == .garbage or (nz(old.spec.wire) and old.build == null)) return error.ChangefeedConflict;
         if (old.phase == .live) {
             if (!same(old.manifest, manifest) or !same(old.content, content)) return error.ChangefeedConflict;
             return self;

@@ -49,8 +49,10 @@ message seeks and immutable rebuilds. Slot metadata now retains upload reservati
 manifest locators, LSN mappings and cleanup debt; the filesystem store durably
 fences retired upload IDs. The private `metadata/pg_spool_cleanup.zig` worker
 resumes durable cleanup checkpoints and verifies physical absence before quota
-release. Production namespace routing/scheduling, the upload/publication worker,
-database cuts and publication selection remain required. These private contracts
+release. `metadata/pg_spool_upload.zig` binds frozen historical wire plans to
+single-use build grants before publication. Production namespace routing,
+scheduling, historical relational production, database cuts and publication
+selection remain required. These private contracts
 and wire tests do not establish existing-client compatibility or activate a
 production replication endpoint. Unknown slot administration stays with the
 replication owner rather than becoming SQL transaction completion work.

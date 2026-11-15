@@ -780,8 +780,8 @@ record, persist bounded provider continuations, durably retire its upload ID,
 and prove the attempt is physically empty before returning capacity. Enumeration
 success alone is insufficient when a provider reports retained/nonempty scopes.
 A live or new upload must never be covered by a cleanup cutoff. The runtime cleanup worker and durable continuation contract below now implement
-this path. Production namespace resolution/scheduling and the upload/publication
-worker remain required; the earlier manual filesystem collector is an isolated
+this path. Production namespace resolution/scheduling remain required; the upload/publication
+worker is implemented below; the earlier manual filesystem collector is an isolated
 storage qualification fixture.
 
 ## In progress: bounded runtime spool cleanup
@@ -829,9 +829,62 @@ tokens, immutable completion and proof matching. Relevant logs:
 
 This is a private worker, not a registered production replication endpoint. The
 production owner still must supply namespace credentials, lifecycle scheduling,
-shared-storage qualification and the upload/publication worker. Coherent cuts,
+shared-storage qualification and wiring of the upload/publication worker below. Coherent cuts,
 typed historical relational rows, public endpoints and existing-client
 qualification remain part of the full implementation objective.
+
+## In progress: historical spool upload/publication worker
+
+`metadata/pg_spool_upload.zig` stages a certified native delivery, observes its
+reservation, then streams one bounded pgoutput message at a time. A producer
+must supply the original historical schema/images and retained completion
+proof, deterministic preflight wire identity, message count and visible-event
+count. Native receipt authority binds that descriptor before any storage scope
+is allocated. Message lengths are included in the wire hash, so equal byte
+concatenation with different message boundaries cannot change the serving index.
+Hidden-only native progress cannot invent an empty PostgreSQL transaction.
+
+The reservation freezes that plan and the original scope. Before opening a
+writer iterator, metadata assigns a unique, single-use build token. Only that
+observed grant may publish. Recovery of an interrupted/unknown build retires its
+attempt and retains its quota; a later charged scope rebuilds the same historical
+plan and LSN interval. It does not repeatedly append potentially different
+outputs to one reservation. Unknown reservation responses recover the recorded
+scope before preparing anything else. Unknown publication responses are resolved
+from the durable mapping; they never create another LSN interval. Protocol 96
+gates wire identity and single-use build grants. Legacy private reservations
+remain readable/cleanable but cannot be resumed by this runtime as strict plans.
+
+During a build the producer's live authorization and session window are checked
+around each message. Near expiry the worker observes current metadata to accept
+renewal of the same owner, while preserving the iterator's original immutable
+definition. A changed owner/build grant or expired lease fails. Iterator buffers
+are released between messages and on errors. The worker verifies complete wire
+identity/count, the actual sealed manifest and original plan, asks the storage
+registry to protect the root, and reobserves ownership before atomic slot
+publication. Publishing is not consumer acknowledgement.
+
+Shared storage is required by default. The local filesystem qualification opts
+out explicitly; no HA capability or production endpoint is implied. Namespace
+resolution must not upload data before admission, and root protection must use
+actual provider retention authority, not a client-supplied digest. Production
+source verification, namespace credentials and scheduling remain required.
+
+`zig build pg-spool-test -j2` exercises actual metadata/filesystem orchestration,
+including wrong wire output, no re-planning before recovery, reservation/build/
+publication response loss, repeated reopen, immutable LSN ordering, lease renewal
+past the original grant, authorization/stale-owner failure, and charged cleanup
+of abandoned attempts while preserving the live spool. The metadata snapshot
+case now also transfers strict wire identity and build grants. Relevant logs:
+`zig/pg-spool-upload-runtime-qualification.log`,
+`zig/pg-spool-upload-control-test.log` and
+`zig/pg-spool-upload-metadata-qualification.log`.
+
+The next runtime integration must connect published spools to the stream owner,
+implement real historical relational production and coherent bootstrap cuts,
+and register production source/storage/authorization capabilities. Public APIs,
+client qualification and the remaining inbound/destination/lifecycle work are
+still part of the full objective.
 
 ## Working constraints
 
