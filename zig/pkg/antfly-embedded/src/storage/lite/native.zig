@@ -3315,8 +3315,8 @@ pub const CatalogCursor = struct {
         const file = self.index.file;
         if (!self.overlay_started) {
             self.overlay_started = true;
-            if (self.start_after) |key| while (self.overlay.peek()) |k| {
-                if (std.mem.order(u8, k, key) != .gt) self.overlay.consumeIfEqual(k) else break;
+            if (self.start_after) |key| while (try self.overlay.peek()) |k| {
+                if (std.mem.order(u8, k, key) != .gt) try self.overlay.consumeIfEqual(k) else break;
             };
         }
         while (true) {
@@ -3331,7 +3331,7 @@ pub const CatalogCursor = struct {
             // and the overlay's smallest remaining key wins. A tie means
             // the overlay supersedes the tree's own (now-stale) entry for
             // that exact key -- consume both, keep only the overlay's.
-            const overlay_key = self.overlay.peek();
+            const overlay_key = try self.overlay.peek();
             const tree_key: ?[]const u8 = if (candidate) |c| c.key else null;
             const take_overlay = overlay_key != null and (tree_key == null or std.mem.order(u8, overlay_key.?, tree_key.?) != .gt);
             if (take_overlay) {
@@ -3339,12 +3339,12 @@ pub const CatalogCursor = struct {
                 if (!std.mem.startsWith(u8, key, self.prefix)) {
                     // Past the prefix range entirely (overlay keys are
                     // sorted, so nothing later in it can match either).
-                    self.overlay.index = self.overlay.keys.len;
+                    self.overlay.exhaust();
                     self.pending_tree = candidate;
                     continue;
                 }
                 if (self.immediate_children_only and std.mem.indexOfScalar(u8, key[self.prefix.len..], '/') != null) {
-                    _ = self.overlay.takeFront();
+                    _ = try self.overlay.takeFront();
                     self.pending_tree = candidate;
                     continue;
                 }
@@ -3366,7 +3366,7 @@ pub const CatalogCursor = struct {
                 // freed as if the overlay had genuinely superseded it
                 // (same bug class as `MergedCursor.advance`'s own fix).
                 const entry = try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key);
-                _ = self.overlay.takeFront();
+                _ = try self.overlay.takeFront();
                 if (entry == null) {
                     self.pending_tree = candidate;
                     continue;
@@ -6545,9 +6545,6 @@ pub const MergedCursor = struct {
     /// last `advance` call fully consumed (returned, or matched a tie
     /// against) whatever it held.
     tree_lookahead: ?DocumentIndexEntry = null,
-    /// Index into `overlay.keys` of the overlay's own current
-    /// candidate, `null` once exhausted in the current direction.
-    overlay_index: ?usize = null,
 
     pub const Entry = union(enum) {
         disk: DocumentIndexEntry,
@@ -6564,9 +6561,12 @@ pub const MergedCursor = struct {
         /// key (`DocumentIndexEntry.deinit`'s own contract) or
         /// `overlay`'s resolved entry value (the owned copy
         /// `SharedRedoOverlay.resolveAlloc` returns, via
-        /// `redoOverlayEntryAt`). `overlay`'s own `key` is borrowed
-        /// from `MergedCursor.overlay`'s own keys array and must never
-        /// be freed here.
+        /// `redoOverlayEntryAt`). `overlay`'s own `key` is borrowed from
+        /// `MergedCursor.overlay`'s current (or, briefly, most recently
+        /// superseded) position and must never be freed here --
+        /// `OverlayScanState` owns and frees it on its own schedule
+        /// (`stale`'s own doc comment: it stays valid until this same
+        /// `OverlayScanState` is asked to move again).
         pub fn deinit(self: *Entry, allocator: Allocator) void {
             switch (self.*) {
                 .disk => |*d| d.deinit(allocator),
@@ -6601,30 +6601,28 @@ pub const MergedCursor = struct {
     pub fn first(self: *MergedCursor) !?Entry {
         self.clearTreeLookahead();
         self.tree_lookahead = try self.tree.first();
-        self.overlay_index = if (self.overlay.keys.len > 0) 0 else null;
+        try self.overlay.resetToFirst();
         return self.advance(.forward);
     }
 
     pub fn last(self: *MergedCursor) !?Entry {
         self.clearTreeLookahead();
         self.tree_lookahead = try self.tree.last();
-        self.overlay_index = if (self.overlay.keys.len > 0) self.overlay.keys.len - 1 else null;
+        try self.overlay.resetToLast();
         return self.advance(.backward);
     }
 
     pub fn seekAtOrAfter(self: *MergedCursor, key: []const u8, strict: bool) !?Entry {
         self.clearTreeLookahead();
         self.tree_lookahead = try self.tree.seekAtOrAfter(key, strict);
-        const idx = self.overlay.indexAtOrAfter(key, strict);
-        self.overlay_index = if (idx < self.overlay.keys.len) idx else null;
+        try self.overlay.resetToAtOrAfter(key, strict);
         return self.advance(.forward);
     }
 
     pub fn seekAtOrBefore(self: *MergedCursor, key: []const u8, strict: bool) !?Entry {
         self.clearTreeLookahead();
         self.tree_lookahead = try self.tree.seekAtOrBefore(key, strict);
-        const count = self.overlay.countAtOrBefore(key, strict);
-        self.overlay_index = if (count > 0) count - 1 else null;
+        try self.overlay.resetToAtOrBefore(key, strict);
         return self.advance(.backward);
     }
 
@@ -6633,14 +6631,15 @@ pub const MergedCursor = struct {
     /// fresh seek) -- false (a direction change) forces `seekAtOrAfter`
     /// from `current_key` instead, mirroring `docstore.Cursor`'s own
     /// `last_direction`-gated choice between `takeBufferedDisk()` and a
-    /// fresh seek.
+    /// fresh seek. The overlay side always re-seeks fresh from
+    /// `current_key` regardless of `continued` -- an O(log n) seek, same
+    /// cost either way, so there is no "continuation" to preserve there.
     pub fn next(self: *MergedCursor, current_key: []const u8, continued: bool) !?Entry {
         if (!continued) {
             self.clearTreeLookahead();
             self.tree_lookahead = try self.tree.seekAtOrAfter(current_key, true);
         }
-        const idx = self.overlay.indexAtOrAfter(current_key, true);
-        self.overlay_index = if (idx < self.overlay.keys.len) idx else null;
+        try self.overlay.resetToAtOrAfter(current_key, true);
         return self.advance(.forward);
     }
 
@@ -6649,8 +6648,7 @@ pub const MergedCursor = struct {
             self.clearTreeLookahead();
             self.tree_lookahead = try self.tree.seekAtOrBefore(current_key, true);
         }
-        const count = self.overlay.countAtOrBefore(current_key, true);
-        self.overlay_index = if (count > 0) count - 1 else null;
+        try self.overlay.resetToAtOrBefore(current_key, true);
         return self.advance(.backward);
     }
 
@@ -6669,7 +6667,7 @@ pub const MergedCursor = struct {
         var disk = try self.fetchTree(direction);
         errdefer if (disk) |*d| d.deinit(self.tree.file.allocator);
         while (true) {
-            const overlay_key: ?[]const u8 = if (self.overlay_index) |idx| self.overlay.keys[idx] else null;
+            const overlay_key: ?[]const u8 = self.overlay.current;
             const Source = enum { overlay, disk };
             var winner: ?Source = null;
             var winner_key: []const u8 = undefined;
@@ -6701,12 +6699,13 @@ pub const MergedCursor = struct {
 
             // `chosen == .overlay`: advance the overlay's own position
             // past this key regardless of what it resolves to below --
-            // visited either way.
-            self.overlay_index = switch (direction) {
-                .forward => if (self.overlay_index.? + 1 < self.overlay.keys.len) self.overlay_index.? + 1 else null,
-                .backward => if (self.overlay_index.? > 0) self.overlay_index.? - 1 else null,
-            };
-            // `overlay.keys` enumerates every key with *any* version
+            // visited either way. `winner_key` stays valid past this
+            // call (`OverlayScanState.step`'s own `stale`-retention
+            // contract) through everything this loop iteration still
+            // does with it below, including a `return` that hands it
+            // out as a borrowed `Entry.overlay.key`.
+            try self.overlay.step(direction == .forward);
+            // The overlay enumerates every key with *any* version
             // currently in the live map, regardless of this cursor's
             // own `mark` -- correct and necessary for the *current*
             // generation (every version predates "now" by definition),
@@ -13205,7 +13204,7 @@ pub const NativeFile = struct {
                 // Merge-join against the overlay, same rule as
                 // CatalogCursor.next(): smaller key wins, a tie means the
                 // overlay supersedes the tree's own stale entry.
-                const overlay_key = self.overlay.peek();
+                const overlay_key = try self.overlay.peek();
                 const tree_key: ?[]const u8 = if (candidate) |c| c.key else null;
                 const take_overlay = overlay_key != null and (tree_key == null or std.mem.order(u8, overlay_key.?, tree_key.?) != .gt);
                 if (take_overlay) {
@@ -13233,7 +13232,7 @@ pub const NativeFile = struct {
                     // `candidate` instead, same as every other "not
                     // actually superseded" path in this loop).
                     const entry = try file.redoOverlayEntry(self.overlay_root, self.index.checkpoint, key);
-                    _ = self.overlay.takeFront();
+                    _ = try self.overlay.takeFront();
                     if (entry == null) {
                         self.pending_tree = candidate;
                         continue;
@@ -14975,7 +14974,7 @@ pub const NativeFile = struct {
                 owned.deinit(allocator);
                 pending_tree = null;
             }
-            const overlay_key = overlay.peek();
+            const overlay_key = try overlay.peek();
             const tree_key: ?[]const u8 = if (pending_tree) |t| t.key else null;
             const take_overlay = overlay_key != null and (tree_key == null or std.mem.order(u8, overlay_key.?, tree_key.?) != .gt);
             if (take_overlay) {
@@ -14992,7 +14991,7 @@ pub const NativeFile = struct {
                     pending_tree = null;
                     pending_tree = try cursor.next();
                 }
-                _ = overlay.takeFront();
+                _ = try overlay.takeFront();
                 if (!entry.is_delete) {
                     const value = if (entry.external_value_root_page != 0)
                         try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
@@ -18016,13 +18015,36 @@ pub const NativeFile = struct {
     /// or the overlay's candidate comes first in a standard merge-join,
     /// without this type needing to know anything about the tree side.
     pub const OverlayScanState = struct {
-        /// §9.6a: each key is an owned copy (`keysWithPrefixAlloc`'s own
-        /// doc comment) -- unlike the pre-sharing design, these are never
-        /// borrowed references into the live map, so `deinit` must free
-        /// each one individually, not just the slice.
-        keys: [][]u8 = &.{},
-        index: usize = 0,
+        /// Null for a non-redo file (`initForPrefixUnchecked`'s own
+        /// short-circuit) -- every method below treats that the same as
+        /// "the overlay is permanently empty."
+        shared: ?*redo_overlay.SharedRedoOverlay = null,
+        io: std.Io = undefined,
+        root: u8 = 0,
+        prefix: []const u8 = &.{},
         allocator: Allocator,
+        /// The overlay candidate at this scan's current position, an
+        /// owned copy (perf/lwa-overlay-order: never a borrowed
+        /// reference into the live, shared, concurrently-mutated treap
+        /// -- see `SharedRedoOverlay.resolveAlloc`'s own doc comment for
+        /// why: a reference held across that structure's lock release is
+        /// a use-after-free risk once a concurrent `reclaim` can run).
+        /// Replaced (never mutated in place) by every `reset*`/`step`
+        /// call below; the key a caller is handed back by `peek`/
+        /// `takeFront`/`advance` stays valid until the *next* such call
+        /// on this same `OverlayScanState` (see `stale`), matching every
+        /// existing caller's own usage pattern: use the returned key,
+        /// then either dupe it or let it go before asking this type to
+        /// move again.
+        current: ?[]u8 = null,
+        /// The previous `current`, kept alive for exactly one more
+        /// transition after it stops being "current" -- freed at the
+        /// start of the *next* transition, not immediately, so a caller
+        /// that is still holding (and using) the value `takeFront`/
+        /// `peek` just returned does not have it pulled out from under
+        /// it by this same call's own internal advance.
+        stale: ?[]u8 = null,
+        started: bool = false,
 
         /// §9.7c (`ReadView`): this used to refuse (return empty) for any
         /// `checkpoint` other than `file.activeCheckpoint()` exactly --
@@ -18060,72 +18082,141 @@ pub const NativeFile = struct {
             return initForPrefixUnchecked(allocator, file, root, prefix);
         }
 
+        /// perf/lwa-overlay-order: no longer touches the shared overlay
+        /// at all -- construction is O(1). Every previous caller eagerly
+        /// paid `SharedRedoOverlay.keysWithPrefixAlloc`'s cost (iterate
+        /// every key in the whole root, dupe every match, sort) on
+        /// *every* cursor open, regardless of whether the cursor ever
+        /// visited more than one key (e.g. an existence probe). Lookups
+        /// below instead seek `shared`'s own ordered index directly, in
+        /// O(log n), fetching (and copying) only the one key actually
+        /// being visited at each step.
         pub fn initForPrefixUnchecked(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, prefix: []const u8) !OverlayScanState {
             const redo = file.redo orelse return .{ .allocator = allocator };
-            const keys = try redo.shared.keysWithPrefixAlloc(allocator, file.runtimeIo(), @backingInt(root), prefix);
-            return .{ .keys = keys, .allocator = allocator };
+            return .{
+                .shared = redo.shared,
+                .io = file.runtimeIo(),
+                .root = @backingInt(root),
+                .prefix = prefix,
+                .allocator = allocator,
+            };
         }
 
         pub fn deinit(self: *OverlayScanState) void {
-            for (self.keys) |k| self.allocator.free(k);
-            self.allocator.free(self.keys);
+            self.retireStale();
+            if (self.current) |c| self.allocator.free(c);
             self.* = undefined;
         }
 
-        /// The smallest remaining key, without consuming it.
-        fn peek(self: *const OverlayScanState) ?[]const u8 {
-            if (self.index >= self.keys.len) return null;
-            return self.keys[self.index];
+        fn retireStale(self: *OverlayScanState) void {
+            if (self.stale) |s| self.allocator.free(s);
+            self.stale = null;
         }
 
-        /// Consumes and returns the smallest remaining key.
-        fn takeFront(self: *OverlayScanState) ?[]const u8 {
-            if (self.index >= self.keys.len) return null;
-            const k = self.keys[self.index];
-            self.index += 1;
-            return k;
+        fn fetchFirstAlloc(self: *OverlayScanState) !?[]u8 {
+            const shared = self.shared orelse return null;
+            return try shared.firstKeyWithPrefixAlloc(self.allocator, self.io, self.root, self.prefix);
         }
 
-        /// If the smallest remaining key equals `key`, consumes it --
-        /// used when the tree side's own candidate collides with the
-        /// overlay's, so the tree's stale value for that key is never
-        /// also visited on a later step.
-        fn consumeIfEqual(self: *OverlayScanState, key: []const u8) void {
-            if (self.index < self.keys.len and std.mem.eql(u8, self.keys[self.index], key)) self.index += 1;
+        fn fetchLastAlloc(self: *OverlayScanState) !?[]u8 {
+            const shared = self.shared orelse return null;
+            return try shared.lastKeyWithPrefixAlloc(self.allocator, self.io, self.root, self.prefix);
         }
 
-        /// Index of the first key that is `>= key` (or `> key` if
-        /// `strict`), i.e. `keys.len` if none -- binary search, since
-        /// `keys` is sorted ascending (`keysWithPrefixAlloc`'s own
-        /// contract). For a bidirectional cursor's own forward-candidate
-        /// position, parallel to `peek`/`takeFront`'s forward-only
-        /// consume model above.
-        pub fn indexAtOrAfter(self: *const OverlayScanState, key: []const u8, strict: bool) usize {
-            var lo: usize = 0;
-            var hi: usize = self.keys.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                const order = std.mem.order(u8, self.keys[mid], key);
-                const before = if (strict) order != .gt else order == .lt;
-                if (before) lo = mid + 1 else hi = mid;
-            }
-            return lo;
+        fn fetchAtOrAfterAlloc(self: *OverlayScanState, key: []const u8, strict: bool) !?[]u8 {
+            const shared = self.shared orelse return null;
+            return try shared.seekKeyAtOrAfterAlloc(self.allocator, self.io, self.root, self.prefix, key, strict);
         }
 
-        /// Count of keys that are `<= key` (or `< key` if `strict`) --
-        /// the backward-candidate position is `keys[result - 1]` when
-        /// `result > 0`, nonexistent otherwise. Binary search, same
-        /// ordering contract as `indexAtOrAfter`.
-        pub fn countAtOrBefore(self: *const OverlayScanState, key: []const u8, strict: bool) usize {
-            var lo: usize = 0;
-            var hi: usize = self.keys.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                const order = std.mem.order(u8, self.keys[mid], key);
-                const include = if (strict) order == .lt else order != .gt;
-                if (include) lo = mid + 1 else hi = mid;
-            }
-            return lo;
+        fn fetchAtOrBeforeAlloc(self: *OverlayScanState, key: []const u8, strict: bool) !?[]u8 {
+            const shared = self.shared orelse return null;
+            return try shared.seekKeyAtOrBeforeAlloc(self.allocator, self.io, self.root, self.prefix, key, strict);
+        }
+
+        /// Replaces `current` with `fresh`, staging the outgoing value
+        /// as `stale` (see that field's own doc comment) rather than
+        /// freeing it immediately.
+        fn transitionTo(self: *OverlayScanState, fresh: ?[]u8) void {
+            self.started = true;
+            self.retireStale();
+            self.stale = self.current;
+            self.current = fresh;
+        }
+
+        /// Resets this scan's position to the smallest key matching
+        /// `prefix` -- O(log n). For a fresh cursor open/first() call,
+        /// never a continuation (see `step` for that).
+        pub fn resetToFirst(self: *OverlayScanState) !void {
+            self.transitionTo(try self.fetchFirstAlloc());
+        }
+
+        /// Resets to the largest key matching `prefix` -- O(log n).
+        pub fn resetToLast(self: *OverlayScanState) !void {
+            self.transitionTo(try self.fetchLastAlloc());
+        }
+
+        /// Resets to the smallest key `>= key` (or `> key` if `strict`)
+        /// matching `prefix` -- O(log n), for `seekAtOrAfter`/a direction
+        /// change.
+        pub fn resetToAtOrAfter(self: *OverlayScanState, key: []const u8, strict: bool) !void {
+            self.transitionTo(try self.fetchAtOrAfterAlloc(key, strict));
+        }
+
+        /// Resets to the largest key `<= key` (or `< key` if `strict`)
+        /// matching `prefix` -- O(log n), for `seekAtOrBefore`/a
+        /// direction change.
+        pub fn resetToAtOrBefore(self: *OverlayScanState, key: []const u8, strict: bool) !void {
+            self.transitionTo(try self.fetchAtOrBeforeAlloc(key, strict));
+        }
+
+        /// Moves to the adjacent key in `direction`, strictly past
+        /// whatever is currently cached -- O(log n), a fresh seek each
+        /// time rather than an in-place pointer increment, since nothing
+        /// may hold a borrowed reference into the shared overlay across
+        /// this type's own lock release (see `current`'s doc comment).
+        /// A no-op once already exhausted (`current == null`): stays
+        /// exhausted, never restarts from the beginning.
+        pub fn step(self: *OverlayScanState, forward: bool) !void {
+            const cur = self.current orelse return;
+            const fresh = if (forward) try self.fetchAtOrAfterAlloc(cur, true) else try self.fetchAtOrBeforeAlloc(cur, true);
+            self.transitionTo(fresh);
+        }
+
+        /// The current (forward-scan) candidate, lazily positioned at
+        /// the first match on first use.
+        pub fn peek(self: *OverlayScanState) !?[]const u8 {
+            if (!self.started) try self.resetToFirst();
+            return self.current;
+        }
+
+        /// Consumes and returns the current (forward-scan) candidate,
+        /// advancing to the next one. The returned slice remains valid
+        /// until the next call to `peek`/`takeFront`/`consumeIfEqual`/
+        /// `step` on this same `OverlayScanState` (see `stale`'s own doc
+        /// comment) -- every existing caller already only uses it within
+        /// that window.
+        pub fn takeFront(self: *OverlayScanState) !?[]const u8 {
+            const result = try self.peek();
+            try self.step(true);
+            return result;
+        }
+
+        /// If the current (forward-scan) candidate equals `key`
+        /// (typically a value this same caller just got from `peek`),
+        /// consumes it -- used when the tree side's own candidate
+        /// collides with the overlay's, so the tree's stale value for
+        /// that key is never also visited on a later step.
+        pub fn consumeIfEqual(self: *OverlayScanState, key: []const u8) !void {
+            const cur = try self.peek() orelse return;
+            if (std.mem.eql(u8, cur, key)) try self.step(true);
+        }
+
+        /// Marks the forward scan permanently exhausted -- used when a
+        /// caller has independently determined (e.g. the current
+        /// candidate no longer matches a narrower prefix than this scan's
+        /// own) that nothing further in sorted order can match either.
+        pub fn exhaust(self: *OverlayScanState) void {
+            self.transitionTo(null);
         }
     };
 
