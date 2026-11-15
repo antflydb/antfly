@@ -1067,8 +1067,8 @@ fields are rejected. Descriptor text, range keys and the total envelope are
 bounded, and non-native storage or restore/hidden-child bootstrap authority is
 not accepted by this entry type.
 
-The required protocol number is reserved as 30. **The advertised data-Raft
-maximum remains 29.** Encoding requires evidence of an activated protocol at
+At this codec milestone, protocol 30 was reserved while the advertised
+maximum remained 29 (the native dispatch milestone below advances it). Encoding requires evidence of an activated protocol at
 least 30; this codec's presence does not activate that protocol. The outer
 `batch: null` poisons older row-batch parsers. The current ordinary envelope
 decoder also explicitly rejects `history_control`, including a forged envelope
@@ -1125,8 +1125,9 @@ operations and non-idempotent row-transform replay at an exact Raft entry.
 This completes the compiled owner call, not data-Raft state-machine submission.
 Projection gating, dedicated entry dispatch, protocol activation, owner-routed
 submission and linearizable history inspection/pages are still outstanding.
-The advertised data-Raft maximum remains 29 and ordinary entry decode continues
-to reject retention envelopes until that integration is complete.
+At this owner-only milestone the advertised maximum remained 29. Ordinary
+entry decode continues to reject retention envelopes; dedicated applying decode
+is required.
 
 ## In progress: typed applying decoder and projection retention gate
 
@@ -1158,11 +1159,35 @@ and native source-control regressions. These tests are included in the normal
 unit/data-storage gates. Log:
 `zig/history-control-projection-contract-qualification.log`.
 
-The advertised maximum remains 29, below the reserved retention protocol 30.
-Native state-machine handling must use the tagged applying decoder and complete
-the compiled-owner mutation before shared applied publication. That dispatch,
-all-member activation, submission and linearizable history reads remain pending;
-this projection gate cannot advertise a working distributed feed on its own.
+At this projection-only milestone the advertised maximum remained 29. The
+following native dispatch milestone completes the applying branch. Submission
+and linearizable history reads remain pending; the projection gate alone does
+not provide a distributed feed.
+
+## In progress: native Raft history application
+
+The data-Raft decoder ceiling is now 30. The applying state machine handles the
+history union explicitly, requires the durable projection barrier, and calls the
+compiled native owner with the original descriptor and exact term/index before
+publishing shared apply progress. Storage contention retries without advancing
+that progress. Deterministic consumer rejections complete their log entry and
+retain a typed failure for the proposer; superseded receipts require outcome
+recovery rather than reporting success. Corruption remains an apply failure.
+The ordinary batch decoder still rejects history entries.
+
+The focused compiled-owner qualification injects a lost reply after durable
+native enrollment, verifies the pending shared watermark and proposer result,
+then retries the same entry successfully. It also verifies that an invalid ACK
+returns its typed conflict while allowing a subsequent valid inspection.
+The projection and codec regression targets accompany this qualification.
+Log: `zig/history-control-native-apply-qualification.log`.
+
+This is an internal apply capability, not a registered public feed capability.
+Owner-routed proposals, linearizable pages and typed result recovery, explicit
+all-member activation qualification, and retained-history split/merge transfer
+remain required before distributed feeds can use it. The unlinked storage
+profile fails closed. Public HTTP/SQL, coherent bootstrap, typed pgoutput and
+existing-client qualification remain outstanding.
 
 ## Working constraints
 

@@ -1246,6 +1246,7 @@ const RaftTableApplyStateMachine = struct {
         applied_index_publication_failure_once: bool = false,
         document_apply_attempts: usize = 0,
         document_apply_successes: usize = 0,
+        history_reply_lost_once_at_index: ?u64 = null,
     } else struct {};
 
     const ApplyFailureKey = struct {
@@ -1335,6 +1336,14 @@ const RaftTableApplyStateMachine = struct {
         InitialChildProvisionAlreadyCommitted,
         SqlFeatureNotSupported,
         SqlArraySubscriptError,
+        InvalidHistoryAdmission,
+        HistoryResynchronizationRequired,
+        HistoryConsumerConflict,
+        HistoryConsumerLimit,
+        HistoryCheckpointConflict,
+        HistoryFull,
+        HistoryPreparedTransactionsPresent,
+        SourceOutcomeUnresolved,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
@@ -1350,6 +1359,14 @@ const RaftTableApplyStateMachine = struct {
                 if (err == @field(@import("../api/relational_integrity_errors.zig").Error, field)) return @field(ExpectedApplyFailure, field);
             }
             return switch (err) {
+                error.InvalidHistoryAdmission => .InvalidHistoryAdmission,
+                error.HistoryResynchronizationRequired => .HistoryResynchronizationRequired,
+                error.HistoryConsumerConflict => .HistoryConsumerConflict,
+                error.HistoryConsumerLimit => .HistoryConsumerLimit,
+                error.HistoryCheckpointConflict => .HistoryCheckpointConflict,
+                error.HistoryFull => .HistoryFull,
+                error.HistoryPreparedTransactionsPresent => .HistoryPreparedTransactionsPresent,
+                error.SourceOutcomeUnresolved => .SourceOutcomeUnresolved,
                 error.InvalidArtifactCatalogCommand => .InvalidArtifactCatalogCommand,
                 error.ArtifactCatalogEpochChanged => .ArtifactCatalogEpochChanged,
                 error.ArtifactCatalogScopeChanged => .ArtifactCatalogScopeChanged,
@@ -1402,6 +1419,14 @@ const RaftTableApplyStateMachine = struct {
                 if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../api/relational_integrity_errors.zig").Error, field);
             }
             return switch (self) {
+                .InvalidHistoryAdmission => error.InvalidHistoryAdmission,
+                .HistoryResynchronizationRequired => error.HistoryResynchronizationRequired,
+                .HistoryConsumerConflict => error.HistoryConsumerConflict,
+                .HistoryConsumerLimit => error.HistoryConsumerLimit,
+                .HistoryCheckpointConflict => error.HistoryCheckpointConflict,
+                .HistoryFull => error.HistoryFull,
+                .HistoryPreparedTransactionsPresent => error.HistoryPreparedTransactionsPresent,
+                .SourceOutcomeUnresolved => error.SourceOutcomeUnresolved,
                 .InvalidArtifactCatalogCommand => error.InvalidArtifactCatalogCommand,
                 .ArtifactCatalogEpochChanged => error.ArtifactCatalogEpochChanged,
                 .ArtifactCatalogScopeChanged => error.ArtifactCatalogScopeChanged,
@@ -1994,6 +2019,32 @@ const RaftTableApplyStateMachine = struct {
         if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
     }
 
+    fn applyHistoryControlForEntry(self: *RaftTableApplyStateMachine, group_id: u64, index: u64, term: u64, control: @import("history_control_entry.zig").Entry) !void {
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
+        const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
+            error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (floor < @import("history_control_entry.zig").required_protocol_version) return error.UnsupportedBatchProtocolVersion;
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const outcome = owner.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(self.alloc, group_id, control.table, control.storage_owner, control.history_control.command, term, index) catch |err| switch (err) {
+            error.WriterLocked, error.StorageBusy, error.ResourceBudgetExceeded, error.StorageOwnerAdmissionPending, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (@import("builtin").is_test) if (self.test_faults.history_reply_lost_once_at_index == index) {
+            self.test_faults.history_reply_lost_once_at_index = null;
+            return error.RaftApplyWriterUnavailable;
+        };
+        switch (outcome) {
+            .applied => {},
+            .rejected => |reason| self.recordApplyFailure(group_id, index, term, ExpectedApplyFailure.fromError(reason.asError()).?),
+            // The marker proves application, not its old result. Require the
+            // proposer to recover the live lease rather than reporting success.
+            .superseded => self.recordApplyFailure(group_id, index, term, .SourceOutcomeUnresolved),
+        }
+    }
+
     fn publishAppliedReady(
         self: *RaftTableApplyStateMachine,
         group_id: u64,
@@ -2243,8 +2294,15 @@ const RaftTableApplyStateMachine = struct {
             if (entry.index > last_index) last_index = entry.index;
             if (entry.index <= completed_index) continue;
             if (entry.entry_type == .normal and data_raft_batch.looksLikeEnvelope(entry.data)) {
-                var decoded = try data_raft_batch.decode(self.alloc, entry.data);
-                defer decoded.deinit(self.alloc);
+                var applying = try data_raft_batch.decodeForApply(self.alloc, entry.data);
+                defer applying.deinit(self.alloc);
+                if (applying == .history_control) {
+                    try self.applyHistoryControlForEntry(group_id, entry.index, entry.term, applying.history_control.value());
+                    completed_index = entry.index;
+                    self.advanceRetryApplyCheckpoint(group_id, entry.index, entry.term, true);
+                    continue;
+                }
+                const decoded = applying.batch;
                 if (decoded.protocol_barrier_version == null and batchRequiresTopologyArbitration(decoded.batch.req)) {
                     if (self.topology_apply_store) |store| if (try store.topologyRejection(self.alloc, group_id, entry.index)) |rejection| {
                         // The ordered raw fold rejected this whole command.
@@ -34760,6 +34818,91 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "data raft ordered history waits for native receipts and preserves rejection outcomes" {
+            if (comptime !linked_storage) return error.SkipZigTest;
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/history-native-apply", .{tmp.sub_path});
+            defer a.free(root);
+            const projection_root = try std.fmt.allocPrint(a, "{s}/projection", .{root});
+            defer a.free(projection_root);
+            const native_root = try std.fmt.allocPrint(a, "{s}/native", .{root});
+            defer a.free(native_root);
+            var projection = try DataRaftApplyStore.init(a, .{ .root_dir = projection_root, .native_source_delegate = true });
+            defer projection.deinit();
+            var owner = antfly.public_api.ProvisionedKernelOwnerSource.init(a, native_root, antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier());
+            defer owner.deinit();
+            var sm = try RaftTableApplyStateMachine.init(a, native_root, antfly.public_api.table_catalog.emptyCatalogSource(), null);
+            defer sm.deinit();
+            sm.attachKernelOwnerSource(&owner);
+            sm.topology_apply_store = &projection;
+            const history = @import("history_control_entry.zig");
+            const contract = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
+            var namespace: [24]u8 = undefined;
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 11, .big);
+            std.mem.writeInt(u64, namespace[16..24], 13, .big);
+            const grant: contract.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1 };
+            var control: history.Entry = .{ .table = "docs", .storage_owner = .{ .lsm_root_generation = 0, .identity = .{ .table_id = 7, .shard_id = 11, .range_id = 13 }, .schema_json = "{}", .indexes_json = "{}" }, .history_control = .{ .command = .{ .enroll = grant } } };
+            const enrollment = try history.encode(a, control, history.required_protocol_version);
+            defer a.free(enrollment);
+            const pending_entry: raft_engine.core.Entry = .{ .term = 1, .index = 2, .entry_type = .normal, .data = enrollment };
+            try std.testing.expectError(error.UnsupportedBatchProtocolVersion, sm.stateMachine().applyReady(601, null, &.{pending_entry}, &.{}));
+            try std.testing.expectEqual(@as(u64, 0), sm.appliedIndex(601));
+            sm.retry_apply_checkpoints.clearRetainingCapacity();
+            const Apply = struct {
+                fn projectionFirst(store: *DataRaftApplyStore, entry: raft_engine.core.Entry) !void {
+                    const bytes = try antfly.raft.state_machine.encodeCommittedEntries(std.testing.allocator, &.{entry});
+                    defer std.testing.allocator.free(bytes);
+                    try store.applyBatch(601, entry.index, bytes);
+                }
+            };
+            const barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", history.required_protocol_version);
+            defer a.free(barrier);
+            const barrier_entry: raft_engine.core.Entry = .{ .term = 1, .index = 1, .entry_type = .normal, .data = barrier };
+            try Apply.projectionFirst(&projection, barrier_entry);
+            try sm.stateMachine().applyReady(601, null, &.{barrier_entry}, &.{});
+            try Apply.projectionFirst(&projection, pending_entry);
+            const token = try sm.registerApplyOutcomeToken(601, 2, 1);
+            defer sm.cancelRegisteredApplyOutcome(token);
+            sm.test_faults.history_reply_lost_once_at_index = 2;
+            try std.testing.expectError(error.RaftApplyWriterUnavailable, sm.stateMachine().applyReady(601, null, &.{pending_entry}, &.{}));
+            try std.testing.expectEqual(@as(u64, 1), sm.appliedIndex(601));
+            try std.testing.expect(!try sm.applyOutcomeReady(token));
+            const durable = try owner.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 601, "docs", control.storage_owner, control.history_control.command, 1, 2);
+            try std.testing.expectEqual(@as(u64, 1), durable.applied.consumer.?.epoch);
+            try sm.stateMachine().applyReady(601, null, &.{pending_entry}, &.{});
+            try std.testing.expectEqual(@as(u64, 2), sm.appliedIndex(601));
+            try std.testing.expect(try sm.applyOutcomeReady(token));
+            try std.testing.expectEqual(.succeeded, sm.takeRegisteredApplyOutcome(token).?);
+            const ref: contract.Reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = 1, .grant = grant.sequence, .definition = grant.definition };
+            control.history_control.command = .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 100 } };
+            const rejected = try history.encode(a, control, history.required_protocol_version);
+            defer a.free(rejected);
+            const rejected_entry: raft_engine.core.Entry = .{ .term = 1, .index = 3, .entry_type = .normal, .data = rejected };
+            try Apply.projectionFirst(&projection, rejected_entry);
+            const rejected_token = try sm.registerApplyOutcomeToken(601, 3, 1);
+            defer sm.cancelRegisteredApplyOutcome(rejected_token);
+            try sm.stateMachine().applyReady(601, null, &.{rejected_entry}, &.{});
+            try std.testing.expectEqual(@as(u64, 3), sm.appliedIndex(601));
+            try std.testing.expectEqual(RaftTableApplyStateMachine.ExpectedApplyFailure.HistoryCheckpointConflict, sm.takeRegisteredApplyOutcome(rejected_token).?.failed);
+            // A deterministic rejection completes its log entry without
+            // poisoning the consumer or blocking the next valid command.
+            control.history_control.command = .{ .inspect = ref };
+            const inspection = try history.encode(a, control, history.required_protocol_version);
+            defer a.free(inspection);
+            const inspection_entry: raft_engine.core.Entry = .{ .term = 1, .index = 4, .entry_type = .normal, .data = inspection };
+            try Apply.projectionFirst(&projection, inspection_entry);
+            const inspection_token = try sm.registerApplyOutcomeToken(601, 4, 1);
+            defer sm.cancelRegisteredApplyOutcome(inspection_token);
+            try sm.stateMachine().applyReady(601, null, &.{inspection_entry}, &.{});
+            try std.testing.expectEqual(@as(u64, 4), sm.appliedIndex(601));
+            try std.testing.expectEqual(.succeeded, sm.takeRegisteredApplyOutcome(inspection_token).?);
+            const inspected = try owner.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(a, 601, "docs", control.storage_owner, control.history_control.command, 1, 4);
+            try std.testing.expectEqual(@as(u64, 1), inspected.applied.consumer.?.epoch);
+        }
+
         test "time series document revision protocol dominates older envelope features" {
             const p = @import("../common/data_raft_protocol.zig");
             var req: antfly.db.types.BatchRequest = .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "row", .value = "{}" }} };

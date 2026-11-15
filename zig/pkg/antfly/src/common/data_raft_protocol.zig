@@ -40,9 +40,9 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 29;
-/// Reserved for dedicated retained-history control entries. The advertised
-/// maximum remains unchanged until native ordered dispatch is integrated.
+pub const batch_protocol_version: u16 = 30;
+/// Dedicated retained-history control entries require native ordered dispatch
+/// and a durable all-applying-member activation barrier.
 pub const batch_history_control_protocol_version: u16 = 30;
 /// Version 29 understands dense text-origin and int8-stub flags. Activation
 /// certifies every applying replica before these envelopes or fragments appear.
