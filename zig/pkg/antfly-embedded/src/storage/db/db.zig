@@ -25877,6 +25877,68 @@ pub const DB = struct {
 
     pub const HistoryConsumerGrant = @import("../history_consumer.zig").Grant;
     pub const HistoryConsumerReference = @import("../history_consumer.zig").Reference;
+    pub const ordered_history = @import("../history_ordered.zig");
+    pub const OrderedHistoryOutcome = ordered_history.Outcome;
+
+    /// Trusted data-Raft apply only. Consumer effects, deterministic rejection
+    /// results and the ordinary ordered-entry marker commit atomically. Public
+    /// request admission and the all-member decoder barrier belong to the owner.
+    pub fn applyOrderedHistoryConsumerControl(self: *DB, command: @import("../history_consumer.zig").Command, entry: OrderedApplyReceipt, bypass_write_gate: bool) !OrderedHistoryOutcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedHistoryConsumerControl", .{ self, command, entry, bypass_write_gate });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        // Mirrored native/standby retention requires an explicit durable
+        // envelope. This ordered primitive cannot drop that mirror silently.
+        if (self.local_execution.replication_async_batch_mirror != null) return error.HistoryAuthorityRequired;
+        const ordered = @import("../history_ordered.zig");
+        const fingerprint = try ordered.fingerprint(self.alloc, command);
+        var replication_mutation = if (bypass_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_write_gate) try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (self.core.identity_namespace.table_id == 0) return error.HistoryAuthorityRequired;
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+            .already_applied => {
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                _ = try @import("../source_authority.zig").require(&read, .raft, namespace);
+                return ordered.replay(&read, namespace, .{ .term = entry.term, .index = entry.index }, fingerprint);
+            },
+            .apply => {},
+        }
+        var rejection: ?ordered.Rejection = if (!std.mem.eql(u8, &namespace, &command.namespace())) .resynchronization else null;
+        while (true) {
+            var txn = try self.core.store.beginWriteTxn();
+            var txn_open = true;
+            defer if (txn_open) txn.abort();
+            if (self.local_execution.restore_staging_required.load(.acquire)) try @import("restore_staging.zig").requireMutableScope(self.alloc, &txn, null);
+            if (try doc_identity.loadNamespaceTxn(&txn)) |stored| {
+                if (!stored.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+            } else try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
+            try @import("../source_authority.zig").bind(&txn, .raft, namespace);
+            const outcome: OrderedHistoryOutcome = if (rejection) |reason| .{ .rejected = reason } else .{
+                .applied = @import("../history_consumer.zig").apply(&txn, command) catch |err| {
+                    rejection = ordered.Rejection.fromError(err) orelse return err;
+                    // A reducer may have staged writes before rejecting. Abort
+                    // everything before recording that terminal outcome separately.
+                    continue;
+                },
+            };
+            const record: ordered.Record = .{ .namespace = namespace, .entry = .{ .term = entry.term, .index = entry.index }, .command = fingerprint, .outcome = outcome };
+            try txn.put(ordered.key, &(try record.encode()));
+            var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+            txn_open = false;
+            return outcome;
+        }
+    }
 
     /// Authenticated native owner provisioning for a resident managed writer.
     /// The serving owner must already have resolved this exact namespace from

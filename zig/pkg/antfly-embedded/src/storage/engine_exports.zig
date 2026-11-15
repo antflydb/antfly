@@ -1151,6 +1151,9 @@ fn provisionNativeHistoryAuthority(self: *DB, expected_namespace: [24]u8) engine
     self.provisionNativeHistoryAuthority(expected_namespace) catch |err| return .{ .failure = .init(@errorName(err)) };
     return .{ .value = {} };
 }
+fn applyOrderedHistoryConsumerControl(self: *DB, command: @import("history_consumer.zig").Command, entry: types.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(@import("history_ordered.zig").Outcome) {
+    return .{ .value = self.applyOrderedHistoryConsumerControl(command, entry, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn nativeHistoryPage(self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request) engine.Outcome(@import("history_page.zig").Page) {
     return .{ .value = self.nativeHistoryPage(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

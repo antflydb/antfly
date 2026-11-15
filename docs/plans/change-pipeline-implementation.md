@@ -1010,6 +1010,52 @@ configuration smoke check also passes in
 `zig/provisioned-native-history-native-build.log`; this checks compiled native
 exports/runtime wiring, not end-to-end replication startup.
 
+## In progress: atomic ordered root retention outcomes
+
+`DB.applyOrderedHistoryConsumerControl` is the trusted storage primitive for
+data-Raft retention controls. Under the apply/snapshot/replication mutation
+guards it binds the actual root's persisted Raft authority and stages consumer
+effects, a bounded result receipt and the ordinary ordered-entry marker in the
+same primary transaction. It creates no document event. Native authority cannot
+be converted by invoking this method. Mirrored batch owners remain unsupported
+until their explicit durable control envelope is implemented.
+
+Expected reducer rejections are committed outcomes, including invalid admission,
+stale consumer/ACK fences, consumer limits and unavailable retention capacity.
+Any partially staged reducer writes are aborted before the rejection transaction
+is recorded. Corruption, allocation failures, storage failures and wrong durable
+owner authority remain errors and cannot advance the ordered marker. This lets
+the eventual state-machine adapter advance a rejected log entry without
+misreporting success or blocking later ACK/cleanup entries forever.
+
+`storage/history_ordered.zig` defines the authenticated canonical HCO1 receipt:
+exact root namespace, term/index, command fingerprint and applied/rejected
+result, in a fixed 192-byte record. Only the latest control receipt is retained.
+Exact replay returns its original result, even after later row writes, and
+rejects a different command under that entry identity. Once a newer control has
+replaced it, replay explicitly reports `superseded`; callers must inspect the
+live lease and cannot infer success, advance ACKs or discard history from that
+result. This avoids an unbounded command/result journal.
+
+The method and result are appended to the native storage-engine ABI. The
+production Raft command codec/all-member activation barrier, state-machine
+dispatch, owner-routed submission and linearizable inspection/page capabilities
+still need integration before any distributed root can advertise this feature.
+The standalone native binding continues to reject Raft profiles.
+
+`zig build ordered-history-consumer-test -j2` runs the physical writer suite and
+is selected by the ordinary lifecycle gate. Coverage includes rejected admission
+followed by successful enrollment, ordered row capture, conflicting payload
+replay, future ACK rejection followed by valid ACK, result recovery after writer
+reopen, explicit supersession, retirement/re-enrollment fencing and corrupted
+receipt rejection. Expanded qualification also checks collection replay after
+reopen leaves retained state byte-for-byte unchanged, bounded receipt encoding
+and allocation failure. Logs: `zig/ordered-history-consumer-qualification.log`
+and `zig/ordered-history-final-qualification.log`.
+The expanded physical writer tests, provisioned-native regression and compiled
+standalone configuration/native-export smoke check all pass. This qualifies the
+storage primitive and ABI, not end-to-end Raft submission or public feeds.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
