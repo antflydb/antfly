@@ -485,11 +485,11 @@ pub fn createExecutorWithOptions(
     defer result.deinit();
 
     // 2. Compile HLO via PJRT
-    // Retain the source vendor accumulation before BF16 publication. A
-    // mathematically equivalent Triton GEMM can cross a BF16 midpoint.
-    var executable = try client.compileWithOptions(result.hlo_bytes, result.output_node_ids.len, client.device, .{
-        .gpu_gemm = if (options.precision == .bf16 and std.ascii.eqlIgnoreCase(try client.platformName(), "cuda")) .vendor else .provider_default,
-    });
+    // Precision fixes publication boundaries and accumulation types. Let the
+    // provider choose its tuned GEMM/fusion schedule; vendor reduction order is
+    // not a portable numerical contract. Strict compilation still preserves
+    // every explicit BF16 conversion. Qualify model accuracy independently.
+    var executable = try client.compileForDevice(result.hlo_bytes, result.output_node_ids.len, client.device);
     var executable_owned = true;
     errdefer if (executable_owned) executable.deinit();
 

@@ -870,6 +870,12 @@ pub const EncodedDeviceImage = struct { tensor: CT, tokens: usize };
 /// tensor operations. Spatial dimensions are processor-selected multiples of
 /// 48; patch extraction remains a reshape/transpose in compiled execution.
 pub fn encodeEmbeddingGemma2PixelTensorResident(cb: *const ComputeBackend, a: std.mem.Allocator, pixels: CT, width: usize, height: usize) !EncodedDeviceImage {
+    return encodeEmbeddingGemma2PixelBatchTensorResident(cb, a, pixels, width, height, 1);
+}
+
+/// One independent attention batch per image; projection/FFN dispatch is shared.
+pub fn encodeEmbeddingGemma2PixelBatchTensorResident(cb: *const ComputeBackend, a: std.mem.Allocator, pixels: CT, width: usize, height: usize, batch: usize) !EncodedDeviceImage {
+    if (batch == 0 or batch > 8) return error.InvalidImageBatch;
     if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0 or width / 48 * (height / 48) > 280) return error.InvalidTensorShape;
     const cfg = embeddingGemma2ImageConfig();
     const g = Geometry{ .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
@@ -879,20 +885,20 @@ pub fn encodeEmbeddingGemma2PixelTensorResident(cb: *const ComputeBackend, a: st
     defer cb.free(centered);
     const scaled_pixels = (try cb.multiplyScalar(centered, 2)) orelse return error.UnsupportedPrimitiveOp;
     defer cb.free(scaled_pixels);
-    const layout = [_]i64{ 1, 3, @intCast(g.grid_y), 16, @intCast(g.grid_x), 16 };
+    const layout = [_]i64{ @intCast(batch), 3, @intCast(g.grid_y), 16, @intCast(g.grid_x), 16 };
     const shaped = try cb.primReshape(scaled_pixels, &layout);
     defer cb.free(shaped);
     const ordered = try cb.primTranspose(shaped, &.{ 0, 2, 4, 3, 5, 1 }, &layout);
     defer cb.free(ordered);
-    const patches = try cb.primReshape(ordered, &.{ @intCast(g.grid_x * g.grid_y), 768 });
+    const patches = try cb.primReshape(ordered, &.{ @intCast(batch * g.grid_x * g.grid_y), 768 });
     defer cb.free(patches);
     var weights = ProjectorWeights.initHuggingFace(cb, a);
     defer weights.deinit();
     const weight = try weights.linearCt("v.patch_embd.weight", 768, cfg.vision_hidden);
     defer cb.free(weight);
-    const hidden = try cb.linearNoBias(patches, weight, g.grid_x * g.grid_y, 768, cfg.vision_hidden);
-    const encoded = try encodeVisionHiddenResident(cb, a, &weights, cfg, hidden, g, 1);
-    return .{ .tensor = encoded.embeddings, .tokens = encoded.tokens };
+    const hidden = try cb.linearNoBias(patches, weight, batch * g.grid_x * g.grid_y, 768, cfg.vision_hidden);
+    const encoded = try encodeVisionHiddenResident(cb, a, &weights, cfg, hidden, g, batch);
+    return .{ .tensor = encoded.embeddings, .tokens = batch * encoded.tokens };
 }
 
 pub fn encodeEmbeddingGemma2VideoTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32) !EncodedImage {
@@ -2084,7 +2090,7 @@ test "gemma4 audio source window is bounded before resampling" {
     try std.testing.expectError(error.UnsupportedAudioFormat, sourceSampleLimitForResample(480_000, 0, 16_000));
 }
 
-const AudioFeatures = struct {
+pub const AudioFeatures = struct {
     allocator: std.mem.Allocator,
     data: []f32,
     resident: ?CT = null,
@@ -2392,25 +2398,41 @@ fn prepareGemma4AudioFeatures(cb: *const ComputeBackend, allocator: std.mem.Allo
     defer prepared.deinit();
     return audioFeaturesFromPrepared(cb, allocator, &prepared);
 }
-fn audioFeaturesFromPrepared(cb: *const ComputeBackend, allocator: std.mem.Allocator, prepared: *const PreparedAudio) !AudioFeatures {
-    const gpu = !audioHostOps().features and supportsGemma4LogMel(cb) and prepared.frames > 0;
-    const out = try allocator.alloc(f32, if (gpu) 0 else prepared.frames * prepared.mel_bins);
+/// CPU processor output is a runtime operand of the compiled audio tower.
+pub fn prepareEmbeddingGemma2AudioFeatures(allocator: std.mem.Allocator, prepared: *const PreparedAudio) !AudioFeatures {
+    const out = try allocator.alloc(f32, prepared.frames * prepared.mel_bins);
     errdefer allocator.free(out);
     const mask = try allocator.dupe(bool, prepared.mask);
     errdefer allocator.free(mask);
-    if (gpu) {
-        var owned_frame = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
-        defer if (owned_frame) cb.decoderRuntimeCancelFrame() catch {};
-        const tensor = try gemma4LogMelTensor(cb, allocator, prepared.samples, prepared.frames, 160, 320, 512, prepared.window, prepared.filters, prepared.mel_bins, 1e-3, mask);
-        errdefer cb.free(tensor);
-        if (owned_frame) {
-            try cb.decoderRuntimeSubmitAndWaitFrame();
-            owned_frame = false;
-        }
-        return .{ .allocator = allocator, .data = out, .resident = tensor, .backend = cb, .mask = mask, .frames = prepared.frames, .mel_bins = prepared.mel_bins };
-    }
     if (prepared.frames > 0) try gemma4LogMelFrames(allocator, prepared.samples, prepared.frames, 160, 320, 512, prepared.window, prepared.filters, prepared.mel_bins, 1e-3, mask, out, audio.blas_available);
     return .{ .allocator = allocator, .data = out, .mask = mask, .frames = prepared.frames, .mel_bins = prepared.mel_bins };
+}
+
+/// Borrow runtime log-mel values; projection stays in the captured program.
+pub fn encodeEmbeddingGemma2AudioFeatureTensorResident(cb: *const ComputeBackend, a: std.mem.Allocator, input: CT, mask: []const bool, frames: usize, mel_bins: usize) !ResidentEncodedAudio {
+    if (frames == 0 or mel_bins != 128 or mask.len != frames) return error.InvalidInputShape;
+    var weights = ProjectorWeights.initHuggingFace(cb, a);
+    defer weights.deinit();
+    var features = AudioFeatures{ .allocator = a, .data = &.{}, .resident = input, .backend = cb, .mask = @constCast(mask), .frames = frames, .mel_bins = mel_bins };
+    return encodeAudioFeaturesResident(cb, a, &weights, embeddingGemma2AudioConfig(), &features);
+}
+
+fn audioFeaturesFromPrepared(cb: *const ComputeBackend, allocator: std.mem.Allocator, prepared: *const PreparedAudio) !AudioFeatures {
+    const gpu = !audioHostOps().features and supportsGemma4LogMel(cb) and prepared.frames > 0;
+    if (!gpu) return prepareEmbeddingGemma2AudioFeatures(allocator, prepared);
+    const out = try allocator.alloc(f32, 0);
+    errdefer allocator.free(out);
+    const mask = try allocator.dupe(bool, prepared.mask);
+    errdefer allocator.free(mask);
+    var owned_frame = cb.kind() == .metal and !cb.decoderRuntimeHasActiveFrame() and try cb.decoderRuntimeBeginFrame();
+    defer if (owned_frame) cb.decoderRuntimeCancelFrame() catch {};
+    const tensor = try gemma4LogMelTensor(cb, allocator, prepared.samples, prepared.frames, 160, 320, 512, prepared.window, prepared.filters, prepared.mel_bins, 1e-3, mask);
+    errdefer cb.free(tensor);
+    if (owned_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        owned_frame = false;
+    }
+    return .{ .allocator = allocator, .data = out, .resident = tensor, .backend = cb, .mask = mask, .frames = prepared.frames, .mel_bins = prepared.mel_bins };
 }
 
 // The GPU front end uses the same zero-padded DFT and magnitude filterbank
@@ -5179,6 +5201,16 @@ fn depthwiseConvWeightCt(
             return publishAudioConstant(self.cb, key, resident, true);
         }
         fn call(self: @This()) !CT {
+            if (self.cb.kind() == .graph) {
+                const raw = try self.store.weightCt(self.name);
+                defer self.cb.free(raw);
+                if ((try self.cb.tensorShapeMatches(raw, &.{ @intCast(self.kernel_size), @intCast(self.hidden) })) orelse false) return self.cb.primReshape(raw, &.{ @intCast(self.kernel_size), @intCast(self.hidden) });
+                const valid = ((try self.cb.tensorShapeMatches(raw, &.{ @intCast(self.hidden), 1, @intCast(self.kernel_size) })) orelse false) or ((try self.cb.tensorShapeMatches(raw, &.{ @intCast(self.hidden), @intCast(self.kernel_size) })) orelse false);
+                if (!valid) return error.InvalidTensorShape;
+                const matrix = try self.cb.primReshape(raw, &.{ @intCast(self.hidden), @intCast(self.kernel_size) });
+                defer self.cb.free(matrix);
+                return self.cb.primTranspose(matrix, &.{ 1, 0 }, &.{ @intCast(self.hidden), @intCast(self.kernel_size) });
+            }
             var key_buf: [256]u8 = undefined;
             const key = try AudioCacheRecipe.depthwiseKey(&key_buf, self.name, self.kernel_size, self.hidden);
             const cache = self.store.huggingface and !audioHostOps().resident and (self.cb.kind() == .metal or self.cb.kind() == .cuda);

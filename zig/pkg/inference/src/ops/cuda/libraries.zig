@@ -161,7 +161,22 @@ pub const CublasLtTable = struct {
 /// the default. Never discover libraries through an unrelated model runtime.
 pub fn openCudnnLibrary() !std.DynLib {
     const configured = @import("antfly_platform").env.getenv("ANTFLY_INFERENCE_CUDA_CUDNN_LIBRARY");
-    return std.DynLib.open(configured orelse "libcudnn.so.9") catch error.CudnnUnavailable;
+    var lib = std.DynLib.open(configured orelse "libcudnn.so.9") catch return error.CudnnUnavailable;
+    errdefer lib.close();
+    // cuDNN defers these imports until its first plan. A missing CUDA-major
+    // dependency can make its vendor shim abort the process instead of return
+    // an SDK error. Decline optional acceleration before entering that shim.
+    const runtime = lib.lookup(*const fn () callconv(.c) usize, "cudnnGetCudartVersion") orelse return error.CudnnUnavailable;
+    const major = runtime() / 1000;
+    if (major < 12) return error.CudnnUnavailable;
+    inline for (.{ .{ "cublasLt", "cublasLtGetVersion" }, .{ "cudart", "cudaRuntimeGetVersion" }, .{ "nvrtc", "nvrtcVersion" } }) |dependency| {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "lib{s}.so.{d}", .{ dependency[0], major });
+        var required = std.DynLib.open(name) catch return error.CudnnUnavailable;
+        defer required.close();
+        _ = required.lookup(*anyopaque, dependency[1]) orelse return error.CudnnUnavailable;
+    }
+    return lib;
 }
 
 const CublasLibrary = struct {

@@ -713,7 +713,10 @@ fn inspectGroup(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAll
 
 fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllocator, session: Session, tokenizer: Tokenizer, group: Group, input_options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache, native_allocator: ?*@import("../backends/admitted_allocator.zig").AdmittedAllocator) !Result {
     if (session.backend() == .pjrt) for (group.content) |part| {
-        if (part != .text) return embedCompiledImage(bounded.allocator(), session, tokenizer, group, input_options, lock, control);
+        if (part != .text) {
+            bounded.limit = 512 * 1024 * 1024;
+            return embedCompiledMedia(bounded.allocator(), session, tokenizer, group, input_options, lock, control);
+        }
     };
     var native_run: ?@import("../backends/admitted_allocator.zig").AdmittedAllocator.RunScope = null;
     defer if (native_run) |*run| run.deinit();
@@ -897,32 +900,75 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
     return .{ .vector = vector, .input_tokens = count };
 }
 
-/// The public compiled path captures the tower, composition and backbone as
-/// one program. Only image decoding/resizing and tokenization run on the host;
-/// projected soft tokens never make a device-to-host-to-device round trip.
-fn embedCompiledImage(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
+/// Owned processor operands. Repeated video slots borrow an earlier owner;
+/// their source indices are part of the compiled program's specialization.
+const CompiledMedia = struct {
+    kind: @import("../execution/embedding_media_frontend.zig").Kind,
+    values: []f32,
+    shape: [4]i64,
+    rank: usize,
+    width: usize,
+    height: usize,
+    tokens: usize,
+    mask: []i64 = &.{},
+    source: usize = 0,
+    owns: bool = true,
+    fn deinit(self: CompiledMedia, a: std.mem.Allocator) void {
+        if (self.owns) {
+            a.free(self.values);
+            a.free(self.mask);
+        }
+    }
+};
+const CompiledFrames = struct {
+    a: std.mem.Allocator,
+    frames: [32]?CompiledMedia = @splat(null),
+    observer: ?@import("antfly_video").preparation.FrameObserver,
+    fn accept(context: *anyopaque, slot: usize, frame: @import("antfly_video").preparation.BorrowedFrame, opts: @import("antfly_video").preparation.Options, control: @import("antfly_media").source.Control) !void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (slot >= self.frames.len or self.frames[slot] != null) return error.InvalidVideoReaderSelection;
+        if (self.observer) |observer| try observer.accept(observer.context, slot, frame, opts, control);
+        const values = try frame.prepare(self.a, opts, control);
+        errdefer self.a.free(values);
+        const tokens = @as(usize, opts.width / 48) * (opts.height / 48);
+        if (opts.width == 0 or opts.height == 0 or opts.width % 48 != 0 or opts.height % 48 != 0 or tokens > 140 or values.len != tokens * 9 * 768) return error.InvalidTensorShape;
+        self.frames[slot] = .{ .kind = .video, .values = values, .shape = .{ @intCast(tokens * 9), 768, 0, 0 }, .rank = 2, .width = opts.width, .height = opts.height, .tokens = tokens };
+    }
+    fn deinit(self: *@This()) void {
+        for (&self.frames) |*item| if (item.*) |value| {
+            value.deinit(self.a);
+            item.* = null;
+        };
+    }
+};
+fn appendCompiledMarkers(a: std.mem.Allocator, rendered: *std.ArrayListUnmanaged(u8), item: CompiledMedia, count: *usize, max_tokens: usize) !void {
+    count.* = std.math.add(usize, count.*, item.tokens) catch return error.EmbeddingInputTooLong;
+    if (count.* > max_tokens) return error.EmbeddingInputTooLong;
+    const image = item.kind != .audio;
+    try rendered.appendSlice(a, if (image) "<|image>" else "<|audio>");
+    for (0..item.tokens) |_| try rendered.appendSlice(a, if (image) "<|image|>" else "<|audio|>");
+    try rendered.appendSlice(a, if (image) "<image|>" else "<audio|>");
+}
+
+/// Decode/processor work stays on the host; all towers, ordered composition
+/// and pooled encoder execution form one captured program.
+fn embedCompiledMedia(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, group: Group, options: Options, lock: ?*std.atomic.Mutex, control: ?Control) !Result {
     const effective = control orelse Control{};
     try validateGroupContent(group, options, false);
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
-    if (!cfg.vision) return error.NoVisionSession;
-    var image_part: ?Part = null;
-    var has_text = false;
-    for (group.content) |part| switch (part) {
-        .text => has_text = true,
-        .image, .raster => {
-            if (image_part != null) return error.UnsupportedCompiledImageCohort;
-            image_part = part;
-        },
-        else => return error.UnsupportedCompiledMediaProgram,
-    };
-    const part = image_part orelse return error.MissingInputs;
     const scope = @import("antfly_image").work_control.Scope.enter(effective.imageWorkControl());
     defer scope.deinit();
-    var image = if (part == .image) try projector.prepareEmbeddingGemma2Image(a, part.image) else try projector.prepareEmbeddingGemma2Raster(a, part.raster);
-    defer image.deinit();
-    const media_tokens = image.geometry.tokenCount();
+    var media = std.ArrayListUnmanaged(CompiledMedia).empty;
+    var media_tokens: usize = 0;
+    defer {
+        for (media.items) |item| item.deinit(a);
+        media.deinit(a);
+    }
     var rendered = std.ArrayListUnmanaged(u8).empty;
     defer rendered.deinit(a);
+    const has_text = for (group.content) |part| {
+        if (part == .text) break true;
+    } else false;
     if (has_text) {
         if (group.title) |title| {
             const prefix = try std.fmt.allocPrint(a, "title: {s} | text: ", .{title});
@@ -937,11 +983,63 @@ fn embedCompiledImage(a: std.mem.Allocator, session: Session, tokenizer: Tokeniz
         switch (content) {
             .text => |text| try rendered.appendSlice(a, text),
             .image, .raster => {
-                try rendered.appendSlice(a, "<|image>");
-                for (0..media_tokens) |_| try rendered.appendSlice(a, "<|image|>");
-                try rendered.appendSlice(a, "<image|>");
+                if (!cfg.vision) return error.NoVisionSession;
+                var image = if (content == .image) try projector.prepareEmbeddingGemma2Image(a, content.image) else try projector.prepareEmbeddingGemma2Raster(a, content.raster);
+                defer image.deinit();
+                const item = CompiledMedia{ .kind = .image, .values = image.pixels, .shape = .{ 1, 3, @intCast(image.geometry.height), @intCast(image.geometry.width) }, .rank = 4, .width = image.geometry.width, .height = image.geometry.height, .tokens = image.geometry.tokenCount(), .source = media.items.len };
+                try media.append(a, item);
+                image.pixels = &.{};
+                try appendCompiledMarkers(a, &rendered, item, &media_tokens, options.max_tokens);
             },
-            else => unreachable,
+            .audio, .pcm => {
+                if (!cfg.audio) return error.NoAudioSession;
+                var prepared = if (content == .pcm) try projector.prepareEmbeddingGemma2AudioPcmWithPacking(a, content.pcm, false) else try projector.prepareEmbeddingGemma2AudioWithPackingBounded(a, content.audio.bytes, content.audio.decode_options, false, options.max_audio_decode_working_bytes);
+                defer prepared.deinit();
+                var features = try projector.prepareEmbeddingGemma2AudioFeatures(a, &prepared);
+                defer features.deinit();
+                const mask = try a.alloc(i64, features.frames);
+                for (mask, features.mask) |*value, valid| value.* = @intFromBool(valid);
+                const item = CompiledMedia{ .kind = .audio, .values = features.data, .mask = mask, .shape = .{ @intCast(features.frames), 128, 0, 0 }, .rank = 2, .width = 128, .height = features.frames, .tokens = prepared.tokenCount(), .source = media.items.len };
+                media.append(a, item) catch |err| {
+                    a.free(mask);
+                    return err;
+                };
+                features.data = &.{};
+                try appendCompiledMarkers(a, &rendered, item, &media_tokens, options.max_tokens);
+            },
+            .video, .sampled_video => {
+                if (!cfg.vision) return error.NoVisionSession;
+                const movie: SampledVideo = if (content == .sampled_video) content.sampled_video else .{ .bytes = content.video, .sampling = .reference };
+                const video = @import("embedding_gemma2_video.zig");
+                var inspection = video.InspectionScope{ .allocator = a };
+                defer inspection.deinit();
+                var frames = CompiledFrames{ .a = a, .observer = options.video_observer };
+                defer frames.deinit();
+                const configuration = video.Configuration{ .prepared_frames = options.video_prepared_frames, .observer = .{ .context = &frames, .accept = CompiledFrames.accept }, .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .inspection_scope = &inspection, .coefficients = options.video_coefficients };
+                const plan = try video.inspectConfiguredPlan(a, movie.bytes, movie.reader, effective, configuration, false);
+                if (options.video_prepared_frames) |prepared| {
+                    if (prepared.len != plan.pictures) return error.InvalidInputShape;
+                    for (prepared, 0..) |frame, slot| {
+                        const first = std.mem.indexOfScalar(u64, plan.picture_indexes[0..plan.pictures], plan.picture_indexes[slot]).?;
+                        if (first != slot) continue;
+                        const w = frame.options.width;
+                        const h = frame.options.height;
+                        const count_frame = @as(usize, w / 48) * (h / 48);
+                        if (w == 0 or h == 0 or w % 48 != 0 or h % 48 != 0 or count_frame > 140 or frame.patches.len != count_frame * 9 * 768) return error.InvalidTensorShape;
+                        frames.frames[slot] = .{ .kind = .video, .values = try a.dupe(f32, frame.patches), .shape = .{ @intCast(count_frame * 9), 768, 0, 0 }, .rank = 2, .width = w, .height = h, .tokens = count_frame };
+                    }
+                } else try video.observeConfigured(a, movie.bytes, movie.reader, effective, configuration);
+                const base = media.items.len;
+                for (plan.picture_indexes[0..plan.pictures], 0..) |picture, slot| {
+                    const first = std.mem.indexOfScalar(u64, plan.picture_indexes[0..plan.pictures], picture).?;
+                    var item = if (first == slot) frames.frames[slot] orelse return error.InvalidVideoReaderSelection else media.items[base + first];
+                    item.source = base + first;
+                    item.owns = first == slot;
+                    try media.append(a, item);
+                    if (first == slot) frames.frames[slot] = null;
+                    try appendCompiledMarkers(a, &rendered, item, &media_tokens, options.max_tokens);
+                }
+            },
         }
     }
     var tokens = try tokenizer.encodeForModel(a, rendered.items, options.max_tokens + 1);
@@ -955,29 +1053,62 @@ fn embedCompiledImage(a: std.mem.Allocator, session: Session, tokenizer: Tokeniz
     defer a.free(mask);
     const rows = try a.alloc(i64, count);
     defer a.free(rows);
-    var media: usize = 0;
-    for (ids, mask, rows, tokens.ids[0..count], tokens.attention_mask[0..count], 0..) |*id, *visible, *row, token, bit, index| {
+    const soft = try a.alloc(SoftTokens, media.items.len);
+    defer a.free(soft);
+    for (soft, media.items) |*value, item| value.* = .{ .id = switch (item.kind) {
+        .image => 258880,
+        .audio => 258881,
+        .video => 258884,
+    }, .embeddings = &.{}, .tokens = item.tokens };
+    for (ids, mask, tokens.ids[0..count], tokens.attention_mask[0..count]) |*id, *visible, token, bit| {
         id.* = token;
         visible.* = bit;
-        row.* = @intCast(if (token == 258880) count + media else index);
-        media += @intFromBool(token == 258880);
     }
-    if (media != media_tokens) return error.InvalidMediaRows;
+    const composition = try compositionRows(a, ids, soft);
+    defer a.free(composition);
+    for (rows, composition) |*dst, value| dst.* = value;
+    const layout = try a.alloc(i64, media.items.len * 5);
+    defer a.free(layout);
+    for (media.items, 0..) |item, index| @memcpy(layout[index * 5 ..][0..5], &[_]i64{ @backingInt(item.kind), @intCast(item.width), @intCast(item.height), @intCast(item.tokens), @intCast(item.source) });
     const T = @import("../backends/tensor.zig").Tensor;
     const shape = [_]i64{ 1, @intCast(count) };
-    const pixel_shape = [_]i64{ 1, 3, @intCast(image.geometry.height), @intCast(image.geometry.width) };
+    const layout_shape = [_]i64{ @intCast(media.items.len), 5 };
     const width = [_]i64{@intCast(options.dimensions)};
-    const inputs = [_]T{
+    var inputs = std.ArrayListUnmanaged(T).empty;
+    defer inputs.deinit(a);
+    var names = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (names.items) |name| a.free(name);
+        names.deinit(a);
+    }
+    for ([_]T{
         .{ .name = "input_ids", .dtype = .i64, .data = std.mem.sliceAsBytes(ids), .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false },
         .{ .name = "attention_mask", .dtype = .i64, .data = std.mem.sliceAsBytes(mask), .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false },
         .{ .name = "media_rows", .dtype = .i64, .data = std.mem.sliceAsBytes(rows), .shape = &shape, .allocator = a, .owns_data = false, .owns_shape = false },
-        .{ .name = "pixel_values", .dtype = .f32, .data = std.mem.sliceAsBytes(image.pixels), .shape = &pixel_shape, .allocator = a, .owns_data = false, .owns_shape = false },
+        .{ .name = "media_layout", .dtype = .i64, .data = std.mem.sliceAsBytes(layout), .shape = &layout_shape, .allocator = a, .owns_data = false, .owns_shape = false },
         .{ .name = "output_dimensions", .dtype = .i64, .data = @constCast(std.mem.sliceAsBytes(&width)), .shape = &.{1}, .allocator = a, .owns_data = false, .owns_shape = false },
-    };
+    }) |input| try inputs.append(a, input);
+    for (media.items, 0..) |*item, index| {
+        if (item.source != index) continue;
+        const name = try std.fmt.allocPrint(a, "media_values_{d}", .{index});
+        names.append(a, name) catch |err| {
+            a.free(name);
+            return err;
+        };
+        try inputs.append(a, .{ .name = name, .dtype = .f32, .data = std.mem.sliceAsBytes(item.values), .shape = item.shape[0..item.rank], .allocator = a, .owns_data = false, .owns_shape = false });
+        if (item.kind == .audio) {
+            const mask_name = try std.fmt.allocPrint(a, "media_mask_{d}", .{index});
+            names.append(a, mask_name) catch |err| {
+                a.free(mask_name);
+                return err;
+            };
+            try inputs.append(a, .{ .name = mask_name, .dtype = .i64, .data = std.mem.sliceAsBytes(item.mask), .shape = item.shape[0..1], .allocator = a, .owns_data = false, .owns_shape = false });
+        }
+    }
     var waiter = Scheduler.Waiter{};
     try enterModel(session, lock, effective, &waiter);
     defer leaveModel(lock, &waiter);
-    const outputs = try session.runWithControl(&inputs, a, control);
+    const outputs = try session.runWithControl(inputs.items, a, control);
     defer a.free(outputs);
     defer for (outputs) |*output| output.deinit();
     if (outputs.len != 1 or outputs[0].dtype != .f32 or !std.mem.eql(i64, outputs[0].shape, &.{ 1, @intCast(options.dimensions) })) return error.InvalidEmbeddingOutputShape;

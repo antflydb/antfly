@@ -62,6 +62,8 @@ pub const WeightShape = struct {
 pub const WeightShapeResolver = struct {
     context: ?*anyopaque = null,
     resolve: *const fn (context: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!?Shape,
+    /// Cold immutable checkpoint tables only; runtime operands never use this.
+    values: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8) anyerror!?[]f32 = null,
 };
 
 pub const TracingCompute = struct {
@@ -298,6 +300,12 @@ pub const TracingCompute = struct {
         .multiply = &multiplyOp,
         .conv1d = &conv1dOp,
         .conv2d = &conv2dOp,
+        .channelLayerNormRelu = &channelNormReluOp,
+        .flattenChannelsTimeFreq = &flattenChannelsOp,
+        .gluRows = &gluRowsOp,
+        .clampScalar = &clampScalarOp,
+        .depthwiseCausalConv1d = &depthwiseCausalOp,
+        .regions = .{ .audio_attention = .{ .localRelative = &localRelativeOp } },
         .rope = &ropeOp,
         .ropePerItem = &ropePerItemOp,
         .visionRope = &visionRopeOp,
@@ -708,7 +716,7 @@ pub const TracingCompute = struct {
 
     fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
         const tc = fromCtx(ctx);
-        const w_id = nodeIdFromCT(weight);
+        var w_id = nodeIdFromCT(weight);
         if (ids.len < total) return error.UnsupportedShape;
         const idx_shape = Shape.init(.i64, &.{@intCast(total)});
         const idx_id = if (try tc.runtimeInput(std.mem.sliceAsBytes(ids[0..total]), .i64, idx_shape)) |node| node else if (tc.isRuntimeEmbeddingIds(ids[0..total])) blk: {
@@ -724,6 +732,14 @@ pub const TracingCompute = struct {
             });
         };
         var b = Builder.init(tc.getGraphMut());
+        if (tc.require_resident_outputs) {
+            // Eager lookup treats checkpoint storage as a contiguous row table.
+            // Axis/position tables may carry extra leading dimensions.
+            const shape = tc.graph.node(w_id).output_shape;
+            const elements = shape.numElements() orelse return error.UnsupportedShape;
+            if (dim == 0 or elements <= 0 or @mod(elements, @as(i64, @intCast(dim))) != 0) return error.InvalidInputShape;
+            if (shape.rank() != 2 or shape.dim(1) != dim) w_id = try b.reshape(w_id, Shape.init(shape.dtype, &.{ @divExact(elements, @as(i64, @intCast(dim))), @intCast(dim) }));
+        }
         const id = try b.embeddingLookup(w_id, idx_id, @intCast(total), @intCast(dim));
         return tc.makeHandle(id);
     }
@@ -1025,7 +1041,8 @@ pub const TracingCompute = struct {
             const denominator = try tc.selectNode(try tc.lessNode(sums, one, reduced_shape), one, sums, reduced_shape);
             break :safe try builder.div(exponentials, try tc.broadcastNode(denominator, &.{ 0, 1, 2 }, score_shape));
         };
-        var result = try builder.matmul3D(probabilities, value);
+        const stored_probabilities = if (tc.precision == .bf16) try builder.convertDtype(try builder.convertDtype(probabilities, .bf16), .f32) else probabilities;
+        var result = try builder.matmul3D(stored_probabilities, value);
         if (token_major) {
             result = try builder.reshape(result, Shape.init(.f32, &.{ @intCast(batch), @intCast(heads), @intCast(queries), @intCast(dim) }));
             result = try builder.transpose(result, &.{ 0, 2, 1, 3 });
@@ -1357,6 +1374,40 @@ pub const TracingCompute = struct {
     }
 
     // ── RoPE ──────────────────────────────────────────────────────────
+
+    fn clampScalarOp(ctx: *anyopaque, input: CT, low: ?f32, high: ?f32) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(&tc.graph);
+        var node = nodeIdFromCT(input);
+        const shape = tc.graph.node(node).output_shape;
+        for ([_]?f32{ low, high }, 0..) |bound, side| if (bound) |value| {
+            const scalar = try tc.broadcastNode(try builder.scalarConst(.f32, value), &.{}, shape);
+            const predicate = try tc.graph.addNode(.{ .op = .{ .less_than = {} }, .output_shape = Shape.init(.bool_, shape.dims[0..shape.rank()]), .inputs = .{ if (side == 0) node else scalar, if (side == 0) scalar else node, null_node, null_node }, .num_inputs = 2 });
+            node = try tc.graph.addNode(.{ .op = .{ .where_select = {} }, .output_shape = shape, .inputs = .{ predicate, scalar, node, null_node }, .num_inputs = 3 });
+        };
+        return tc.makeHandle(node);
+    }
+
+    fn channelNormReluOp(ctx: *anyopaque, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        return tc.makeHandle(try @import("temporal_program.zig").channelNormRelu(&tc.graph, nodeIdFromCT(input), nodeIdFromCT(weight), channels, positions, eps));
+    }
+    fn flattenChannelsOp(ctx: *anyopaque, input: CT, time: usize, freq: usize, channels: usize) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        return tc.makeHandleExact(try @import("temporal_program.zig").flattenChannels(&tc.graph, nodeIdFromCT(input), time, freq, channels));
+    }
+    fn gluRowsOp(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        return tc.makeHandle(try @import("temporal_program.zig").glu(&tc.graph, nodeIdFromCT(input), rows, dim));
+    }
+    fn depthwiseCausalOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, dim: usize, kernel: usize) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        return tc.makeHandle(try @import("temporal_program.zig").depthwiseCausal(&tc.graph, nodeIdFromCT(input), nodeIdFromCT(weight), rows, dim, kernel));
+    }
+    fn localRelativeOp(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        return tc.makeHandle(try @import("temporal_program.zig").localRelative(&tc.graph, nodeIdFromCT(q), nodeIdFromCT(k), nodeIdFromCT(v), nodeIdFromCT(rel), nodeIdFromCT(scales), nodeIdFromCT(valid), params));
+    }
 
     fn visionRopeOp(ctx: *anyopaque, input: CT, rows: usize, dim: usize, theta: f32, positions: []const u32) anyerror!?CT {
         const tc = fromCtx(ctx);
@@ -1822,8 +1873,25 @@ pub const TracingCompute = struct {
 
     fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
         const tc = fromCtx(ctx);
-        if (tc.require_resident_outputs) return error.HostReadbackDuringCapture;
         const node_id = nodeIdFromCT(tensor);
+        if (tc.require_resident_outputs) {
+            var source = node_id;
+            while (tc.graph.node(source).op == .convert_dtype) source = tc.graph.node(source).inputs[0];
+            const n = tc.graph.node(source);
+            if (n.op != .parameter) return error.HostReadbackDuringCapture;
+            for (tc.runtime_inputs.items) |input| if (input.node == source) return error.HostReadbackDuringCapture;
+            const count = n.output_shape.numElements() orelse return error.HostReadbackDuringCapture;
+            if (count < 0 or count > 4096) return error.HostReadbackDuringCapture;
+            const resolver = tc.weight_shape_resolver orelse return error.HostReadbackDuringCapture;
+            const read = resolver.values orelse return error.HostReadbackDuringCapture;
+            const values = (try read(resolver.context, allocator, tc.graph.parameterName(n))) orelse return error.MissingWeight;
+            errdefer allocator.free(values);
+            if (values.len != count) return error.InvalidInputShape;
+            if (n.output_shape.dtype == .bf16) for (values) |*value| {
+                value.* = @import("antfly_tile").fexpr.roundBf16Value(value.*);
+            };
+            return values;
+        }
         // Mark as graph output
         try tc.graph.markOutput(node_id);
         // Return dummy zeros — tracing doesn't produce real values
@@ -1988,4 +2056,36 @@ test "TracingCompute extractGraph transfers ownership" {
     // Extracted graph should have nodes and outputs.
     try std.testing.expect(extracted.nodeCount() > 0);
     try std.testing.expect(extracted.outputs.items.len > 0);
+}
+
+test "capture reads only bounded immutable checkpoint metadata" {
+    const a = std.testing.allocator;
+    const Resolver = struct {
+        fn shape(_: ?*anyopaque, _: std.mem.Allocator, name: []const u8) anyerror!?Shape {
+            return Shape.init(.f32, &.{if (std.mem.eql(u8, name, "large")) @as(i64, 4097) else 2});
+        }
+        fn values(_: ?*anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror!?[]f32 {
+            return try allocator.dupe(f32, &.{ 0.25, 0.5 });
+        }
+    };
+    var tracer = TracingCompute.initWithWeightResolver(a, .{ .resolve = Resolver.shape, .values = Resolver.values });
+    defer tracer.deinit();
+    tracer.require_resident_outputs = true;
+    const cb = tracer.backend();
+    const weight = try cb.getWeight("small");
+    defer cb.free(weight);
+    const metadata = try cb.toFloat32(weight, a);
+    defer a.free(metadata);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.5 }, metadata);
+    const large = try cb.getWeight("large");
+    defer cb.free(large);
+    try std.testing.expectError(error.HostReadbackDuringCapture, cb.toFloat32(large, a));
+    const values = [_]f32{ 0.25, 0.5 };
+    _ = try tracer.bindRuntimeInput("activation", Shape.init(.f32, &.{2}), std.mem.sliceAsBytes(&values));
+    const runtime = try cb.fromFloat32Shape(&values, &.{2});
+    defer cb.free(runtime);
+    try std.testing.expectError(error.HostReadbackDuringCapture, cb.toFloat32(runtime, a));
+    const transformed = try cb.multiply(weight, weight);
+    defer cb.free(transformed);
+    try std.testing.expectError(error.HostReadbackDuringCapture, cb.toFloat32(transformed, a));
 }

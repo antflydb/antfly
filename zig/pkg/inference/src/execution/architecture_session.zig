@@ -7928,7 +7928,7 @@ fn programTextInputs(inputs: []const @import("capture.zig").Input) !ProgramTextI
 }
 fn archValidateProgramInputs(ptr: *anyopaque, inputs: []const @import("capture.zig").Input) anyerror!void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.arch_config == .embedding_gemma2 and @import("embedding_media_frontend.zig").hasPixels(inputs)) return @import("embedding_media_frontend.zig").validate(self.arch_config.embedding_gemma2, inputs);
+    if (self.arch_config == .embedding_gemma2 and @import("embedding_media_frontend.zig").hasMedia(inputs)) return @import("embedding_media_frontend.zig").validate(self.arch_config.embedding_gemma2, inputs);
     if (self.arch_config == .gpt) {
         _ = try programDecoderInputs(inputs, self.arch_config.gpt);
         return;
@@ -8017,7 +8017,7 @@ fn archProgramForward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator:
 fn archEmbeddingProgramForward(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const @import("capture.zig").Input) anyerror![]@import("capture.zig").Output {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.arch_config != .embedding_gemma2) return error.UnsupportedModelProgram;
-    if (@import("embedding_media_frontend.zig").hasPixels(inputs)) return @import("embedding_media_frontend.zig").run(self.arch_config.embedding_gemma2, cb, allocator, inputs);
+    if (@import("embedding_media_frontend.zig").hasMedia(inputs)) return @import("embedding_media_frontend.zig").run(self.arch_config.embedding_gemma2, cb, allocator, inputs);
     const parsed = try programTextInputs(inputs);
     const bi = parsed.text;
     const count = parsed.dimensions orelse return error.MissingInputs;
@@ -8061,7 +8061,7 @@ fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std
     };
     for (inputs, declared) |input, *value| value.* = .{
         .tensor = input,
-        .specialize = std.mem.eql(u8, input.name, "output_dimensions") or std.mem.eql(u8, input.name, "media_rows") or
+        .specialize = std.mem.eql(u8, input.name, "output_dimensions") or std.mem.eql(u8, input.name, "media_rows") or std.mem.eql(u8, input.name, "media_layout") or std.mem.startsWith(u8, input.name, "media_mask_") or
             (specialize_masks and (std.mem.eql(u8, input.name, "attention_mask") or std.mem.eql(u8, input.name, "encoder_attention_mask"))),
     };
     return self.captured_programs.run(self.allocator, .{

@@ -81,12 +81,26 @@ const Entry = struct {
             inline else => |tag| @field(@import("ml").graph.DType, @tagName(tag)),
         }, shape);
     }
+    fn weightValues(context: ?*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!?[]f32 {
+        const backend: *const ops.ComputeBackend = @ptrCast(@alignCast(context.?));
+        const weight = try backend.getWeight(name);
+        defer backend.free(weight);
+        const shape = try backend.tensorShape(weight, allocator);
+        defer allocator.free(shape);
+        var count: usize = 1;
+        for (shape) |dim| {
+            if (dim < 0 or dim > 4096) return error.HostReadbackDuringCapture;
+            count = try std.math.mul(usize, count, @intCast(dim));
+        }
+        if (count > 4096) return error.HostReadbackDuringCapture;
+        return try backend.toFloat32(weight, allocator);
+    }
     fn create(allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, key: Key) !*Entry {
         const frame = try allocator.create(Frame);
         errdefer allocator.destroy(frame);
         frame.backend = try provider.create(provider.context, allocator);
         errdefer frame.backend.deinit();
-        var program = try capture.trace(allocator, forward, inputs, .{ .context = @constCast(&frame.backend), .resolve = weightShape });
+        var program = try capture.trace(allocator, forward, inputs, .{ .context = @constCast(&frame.backend), .resolve = weightShape, .values = weightValues });
         errdefer program.deinit();
         const entry = try allocator.create(Entry);
         errdefer allocator.destroy(entry);
@@ -546,4 +560,109 @@ test "captured forward BF16 rotary preserves coefficient product and partial-lay
         defer for (outputs) |*output| output.deinit();
         try std.testing.expectEqualSlices(f32, &expected, outputs[0].asFloat32());
     };
+}
+
+const TestTemporal = struct {
+    fn client(a: std.mem.Allocator) !@import("pjrt").pjrt.Client {
+        const Client = @import("pjrt").pjrt.Client;
+        // Standalone CUDA qualification needs an explicit, small pool; the
+        // native CUDA backend is deliberately unnecessary for these tests.
+        const policy: Client.MemoryPolicy = if (platform.env.getenv("ANTFLY_PJRT_TEST_CUDA_DEVICE_BYTES")) |bytes|
+            .{ .cuda = .{ .capacity_bytes = 256 * 1024 * 1024, .device_bytes = try std.fmt.parseInt(usize, bytes, 10) } }
+        else
+            .cpu;
+        return Client.initFromEnvWithMemoryPolicy(a, policy);
+    }
+    const params = ops.Gemma4AudioLocalAttentionParams{ .rows = 5, .hidden = 4, .heads = 2, .head_dim = 2, .chunk = 2, .context_left = 3, .context = 4, .k_scale = 0.7, .logit_cap = 50, .invalid_value = -1e9, .exclude_farthest_key = true };
+    const rel = [_]f32{ 0.1, -0.2, 0.3, 0.4, -0.3, 0.2, -0.1, 0.1, 0.2, -0.4, 0.3, 0.1 };
+    const scales = [_]f32{ 0.7, 0.9 };
+    const weights = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.4, 0.3, 0.2, 0.1, -0.2, 0.5, -0.1, 0.2 };
+    const valid = [_]bool{ true, true, false, true, true };
+    fn forward(_: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, inputs: []const capture.Input) anyerror![]capture.Output {
+        return forwardWithParams(cb, a, inputs, params);
+    }
+    fn independent(_: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, inputs: []const capture.Input) anyerror![]capture.Output {
+        var p = params;
+        p.arithmetic = .independent_f32;
+        p.query_scale = 1.3;
+        p.publication = .bf16_values_f32;
+        return forwardWithParams(cb, a, inputs, p);
+    }
+    fn forwardWithParams(cb: *const ops.ComputeBackend, a: std.mem.Allocator, inputs: []const capture.Input, p: ops.Gemma4AudioLocalAttentionParams) anyerror![]capture.Output {
+        const x = try cb.fromFloat32Shape(inputs[0].tensor.asFloat32(), &.{ 5, 4 });
+        defer cb.free(x);
+        const table = try cb.fromFloat32Shape(&rel, &.{ 1, 3, 4 });
+        defer cb.free(table);
+        const relative = try cb.primReshape(table, &.{ 3, 4 });
+        defer cb.free(relative);
+        const gathered = try cb.embeddingLookup(table, &.{ 2, 0 }, 2, 4);
+        errdefer cb.free(gathered);
+        const scale = try cb.fromFloat32Shape(&scales, &.{2});
+        defer cb.free(scale);
+        const mask = try cb.fromFloat32Shape(&.{ 1, 1, 0, 1, 1 }, &.{5});
+        defer cb.free(mask);
+        const kernel = try cb.fromFloat32Shape(&weights, &.{ 3, 4 });
+        defer cb.free(kernel);
+        const attention = (try cb.gemma4AudioLocalAttention(x, x, x, relative, scale, mask, p)) orelse return error.UnsupportedPrimitiveOp;
+        errdefer cb.free(attention);
+        const convolution = (try cb.depthwiseCausalConv1d(x, kernel, 5, 4, 3)) orelse return error.UnsupportedPrimitiveOp;
+        errdefer cb.free(convolution);
+        const outputs = try a.alloc(capture.Output, 3);
+        outputs[0] = .{ .name = "attention", .value = attention };
+        outputs[1] = .{ .name = "convolution", .value = convolution };
+        outputs[2] = .{ .name = "positions", .value = gathered };
+        return outputs;
+    }
+};
+
+test "captured temporal PJRT local relative attention and causal convolution preserve masks and runtime values" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var client = try TestTemporal.client(a);
+    defer client.deinit();
+    var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
+    defer source.weights.deinitOwned();
+    var input = try Tensor.initFloat32(a, "x", &.{ 5, 4 }, &.{ 0.1, -0.2, 0.3, -0.4, 0.5, 0.7, -0.1, 0.2, -0.3, 0.4, 0.9, 0.8, 0.2, -0.6, 0.1, 0.7, -0.5, 0.4, 0.3, -0.2 });
+    defer input.deinit();
+    var cache = Cache{};
+    defer cache.deinit(a);
+    for (0..2) |iteration| {
+        input.asFloat32Mut()[0] += @as(f32, @floatFromInt(iteration)) * 0.3;
+        const expected = try @import("../architectures/gemma4_projector.zig").audioLocalAttentionReference(a, TestTemporal.params, input.asFloat32(), input.asFloat32(), input.asFloat32(), &TestTemporal.rel, &TestTemporal.scales, &TestTemporal.valid);
+        defer a.free(expected);
+        const outputs = try cache.run(a, .{ .context = &source, .create = TestProvider.create, .import = TestProvider.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client) } }, .{ .context = &source, .fingerprint = 1, .output_names = &.{ "attention", "convolution", "positions" }, .run = TestTemporal.forward }, &.{.{ .tensor = input }}, a, null);
+        defer a.free(outputs);
+        defer for (outputs) |*output| output.deinit();
+        try std.testing.expectEqualSlices(f32, TestTemporal.rel[8..12], outputs[2].asFloat32()[0..4]);
+        try std.testing.expectEqualSlices(f32, TestTemporal.rel[0..4], outputs[2].asFloat32()[4..8]);
+        for (expected, outputs[0].asFloat32()) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-6);
+        for (0..5) |row| for (0..4) |channel| {
+            var want: f32 = 0;
+            for (0..3) |tap| if (row + tap >= 2) {
+                want += input.asFloat32()[(row + tap - 2) * 4 + channel] * TestTemporal.weights[tap * 4 + channel];
+            };
+            try std.testing.expectApproxEqAbs(want, outputs[1].asFloat32()[row * 4 + channel], 1e-6);
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.entries.items.len);
+}
+
+test "captured temporal PJRT independent reductions publish BF16 values after F32 probabilities" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var client = try TestTemporal.client(a);
+    defer client.deinit();
+    var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
+    defer source.weights.deinitOwned();
+    var input = try Tensor.initFloat32(a, "x", &.{ 5, 4 }, &.{ 0.1, -0.2, 0.3, -0.4, 0.5, 0.7, -0.1, 0.2, -0.3, 0.4, 0.9, 0.8, 0.2, -0.6, 0.1, 0.7, -0.5, 0.4, 0.3, -0.2 });
+    defer input.deinit();
+    var cache = Cache{};
+    defer cache.deinit(a);
+    const outputs = try cache.run(a, .{ .context = &source, .create = TestProvider.create, .import = TestProvider.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client) } }, .{ .context = &source, .fingerprint = 2, .output_names = &.{ "attention", "convolution", "positions" }, .run = TestTemporal.independent }, &.{.{ .tensor = input }}, a, null);
+    defer a.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    // Frozen scalar reference: distinct content/relative F32 dot reductions,
+    // F32 softmax/value contraction, then one BF16 publication per coordinate.
+    const expected = [_]f32{ 0.10009765625, -0.2001953125, 0.30078125, -0.400390625, 0.337890625, 0.333984375, 0.09130859375, -0.0869140625, 0, 0, 0, 0, 0.2001953125, -0.6015625, 0.10009765625, 0.69921875, -0.1572265625, -0.08935546875, 0.21484375, 0.1845703125 };
+    try std.testing.expectEqualSlices(f32, &expected, outputs[0].asFloat32());
 }
